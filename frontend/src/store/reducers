@@ -1,0 +1,24 @@
+import { createSlice } from '@reduxjs/toolkit';
+import { Listing } from 'frontend/src/schema/listing';
+import { fetchListingsAsync } from '../actions/listingActions';
+
+const listingSlice = createSlice({
+  name: 'listings',
+  initialState: [] as Listing[],
+  reducers: {},
+  extraReducers: (builder) => {
+    builder
+      .addCase(fetchListingsAsync.pending, (state) => {
+        // You might want to set a loading state here
+      })
+      .addCase(fetchListingsAsync.fulfilled, (state, action) => {
+        return action.payload;
+      })
+      .addCase(fetchListingsAsync.rejected, (state, action) => {
+        // Handle error state here
+        console.error('Failed to fetch listings:', action.error);
+      });
+  },
+});
+
+export const listingReducer = listingSlice.reducer;
