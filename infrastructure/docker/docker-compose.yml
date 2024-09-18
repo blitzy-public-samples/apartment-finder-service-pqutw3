@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    environment:
+      - REACT_APP_API_URL=http://backend:5000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/myapp
+      - JWT_SECRET=${JWT_SECRET}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  db:
+    image: gcr.io/cloudsql-docker/gce-proxy:1.19.1
+    command:
+      - "/cloud_sql_proxy"
+      - "-instances=<INSTANCE_CONNECTION_NAME>=tcp:5432"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./secrets:/secrets
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-credentials.json
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "5432"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  default:
+    driver: bridge
+
+volumes:
+  db-data:
+    driver: local
+
+# HUMAN ASSISTANCE NEEDED
+# Please replace <INSTANCE_CONNECTION_NAME> with the actual Google Cloud SQL instance connection name.
+# Also, ensure that the google-credentials.json file is placed in the ./secrets directory.
