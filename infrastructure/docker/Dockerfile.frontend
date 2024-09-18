@@ -1,0 +1,36 @@
+# Use an official Node.js runtime as the base image
+FROM node:14 as build
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy package.json and package-lock.json
+COPY package.json package-lock.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy the rest of the application code
+COPY . .
+
+# Build the React app
+RUN npm run build
+
+# Use nginx to serve the React app
+FROM nginx:alpine
+
+# Copy the build output to replace the default nginx contents.
+COPY --from=build /app/build /usr/share/nginx/html
+
+# Expose port 80
+EXPOSE 80
+
+# Start nginx
+CMD ["nginx", "-g", "daemon off;"]
+
+# HUMAN ASSISTANCE NEEDED
+# Please verify the following:
+# 1. Ensure that the Node.js version (14) is appropriate for your project
+# 2. Confirm that 'npm run build' is the correct command to build your React app
+# 3. Check if any environment variables need to be set during the build process
+# 4. Verify if any additional nginx configuration is required for your specific app
