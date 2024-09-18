@@ -1,0 +1,37 @@
+import { createAsyncThunk } from '@reduxjs/toolkit';
+import { fetchListings } from 'frontend/src/services/api';
+import { Listing } from 'frontend/src/schema/listing';
+
+export const fetchListingsAsync = createAsyncThunk('listings/fetchListings', 
+  async (filter: object): Promise<Listing[]> => {
+    const listings = await fetchListings(filter);
+    return listings;
+  }
+);
+
+import { createAction } from '@reduxjs/toolkit';
+import { Filter } from 'frontend/src/schema/filter';
+
+export const setFilter = createAction<Filter>('filters/setFilter');
+
+import { createAsyncThunk } from '@reduxjs/toolkit';
+import { login, logout } from 'frontend/src/services/auth';
+import { User } from 'frontend/src/schema/user';
+
+export const loginAsync = createAsyncThunk('user/login',
+  async (credentials: object): Promise<User> => {
+    const user = await login(credentials);
+    return user;
+  }
+);
+
+export const logoutAsync = createAsyncThunk('user/logout',
+  async (): Promise<void> => {
+    await logout();
+  }
+);
+
+// HUMAN ASSISTANCE NEEDED
+// The logoutAsync thunk should also clear user data from the store.
+// This might require additional logic in the reducer or a separate action.
+// Please review and implement the necessary changes to clear user data upon logout.
