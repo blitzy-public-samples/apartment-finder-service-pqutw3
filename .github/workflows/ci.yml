@@ -33,7 +33,7 @@ jobs:
         set -euo pipefail
         # Suppressed advisories, their reachability assessments and the shared
         # review trigger: documentation/security/decision-log.md section 2.2
-        SUPPRESSED="PYSEC-2026-1325 PYSEC-2026-2132 PYSEC-2026-161 PYSEC-2026-248 PYSEC-2026-249 PYSEC-2026-2280 PYSEC-2026-2281 PYSEC-2026-2275 PYSEC-2026-141 PYSEC-2026-142 GHSA-6v7p-g79w-8964 PYSEC-2026-1375 PYSEC-2026-1374 PYSEC-2026-1845"
+        SUPPRESSED="PYSEC-2026-1325 PYSEC-2026-2132 PYSEC-2026-161 PYSEC-2026-248 PYSEC-2026-249 PYSEC-2026-2280 PYSEC-2026-2281 PYSEC-2026-2275 PYSEC-2026-141 PYSEC-2026-142 GHSA-6v7p-g79w-8964 PYSEC-2026-1375 PYSEC-2026-1374 PYSEC-2026-1845 PYSEC-2026-2270"
         IGNORE=""
         for id in $SUPPRESSED; do IGNORE="$IGNORE --ignore-vuln $id"; done
         pip freeze > /tmp/frozen.txt

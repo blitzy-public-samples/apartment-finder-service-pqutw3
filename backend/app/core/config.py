@@ -109,8 +109,7 @@ def _is_valid_origin(origin: str) -> bool:
             return False
         if not 1 <= port <= _MAX_PORT:
             return False
-        # SEC-03: a browser omits the scheme default port, so an entry
-        # carrying it can never match an Origin header
+        # SEC-03: rejects an entry carrying the scheme's default port
         if port == _ORIGIN_DEFAULT_PORTS[parts.scheme]:
             return False
     if not _is_valid_host(host):

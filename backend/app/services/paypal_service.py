@@ -159,7 +159,7 @@ def _find_payment_resource(reference: str) -> Optional[Dict]:
 
 
 async def process_payment(payment_method: str, amount: float) -> bool:
-    # SEC-09/F-01: approves only a reference PayPal confirms as authorized for
+    # SEC-09: approves only a reference PayPal confirms as authorized for
     # this exact amount; every unverified, malformed or failing path returns
     # False
     if not isinstance(payment_method, str) or not payment_method.strip():

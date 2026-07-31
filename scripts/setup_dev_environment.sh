@@ -24,10 +24,17 @@ check_software() {
 
 # Install project dependencies
 install_dependencies() {
+    local repo_root
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
+
     echo "Installing project dependencies..."
-    
-    # Install Python dependencies
-    pip3 install -r requirements.txt
+
+    # SEC-11: installs the tracked backend manifest with the active
+    # interpreter; a failed install aborts the run (CWE-252)
+    if ! python3 -m pip install -r "$repo_root/backend/requirements.txt"; then
+        echo "Failed to install $repo_root/backend/requirements.txt. Resolve the installation error, then rerun." >&2
+        return 1
+    fi
     
     # Install Node.js dependencies
     npm install
@@ -36,9 +43,17 @@ install_dependencies() {
 # Set up virtual environments
 setup_virtual_env() {
     echo "Setting up virtual environment..."
-    
-    python3 -m venv venv
-    source venv/bin/activate
+
+    # SEC-11: an unusable interpreter aborts the run (CWE-252)
+    if ! python3 -m venv venv; then
+        echo "Failed to create the virtual environment at ./venv. Install the python3 venv module, then rerun." >&2
+        return 1
+    fi
+
+    if ! source venv/bin/activate; then
+        echo "Failed to activate ./venv. Remove the directory, then rerun." >&2
+        return 1
+    fi
     
     echo "Virtual environment activated."
 }
@@ -105,6 +120,20 @@ EOF
     echo "Environment variables configured. Generated credentials written to .env file."
 }
 
+# Verify the owner bootstrap can import what it needs
+check_schema_prerequisites() {
+    local repo_root
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
+
+    PYTHONPATH="$repo_root" python3 - <<'PY'
+import importlib
+
+importlib.import_module("sqlalchemy")
+importlib.import_module("psycopg2")
+importlib.import_module("backend.app.db.models")
+PY
+}
+
 # Create the database schema with the owner role
 create_schema_as_owner() {
     local repo_root
@@ -133,6 +162,13 @@ PY
 # Initialize local database
 init_database() {
     echo "Initializing local database..."
+
+    # SEC-11: verifies the owner bootstrap's imports before the first
+    # database object exists (CWE-252)
+    if ! check_schema_prerequisites; then
+        echo "Cannot import SQLAlchemy, psycopg2 and backend.app.db.models with this interpreter. Install backend/requirements.txt, then rerun." >&2
+        return 1
+    fi
     
     if ! createdb dbname; then
         echo "Failed to create database dbname. Check the local PostgreSQL server, then rerun." >&2
@@ -187,8 +223,10 @@ run_migrations() {
 # Main execution
 main() {
     check_software
-    install_dependencies
-    setup_virtual_env
+    # SEC-11: prepares and populates the interpreter before the credential
+    # and database steps
+    setup_virtual_env || exit 1
+    install_dependencies || exit 1
     # SEC-01/SEC-11: a failed credential or role provisioning step stops the run
     configure_env_vars || exit 1
     init_database || exit 1

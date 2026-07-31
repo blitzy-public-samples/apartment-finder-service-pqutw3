@@ -13,8 +13,7 @@ def _require_json_number(value):
 
 
 def _require_iso_datetime_string(value):
-    # SEC-05: accepts an ISO-8601 date-time string only; rejects numbers,
-    # which pydantic would otherwise read as a Unix timestamp
+    # SEC-05: accepts an ISO-8601 date-time string only; rejects numbers
     if value is None:
         return value
     if not isinstance(value, str):
@@ -37,8 +36,7 @@ class Listing(BaseModel):
 
 
 class ListingCreate(BaseModel):
-    # SEC-05: writable-field allow-list for listings.py:23, typed strictly so
-    # a wrong JSON type is rejected rather than coerced
+    # SEC-05: strictly typed writable-field allow-list for POST /listings/
     rent: float
     broker_fee: Optional[float] = None
     square_footage: Optional[float] = None
