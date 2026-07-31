@@ -1,0 +1,8 @@
+# Environment files
+.env
+
+# Credentials, certificates, and keys
+secrets/
+*.pem
+*.key
+*credentials*.json
