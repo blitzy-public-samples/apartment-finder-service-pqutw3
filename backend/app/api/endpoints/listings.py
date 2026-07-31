@@ -4,7 +4,7 @@ from typing import List
 
 from backend.app.db.database import get_db
 from backend.app.schema.listing import ListingCreate, Listing
-from backend.app.db.models import Listing as ListingModel
+from backend.app.db.models import Listing as ListingModel, User
 from backend.app.core.security import get_current_user
 
 router = APIRouter()
