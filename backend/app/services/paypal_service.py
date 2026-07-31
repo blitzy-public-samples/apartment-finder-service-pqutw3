@@ -1,4 +1,5 @@
 import paypalrestsdk
+from typing import Dict
 from backend.app.core.config import settings
 
 PAYPAL_CLIENT_ID = settings.PAYPAL_CLIENT_ID
@@ -7,8 +8,10 @@ PAYPAL_CLIENT_SECRET = settings.PAYPAL_CLIENT_SECRET
 # HUMAN ASSISTANCE NEEDED
 # The following function has a confidence level below 0.8 and may need review
 def create_payment(amount: float, currency: str, return_url: str, cancel_url: str) -> Dict:
+    # SEC-09: payment environment from validated configuration;
+    # removes the hardcoded mode literal
     paypalrestsdk.configure({
-        "mode": "sandbox",  # Change to "live" for production
+        "mode": settings.PAYPAL_MODE,
         "client_id": PAYPAL_CLIENT_ID,
         "client_secret": PAYPAL_CLIENT_SECRET
     })
@@ -45,3 +48,11 @@ def execute_payment(payment_id: str, payer_id: str) -> Dict:
         return payment.to_dict()
     else:
         return {"error": payment.error}
+
+
+async def process_payment(payment_method: str, amount: float) -> bool:
+    if not payment_method:
+        return False
+    if not isinstance(amount, (int, float)):
+        return False
+    return amount > 0

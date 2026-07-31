@@ -27,8 +27,12 @@ services:
     depends_on:
       - db
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/myapp
-      - JWT_SECRET=${JWT_SECRET}
+      # SEC-01: no inline default; unset value fails backend startup
+      - DATABASE_URL=${DATABASE_URL}
+      # SEC-01: backend reads SECRET_KEY
+      - SECRET_KEY=${SECRET_KEY}
+      # SEC-10: db service is the Cloud SQL Auth Proxy on plain local TCP
+      - DB_SSLMODE=disable
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
