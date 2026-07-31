@@ -53,6 +53,11 @@ resource "google_sql_database_instance" "main" {
 
   settings {
     tier = "db-f1-micro"
+
+    # SEC-10: instance refuses unencrypted connections
+    ip_configuration {
+      ssl_mode = "ENCRYPTED_ONLY"
+    }
   }
 
   deletion_protection = false
@@ -61,6 +66,13 @@ resource "google_sql_database_instance" "main" {
 resource "google_sql_database" "database" {
   name     = "main-database"
   instance = google_sql_database_instance.main.name
+}
+
+# SEC-11: application role separate from the instance admin account
+resource "google_sql_user" "app" {
+  name     = var.db_app_user
+  instance = google_sql_database_instance.main.name
+  password = var.db_app_password
 }
 
 # Resource definitions for Google Cloud Storage buckets
