@@ -1,80 +1,38 @@
-# apartment-finder-service — backend Python dependency manifest
+# apartment-finder-service - backend Python dependency manifest.
 #
-# Runtime: CPython 3.9 (declared in infrastructure/docker/Dockerfile.backend,
-# .github/workflows/ci.yml, infrastructure/terraform/main.tf and scripts/deploy.sh).
-# Every pin below is the highest release installable on Python 3.9; where a newer
-# release exists but was deliberately declined, the reason is stated inline.
+# Target runtime: CPython 3.9 (infrastructure/docker/Dockerfile.backend:2,
+# .github/workflows/ci.yml:19, infrastructure/terraform/main.tf:99,
+# scripts/deploy.sh:24).
 #
 # Consumed by:
-#   infrastructure/docker/Dockerfile.backend  ->  pip install --no-cache-dir -r requirements.txt
-#   .github/workflows/ci.yml                  ->  pip install -r backend/requirements.txt
+#   infrastructure/docker/Dockerfile.backend:8,11
+#   .github/workflows/ci.yml:29
 #
-# Install:  python3.9 -m venv .venv && . .venv/bin/activate
-#           pip install -r backend/requirements.txt
+# Rationale: documentation/security/decision-log.md
 
 # ---------------------------------------------------------------------------
-# Web framework and server
+# Runtime dependencies
 # ---------------------------------------------------------------------------
-# 0.125.0 is the highest fastapi installable on Python 3.9 (>=0.126 requires
-# 3.10+). It pulls starlette 0.49.3, the highest starlette available on 3.9.
-fastapi==0.125.0
+fastapi==0.125.0                    # constraint: highest release installable on Python 3.9
 uvicorn==0.39.0
-
-# ---------------------------------------------------------------------------
-# Validation and settings
-# ---------------------------------------------------------------------------
-# Held on the pydantic 1.x line: backend/app/core/config.py imports BaseSettings
-# from pydantic directly (moved to pydantic-settings in 2.x) and six call sites
-# use Model.from_orm() (renamed in 2.x). 1.10.26 is the highest 1.x release.
-# The [dotenv] extra is REQUIRED: config.py sets `env_file = ".env"`, and
-# pydantic 1.x raises "ImportError: python-dotenv is not installed" the moment a
-# .env file is present without it.
-pydantic[dotenv]==1.10.26
-python-dotenv==1.2.1
+pydantic==1.10.26                   # constraint: 1.x line required
 email-validator==2.3.0
-
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
 SQLAlchemy==2.0.51
 psycopg2-binary==2.9.12
-
-# ---------------------------------------------------------------------------
-# Authentication and password hashing
-# ---------------------------------------------------------------------------
 python-jose[cryptography]==3.5.0
 passlib[bcrypt]==1.7.4
-# bcrypt MUST stay below 5.0.0. Under 5.0.0 passlib's internal capability probe
-# raises "ValueError: password cannot be longer than 72 bytes" while building
-# CryptContext(schemes=['bcrypt']) (backend/app/core/security.py:11), which
-# breaks all password hashing at import time.
-bcrypt==4.3.0
-
-# ---------------------------------------------------------------------------
-# Rate limiting (in-process, no external store required)
-# ---------------------------------------------------------------------------
+bcrypt==4.3.0                       # constraint: must remain below 5.0.0
 slowapi==0.1.10
-
-# ---------------------------------------------------------------------------
-# Third-party integrations
-# ---------------------------------------------------------------------------
 requests==2.32.5
 paypalrestsdk==1.13.3
 sendgrid==6.12.5
 
-# NOTE: python-multipart is intentionally NOT listed. The backend contains no
-# Form(), File(), UploadFile or OAuth2PasswordRequestForm usage, so no multipart
-# parsing is reachable; omitting it keeps six unpatchable-on-3.9 advisories out
-# of the resolved dependency closure.
-
 # ---------------------------------------------------------------------------
 # Development, test and audit tooling
-# (kept in this file because .github/workflows/ci.yml installs only this
-#  manifest before running flake8 and pytest --cov)
+# Consumers: .github/workflows/ci.yml:41-44 (flake8), :51-54 (pytest --cov)
 # ---------------------------------------------------------------------------
 pytest==8.4.2
 pytest-cov==7.1.0
 flake8==7.3.0
 pip-audit==2.9.0
-# httpx backs fastapi.testclient.TestClient and is not a FastAPI dependency.
 httpx==0.28.1
