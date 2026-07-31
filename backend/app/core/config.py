@@ -73,6 +73,8 @@ class Settings(BaseSettings):
                 )
             parts = urlsplit(origin)
             host = parts.netloc
+            # SEC-03: also rejects whitespace, control and non-ASCII
+            # characters, which a browser never sends in an Origin
             is_origin = (
                 parts.scheme in ("http", "https")
                 and host != ""
@@ -80,6 +82,10 @@ class Settings(BaseSettings):
                 and "@" not in host
                 and "*" not in host
                 and origin == f"{parts.scheme}://{host}"
+                and origin.isascii()
+                and not any(
+                    c.isspace() or not c.isprintable() for c in origin
+                )
             )
             if not is_origin:
                 raise ValueError(
