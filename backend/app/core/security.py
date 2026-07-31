@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from typing import Optional
 from jose import jwt
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, Request, status
@@ -36,7 +37,7 @@ def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
 # This function might need additional error handling and token validation
 def get_current_user(
     request: Request,
-    token: str = Depends(oauth2_scheme),
+    token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> User:
     # SEC-06: session cookie read before the bearer header
@@ -49,7 +50,7 @@ def get_current_user(
         )
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id: str = payload.get("sub")
+        user_id: Optional[str] = payload.get("sub")
         if user_id is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

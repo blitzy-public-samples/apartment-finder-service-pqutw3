@@ -1,22 +1,31 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr
 from datetime import datetime
 from typing import List, Optional
 
 class ZipCode(BaseModel):
     code: str
 
+    class Config:
+        orm_mode = True
+
 class Criteria(BaseModel):
-    field: str
-    operator: str
-    value: str
+    # SEC-05: strict strings reject a wrong JSON type instead of coercing it
+    field: StrictStr
+    operator: StrictStr
+    value: StrictStr
+
+    class Config:
+        extra = "forbid"   # SEC-05: rejects unknown keys in nested criteria
+        orm_mode = True    # SEC-05: reads the mapped criteria rows on response
 
 # SEC-05: writable-field allow-list for POST /filters/
 class FilterCreate(BaseModel):
-    name: str
+    name: StrictStr
     criteria: List[Criteria]
 
     class Config:
-        extra = "forbid"   # SEC-05: rejects unknown keys; closes the CWE-915 vector
+        # SEC-05: rejects unknown keys; closes the CWE-915 vector
+        extra = "forbid"
 
 class Filter(BaseModel):
     id: str
@@ -26,3 +35,6 @@ class Filter(BaseModel):
     last_used: Optional[datetime]
     zip_codes: List[ZipCode]
     criteria: List[Criteria]
+
+    class Config:
+        orm_mode = True

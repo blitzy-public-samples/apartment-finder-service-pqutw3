@@ -1,6 +1,14 @@
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr, StrictStr, validator
 from datetime import datetime
 from typing import Optional
+
+
+def _require_json_string(value):
+    # SEC-05: rejects a non-string JSON value before any coercion runs
+    if not isinstance(value, str):
+        raise TypeError("must be a JSON string")
+    return value
+
 
 class User(BaseModel):
     # SEC-02: matches the integer primary key; ends the identity type mismatch
@@ -21,7 +29,11 @@ PASSWORD_SPECIAL_CHARACTERS = "!@#$%^&*()_+-=[]{};':\"\\|,.<>/?"
 
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str
+    password: StrictStr
+
+    # SEC-05: email must arrive as a JSON string; no type coercion
+    _require_string_email = validator(
+        "email", pre=True, allow_reuse=True)(_require_json_string)
 
     # SEC-04: server-side password policy; mirrors the client rule
     @validator("password")
@@ -49,12 +61,18 @@ class UserCreate(BaseModel):
         return value
 
     class Config:
-        extra = "forbid"   # SEC-05: rejects unknown keys; closes the CWE-915 vector
+        # SEC-05: rejects unknown keys; closes the CWE-915 vector
+        extra = "forbid"
 
 
 class UserLogin(BaseModel):
     email: EmailStr
-    password: str
+    password: StrictStr
+
+    # SEC-05: email must arrive as a JSON string; no type coercion
+    _require_string_email = validator(
+        "email", pre=True, allow_reuse=True)(_require_json_string)
 
     class Config:
-        extra = "forbid"   # SEC-05: rejects unknown keys; closes the CWE-915 vector
+        # SEC-05: rejects unknown keys; closes the CWE-915 vector
+        extra = "forbid"

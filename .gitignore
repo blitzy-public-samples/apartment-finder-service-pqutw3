@@ -1,5 +1,6 @@
 # Environment files
 .env
+.env.tmp.*
 
 # Credentials, certificates, and keys
 secrets/

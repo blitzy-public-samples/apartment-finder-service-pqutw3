@@ -1,27 +1,31 @@
 # apartment-finder-service - backend Python dependency manifest.
 #
-# Target runtime: CPython 3.9 (infrastructure/docker/Dockerfile.backend:2,
-# .github/workflows/ci.yml:19, infrastructure/terraform/main.tf:99,
-# scripts/deploy.sh:24).
+# Target runtime: CPython 3.9, declared by the python:3.9-slim base image in
+# infrastructure/docker/Dockerfile.backend, the python-version input of the
+# "Set up Python" step in .github/workflows/ci.yml, the runtime argument of
+# the google_cloudfunctions_function resource in
+# infrastructure/terraform/main.tf, and the --runtime flag in
+# scripts/deploy.sh.
 #
 # Consumed by:
-#   infrastructure/docker/Dockerfile.backend:8,11
-#   .github/workflows/ci.yml:29
+#   infrastructure/docker/Dockerfile.backend, which copies this file and
+#     installs from it
+#   the "Install Python dependencies" step in .github/workflows/ci.yml
 #
 # Rationale: documentation/security/decision-log.md
 
 # ---------------------------------------------------------------------------
 # Runtime dependencies
 # ---------------------------------------------------------------------------
-fastapi==0.125.0                    # constraint: highest release installable on Python 3.9
+fastapi==0.125.0
 uvicorn==0.39.0
-pydantic[dotenv]==1.10.26           # constraint: 1.x line required, [dotenv] extra required by env_file
+pydantic==1.10.26
 email-validator==2.3.0
 SQLAlchemy==2.0.51
 psycopg2-binary==2.9.12
 python-jose[cryptography]==3.5.0
 passlib[bcrypt]==1.7.4
-bcrypt==4.3.0                       # constraint: must remain below 5.0.0
+bcrypt==4.3.0
 slowapi==0.1.10
 requests==2.32.5
 paypalrestsdk==1.13.3
@@ -29,8 +33,9 @@ sendgrid==6.12.5
 
 # ---------------------------------------------------------------------------
 # Development, test and audit tooling
-# Consumers: .github/workflows/ci.yml:70-73 (flake8), :80-83 (pytest --cov)
-# Audit gate consumer: .github/workflows/ci.yml:31-58 (pip-audit)
+# Consumers in .github/workflows/ci.yml: the "Run Flake8" step (flake8), the
+# "Run backend unit tests" step (pytest, pytest-cov) and the "Audit Python
+# dependencies" step (pip-audit).
 # ---------------------------------------------------------------------------
 pytest==8.4.2
 pytest-cov==7.1.0
