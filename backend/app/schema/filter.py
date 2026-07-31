@@ -10,6 +10,14 @@ class Criteria(BaseModel):
     operator: str
     value: str
 
+# SEC-05: writable-field allow-list for POST /filters/
+class FilterCreate(BaseModel):
+    name: str
+    criteria: List[Criteria]
+
+    class Config:
+        extra = "forbid"   # SEC-05: rejects unknown keys; closes the CWE-915 vector
+
 class Filter(BaseModel):
     id: str
     user_id: str

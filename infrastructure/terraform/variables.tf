@@ -68,3 +68,15 @@ variable "cloud_function_name_analyze" {
   type        = string
   default     = "data-analyze-function"
 }
+
+variable "db_app_user" {
+  description = "The name of the application database role"
+  type        = string
+  default     = "app_user"
+}
+
+variable "db_app_password" {
+  description = "The password for the application database role"
+  type        = string
+  sensitive   = true
+}
