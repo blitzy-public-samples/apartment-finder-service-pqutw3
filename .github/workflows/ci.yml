@@ -28,6 +28,35 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r backend/requirements.txt
 
+    - name: Audit Python dependencies
+      run: |
+        set -euo pipefail
+        # Suppressed advisories, their reachability assessments and the shared
+        # review trigger: documentation/security/decision-log.md section 2.2
+        SUPPRESSED="PYSEC-2026-1325 PYSEC-2026-2132 PYSEC-2026-161 PYSEC-2026-248 PYSEC-2026-249 PYSEC-2026-2280 PYSEC-2026-2281 PYSEC-2026-2275 PYSEC-2026-141 PYSEC-2026-142 GHSA-6v7p-g79w-8964 PYSEC-2026-1375 PYSEC-2026-1374 PYSEC-2026-1845 PYSEC-2026-2270"
+        IGNORE=""
+        for id in $SUPPRESSED; do IGNORE="$IGNORE --ignore-vuln $id"; done
+        pip freeze > /tmp/frozen.txt
+        pip-audit --strict --no-deps -r /tmp/frozen.txt $IGNORE
+        # pip-audit accepts an --ignore-vuln identifier that matches nothing
+        # without emitting a diagnostic, so a stale or mistyped entry would
+        # silently disable part of the gate. Fail the build instead.
+        pip-audit --no-deps --format json -r /tmp/frozen.txt > /tmp/pip-audit.json || true
+        SUPPRESSED="$SUPPRESSED" python - <<'PY'
+        import json, os, sys
+        wanted = set(os.environ["SUPPRESSED"].split())
+        with open("/tmp/pip-audit.json") as handle:
+            report = json.load(handle)
+        matched = set()
+        for dependency in report.get("dependencies", []):
+            for vuln in dependency.get("vulns", []):
+                matched |= {vuln["id"], *(vuln.get("aliases") or [])} & wanted
+        stale = sorted(wanted - matched)
+        if stale:
+            sys.exit("Suppression entries matched no live advisory: " + ", ".join(stale))
+        print("All %d suppression entries matched a live advisory." % len(wanted))
+        PY
+
     - name: Install Node.js dependencies
       run: |
         cd frontend

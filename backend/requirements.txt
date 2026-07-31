@@ -15,7 +15,7 @@
 # ---------------------------------------------------------------------------
 fastapi==0.125.0                    # constraint: highest release installable on Python 3.9
 uvicorn==0.39.0
-pydantic==1.10.26                   # constraint: 1.x line required
+pydantic[dotenv]==1.10.26           # constraint: 1.x line required, [dotenv] extra required by env_file
 email-validator==2.3.0
 SQLAlchemy==2.0.51
 psycopg2-binary==2.9.12
@@ -29,7 +29,8 @@ sendgrid==6.12.5
 
 # ---------------------------------------------------------------------------
 # Development, test and audit tooling
-# Consumers: .github/workflows/ci.yml:41-44 (flake8), :51-54 (pytest --cov)
+# Consumers: .github/workflows/ci.yml:70-73 (flake8), :80-83 (pytest --cov)
+# Audit gate consumer: .github/workflows/ci.yml:31-58 (pip-audit)
 # ---------------------------------------------------------------------------
 pytest==8.4.2
 pytest-cov==7.1.0
