@@ -38,9 +38,8 @@ jobs:
         for id in $SUPPRESSED; do IGNORE="$IGNORE --ignore-vuln $id"; done
         pip freeze > /tmp/frozen.txt
         pip-audit --strict --no-deps -r /tmp/frozen.txt $IGNORE
-        # pip-audit accepts an --ignore-vuln identifier that matches nothing
-        # without emitting a diagnostic, so a stale or mistyped entry would
-        # silently disable part of the gate. Fail the build instead.
+        # Stale-suppression cross-check: fails the build when a suppression
+        # entry matches no live advisory
         pip-audit --no-deps --format json -r /tmp/frozen.txt > /tmp/pip-audit.json || true
         SUPPRESSED="$SUPPRESSED" python - <<'PY'
         import json, os, sys
@@ -56,6 +55,22 @@ jobs:
             sys.exit("Suppression entries matched no live advisory: " + ", ".join(stale))
         print("All %d suppression entries matched a live advisory." % len(wanted))
         PY
+
+    # SEC-01, SEC-12: repository-wide credential scan over tracked content.
+    # Pattern source of record; see documentation/security/decision-log.md
+    - name: Scan for hardcoded credentials
+      run: |
+        if git grep -In -E "postgres:postgres|PASSWORD '[^']+'|SECRET_KEY=[A-Za-z0-9_]|password@" -- ':(exclude).github/workflows/ci.yml' ':(exclude)SECURITY.md'; then exit 1; fi
+
+    # SEC-09: frontend client-secret guard
+    - name: Scan frontend for client secrets
+      run: |
+        if grep -rIn -E "CLIENT_SECRET|client_secret" frontend/; then exit 1; fi
+
+    # SEC-06: browser-storage guard
+    - name: Scan frontend for browser token storage
+      run: |
+        if grep -rIn -E "localStorage|sessionStorage" frontend/src/; then exit 1; fi
 
     - name: Install Node.js dependencies
       run: |
