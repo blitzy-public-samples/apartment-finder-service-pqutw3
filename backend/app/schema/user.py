@@ -28,6 +28,19 @@ PASSWORD_DIGITS = "0123456789"
 PASSWORD_SPECIAL_CHARACTERS = "!@#$%^&*()_+-=[]{};':\"\\|,.<>/?"
 
 
+def _reject_unhashable_password(value: str) -> str:
+    # SEC-05: bcrypt aborts the hash on a control character and passlib
+    # refuses a secret past its own size limit (auth.py:156, auth.py:206)
+    # SEC-04: 72-byte bcrypt ceiling; blocks silent truncation
+    if len(value.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        raise ValueError(
+            f"must not exceed {PASSWORD_MAX_BYTES} UTF-8 bytes"
+        )
+    if any(unicodedata.category(c) == "Cc" for c in value):
+        raise ValueError("must not contain control characters")
+    return value
+
+
 class UserCreate(BaseModel):
     email: EmailStr
     password: StrictStr
@@ -43,15 +56,8 @@ class UserCreate(BaseModel):
             raise ValueError(
                 f"must be at least {PASSWORD_MIN_LENGTH} characters long"
             )
-        # SEC-04: 72-byte bcrypt ceiling; blocks silent truncation
-        if len(value.encode("utf-8")) > PASSWORD_MAX_BYTES:
-            raise ValueError(
-                f"must not exceed {PASSWORD_MAX_BYTES} UTF-8 bytes"
-            )
-        # SEC-04: rejects NUL and every other control character; bcrypt
-        # refuses such input and aborts the hash (auth.py:156)
-        if any(unicodedata.category(c) == "Cc" for c in value):
-            raise ValueError("must not contain control characters")
+        # SEC-04: 72-byte ceiling and control-character rejection
+        _reject_unhashable_password(value)
         if not any(c in PASSWORD_UPPERCASE for c in value):
             raise ValueError("must include at least one uppercase letter")
         if not any(c in PASSWORD_LOWERCASE for c in value):
@@ -77,6 +83,12 @@ class UserLogin(BaseModel):
     # SEC-05: email must arrive as a JSON string; no type coercion
     _require_string_email = validator(
         "email", pre=True, allow_reuse=True)(_require_json_string)
+
+    # SEC-05: refuses the two shapes the hasher cannot process; an
+    # unauthenticated caller can no longer force a 500 out of verify_password
+    # (CWE-20). Policy length and character-class rules stay on UserCreate.
+    _reject_unhashable = validator(
+        "password", allow_reuse=True)(_reject_unhashable_password)
 
     class Config:
         # SEC-05: rejects unknown keys; closes the CWE-915 vector

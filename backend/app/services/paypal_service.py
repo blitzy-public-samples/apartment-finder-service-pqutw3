@@ -8,6 +8,11 @@ from backend.app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# SEC-09/SEC-12: the provider SDK writes its request headers at DEBUG in every
+# mode except live, and the Authorization header carries
+# base64(client_id:client_secret) (CWE-532)
+logging.getLogger("paypalrestsdk").setLevel(logging.INFO)
+
 PAYPAL_CLIENT_ID = settings.PAYPAL_CLIENT_ID
 PAYPAL_CLIENT_SECRET = settings.PAYPAL_CLIENT_SECRET
 

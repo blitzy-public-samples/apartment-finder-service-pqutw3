@@ -38,6 +38,45 @@ def create_tables():
     # only for absent tables and the application role holds no CREATE
     Base.metadata.create_all(bind=engine, checkfirst=True)
 
+
+class SanitizedServerErrorMiddleware:
+    # SEC-08: answers an unhandled exception from inside the CORS layer, so a
+    # 500 carries the same cross-origin headers as every other status and the
+    # response header set no longer identifies which component failed
+    # (CWE-209). The framework routes an Exception handler to
+    # ServerErrorMiddleware, which is built outside every application
+    # middleware.
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def send_started(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_started)
+        except Exception as exc:
+            # SEC-08: a partially sent response cannot be replaced; the
+            # framework boundary outside this layer completes it
+            if started:
+                raise
+            response = handle_unhandled_exception(
+                Request(scope, receive), exc
+            )
+            await response(scope, receive, send)
+
+
+# SEC-08: registered before CORSMiddleware, which places this layer inside it
+app.add_middleware(SanitizedServerErrorMiddleware)
+
 # HUMAN ASSISTANCE NEEDED
 # The following setup section has a confidence level below 0.8 and may need review
 # Application setup and configuration
@@ -147,10 +186,14 @@ def _validation_field_names(errors) -> list:
     # carried by msg, ctx and input
     names = []
     for error in errors:
-        parts = [str(part) for part in error.get("loc", ())]
-        if len(parts) > 1 and parts[0] in _REQUEST_LOCATIONS:
-            parts = parts[1:]
-        name = ".".join(parts)
+        location = tuple(error.get("loc", ()))
+        if len(location) > 1 and location[0] in _REQUEST_LOCATIONS:
+            location = location[1:]
+        # SEC-08: a body that is not JSON is located by a byte offset rather
+        # than a field; the offset measures the submitted content (CWE-209)
+        if len(location) == 1 and isinstance(location[0], int):
+            continue
+        name = ".".join(str(part) for part in location)
         if name and name not in names:
             names.append(name)
     return names

@@ -7,3 +7,20 @@ secrets/
 *.pem
 *.key
 *credentials*.json
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local virtual environments
+.venv/
+venv/
+
+# Node and frontend build artifacts
+node_modules/
+frontend/build/

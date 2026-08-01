@@ -11,6 +11,16 @@ _ORIGIN_DEFAULT_PORTS = {"http": 80, "https": 443}
 # UTF-8 bytes of SECRET_KEY
 HMAC_KEY_MIN_BYTES = {"HS256": 32, "HS384": 48, "HS512": 64}
 
+# SEC-10: the libpq sslmode domain, in ascending order of protection
+DB_SSLMODES = (
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+)
+
 # SEC-03: origin syntax limits applied to every ALLOWED_ORIGINS entry
 _ORIGIN_SCHEMES = ("http", "https")
 _MAX_PORT = 65535
@@ -136,7 +146,8 @@ class Settings(BaseSettings):
     # the configured ALGORITHM is applied by validate_secret_key_bytes
     SECRET_KEY: str = Field(..., min_length=32)
     ALGORITHM: str
-    ACCESS_TOKEN_EXPIRE_MINUTES: int
+    # SEC-12: a non-positive lifetime mints an already-expired token
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(..., gt=0)
     ZILLOW_API_KEY: str
     PAYPAL_CLIENT_ID: str
     PAYPAL_CLIENT_SECRET: str
@@ -154,9 +165,11 @@ class Settings(BaseSettings):
     # SEC-06: cookie Secure attribute is environment-driven
     COOKIE_SECURE: bool = True
 
-    # SEC-07: login throttle thresholds
-    LOGIN_RATE_LIMIT_ATTEMPTS: int = 5
-    LOGIN_RATE_LIMIT_WINDOW_MINUTES: int = 15
+    # SEC-07: login throttle thresholds; a non-positive window prunes every
+    # counter on the next attempt and leaves credential guessing unbounded
+    # (CWE-307)
+    LOGIN_RATE_LIMIT_ATTEMPTS: int = Field(5, ge=1)
+    LOGIN_RATE_LIMIT_WINDOW_MINUTES: int = Field(15, ge=1)
 
     # SEC-12: settings read at module scope by the service layer
     SENDGRID_API_KEY: str
@@ -181,6 +194,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PAYPAL_MODE must be either 'sandbox' or 'live', "
                 f"got: {value!r}"
+            )
+        return value
+
+    @validator("DB_SSLMODE")
+    def validate_db_sslmode(cls, value):
+        # SEC-10: libpq transport-mode domain; refuses a value the driver
+        # rejects at connect time and refuses an appended connection
+        # parameter (CWE-319, CWE-1188).
+        if value not in DB_SSLMODES:
+            raise ValueError(
+                "DB_SSLMODE must be one of "
+                + ", ".join(DB_SSLMODES)
+                + f", got: {value!r}"
             )
         return value
 
@@ -231,5 +257,19 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+        @classmethod
+        def parse_env_var(cls, field_name: str, raw_value: str):
+            # SEC-03: names the required JSON form when a list-valued
+            # setting cannot be parsed; the startup failure stays
+            # fail-closed (CWE-1188)
+            try:
+                return cls.json_loads(raw_value)
+            except ValueError:
+                raise ValueError(
+                    f"{field_name} must be a JSON array of double-quoted "
+                    'entries, e.g. ["https://app.example.com",'
+                    '"http://localhost:3000"]'
+                )
 
 settings = Settings()
