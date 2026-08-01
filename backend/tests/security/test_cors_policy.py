@@ -5,9 +5,19 @@ An allow-listed origin comes back echoed verbatim, with credentials
 enabled. An origin outside the list gets no allow-origin header at all.
 An unsafe allow-list raises a validation error while ``Settings`` is
 built, which stops the process at import.
+
+The allow-list arrives from the environment in production, and that path
+differs from passing a keyword: an unparsable value is refused before
+any validator sees it, and the guidance an operator needs travels on the
+cause rather than in the message. Both spellings are covered here, so a
+rejection proved through a keyword is never mistaken for a rejection
+proved through the environment.
 """
+import json
+
 import pytest
 from pydantic import ValidationError
+from pydantic.env_settings import SettingsError
 
 from backend.app.core.config import Settings, settings
 
@@ -51,8 +61,45 @@ _ALLOW_CREDENTIALS = "Access-Control-Allow-Credentials"
 _ALLOW_METHODS = "Access-Control-Allow-Methods"
 _ALLOW_HEADERS = "Access-Control-Allow-Headers"
 _MAX_AGE = "Access-Control-Max-Age"
+_VARY = "Vary"
 
 _REFERENCE_ORIGIN = "https://reference.example.com"
+
+# SEC-03: the name of the setting the environment carries
+_ALLOW_LIST_VARIABLE = "ALLOWED_ORIGINS"
+
+# SEC-03: the JSON array spelling .env.example documents, which is the
+# only form the environment path accepts
+DOCUMENTED_ENV_ORIGINS = ("https://app.example.com", "http://localhost:3000")
+
+# SEC-03: environment values no JSON parser accepts. A bare
+# comma-separated list is the spelling an operator reaches for first.
+UNPARSABLE_ENV_VALUES = (
+    pytest.param(
+        "https://a.example.com,https://b.example.com",
+        id="comma-separated-string",
+    ),
+    pytest.param("https://a.example.com", id="single-bare-origin"),
+    pytest.param("['https://a.example.com']", id="single-quoted-array"),
+    pytest.param("", id="empty-string"),
+)
+
+# SEC-03: environment values that parse as JSON and then fail the
+# allow-list rules, which proves the environment path reaches the same
+# validator the keyword path does
+UNSAFE_ENV_VALUES = (
+    pytest.param("[]", id="empty-array"),
+    pytest.param('["*"]', id="wildcard"),
+    pytest.param('["null"]', id="opaque-origin"),
+    pytest.param('["testserver"]', id="bare-host"),
+    pytest.param(
+        '["https://good.example.com","*"]',
+        id="wildcard-mixed-with-a-valid-origin",
+    ),
+)
+
+# SEC-03: the guidance the operator-facing cause has to carry
+_REQUIRED_FORM_MARKERS = ("JSON array", '"https://app.example.com"')
 
 
 def _header_tokens(value):
@@ -117,7 +164,8 @@ def test_allow_listed_origin_is_echoed_with_credentials(client, origin):
     """An allow-listed origin comes back as itself and the response
     turns credentials on.
 
-    The echoed value is the full origin string, never a wildcard.
+    The echoed value is the full origin string, never a wildcard, and
+    the response declares that it varies by origin.
     """
     response = client.get(PUBLIC_READ_PATH, headers={"Origin": origin})
 
@@ -126,6 +174,11 @@ def test_allow_listed_origin_is_echoed_with_credentials(client, origin):
     assert response.headers[_ALLOW_ORIGIN] == origin
     assert response.headers[_ALLOW_ORIGIN] != WILDCARD
     assert response.headers[_ALLOW_CREDENTIALS] == "true"
+
+    # SEC-03: an explicit allow-list makes the response origin-dependent,
+    # so a shared cache must key on Origin rather than serve one stored
+    # copy to every caller
+    assert "origin" in _header_tokens(response.headers[_VARY])
 
 
 def test_preflight_from_an_allow_listed_origin_is_approved(client):
@@ -140,6 +193,10 @@ def test_preflight_from_an_allow_listed_origin_is_approved(client):
     assert response.headers[_ALLOW_CREDENTIALS] == "true"
     assert response.headers[_MAX_AGE].isdigit()
     assert int(response.headers[_MAX_AGE]) > 0
+
+    # SEC-03: the cached decision is origin-dependent, so the cache key
+    # has to include the origin that earned it
+    assert "origin" in _header_tokens(response.headers[_VARY])
 
 
 def test_preflight_advertises_an_explicit_method_list(client):
@@ -273,8 +330,10 @@ def test_unsafe_allow_list_prevents_startup(unsafe_value):
     """An unsafe allow-list raises a validation error naming
     ALLOWED_ORIGINS, and building ``Settings`` at import then fails.
 
-    A bare comma-separated string is among the rejected shapes. The
-    JSON array form in ``.env.example`` is the accepted spelling.
+    Each value arrives as a keyword, so these cases reach the field
+    validator directly. The environment path a deployment uses is
+    covered separately below, because it refuses an unparsable value
+    before any validator runs.
     """
     with pytest.raises(ValidationError) as raised:
         _build_settings_with_allow_list(unsafe_value)
@@ -300,3 +359,68 @@ def test_enumerated_allow_list_is_accepted(safe_value):
     built = _build_settings_with_allow_list(safe_value)
 
     assert built.ALLOWED_ORIGINS == safe_value
+
+
+def test_the_documented_environment_spelling_is_accepted(monkeypatch):
+    """The JSON array form ``.env.example`` documents parses.
+
+    This is the path a deployment takes, so the documented spelling has
+    to work there and not only as a keyword.
+    """
+    monkeypatch.setenv(
+        _ALLOW_LIST_VARIABLE, json.dumps(list(DOCUMENTED_ENV_ORIGINS))
+    )
+
+    built = Settings(_env_file=None)
+
+    assert built.ALLOWED_ORIGINS == list(DOCUMENTED_ENV_ORIGINS)
+
+
+@pytest.mark.parametrize("raw_value", UNPARSABLE_ENV_VALUES)
+def test_an_unparsable_environment_allow_list_names_the_required_form(
+    monkeypatch, raw_value
+):
+    """An unparsable environment value fails closed and says what to
+    write.
+
+    The library refuses the value before the field validator runs and
+    reports only the lowercased variable name, so the guidance an
+    operator needs survives on the cause alone. Without it a failed
+    deployment reports a parser complaint about a character offset.
+    """
+    monkeypatch.setenv(_ALLOW_LIST_VARIABLE, raw_value)
+
+    with pytest.raises(SettingsError) as raised:
+        Settings(_env_file=None)
+
+    # SEC-03: the process does not start on an unusable allow-list
+    reported = str(raised.value)
+    assert _ALLOW_LIST_VARIABLE.lower() in reported.lower()
+
+    # SEC-03: the required form is carried by the cause, not the message
+    cause = raised.value.__cause__
+    assert isinstance(cause, ValueError)
+    guidance = str(cause)
+    assert _ALLOW_LIST_VARIABLE in guidance
+    for marker in _REQUIRED_FORM_MARKERS:
+        assert marker in guidance, guidance
+        assert marker not in reported
+
+
+@pytest.mark.parametrize("raw_value", UNSAFE_ENV_VALUES)
+def test_an_unsafe_environment_allow_list_prevents_startup(
+    monkeypatch, raw_value
+):
+    """A parsable but unsafe environment value is refused by name.
+
+    A value that parses reaches the same field validator the keyword
+    cases exercise, so the wildcard and the opaque origin cannot enter
+    through the environment either.
+    """
+    monkeypatch.setenv(_ALLOW_LIST_VARIABLE, raw_value)
+
+    with pytest.raises(ValidationError) as raised:
+        Settings(_env_file=None)
+
+    # SEC-03: an unsafe allow-list prevents startup
+    assert _rejected_field_names(raised.value) == {_ALLOW_LIST_VARIABLE}

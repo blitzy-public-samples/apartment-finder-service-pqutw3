@@ -9,11 +9,16 @@ server holds the only copy that a caller cannot bypass.
 The cases run at two layers. The HTTP layer pins the status code, the
 field name and the absence of any database row. The schema layer pins
 the character set and reports a direct failure when a rule moves.
+
+The stored value is checked too. Every ceiling below is a bcrypt input
+limit, so the scheme that produced the hash is part of the policy rather
+than an implementation detail behind it.
 """
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import text
 
+from backend.app.core.security import verify_password
 from backend.app.schema.user import UserCreate
 
 # There is no /api prefix: router.py applies /auth and main.py includes
@@ -100,6 +105,14 @@ SPECIAL_PARAMS = [
     for character in SPECIALS
 ]
 
+# SEC-04: the modular-crypt identifier of the scheme AAP 0.7.1 pins, and
+# the smallest work factor that scheme may be configured with
+BCRYPT_IDENTIFIER = "2b"
+MIN_BCRYPT_COST = 12
+
+# SEC-04: a second address for the salting case
+SECOND_SCHEMA_EMAIL = "policy-probe-two@example.com"
+
 
 def _register(client, email, password):
     return client.post(
@@ -114,6 +127,22 @@ def _user_row_count(session, email):
         text("SELECT COUNT(*) FROM users WHERE email = :email"),
         {"email": email},
     ).scalar()
+
+
+def _stored_password_hash(session, email):
+    # SEC-04: reads the column the route wrote, so the assertion covers
+    # what an attacker reaching the table would find
+    return session.execute(
+        text("SELECT hashed_password FROM users WHERE email = :email"),
+        {"email": email},
+    ).scalar()
+
+
+def _modular_crypt_parts(stored):
+    # SEC-04: a modular-crypt hash is $identifier$cost$salt-and-digest
+    assert stored.startswith("$"), stored
+    identifier, cost, remainder = stored[1:].split("$", 2)
+    return identifier, cost, remainder
 
 
 def test_special_set_mirrors_the_client_rule():
@@ -279,3 +308,63 @@ def test_schema_rejects_every_policy_violation(password):
         UserCreate(email=SCHEMA_EMAIL, password=password)
 
     assert failure.value.errors()[0]["loc"] == ("password",)
+
+
+def test_the_stored_secret_is_a_bcrypt_hash(
+    client, db_session, unique_email
+):
+    """Registration stores a bcrypt hash at the pinned work factor.
+
+    The 72-byte ceiling every case above asserts is the bcrypt input
+    limit, so a different scheme would leave the whole policy arbitrary.
+    A reversible or fast digest would also hand an attacker who reads
+    one table every password in it (CWE-916).
+    """
+    response = _register(client, unique_email, COMPLIANT)
+    assert response.status_code == 200
+
+    stored = _stored_password_hash(db_session, unique_email)
+    assert stored
+
+    # SEC-04: the submitted value is not what the row holds, and the
+    # hash is not what the response returns
+    assert stored != COMPLIANT
+    assert COMPLIANT not in stored
+    assert stored not in response.text
+
+    # SEC-04: the pinned scheme, at or above the pinned work factor
+    identifier, cost, remainder = _modular_crypt_parts(stored)
+    assert identifier == BCRYPT_IDENTIFIER
+    assert cost.isdigit(), cost
+    assert int(cost) >= MIN_BCRYPT_COST
+    assert remainder
+
+    # SEC-04: the hash verifies the password it was made from and
+    # nothing else
+    assert verify_password(COMPLIANT, stored)
+    assert not verify_password(COMPLIANT + "x", stored)
+
+
+def test_one_password_stored_twice_yields_two_hashes(
+    client, db_session, unique_email
+):
+    """Two accounts sharing a password store different hashes.
+
+    Equal hashes would let one cracked password unlock every account
+    that reused it, and would make the column a lookup table (CWE-759).
+    """
+    second_email = SECOND_SCHEMA_EMAIL
+
+    assert _register(client, unique_email, COMPLIANT).status_code == 200
+    assert _register(client, second_email, COMPLIANT).status_code == 200
+
+    first = _stored_password_hash(db_session, unique_email)
+    second = _stored_password_hash(db_session, second_email)
+
+    # SEC-04: a per-row salt makes the two hashes differ
+    assert first and second
+    assert first != second
+
+    # SEC-04: both still verify the shared password
+    assert verify_password(COMPLIANT, first)
+    assert verify_password(COMPLIANT, second)

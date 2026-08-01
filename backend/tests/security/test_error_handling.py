@@ -3,11 +3,13 @@
 Every error reply must carry the same envelope, withhold internal
 detail, and quote a correlation identifier the server log repeats.
 """
+import json
 import logging
 from contextlib import contextmanager
 
 import pytest
-from sqlalchemy.exc import SQLAlchemyError
+from conftest import ALLOWED_ORIGIN
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.app.core.security import (
     SESSION_COOKIE_NAME,
@@ -64,6 +66,19 @@ _LEAK_MARKERS_EXACT_CASE = (
 # SEC-07: an upper bound on the login attempts the throttle case sends
 _LOGIN_ATTEMPT_CEILING = 25
 
+# SEC-08: a body no JSON parser accepts. The parser reports the position
+# it stopped at, and that position measures the submitted content.
+NON_JSON_BODY = b"this-is-not-json-" + b"x" * 40
+
+# SEC-08: the cross-origin headers a reply from inside the CORS layer
+# carries. A reply from outside it carries none of them.
+_ALLOW_ORIGIN_HEADER = "Access-Control-Allow-Origin"
+_ALLOW_CREDENTIALS_HEADER = "Access-Control-Allow-Credentials"
+
+# SEC-08: the detail the duplicate-address guard raises. The boundary
+# replaces it with the status phrase, so it must not reach the caller.
+_DUPLICATE_INTERNAL_DETAIL = "Email already registered"
+
 
 def _bearer(token):
     """Return the Authorization header carrying one bearer token."""
@@ -113,6 +128,31 @@ def _login_until_throttled(client, email):
     )
 
 
+class _CommitLosesTheRace:
+    """A session view whose commit reports a duplicate key.
+
+    Every other call reaches the real session, so the route's pre-check
+    query, its insert and its rollback all behave normally and only the
+    commit fails - which is the shape of a lost unique-address race.
+    """
+
+    def __init__(self, session):
+        self._session = session
+        self.rolled_back = False
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    def commit(self):
+        raise IntegrityError(
+            "INSERT INTO users", {}, Exception("duplicate key value")
+        )
+
+    def rollback(self):
+        self.rolled_back = True
+        self._session.rollback()
+
+
 @pytest.fixture
 def failing_database(client):
     """Yield a factory that makes the session dependency raise."""
@@ -141,6 +181,37 @@ def failing_database(client):
         yield _failing
     finally:
         _restore()
+
+
+@pytest.fixture
+def losing_the_commit_race(client):
+    """Yield a factory that makes the registration commit lose a race."""
+    harness_override = app.dependency_overrides[get_db]
+
+    @contextmanager
+    def _racing():
+        views = []
+
+        def _racing_get_db():
+            session = next(harness_override())
+            view = _CommitLosesTheRace(session)
+            views.append(view)
+            try:
+                yield view
+            finally:
+                session.close()
+
+        app.dependency_overrides[get_db] = _racing_get_db
+        try:
+            yield views
+        finally:
+            # SEC-08: restores the single harness override key
+            app.dependency_overrides[get_db] = harness_override
+
+    try:
+        yield _racing
+    finally:
+        app.dependency_overrides[get_db] = harness_override
 
 
 def test_forced_internal_error_returns_a_sanitized_500(
@@ -206,6 +277,91 @@ def test_validation_error_names_fields_and_withholds_values(client):
     # SEC-08: the submitted value never returns to the caller
     assert SUBMITTED_VALUE_SENTINEL not in response.text
     _assert_no_internal_detail(response.text)
+
+
+def test_a_body_that_is_not_json_reports_no_byte_offset(client):
+    """A body no parser accepts is refused without measuring it.
+
+    The parser locates the failure by an offset into the submitted
+    content, so promoting that offset into the field list would publish
+    a measurement of the request body back to its sender.
+    """
+    response = client.post(
+        "/auth/register",
+        content=NON_JSON_BODY,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    body = _assert_uniform_envelope(response)
+    # SEC-08: an offset is a measurement of the body, never a field name
+    assert body["fields"] == []
+    # SEC-08: no number reaches the caller at all. The correlation
+    # identifier is excluded because it is random hex and carries no
+    # information about the request.
+    reportable = json.dumps(
+        {key: value for key, value in body.items() if key != "error_id"}
+    )
+    assert not [
+        character for character in reportable if character.isdigit()
+    ], reportable
+    # SEC-08: the submitted bytes do not return either
+    assert NON_JSON_BODY.decode() not in response.text
+    _assert_no_internal_detail(response.text)
+
+
+def test_a_sanitized_500_reaches_an_allow_listed_origin(
+    client, failing_database
+):
+    """A 500 carries the cross-origin headers every other status does.
+
+    The sanitized layer is registered ahead of the cross-origin
+    middleware, which nests it inside. Moving it outside would leave a
+    browser reading an opaque network failure instead of the envelope
+    and the correlation identifier inside it.
+    """
+    with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
+        response = client.get(
+            "/listings/", headers={"Origin": ALLOWED_ORIGIN}
+        )
+
+    assert response.status_code == 500
+    body = _assert_uniform_envelope(response)
+    assert body["detail"] == GENERIC_SERVER_DETAIL
+    # SEC-08: the failure is answered from inside the cross-origin layer
+    assert response.headers[_ALLOW_ORIGIN_HEADER] == ALLOWED_ORIGIN
+    assert response.headers[_ALLOW_CREDENTIALS_HEADER] == "true"
+    assert "origin" in response.headers.get("vary", "").lower()
+    assert response.headers["content-type"].startswith("application/json")
+    _assert_no_internal_detail(response.text)
+    assert EXCEPTION_TEXT_SENTINEL not in response.text
+
+
+def test_a_lost_unique_address_race_answers_bad_request(
+    client, losing_the_commit_race, unique_email
+):
+    """A registration losing the unique-address race is not a 500.
+
+    The pre-check clears because no row holds the address yet, so only
+    the commit fails. The route answers with the same 400 the pre-check
+    raises, and the failed transaction is rolled back.
+    """
+    with losing_the_commit_race() as views:
+        response = client.post(
+            "/auth/register",
+            json={"email": unique_email, "password": POLICY_PASSWORD},
+        )
+
+    # SEC-08: a lost race is a rejected request, never a server fault
+    assert response.status_code != 500, response.text
+    assert response.status_code == 400, response.text
+    body = _assert_uniform_envelope(response)
+    assert body["fields"] == []
+    # SEC-08: the raised detail is replaced by the status phrase
+    assert _DUPLICATE_INTERNAL_DETAIL not in response.text
+    _assert_no_internal_detail(response.text)
+    # SEC-08: the open transaction is discarded rather than left behind
+    assert views and views[-1].rolled_back
 
 
 def test_the_error_envelope_is_uniform_across_handlers(
