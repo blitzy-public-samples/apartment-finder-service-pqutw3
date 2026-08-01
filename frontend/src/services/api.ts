@@ -3,7 +3,8 @@ import { Listing } from 'frontend/src/schema/listing';
 import { Filter } from 'frontend/src/schema/filter';
 import { User } from 'frontend/src/schema/user';
 
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+export const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
+axios.defaults.withCredentials = true; // SEC-06: sends the session cookie
 
 export const fetchListings = async (filter: Filter): Promise<Listing[]> => {
   try {
