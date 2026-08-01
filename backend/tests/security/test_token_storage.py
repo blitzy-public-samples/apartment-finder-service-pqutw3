@@ -1,9 +1,12 @@
 """SEC-06 regression tests for session token storage.
 
-The session token travels in an HttpOnly cookie that page script cannot
-read, and the register and login bodies keep the keys they had. Nine
-tests cover the cookie attributes, both response bodies, a cookie-only
-request, the bearer-header fallback and logout.
+Both auth routes set the session cookie with HttpOnly, Secure and
+SameSite=Strict, and the register and login bodies keep the keys they
+had. The cases cover the cookie attributes, both response bodies, a
+cookie-only request, the bearer-header fallback, cookie precedence over
+a conflicting header, and logout. Every assertion here is a backend one.
+No test in this file runs browser script; it asserts the HttpOnly
+attribute, not what a browser does with it.
 """
 from datetime import datetime, timedelta
 from http import HTTPStatus
@@ -33,13 +36,18 @@ EXPECTED_COOKIE_PATH = "/"
 
 # Frozen response contracts, read from
 # backend/app/api/endpoints/auth.py:177-184 and :220-223
-REGISTER_BODY_KEYS = frozenset({"user", "access_token", "token_type"})
+# SEC-06: the body key naming the token, derived from the cookie name
+TOKEN_BODY_KEY = SESSION_COOKIE_NAME
+REGISTER_BODY_KEYS = frozenset({"user", TOKEN_BODY_KEY, "token_type"})
 REGISTER_USER_KEYS = frozenset({"id", "email"})
-LOGIN_BODY_KEYS = frozenset({"access_token", "token_type"})
+LOGIN_BODY_KEYS = frozenset({TOKEN_BODY_KEY, "token_type"})
 EXPECTED_TOKEN_TYPE = "bearer"
 
 BEARER_PREFIX = "Bearer "
 EXPECTED_AUTH_CHALLENGE = "Bearer"
+
+# SEC-06: a cookie value that carries no valid signature
+MALFORMED_COOKIE_TOKEN = "not-a-signed-token"
 
 # SEC-08: the detail get_current_user raises; the error boundary at
 # main.py:234 keeps it out of the response body
@@ -76,7 +84,7 @@ def _session_cookie_directive(response):
 
 
 def _assert_cookie_security_attributes(morsel):
-    """Check the three attributes that keep the token away from script."""
+    """Check the session cookie's HttpOnly, Secure, SameSite and Path."""
     # SEC-06: HttpOnly puts the token beyond page script
     assert morsel["httponly"] is True, "the session cookie omits HttpOnly"
     # SEC-06: the Secure attribute follows settings.COOKIE_SECURE
@@ -94,7 +102,7 @@ def _assert_cookie_security_attributes(morsel):
 
 
 def _assert_cookie_lifetime(morsel):
-    """Check the cookie expires with the token it carries."""
+    """Check the cookie lifetime matches the configured token lifetime."""
     assert morsel["max-age"] or morsel["expires"], (
         "the session cookie carries neither Max-Age nor Expires"
     )
@@ -148,6 +156,14 @@ def _send_with_one_cookie(client, cookie_value, headers):
     return client.send(request)
 
 
+def test_the_session_cookie_name_matches_the_frozen_body_key():
+    """The cookie name and the frozen response body key are one name."""
+    # SEC-06: auth.py publishes the token under this key in the body and
+    # in the cookie, so a cookie rename cannot move the frozen contract
+    assert SESSION_COOKIE_NAME == "access_token"
+    assert TOKEN_BODY_KEY == "access_token"
+
+
 def test_register_response_sets_the_httponly_session_cookie(
     client, unique_email
 ):
@@ -162,7 +178,7 @@ def test_register_response_sets_the_httponly_session_cookie(
     _assert_cookie_security_attributes(morsel)
     _assert_cookie_lifetime(morsel)
     # SEC-06: the cookie and the body carry the same token
-    assert morsel.value == response.json()["access_token"]
+    assert morsel.value == response.json()[TOKEN_BODY_KEY]
 
 
 def test_login_response_sets_the_httponly_session_cookie(
@@ -177,7 +193,7 @@ def test_login_response_sets_the_httponly_session_cookie(
     _assert_cookie_security_attributes(morsel)
     _assert_cookie_lifetime(morsel)
     # SEC-06: the cookie and the body carry the same token
-    assert morsel.value == response.json()["access_token"]
+    assert morsel.value == response.json()[TOKEN_BODY_KEY]
     assert client.cookies.get(SESSION_COOKIE_NAME) == morsel.value
 
 
@@ -195,8 +211,8 @@ def test_register_response_body_keys_are_unchanged(client, unique_email):
     assert body["token_type"] == EXPECTED_TOKEN_TYPE
     assert body["user"]["email"] == unique_email
     assert isinstance(body["user"]["id"], int)
-    assert isinstance(body["access_token"], str)
-    assert body["access_token"]
+    assert isinstance(body[TOKEN_BODY_KEY], str)
+    assert body[TOKEN_BODY_KEY]
 
 
 def test_login_response_body_carries_no_user_key(client, register_user):
@@ -209,8 +225,8 @@ def test_login_response_body_carries_no_user_key(client, register_user):
     assert set(body) == LOGIN_BODY_KEYS
     assert "user" not in body
     assert body["token_type"] == EXPECTED_TOKEN_TYPE
-    assert isinstance(body["access_token"], str)
-    assert body["access_token"]
+    assert isinstance(body[TOKEN_BODY_KEY], str)
+    assert body[TOKEN_BODY_KEY]
 
 
 def test_cookie_only_request_authenticates(client, db_session, register_user):
@@ -222,7 +238,6 @@ def test_cookie_only_request_authenticates(client, db_session, register_user):
     _seed_owned_filter(db_session, account)
 
     request = client.build_request("GET", PROTECTED_ROUTE)
-    # SEC-06: no bearer header on the request
     assert "authorization" not in request.headers
     response = client.send(request)
 
@@ -239,7 +254,7 @@ def test_bearer_header_authenticates_after_the_cookie_is_cleared(
     account = register_user()
     login = _login(client, account)
     assert login.status_code == 200, login.text
-    token = login.json()["access_token"]
+    token = login.json()[TOKEN_BODY_KEY]
     _seed_owned_filter(db_session, account)
 
     client.cookies.delete(SESSION_COOKIE_NAME)
@@ -250,7 +265,6 @@ def test_bearer_header_authenticates_after_the_cookie_is_cleared(
         PROTECTED_ROUTE,
         headers={"Authorization": BEARER_PREFIX + token},
     )
-    # SEC-06: no session cookie on the request
     assert "cookie" not in request.headers
     response = client.send(request)
 
@@ -258,21 +272,52 @@ def test_bearer_header_authenticates_after_the_cookie_is_cleared(
     assert response.json()[0]["user_id"] == str(account["id"])
 
 
-def test_cookie_and_bearer_header_together_authenticate(
-    client, register_user
+def test_cookie_identity_answers_a_conflicting_bearer_header(
+    client, db_session, register_user
 ):
-    """Sending both the cookie and the header keeps the request working."""
-    account = register_user()
-    login = _login(client, account)
+    """The cookie identity answers when the header names another account."""
+    cookie_owner = register_user()
+    header_owner = register_user()
+    assert cookie_owner["id"] != header_owner["id"]
+    _seed_owned_filter(db_session, cookie_owner)
+
+    login = _login(client, cookie_owner)
     assert login.status_code == 200, login.text
-    token = login.json()["access_token"]
-    assert client.cookies.get(SESSION_COOKIE_NAME) == token
+    assert client.cookies.get(SESSION_COOKIE_NAME) == (
+        login.json()["access_token"]
+    )
 
     response = client.get(
         PROTECTED_ROUTE,
-        headers={"Authorization": BEARER_PREFIX + token},
+        headers={
+            "Authorization": BEARER_PREFIX + header_owner["access_token"]
+        },
     )
+
     assert response.status_code == 200, response.text
+    # SEC-06: the cookie identity answers, not the header identity
+    owners = [row["user_id"] for row in response.json()]
+    assert owners == [str(cookie_owner["id"])]
+
+
+def test_an_invalid_session_cookie_is_not_rescued_by_a_bearer_header(
+    client, db_session, register_user
+):
+    """A present cookie that fails validation refuses the request."""
+    account = register_user()
+    _seed_owned_filter(db_session, account)
+    client.cookies.set(SESSION_COOKIE_NAME, MALFORMED_COOKIE_TOKEN)
+
+    response = client.get(
+        PROTECTED_ROUTE,
+        headers={"Authorization": BEARER_PREFIX + account["access_token"]},
+    )
+
+    assert response.status_code == 401, response.text
+    assert response.headers["WWW-Authenticate"] == EXPECTED_AUTH_CHALLENGE
+    body = response.json()
+    assert body["detail"] == HTTPStatus.UNAUTHORIZED.phrase
+    assert INTERNAL_401_DETAIL not in response.text
 
 
 def test_the_session_cookie_outranks_the_bearer_header(
@@ -367,7 +412,8 @@ def test_a_cleared_cookie_leaves_the_bearer_header_in_charge(
     account = register_user()
     login = _login(client, account)
     assert login.status_code == 200, login.text
-    token = login.json()["access_token"]
+    token = login.json()[TOKEN_BODY_KEY]
+    assert client.cookies.get(SESSION_COOKIE_NAME) == token
     _seed_owned_filter(db_session, account)
 
     response = _send_with_one_cookie(
@@ -386,7 +432,7 @@ def test_logout_clears_the_session_cookie(client, register_user):
     login = _login(client, account)
     assert login.status_code == 200, login.text
     assert client.cookies.get(SESSION_COOKIE_NAME) == (
-        login.json()["access_token"]
+        login.json()[TOKEN_BODY_KEY]
     )
 
     logout = client.post(LOGOUT_ROUTE)

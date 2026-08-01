@@ -1,4 +1,4 @@
-"""Request-validation regression tests for every write endpoint.
+"""Request-validation regression tests for the write endpoints.
 
 Each test proves one endpoint refuses a body it does not declare, so a
 client cannot set a server-owned column by adding a key to the request.
@@ -7,6 +7,11 @@ The same file pins the contracts a validation change could quietly move:
 the set of paths and verbs the application declares, the pagination the
 public read path applies, the response model the filter route declares,
 and the answer a duplicate address receives.
+
+The domain cases carry that further. A declared numeric field also has a
+range, and a value outside it - NaN, either infinity, a magnitude no
+float holds, or a figure beneath the field's floor - stops at the
+request boundary, ahead of the write path and ahead of the payment call.
 """
 from contextlib import contextmanager
 from datetime import datetime
@@ -129,6 +134,13 @@ def _bearer(access_token):
 def _without(body, key):
     """Return a copy of one body with a single key removed."""
     return {name: value for name, value in body.items() if name != key}
+
+
+def _post_raw(client, path, raw_body, access_token):
+    """Post one raw JSON document with no client-side encoding."""
+    headers = _bearer(access_token)
+    headers["content-type"] = "application/json"
+    return client.post(path, content=raw_body, headers=headers)
 
 
 def _rejected_fields(response):
@@ -259,7 +271,6 @@ def test_register_refuses_client_supplied_identifier(
             "id": 4321,
         },
     )
-    # SEC-05: unknown key rejected; closes the CWE-915 vector
     _assert_rejected(response, 422, "id")
 
 
@@ -273,7 +284,6 @@ def test_login_refuses_undeclared_key(client, registered_user):
             "is_admin": True,
         },
     )
-    # SEC-05: unknown key rejected; closes the CWE-915 vector
     _assert_rejected(response, 422, "is_admin")
 
 
@@ -283,15 +293,12 @@ def test_listing_refuses_client_supplied_owner(
     """The listing route refuses a client-supplied owner and writes
     no row."""
     account = register_user()
-    # SEC-05: authenticated first; sub-dependencies resolve before body
-    # validation
+    # SEC-05: authenticated caller
     response = client.post(
         "/listings/",
         json=dict(DECLARED_LISTING_BODY, owner_id=account["id"]),
         headers=_bearer(account["access_token"]),
     )
-    # SEC-05: unknown key rejected; closes the CWE-915 vector at
-    # listings.py:31
     _assert_rejected(response, 422, "owner_id")
     assert db_session.query(ListingModel).count() == 0
 
@@ -301,28 +308,22 @@ def test_listing_refuses_client_supplied_identifier(
 ):
     """The listing route refuses a client-supplied record identifier."""
     account = register_user()
-    # SEC-05: authenticated first; sub-dependencies resolve before body
-    # validation
     response = client.post(
         "/listings/",
         json=dict(DECLARED_LISTING_BODY, id=99),
         headers=_bearer(account["access_token"]),
     )
-    # SEC-05: unknown key rejected; closes the CWE-915 vector
     _assert_rejected(response, 422, "id")
 
 
 def test_filter_refuses_undeclared_key(client, register_user):
     """The filter route refuses a body carrying an undeclared key."""
     account = register_user()
-    # SEC-05: authenticated first; sub-dependencies resolve before body
-    # validation
     response = client.post(
         "/filters/",
         json=dict(DECLARED_FILTER_BODY, user_id=account["id"]),
         headers=_bearer(account["access_token"]),
     )
-    # SEC-05: unknown key rejected; closes the CWE-915 vector
     _assert_rejected(response, 422, "user_id")
 
 
@@ -330,8 +331,6 @@ def test_filter_refuses_undeclared_nested_key(client, register_user):
     """The filter route refuses an undeclared key nested inside one
     criterion."""
     account = register_user()
-    # SEC-05: authenticated first; sub-dependencies resolve before body
-    # validation
     response = client.post(
         "/filters/",
         json={
@@ -348,20 +347,14 @@ def test_subscription_refuses_undeclared_key(client, register_user):
     """The subscription route refuses a body carrying an undeclared
     key."""
     account = register_user()
-    # SEC-05: authenticated first; sub-dependencies resolve before body
-    # validation
     response = client.post(
         "/subscriptions/",
         json=dict(EMPTY_PLAN_SUBSCRIPTION_BODY, user_id=account["id"]),
         headers=_bearer(account["access_token"]),
     )
-    # SEC-05: unknown key rejected; closes the CWE-915 vector
     _assert_rejected(response, 422, "user_id")
 
 
-# ---------------------------------------------------------------------
-# The guard answers before the body is read
-# ---------------------------------------------------------------------
 @pytest.mark.parametrize(
     "path, body",
     (
@@ -383,18 +376,15 @@ def test_undeclared_key_without_credentials_is_refused(
 ):
     """The guard refuses a request carrying no credentials before
     anything reads the body."""
-    # SEC-06: the session cookie rides on any client that holds one
+    # SEC-06: no session cookie on this client
     client.cookies.clear()
     assert not client.cookies
     response = client.post(path, json=body)
-    # SEC-05: no credentials; the guard answers before body validation
+    # SEC-05: unauthenticated branch
     _assert_rejected(response, 401)
     assert response.status_code != 422
 
 
-# ---------------------------------------------------------------------
-# A required key is missing
-# ---------------------------------------------------------------------
 def test_register_refuses_missing_password(client, unique_email):
     """The register route refuses a body with no password."""
     response = client.post(
@@ -426,9 +416,6 @@ def test_subscription_refuses_missing_plan(client, register_user):
     _assert_rejected(response, 422, "plan_id")
 
 
-# ---------------------------------------------------------------------
-# A value arrives malformed or wrongly typed
-# ---------------------------------------------------------------------
 def test_register_refuses_malformed_email(client):
     """The register route refuses an address that is not an email."""
     response = client.post(
@@ -515,6 +502,222 @@ def test_subscription_refuses_wrongly_typed_field(
 
 
 # ---------------------------------------------------------------------
+# A number arrives outside its domain
+# ---------------------------------------------------------------------
+# SEC-05: the wire spellings a JSON body carries for a value no float holds
+NON_FINITE_LITERALS = ("NaN", "Infinity", "-Infinity", "1e309", "-1e309")
+
+# SEC-05: a magnitude float() refuses outright, raising OverflowError
+UNREPRESENTABLE_MAGNITUDE = 10 ** 400
+
+LISTING_DOMAIN_CASES = (
+    ("rent", 0),
+    ("rent", -500.0),
+    ("rent", UNREPRESENTABLE_MAGNITUDE),
+    ("broker_fee", -1.0),
+    ("broker_fee", UNREPRESENTABLE_MAGNITUDE),
+    ("square_footage", 0),
+    ("square_footage", -650.0),
+    ("square_footage", UNREPRESENTABLE_MAGNITUDE),
+    ("bedrooms", -1),
+    ("bathrooms", -2),
+)
+
+LISTING_DOMAIN_IDS = (
+    "rent-zero",
+    "rent-negative",
+    "rent-unrepresentable",
+    "broker-fee-negative",
+    "broker-fee-unrepresentable",
+    "square-footage-zero",
+    "square-footage-negative",
+    "square-footage-unrepresentable",
+    "bedrooms-negative",
+    "bathrooms-negative",
+)
+
+SUBSCRIPTION_DOMAIN_CASES = (
+    ("amount", 0),
+    ("amount", -19.99),
+    ("amount", UNREPRESENTABLE_MAGNITUDE),
+)
+
+SUBSCRIPTION_DOMAIN_IDS = (
+    "amount-zero",
+    "amount-negative",
+    "amount-unrepresentable",
+)
+
+# SEC-05: the lowest value each listing field admits
+BOUNDARY_LISTING_BODY = {
+    "rent": 0.01,
+    "broker_fee": 0.0,
+    "square_footage": 0.5,
+    "bedrooms": 0,
+    "bathrooms": 0,
+    "street_address": "1 Test Way",
+}
+
+# SEC-05: a named plan, keeping the empty-plan path out of these cases
+NAMED_PLAN = "monthly"
+
+
+@pytest.mark.parametrize(
+    "field, value", LISTING_DOMAIN_CASES, ids=LISTING_DOMAIN_IDS
+)
+def test_listing_refuses_out_of_domain_number(
+    client, register_user, db_session, field, value
+):
+    """The listing route refuses a number outside its field domain."""
+    account = register_user()
+    response = client.post(
+        "/listings/",
+        json=dict(DECLARED_LISTING_BODY, **{field: value}),
+        headers=_bearer(account["access_token"]),
+    )
+    # SEC-05: the domain holds at the request boundary, with no server
+    # fault and no row written
+    _assert_rejected(response, 422, field)
+    assert db_session.query(ListingModel).count() == 0
+
+
+@pytest.mark.parametrize(
+    "field, value", LISTING_DOMAIN_CASES, ids=LISTING_DOMAIN_IDS
+)
+def test_listing_model_refuses_out_of_domain_number(field, value):
+    """The listing model refuses the same number with no route
+    involved."""
+    with pytest.raises(ValidationError) as raised:
+        ListingCreate(**dict(DECLARED_LISTING_BODY, **{field: value}))
+    assert (field,) in [error["loc"] for error in raised.value.errors()]
+
+
+@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
+def test_listing_refuses_every_non_finite_rent(
+    client, register_user, db_session, literal
+):
+    """The listing route refuses each wire spelling of a non-finite
+    rent."""
+    account = register_user()
+    body = (
+        '{"rent": %s, "bedrooms": 2, "bathrooms": 1,'
+        ' "street_address": "1 Test Way"}' % literal
+    )
+    response = _post_raw(
+        client, "/listings/", body, account["access_token"]
+    )
+    # SEC-05: NaN and both infinities stop at the request boundary
+    _assert_rejected(response, 422, "rent")
+    assert db_session.query(ListingModel).count() == 0
+
+
+def test_listing_admits_the_lowest_value_each_field_allows():
+    """The listing model admits a no-fee studio at the domain floor."""
+    model = ListingCreate(**BOUNDARY_LISTING_BODY)
+    assert model.rent == 0.01
+    assert model.broker_fee == 0.0
+    assert model.square_footage == 0.5
+    assert model.bedrooms == 0
+    assert model.bathrooms == 0
+
+
+@pytest.mark.parametrize(
+    "field, value", SUBSCRIPTION_DOMAIN_CASES, ids=SUBSCRIPTION_DOMAIN_IDS
+)
+def test_subscription_refuses_out_of_domain_amount(
+    client, register_user, field, value
+):
+    """The subscription route refuses an amount outside its domain."""
+    account = register_user()
+    response = client.post(
+        "/subscriptions/",
+        json=dict(
+            EMPTY_PLAN_SUBSCRIPTION_BODY,
+            plan_id=NAMED_PLAN,
+            **{field: value}
+        ),
+        headers=_bearer(account["access_token"]),
+    )
+    # SEC-05: the amount domain holds ahead of the payment call
+    _assert_rejected(response, 422, field)
+
+
+@pytest.mark.parametrize(
+    "field, value", SUBSCRIPTION_DOMAIN_CASES, ids=SUBSCRIPTION_DOMAIN_IDS
+)
+def test_subscription_model_refuses_out_of_domain_amount(field, value):
+    """The subscription model refuses the same amount with no route
+    involved."""
+    with pytest.raises(ValidationError) as raised:
+        SubscriptionCreate(
+            **dict(
+                EMPTY_PLAN_SUBSCRIPTION_BODY,
+                plan_id=NAMED_PLAN,
+                **{field: value}
+            )
+        )
+    assert (field,) in [error["loc"] for error in raised.value.errors()]
+
+
+@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
+def test_subscription_refuses_every_non_finite_amount(
+    client, register_user, literal
+):
+    """The subscription route refuses each wire spelling of a non-finite
+    amount."""
+    account = register_user()
+    body = (
+        '{"plan_id": "monthly", "payment_method": "paypal",'
+        ' "amount": %s, "start_date": "2030-01-01T00:00:00"}' % literal
+    )
+    response = _post_raw(
+        client, "/subscriptions/", body, account["access_token"]
+    )
+    # SEC-05: NaN and both infinities stop ahead of the payment call
+    _assert_rejected(response, 422, "amount")
+
+
+@pytest.mark.parametrize(
+    "end_date",
+    ("2029-12-31T23:59:59", "2030-01-01T00:00:00"),
+    ids=("end-before-start", "end-equals-start"),
+)
+def test_subscription_refuses_an_unordered_term(
+    client, register_user, end_date
+):
+    """The subscription route refuses a term that ends before it
+    begins."""
+    account = register_user()
+    response = client.post(
+        "/subscriptions/",
+        json=dict(
+            EMPTY_PLAN_SUBSCRIPTION_BODY,
+            plan_id=NAMED_PLAN,
+            end_date=end_date,
+        ),
+        headers=_bearer(account["access_token"]),
+    )
+    # SEC-05: the term order holds at the request boundary
+    _assert_rejected(response, 422, "end_date")
+
+
+def test_subscription_admits_an_ordered_term_and_an_open_one():
+    """The subscription model admits an ordered term and an open one."""
+    ordered = SubscriptionCreate(
+        **dict(
+            EMPTY_PLAN_SUBSCRIPTION_BODY,
+            plan_id=NAMED_PLAN,
+            end_date="2031-01-01T00:00:00",
+        )
+    )
+    assert ordered.end_date > ordered.start_date
+    open_ended = SubscriptionCreate(
+        **dict(EMPTY_PLAN_SUBSCRIPTION_BODY, plan_id=NAMED_PLAN)
+    )
+    assert open_ended.end_date is None
+
+
+# ---------------------------------------------------------------------
 # A declared key arrives empty
 # ---------------------------------------------------------------------
 def test_filter_empty_name_and_criteria_answer_bad_request(
@@ -549,9 +752,6 @@ def test_subscription_empty_plan_answers_bad_request(
     assert response.status_code != 422
 
 
-# ---------------------------------------------------------------------
-# A body of declared keys only
-# ---------------------------------------------------------------------
 def test_declared_listing_body_writes_no_row(
     client, register_user, db_session
 ):
@@ -566,9 +766,6 @@ def test_declared_listing_body_writes_no_row(
     assert db_session.query(ListingModel).count() == 0
 
 
-# ---------------------------------------------------------------------
-# The request schemas reject an unknown key on their own
-# ---------------------------------------------------------------------
 UNKNOWN_KEY_MODEL_CASES = (
     (
         UserCreate,

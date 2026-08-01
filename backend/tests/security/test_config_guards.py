@@ -1,5 +1,5 @@
 """Configuration guards for the payment environment, the signing key and
-database transport.
+database transport, and the authorization of a payment reference.
 
 Three settings decide whether the application starts in a safe state: the
 payment environment, the signing key length, and the database transport
@@ -7,16 +7,30 @@ mode. Every case builds ``Settings`` directly and inspects the field named
 in the validation error it raises.
 
 The transport cases execute ``backend/app/db/database.py`` against each
-database URL form and inspect the engine it builds, and the payment
-cases execute ``backend/app/services/paypal_service.py`` with the
-provider library replaced, so the configured environment is read by the
-code that talks to the provider rather than only validated in isolation.
+database URL form and inspect the engine it builds; no case establishes a
+live encrypted database connection. The payment cases execute
+``backend/app/services/paypal_service.py`` with the provider library
+replaced, so the configured environment is read by the code that talks to
+the provider rather than only validated in isolation.
+
+The authorization cases drive ``process_payment`` against fixed provider
+payloads. A reference authorizes a charge only when the state, the total,
+the reported unit, the payer and, for a reusable billing agreement, the
+bound plan all match, and it authorizes one charge and no more. The
+consumption ledger holds per-process state, so a second worker keeps its
+own; the multi-worker limitation is recorded in the decision log under
+SEC-09.
 """
+import asyncio
 import importlib.util
+import inspect
+import time
 from unittest import mock
 
 import paypalrestsdk
+import paypalrestsdk.api
 import pytest
+import requests
 from pydantic import VERSION as PYDANTIC_VERSION
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event
@@ -36,9 +50,7 @@ POSTGRES_DRIVER_URL = "postgresql+psycopg2://u:p@localhost:5432/d"
 SQLITE_URL = "sqlite://"
 
 # SEC-10: the transport modes the database driver defines, ascending in
-# protection. The two verifying modes are accepted as configuration and
-# need a root certificate distributed out of band, which this work
-# deliberately defers; require encrypts without verifying the server.
+# protection; require encrypts without verifying the server certificate
 LIBPQ_SSLMODES = (
     "disable",
     "allow",
@@ -78,8 +90,6 @@ KEY_CHARACTER = "a"
 # SEC-12: clears the byte floor of every accepted signing algorithm
 LONG_KEY = KEY_CHARACTER * 64
 
-# SEC-01/SEC-12: the signing key field, addressed by name; no line here
-# spells a key assignment
 SIGNING_KEY_FIELD = "SECRET_KEY"
 
 
@@ -228,7 +238,6 @@ def test_payment_mode_accepts_the_two_supported_environments(mode):
     assert build_settings(PAYPAL_MODE=mode).PAYPAL_MODE == mode
 
 
-# SEC-09: payment environment domain
 @pytest.mark.parametrize(
     "mode",
     [
@@ -247,7 +256,6 @@ def test_payment_mode_rejects_values_outside_the_domain(mode):
     assert_rejects("PAYPAL_MODE", PAYPAL_MODE=mode)
 
 
-# SEC-09: payment environment domain
 def test_payment_mode_defaults_to_sandbox(monkeypatch):
     """With no payment environment configured, the default is sandbox."""
     monkeypatch.delenv("PAYPAL_MODE", raising=False)
@@ -342,7 +350,6 @@ def test_signing_key_below_the_floor_is_rejected(length):
     assert SIGNING_KEY_MIN_LENGTH in limits, reported
 
 
-# SEC-12: RFC 7518 sec. 3.2 key-length floor
 @pytest.mark.parametrize(
     "length",
     [SIGNING_KEY_MIN_LENGTH, SIGNING_KEY_MIN_LENGTH + 1, 64, 128],
@@ -364,7 +371,6 @@ def test_signing_algorithm_accepts_the_keyed_hash_family(algorithm):
     assert built.ALGORITHM == algorithm
 
 
-# SEC-12: token signing algorithm family
 @pytest.mark.parametrize(
     "algorithm", ["none", "None", "NONE", "RS256", "ES256", "PS256", ""]
 )
@@ -525,7 +531,6 @@ def test_sslmode_argument_breaks_a_sqlite_connection():
     assert "sslmode" in str(caught.value)
 
 
-# SEC-10: sslmode applied for postgres, withheld for sqlite
 def test_application_sqlite_engine_opens_a_connection():
     """The engine the application built for SQLite serves a query."""
     assert database.engine.url.get_backend_name() == "sqlite"
@@ -533,7 +538,6 @@ def test_application_sqlite_engine_opens_a_connection():
         assert connection.exec_driver_sql("select 1").scalar() == 1
 
 
-# SEC-10: sslmode applied for postgres, withheld for sqlite
 @pytest.mark.parametrize("url", [POSTGRES_URL, POSTGRES_DRIVER_URL])
 def test_postgres_url_applies_the_configured_sslmode(url):
     """A PostgreSQL URL carries the configured transport mode."""
@@ -542,7 +546,6 @@ def test_postgres_url_applies_the_configured_sslmode(url):
     assert recorded_connect_args(module.engine)["sslmode"] == "require"
 
 
-# SEC-10: sslmode applied for postgres, withheld for sqlite
 @pytest.mark.parametrize("mode", LIBPQ_SSLMODES)
 def test_postgres_url_carries_each_configured_mode(mode):
     """Every configured transport mode reaches the PostgreSQL driver."""
@@ -550,7 +553,6 @@ def test_postgres_url_carries_each_configured_mode(mode):
     assert recorded_connect_args(module.engine)["sslmode"] == mode
 
 
-# SEC-10: sslmode applied for postgres, withheld for sqlite
 def test_sqlite_url_withholds_the_sslmode_argument():
     """A SQLite URL yields a connectable engine with no sslmode."""
     module = load_database_module(SQLITE_URL, "require")
@@ -560,7 +562,6 @@ def test_sqlite_url_withholds_the_sslmode_argument():
         assert connection.exec_driver_sql("select 1").scalar() == 1
 
 
-# SEC-10: sslmode applied for postgres, withheld for sqlite
 def test_loading_the_database_module_leaves_shared_state_intact():
     """Probing both branches leaves the application engine unchanged."""
     original_url = settings.DATABASE_URL
@@ -580,7 +581,6 @@ def test_transport_mode_defaults_to_require(monkeypatch):
     assert build_settings().DB_SSLMODE == "require"
 
 
-# SEC-10: explicit transport mode replaces the driver's negotiated default
 @pytest.mark.parametrize("mode", LIBPQ_SSLMODES)
 def test_transport_mode_accepts_every_driver_defined_mode(mode):
     """Each transport mode the database driver defines is accepted."""
@@ -611,3 +611,312 @@ def test_the_accepted_transport_domain_matches_the_declared_one():
     assert tuple(DB_SSLMODES) == LIBPQ_SSLMODES
     for mode in DB_SSLMODES:
         assert build_settings(DB_SSLMODE=mode).DB_SSLMODE == mode
+
+
+# SEC-09: identities the transaction-authorization cases bind against
+PAYER_IDENTITY = "PAYER-1"
+BOUND_PLAN = "PLAN-A"
+CHARGE_TOTAL = 10.00
+
+
+def approved_payment(total="10.00", currency="USD", state="approved",
+                     payer=PAYER_IDENTITY):
+    """Build the payload PayPal returns for a one-off payment."""
+    resource = {
+        "id": "PAY-1",
+        "state": state,
+        "transactions": [{"amount": {"total": total, "currency": currency}}],
+    }
+    if payer is not None:
+        resource["payer"] = {"payer_info": {"payer_id": payer}}
+    return resource
+
+
+def active_agreement(value="10.00", currency="USD", state="active",
+                     plan=BOUND_PLAN, payer=PAYER_IDENTITY):
+    """Build the payload PayPal returns for a reusable billing agreement."""
+    plan_body = {"payment_definitions": [
+        {"amount": {"value": value, "currency": currency}}]}
+    if plan is not None:
+        plan_body["id"] = plan
+    resource = {"id": "I-1", "state": state, "plan": plan_body}
+    if payer is not None:
+        resource["payer"] = {"payer_info": {"payer_id": payer}}
+    return resource
+
+
+def authorize(resource, amount=CHARGE_TOTAL, reference="PAY-1", **binding):
+    """Verify one charge against a fixed provider payload."""
+    loop = asyncio.new_event_loop()
+    try:
+        with mock.patch.object(paypal_service, "_find_payment_resource",
+                               return_value=resource):
+            return loop.run_until_complete(paypal_service.process_payment(
+                reference, amount, **binding))
+    finally:
+        loop.close()
+
+
+def refusal(resource, amount=CHARGE_TOTAL, currency="USD", plan_id=None,
+            payer_id=None):
+    """Return the reason the authorization gate refuses one charge."""
+    return paypal_service._resource_authorizes_charge(
+        resource, amount, currency, plan_id, payer_id)
+
+
+@pytest.fixture
+def spent_references():
+    """Give one case an empty consumption ledger and leave it empty."""
+    def reset():
+        paypal_service._consumed_references.clear()
+        paypal_service._claimed_references.clear()
+    reset()
+    yield paypal_service._consumed_references
+    reset()
+
+
+# SEC-09: a reference matching every dimension authorizes the charge
+def test_charge_authorizes_a_matching_reference(spent_references):
+    """A payment matching amount, unit and payer authorizes the charge."""
+    assert refusal(approved_payment()) is None
+    assert authorize(approved_payment()) is True
+
+
+# SEC-09: the reported unit is bound to the charge (CWE-863)
+@pytest.mark.parametrize("currency", ["JPY", "EUR", "GBP", "ZWL"])
+def test_charge_refuses_a_foreign_currency_total(currency, spent_references):
+    """A total matching numerically in another unit does not authorize."""
+    resource = approved_payment(currency=currency)
+    assert refusal(resource) == "currency_mismatch"
+    assert authorize(resource) is False
+
+
+# SEC-09: the reported unit is bound to the charge (CWE-863)
+def test_charge_refuses_a_total_carrying_no_unit(spent_references):
+    """A total PayPal reports with no currency does not authorize."""
+    resource = {
+        "id": "PAY-1",
+        "state": "approved",
+        "transactions": [{"amount": {"total": "10.00"}}],
+        "payer": {"payer_info": {"payer_id": PAYER_IDENTITY}},
+    }
+    assert refusal(resource) == "currency_mismatch"
+    assert authorize(resource) is False
+
+
+# SEC-09: the reported unit is bound to the charge (CWE-863)
+def test_charge_refuses_a_split_total_in_mixed_units(spent_references):
+    """A split total summing correctly across two units does not authorize."""
+    resource = {
+        "id": "PAY-1",
+        "state": "approved",
+        "transactions": [
+            {"amount": {"total": "6.00", "currency": "USD"}},
+            {"amount": {"total": "4.00", "currency": "JPY"}},
+        ],
+        "payer": {"payer_info": {"payer_id": PAYER_IDENTITY}},
+    }
+    assert refusal(resource) == "currency_mismatch"
+    assert authorize(resource) is False
+
+
+# SEC-09: the reported unit is bound to the charge (CWE-863)
+def test_charge_admits_a_bound_unit_and_normalizes_its_spelling(
+        spent_references):
+    """A caller-bound unit authorizes, and its spelling is normalized."""
+    assert authorize(approved_payment(currency="JPY"), reference="PAY-JPY",
+                     currency="JPY") is True
+    assert authorize(approved_payment(currency="usd"), reference="PAY-USD",
+                     currency=" usd ") is True
+
+
+# SEC-09: the provider must name the payer (CWE-863)
+def test_charge_refuses_an_unidentified_payer(spent_references):
+    """A reference PayPal attributes to nobody does not authorize."""
+    resource = approved_payment(payer=None)
+    assert refusal(resource) == "payer_unidentified"
+    assert authorize(resource) is False
+
+
+# SEC-09: the provider must name the payer (CWE-863)
+def test_charge_refuses_a_payer_the_caller_did_not_expect(spent_references):
+    """A bound payer that differs from the reported one does not authorize."""
+    resource = approved_payment()
+    assert refusal(resource, payer_id="SOMEONE-ELSE") == "payer_mismatch"
+    assert authorize(resource, payer_id="SOMEONE-ELSE") is False
+    assert authorize(resource, payer_id=PAYER_IDENTITY) is True
+
+
+# SEC-09: a reusable agreement authorizes nothing until a plan is bound
+def test_charge_refuses_an_unbound_reusable_agreement(spent_references):
+    """An agreement reached with no plan bound does not authorize."""
+    resource = active_agreement()
+    assert refusal(resource) == "plan_unbound"
+    assert authorize(resource) is False
+
+
+# SEC-09: a reusable agreement is bound to one plan (CWE-863)
+def test_charge_refuses_an_agreement_for_another_plan(spent_references):
+    """An agreement carrying a different plan does not authorize."""
+    resource = active_agreement(plan="PLAN-B")
+    assert refusal(resource, plan_id=BOUND_PLAN) == "plan_mismatch"
+    assert authorize(resource, plan_id=BOUND_PLAN) is False
+
+
+# SEC-09: a reusable agreement is bound to one plan (CWE-863)
+def test_charge_refuses_an_agreement_naming_no_plan(spent_references):
+    """An agreement reporting no plan identifier does not authorize."""
+    resource = active_agreement(plan=None)
+    assert refusal(resource, plan_id=BOUND_PLAN) == "plan_mismatch"
+    assert authorize(resource, plan_id=BOUND_PLAN) is False
+
+
+# SEC-09: a reusable agreement is bound to one plan (CWE-863)
+def test_charge_admits_an_agreement_for_the_bound_plan(spent_references):
+    """An agreement carrying the bound plan authorizes the charge."""
+    assert refusal(active_agreement(), plan_id=BOUND_PLAN) is None
+    assert authorize(active_agreement(), plan_id=BOUND_PLAN) is True
+
+
+# SEC-09: a reusable agreement is bound to one plan and one unit
+def test_charge_refuses_a_bound_agreement_in_a_foreign_unit(spent_references):
+    """An agreement for the bound plan in another unit does not authorize."""
+    resource = active_agreement(currency="JPY")
+    assert refusal(resource, plan_id=BOUND_PLAN) == "currency_mismatch"
+    assert authorize(resource, plan_id=BOUND_PLAN) is False
+
+
+# SEC-09: a verified reference is spent once (CWE-294)
+def test_a_verified_reference_authorizes_one_charge_only(spent_references):
+    """Replaying a reference that already paid does not authorize again."""
+    resource = approved_payment()
+    outcomes = [authorize(resource, reference="PAY-REPLAY") for _ in range(3)]
+    assert outcomes == [True, False, False]
+    assert authorize(resource, reference="PAY-OTHER") is True
+    assert len(paypal_service._claimed_references) == 0
+
+
+# SEC-09: a spent reference reaches no provider call (CWE-294)
+def test_a_spent_reference_drives_no_provider_call(spent_references):
+    """A replayed reference is refused ahead of any provider request."""
+    lookup = mock.Mock(return_value=approved_payment())
+    loop = asyncio.new_event_loop()
+    try:
+        with mock.patch.object(paypal_service, "_find_payment_resource",
+                               lookup):
+            outcomes = [
+                loop.run_until_complete(paypal_service.process_payment(
+                    "PAY-ONCE", CHARGE_TOTAL))
+                for _ in range(4)]
+    finally:
+        loop.close()
+    assert outcomes == [True, False, False, False]
+    assert lookup.call_count == 1
+
+
+# SEC-09: a verified reference is spent once (CWE-294)
+def test_concurrent_attempts_on_one_reference_admit_one(spent_references):
+    """Two attempts in flight on one reference authorize exactly once."""
+    def lookup(reference):
+        time.sleep(0.05)
+        return approved_payment()
+
+    async def both():
+        return await asyncio.gather(
+            paypal_service.process_payment("PAY-RACE", CHARGE_TOTAL),
+            paypal_service.process_payment("PAY-RACE", CHARGE_TOTAL))
+
+    loop = asyncio.new_event_loop()
+    try:
+        with mock.patch.object(paypal_service, "_find_payment_resource",
+                               side_effect=lookup):
+            outcomes = loop.run_until_complete(both())
+    finally:
+        loop.close()
+    assert sorted(outcomes) == [False, True]
+    assert len(paypal_service._claimed_references) == 0
+
+
+# SEC-09: a verified reference is spent once (CWE-294)
+def test_the_ledger_records_no_provider_reference(spent_references):
+    """The ledger holds a digest, never the reference PayPal issued."""
+    assert authorize(approved_payment(), reference="PAY-SECRET") is True
+    assert "PAY-SECRET" not in spent_references
+    assert list(spent_references) == [
+        paypal_service._reference_key("PAY-SECRET")]
+
+
+# SEC-09: a refused reference is not consumed
+def test_a_refused_reference_stays_available(spent_references):
+    """A reference refused once is still usable when the charge matches."""
+    assert authorize(approved_payment(currency="JPY"),
+                     reference="PAY-RETRY") is False
+    assert len(paypal_service._claimed_references) == 0
+    assert authorize(approved_payment(), reference="PAY-RETRY") is True
+
+
+# SEC-09: a verified reference is spent once (CWE-294)
+def test_the_consumption_ledger_stays_bounded(spent_references):
+    """The ledger evicts its oldest entry rather than growing without end."""
+    limit = paypal_service._CONSUMPTION_LIMIT
+    first = paypal_service._reference_key("PAY-0")
+    for index in range(limit + 1):
+        paypal_service._consume_reference(
+            paypal_service._reference_key("PAY-%d" % index))
+    assert len(spent_references) == limit
+    assert first not in spent_references
+
+
+# SEC-09: every provider call is bounded in time (CWE-400)
+def test_every_provider_call_carries_a_timeout():
+    """The transport supplies a timeout the provider SDK never sets."""
+    assert isinstance(paypalrestsdk.api.requests,
+                      paypal_service._BoundedTransport)
+    recorded = {}
+
+    class Recorder:
+        def request(self, *args, **kwargs):
+            recorded.update(kwargs)
+            raise requests.exceptions.Timeout("bounded")
+
+    bounded = paypal_service._BoundedTransport(
+        Recorder(), paypal_service._REQUEST_TIMEOUT_SECONDS)
+    with mock.patch.object(paypalrestsdk.api, "requests", bounded):
+        assert paypal_service._find_payment_resource("PAY-TIMEOUT") is None
+    assert recorded["timeout"] == paypal_service._REQUEST_TIMEOUT_SECONDS
+    assert paypal_service._REQUEST_TIMEOUT_SECONDS > 0
+
+
+# SEC-09: every provider call is bounded in time (CWE-400)
+def test_a_provider_timeout_refuses_the_charge(spent_references):
+    """A provider call that times out refuses rather than raising."""
+    class Stalled:
+        def request(self, *args, **kwargs):
+            raise requests.exceptions.Timeout("bounded")
+
+    bounded = paypal_service._BoundedTransport(
+        Stalled(), paypal_service._REQUEST_TIMEOUT_SECONDS)
+    loop = asyncio.new_event_loop()
+    try:
+        with mock.patch.object(paypalrestsdk.api, "requests", bounded):
+            outcome = loop.run_until_complete(
+                paypal_service.process_payment("PAY-STALL", CHARGE_TOTAL))
+    finally:
+        loop.close()
+    assert outcome is False
+
+
+# SEC-09: the binding parameters leave the caller contract unchanged
+def test_the_verification_call_contract_is_preserved():
+    """The two positional parameters stay first; the bindings are keyword."""
+    signature = inspect.signature(paypal_service.process_payment)
+    parameters = list(signature.parameters.values())
+    positional = [p.name for p in parameters
+                  if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
+    keyword_only = {p.name for p in parameters
+                    if p.kind is inspect.Parameter.KEYWORD_ONLY}
+    assert positional == ["payment_method", "amount"]
+    assert keyword_only == {"currency", "plan_id", "payer_id"}
+    assert all(parameters[index].default is None
+               for index in range(2, len(parameters)))
+    assert inspect.iscoroutinefunction(paypal_service.process_payment)

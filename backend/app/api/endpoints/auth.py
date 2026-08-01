@@ -1,3 +1,5 @@
+import hmac
+import secrets
 import threading
 import time
 from datetime import datetime
@@ -23,14 +25,24 @@ router = APIRouter()
 # SEC-07: the single application limiter; main.py registers this object
 limiter = Limiter(key_func=get_remote_address)
 
-# SEC-07: login-attempt counters, one key per account and one per client
-# address. Entries expire with the throttle window; at the cap only a key
-# below the limit is evicted.
+# SEC-07: the limit the limiter enforces on the login route, keyed by
+# client address. Threshold and window come from settings.
+LOGIN_RATE_LIMIT = "{0}/{1} minutes".format(
+    settings.LOGIN_RATE_LIMIT_ATTEMPTS,
+    settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES,
+)
+
+# SEC-07: login-failure counters, one key per account, which bound
+# guessing that spreads across client addresses. Entries expire with the
+# throttle window; at the cap only a key below the limit is evicted.
 _LOGIN_FAILURE_TRACKING_CAP = 4096
 _ACCOUNT_KEY_PREFIX = "acct:"
-_ADDRESS_KEY_PREFIX = "addr:"
 _login_failures = {}
 _login_failures_lock = threading.Lock()
+
+# SEC-07: a per-process key for the audit marker; an unkeyed digest of an
+# email address is recoverable from a candidate dictionary (CWE-916)
+_AUDIT_MARKER_KEY = secrets.token_bytes(32)
 
 # SEC-06: HttpOnly/Secure/SameSite session cookie; removes the token from
 # script-readable storage. The set and the clear share these attributes.
@@ -43,14 +55,45 @@ def _account_key(email: str) -> str:
     return _ACCOUNT_KEY_PREFIX + (email or "").strip().lower()
 
 
-def _address_key(request: Request) -> str:
-    # SEC-07: one counter per client address
-    return _ADDRESS_KEY_PREFIX + (get_remote_address(request) or "")
-
-
 def _account_marker(throttle_key: str) -> str:
-    # SEC-07: redacted account reference for the audit record
-    return sha256(throttle_key.encode("utf-8")).hexdigest()[:16]
+    # SEC-07: keyed, redacted account reference for the audit record
+    return hmac.new(
+        _AUDIT_MARKER_KEY, throttle_key.encode("utf-8"), sha256
+    ).hexdigest()[:16]
+
+
+# SEC-08: one detail for every way an attempt fails; an unknown address and
+# a wrong secret are indistinguishable to the caller (CWE-209)
+_UNIFORM_CREDENTIAL_DETAIL = "Incorrect email or password"
+
+
+class CredentialRejected(HTTPException):
+    # SEC-07: the single 401 the credential path returns, whatever refused
+    # the attempt. SEC-08: audit_context holds redacted markers only; the
+    # error boundary records them under the response error_id.
+    def __init__(self, hasher_refusal: str = ""):
+        super().__init__(
+            status_code=401, detail=_UNIFORM_CREDENTIAL_DETAIL
+        )
+        if hasher_refusal:
+            self.audit_context = {"hasher": hasher_refusal}
+
+
+def _verified_credentials(db_user, submitted_password: str):
+    # SEC-04/SEC-08: the hasher refuses a NUL byte, a secret past passlib's
+    # own size ceiling, and a stored hash it cannot parse. Each refusal is
+    # answered by the counted uniform 401 of the credential path - never a
+    # 500, never a distinguishable 422 (CWE-209, CWE-307). Returns
+    # (matched, refusing exception type name).
+    if db_user is None:
+        return False, ""
+    try:
+        matched = verify_password(
+            submitted_password, db_user.hashed_password
+        )
+    except ValueError as refusal:
+        return False, type(refusal).__name__
+    return matched, ""
 
 
 class AccountThrottled(HTTPException):
@@ -86,10 +129,10 @@ def _evict_unexhausted_login_keys(limit: int, needed: int) -> bool:
 
 
 def _reserve_login_attempt(*throttle_keys: str) -> bool:
-    # SEC-07: counts the attempt on every key and decides admission inside one
-    # critical section, so a concurrent burst cannot share one allowance
-    # (CWE-367). Returns False when any key is at the limit, and when the map
-    # is at capacity with no evictable key. A successful authentication
+    # SEC-07: counts the attempt on every account key and decides admission
+    # inside one critical section, so a concurrent burst cannot share one
+    # allowance (CWE-367). Returns False when any key is at the limit, and when
+    # the map is at capacity with no evictable key. A successful authentication
     # releases the reservation through _clear_login_failures.
     now = time.monotonic()
     window = settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES * 60
@@ -184,18 +227,19 @@ def register_user(
     }
 
 @router.post('/login')
+@limiter.limit(LOGIN_RATE_LIMIT)
 def login_user(
     request: Request,
     response: Response,
     user: UserLogin,
     db: Session = Depends(get_db),
 ):
-    # SEC-07: account-keyed and address-keyed throttle; both attempts are
-    # counted before the credentials are read, and bound credential-guessing
-    # attempts (CWE-307)
+    # SEC-07: the decorator above refuses the attempt past the threshold
+    # for one client address; the counter below refuses it for one account
+    # reached from many addresses, and counts before the credentials are
+    # read, so both bound credential guessing (CWE-307)
     account_key = _account_key(user.email)
-    address_key = _address_key(request)
-    if not _reserve_login_attempt(account_key, address_key):
+    if not _reserve_login_attempt(account_key):
         # SEC-07: the error boundary logs this attempt under the response
         # error_id; SEC-08: neither the client address nor the submitted
         # email reaches the record
@@ -203,13 +247,14 @@ def login_user(
 
     # Verify user credentials
     db_user = db.query(User).filter(User.email == user.email).first()
-    if not db_user or not verify_password(user.password, db_user.hashed_password):
+    matched, hasher_refusal = _verified_credentials(db_user, user.password)
+    if not matched:
         # SEC-07: the reserved attempt stands, so a credential failure is
-        # counted exactly once on both keys
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
+        # counted exactly once on the account key
+        raise CredentialRejected(hasher_refusal)
     
-    # SEC-07: authentication succeeded, so neither counter retains state
-    _clear_login_failures(account_key, address_key)
+    # SEC-07: authentication succeeded, so the counter retains no state
+    _clear_login_failures(account_key)
 
     # Generate access token
     # SEC-02: mints sub as user id; closes the sub/User.id identity mismatch

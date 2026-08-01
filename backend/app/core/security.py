@@ -69,9 +69,8 @@ def get_current_user(
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    # SEC-02: coerces sub to int; closes the sub/User.id identity mismatch.
-    # A padded, signed, spaced, underscored, fullwidth or out-of-range
-    # spelling is rejected rather than coerced (CWE-287)
+    # SEC-02: coerces sub to int and rejects a non-canonical decimal User.id
+    # subject; closes the sub/User.id identity mismatch (CWE-287)
     if (
         not isinstance(user_id, str)
         or not _CANONICAL_SUBJECT.fullmatch(user_id)

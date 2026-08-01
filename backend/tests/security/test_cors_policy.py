@@ -4,7 +4,7 @@ policy.
 An allow-listed origin comes back echoed verbatim, with credentials
 enabled. An origin outside the list gets no allow-origin header at all.
 An unsafe allow-list raises a validation error while ``Settings`` is
-built, which stops the process at import.
+built; the cases here assert that error, not a process exit.
 
 The allow-list arrives from the environment in production, and that path
 differs from passing a keyword: an unparsable value is refused before
@@ -14,31 +14,31 @@ rejection proved through a keyword is never mistaken for a rejection
 proved through the environment.
 """
 import json
+from datetime import datetime
 
 import pytest
 from pydantic import ValidationError
 from pydantic.env_settings import SettingsError
 
 from backend.app.core.config import Settings, settings
+from backend.app.db.models import Listing as ListingModel
+from backend.app.main import app
+from backend.app.schema.filter import Filter
 
-# SEC-03: the enumerated allow-list the running application booted with
 ALLOW_LISTED_ORIGINS = tuple(settings.ALLOWED_ORIGINS)
 
 _PRIMARY_ORIGIN = ALLOW_LISTED_ORIGINS[0]
 _PRIMARY_SCHEME, _, _PRIMARY_AUTHORITY = _PRIMARY_ORIGIN.partition("://")
 
-# SEC-03: an allow-listed origin carrying an appended suffix
 _SUFFIX_EXTENDED_ORIGIN = "{0}.attacker.example.com".format(
     _PRIMARY_ORIGIN
 )
 
-# SEC-03: the allow-listed authority reached over the other scheme
 _SCHEME_SWAPPED_ORIGIN = "{0}://{1}".format(
     "http" if _PRIMARY_SCHEME == "https" else "https",
     _PRIMARY_AUTHORITY,
 )
 
-# SEC-03: an origin that appears nowhere in the allow-list
 _UNRELATED_ORIGIN = "https://evil.example.com"
 
 # SEC-03: the opaque origin a sandboxed frame or a redirect sends
@@ -55,6 +55,24 @@ PUBLIC_READ_PATH = "/listings/"
 ADVERTISED_METHODS = ("GET", "POST", "OPTIONS")
 WITHHELD_METHODS = ("PUT", "PATCH", "DELETE")
 ADVERTISED_REQUEST_HEADERS = ("Content-Type", "Authorization")
+
+# SEC-03: the request headers Starlette always adds to the advertised
+# list, whatever the registered allow-list holds
+SAFELISTED_REQUEST_HEADERS = (
+    "Accept",
+    "Accept-Language",
+    "Content-Language",
+    "Content-Type",
+)
+
+# SEC-03: the exact token sets a preflight response carries
+ADVERTISED_METHOD_TOKENS = frozenset(
+    name.lower() for name in ADVERTISED_METHODS
+)
+ADVERTISED_HEADER_TOKENS = frozenset(
+    name.lower()
+    for name in ADVERTISED_REQUEST_HEADERS + SAFELISTED_REQUEST_HEADERS
+)
 
 _ALLOW_ORIGIN = "Access-Control-Allow-Origin"
 _ALLOW_CREDENTIALS = "Access-Control-Allow-Credentials"
@@ -170,7 +188,6 @@ def test_allow_listed_origin_is_echoed_with_credentials(client, origin):
     response = client.get(PUBLIC_READ_PATH, headers={"Origin": origin})
 
     assert response.status_code == 200
-    # SEC-03: exact origin equality, no prefix match, no reflection
     assert response.headers[_ALLOW_ORIGIN] == origin
     assert response.headers[_ALLOW_ORIGIN] != WILDCARD
     assert response.headers[_ALLOW_CREDENTIALS] == "true"
@@ -187,7 +204,6 @@ def test_preflight_from_an_allow_listed_origin_is_approved(client):
     response = _preflight(client, _PRIMARY_ORIGIN)
 
     assert response.status_code == 200
-    # SEC-03: exact origin equality, no prefix match, no reflection
     assert response.headers[_ALLOW_ORIGIN] == _PRIMARY_ORIGIN
     assert response.headers[_ALLOW_ORIGIN] != WILDCARD
     assert response.headers[_ALLOW_CREDENTIALS] == "true"
@@ -200,14 +216,17 @@ def test_preflight_from_an_allow_listed_origin_is_approved(client):
 
 
 def test_preflight_advertises_an_explicit_method_list(client):
-    """A preflight advertises the three methods the routes serve, and
-    names neither a wildcard nor a verb no route exposes."""
+    """A preflight advertises exactly the three methods the routes serve.
+
+    The advertised set is compared whole, so an added verb fails the
+    case as surely as a missing one.
+    """
     response = _preflight(client, _PRIMARY_ORIGIN)
     advertised = _header_tokens(response.headers[_ALLOW_METHODS])
 
     assert response.status_code == 200
     # SEC-03: enumerated methods, not a wildcard
-    assert {name.lower() for name in ADVERTISED_METHODS} <= advertised
+    assert advertised == ADVERTISED_METHOD_TOKENS
     assert WILDCARD not in advertised
     assert response.headers[_ALLOW_METHODS] != WILDCARD
     for name in WITHHELD_METHODS:
@@ -224,8 +243,12 @@ def test_preflight_refuses_a_method_outside_the_list(client, method):
 
 
 def test_preflight_advertises_an_explicit_request_header_list(client):
-    """A preflight advertises the request headers the routes read, and
-    never a wildcard."""
+    """A preflight advertises exactly the registered request headers
+    together with the four Starlette always safelists.
+
+    The set is compared whole, so widening the registered allow-list
+    fails the case.
+    """
     response = _preflight(
         client,
         _PRIMARY_ORIGIN,
@@ -235,9 +258,7 @@ def test_preflight_advertises_an_explicit_request_header_list(client):
 
     assert response.status_code == 200
     # SEC-03: enumerated request headers, not a wildcard
-    assert {
-        name.lower() for name in ADVERTISED_REQUEST_HEADERS
-    } <= advertised
+    assert advertised == ADVERTISED_HEADER_TOKENS
     assert WILDCARD not in advertised
     assert response.headers[_ALLOW_HEADERS] != WILDCARD
 
@@ -273,7 +294,6 @@ def test_unlisted_origin_receives_no_allow_origin_header(client, origin):
     response = client.get(PUBLIC_READ_PATH, headers={"Origin": origin})
 
     assert response.status_code == 200
-    # SEC-03: the allow-origin header is withheld outright
     assert _ALLOW_ORIGIN not in response.headers
 
 
@@ -283,16 +303,11 @@ def test_preflight_from_an_unlisted_origin_is_refused(client):
     response = _preflight(client, _UNRELATED_ORIGIN)
 
     assert response.status_code == 400
-    # SEC-03: the allow-origin header is withheld outright
     assert _ALLOW_ORIGIN not in response.headers
 
 
 def test_reference_arguments_build_valid_settings():
-    """The keyword mapping every allow-list case starts from builds a
-    valid ``Settings`` object.
-
-    A rejection in a later case belongs to the one overridden key.
-    """
+    """The shared keyword mapping builds a valid Settings object."""
     built = Settings(**_reference_settings_arguments())
 
     assert built.ALLOWED_ORIGINS == [_REFERENCE_ORIGIN]
@@ -328,7 +343,8 @@ def test_running_settings_carry_an_enumerated_allow_list():
 )
 def test_unsafe_allow_list_prevents_startup(unsafe_value):
     """An unsafe allow-list raises a validation error naming
-    ALLOWED_ORIGINS, and building ``Settings`` at import then fails.
+    ALLOWED_ORIGINS. A JSON array, the form ``.env.example`` documents,
+    is accepted.
 
     Each value arrives as a keyword, so these cases reach the field
     validator directly. The environment path a deployment uses is
@@ -338,7 +354,6 @@ def test_unsafe_allow_list_prevents_startup(unsafe_value):
     with pytest.raises(ValidationError) as raised:
         _build_settings_with_allow_list(unsafe_value)
 
-    # SEC-03: an unsafe allow-list prevents startup
     assert _rejected_field_names(raised.value) == {"ALLOWED_ORIGINS"}
 
 
@@ -424,3 +439,126 @@ def test_an_unsafe_environment_allow_list_prevents_startup(
 
     # SEC-03: an unsafe allow-list prevents startup
     assert _rejected_field_names(raised.value) == {_ALLOW_LIST_VARIABLE}
+
+
+# the paths the framework registers for its own documentation, excluded
+# from the application route map below
+FRAMEWORK_DOC_PATHS = frozenset(
+    {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+)
+
+# the frozen path and verb contract: every application route the plan
+# preserves, plus the one route the cookie migration adds
+APPLICATION_ROUTE_MAP = {
+    "/auth/register": frozenset({"POST"}),
+    "/auth/login": frozenset({"POST"}),
+    "/auth/logout": frozenset({"POST"}),
+    "/listings/": frozenset({"GET", "POST"}),
+    "/filters/": frozenset({"GET", "POST"}),
+    "/subscriptions/": frozenset({"GET", "POST"}),
+}
+
+# how many listings the pagination case persists
+SEEDED_LISTING_COUNT = 5
+
+_SEED_STAMP = datetime(2026, 1, 1)
+
+
+def _registered_route_map():
+    # the path and verb map the application actually exposes
+    registered = {}
+    for route in app.routes:
+        methods = getattr(route, "methods", None)
+        if not methods:
+            continue
+        registered.setdefault(route.path, set()).update(methods)
+    return {path: frozenset(verbs) for path, verbs in registered.items()}
+
+
+def _route_for(path, method):
+    for route in app.routes:
+        verbs = getattr(route, "methods", None) or ()
+        if route.path == path and method in verbs:
+            return route
+    raise AssertionError(
+        "no {0} route is registered at {1}".format(method, path)
+    )
+
+
+def seed_listings(db_session, count):
+    """Persist a run of listings, each carrying a distinct rent."""
+    rows = [
+        ListingModel(
+            created_at=_SEED_STAMP,
+            updated_at=_SEED_STAMP,
+            rent=1000.0 + index,
+            street_address="{0} Example Street".format(index),
+        )
+        for index in range(count)
+    ]
+    db_session.add_all(rows)
+    db_session.commit()
+    return rows
+
+
+def test_the_application_route_map_is_unchanged():
+    """The exposed paths and verbs match the frozen contract exactly.
+
+    Comparing the whole map fails a renamed path, a dropped route and an
+    added verb alike, including on a route no other case calls.
+    """
+    registered = _registered_route_map()
+    excluded = {
+        path for path in registered if path in FRAMEWORK_DOC_PATHS
+    }
+    application = {
+        path: verbs
+        for path, verbs in registered.items()
+        if path not in FRAMEWORK_DOC_PATHS
+    }
+
+    assert excluded <= FRAMEWORK_DOC_PATHS
+    assert application == APPLICATION_ROUTE_MAP
+
+
+def test_the_filter_create_route_declares_its_response_model():
+    """POST /filters/ still declares the response model it always had.
+
+    Dropping it would widen the response body without changing any
+    status code, so no request-level case would notice.
+    """
+    route = _route_for("/filters/", "POST")
+
+    assert route.response_model is Filter
+
+
+def test_the_public_read_path_stays_open_and_paginates(client, db_session):
+    """The public read path serves both pagination bounds unauthenticated.
+
+    Each paginated read is compared against the unpaginated one, so the
+    assertions hold whatever order the rows come back in.
+    """
+    seed_listings(db_session, SEEDED_LISTING_COUNT)
+
+    every = client.get(PUBLIC_READ_PATH)
+    assert every.status_code == 200
+    identifiers = [row["id"] for row in every.json()]
+    assert len(identifiers) == SEEDED_LISTING_COUNT
+
+    skipped = client.get(PUBLIC_READ_PATH, params={"skip": 2})
+    assert skipped.status_code == 200
+    assert [row["id"] for row in skipped.json()] == identifiers[2:]
+
+    limited = client.get(PUBLIC_READ_PATH, params={"limit": 2})
+    assert limited.status_code == 200
+    assert [row["id"] for row in limited.json()] == identifiers[:2]
+
+    window = client.get(PUBLIC_READ_PATH, params={"skip": 1, "limit": 2})
+    assert window.status_code == 200
+    assert [row["id"] for row in window.json()] == identifiers[1:3]
+
+    beyond = client.get(
+        PUBLIC_READ_PATH, params={"skip": SEEDED_LISTING_COUNT}
+    )
+    assert beyond.status_code == 200
+    assert beyond.json() == []

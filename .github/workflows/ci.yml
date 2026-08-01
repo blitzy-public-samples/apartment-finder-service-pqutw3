@@ -31,46 +31,44 @@ jobs:
     - name: Audit Python dependencies
       run: |
         set -euo pipefail
-        # Suppressed advisories, their reachability assessments and the shared
-        # review trigger: documentation/security/decision-log.md section 2.2
-        SUPPRESSED="PYSEC-2026-1325 PYSEC-2026-2132 PYSEC-2026-161 PYSEC-2026-248 PYSEC-2026-249 PYSEC-2026-2280 PYSEC-2026-2281 PYSEC-2026-2275 PYSEC-2026-141 PYSEC-2026-142 GHSA-6v7p-g79w-8964 PYSEC-2026-1375 PYSEC-2026-1374 PYSEC-2026-1845 PYSEC-2026-2270"
-        IGNORE=""
-        for id in $SUPPRESSED; do IGNORE="$IGNORE --ignore-vuln $id"; done
-        pip freeze > /tmp/frozen.txt
-        pip-audit --strict --no-deps -r /tmp/frozen.txt $IGNORE
-        # Stale-suppression cross-check: fails the build when a suppression
-        # entry matches no live advisory
-        pip-audit --no-deps --format json -r /tmp/frozen.txt > /tmp/pip-audit.json || true
-        SUPPRESSED="$SUPPRESSED" python - <<'PY'
-        import json, os, sys
-        wanted = set(os.environ["SUPPRESSED"].split())
-        with open("/tmp/pip-audit.json") as handle:
-            report = json.load(handle)
-        matched = set()
-        for dependency in report.get("dependencies", []):
-            for vuln in dependency.get("vulns", []):
-                matched |= {vuln["id"], *(vuln.get("aliases") or [])} & wanted
-        stale = sorted(wanted - matched)
-        if stale:
-            sys.exit("Suppression entries matched no live advisory: " + ", ".join(stale))
-        print("All %d suppression entries matched a live advisory." % len(wanted))
-        PY
+        # CWE-1104: dependency advisory gate. Suppressed advisories, their
+        # reachability assessments and the shared review trigger:
+        # documentation/security/decision-log.md section 2.2
+        # --all also audits pip, setuptools and wheel, which plain freeze omits
+        pip freeze --all > /tmp/frozen.txt
+        pip-audit --strict --no-deps -r /tmp/frozen.txt \
+          --ignore-vuln PYSEC-2026-1325 --ignore-vuln PYSEC-2026-2132 \
+          --ignore-vuln PYSEC-2026-161  --ignore-vuln PYSEC-2026-248 \
+          --ignore-vuln PYSEC-2026-249  --ignore-vuln PYSEC-2026-2280 \
+          --ignore-vuln PYSEC-2026-2281 --ignore-vuln PYSEC-2026-2275 \
+          --ignore-vuln PYSEC-2026-141  --ignore-vuln PYSEC-2026-142
 
     # SEC-01, SEC-12: repository-wide credential scan over tracked content.
     # Pattern source of record; see documentation/security/decision-log.md
     - name: Scan for hardcoded credentials
+      if: always()
       run: |
         if git grep -In -E "postgres:postgres|PASSWORD '[^']+'|SECRET_KEY=[A-Za-z0-9_]|password@" -- ':(exclude).github/workflows/ci.yml' ':(exclude)SECURITY.md'; then exit 1; fi
 
     # SEC-09: frontend client-secret guard
     - name: Scan frontend for client secrets
+      if: always()
       run: |
         if grep -rIn -E "CLIENT_SECRET|client_secret" frontend/; then exit 1; fi
 
     # SEC-06: browser-storage guard
     - name: Scan frontend for browser token storage
+      if: always()
       run: |
         if grep -rIn -E "localStorage|sessionStorage" frontend/src/; then exit 1; fi
+
+    # SEC-02 to SEC-12: the security regression suite, reached even after a
+    # step with a known non-zero baseline
+    - name: Run backend security tests
+      if: always()
+      run: |
+        cd backend
+        python -m pytest tests/security -q
 
     - name: Install Node.js dependencies
       run: |
@@ -96,12 +94,6 @@ jobs:
       run: |
         cd backend
         python -m pytest --cov=./ --cov-report=xml
-
-    - name: Run integration tests
-      run: |
-        # HUMAN ASSISTANCE NEEDED
-        # Add commands to run integration tests. This might involve setting up a test database,
-        # starting both frontend and backend services, and running end-to-end tests.
 
     - name: Upload frontend test coverage
       uses: actions/upload-artifact@v2

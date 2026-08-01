@@ -9,8 +9,10 @@ from contextlib import contextmanager
 
 import pytest
 from conftest import ALLOWED_ORIGIN
+from fastapi.exceptions import StarletteHTTPException
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from backend.app.core.config import settings
 from backend.app.core.security import (
     SESSION_COOKIE_NAME,
     create_access_token,
@@ -22,14 +24,22 @@ from backend.app.main import app
 # emits, whatever the status
 ERROR_ENVELOPE_KEYS = {"detail", "error_id", "fields"}
 
-# SEC-08: the detail both 500 handlers return
 GENERIC_SERVER_DETAIL = "Internal server error"
 
-# SEC-08: a submitted value the 422 reply must not repeat
 SUBMITTED_VALUE_SENTINEL = "zzz-sentinel-9137"
 
-# SEC-08: exception text the reply and the log must both withhold
+# SEC-08: exception text the reply withholds and the server log carries
 EXCEPTION_TEXT_SENTINEL = "zzz-exception-text-4412"
+
+# SEC-08: secrets planted inside an exception message, each in the shape
+# a diagnostic record has to strip before a handler receives it
+PLANTED_SIGNING_KEY = "zzz-planted-signing-key-7781-abcdefghijklmnop"
+PLANTED_DSN = (
+    "postgresql://svcuser:zzz-planted-dsn-2244@db.internal:5432/appdb"
+)
+PLANTED_DSN_CREDENTIAL = "zzz-planted-dsn-2244"
+PLANTED_BEARER = "zzz-planted-bearer-5150-qrstuvwx"
+REDACTION_MARKER = "[redacted]"
 
 # SEC-04: a synthetic fixture value clearing every rule in
 # backend/app/schema/user.py - at least twelve characters with one
@@ -109,7 +119,7 @@ def _assert_no_internal_detail(text):
 
 
 def _login_until_throttled(client, email):
-    """Return the first login reply the throttle answers."""
+    """Return the first 429 response from repeated failed logins."""
     rejected = 0
     for _ in range(_LOGIN_ATTEMPT_CEILING):
         response = client.post(
@@ -223,7 +233,6 @@ def test_forced_internal_error_returns_a_sanitized_500(
 
     assert response.status_code == 500
     body = _assert_uniform_envelope(response)
-    # SEC-08: the generic detail; no exception text reaches the caller
     assert body["detail"] == GENERIC_SERVER_DETAIL
     assert body["fields"] == []
     _assert_no_internal_detail(response.text)
@@ -274,7 +283,6 @@ def test_validation_error_names_fields_and_withholds_values(client):
     assert response.status_code == 422
     body = _assert_uniform_envelope(response)
     assert set(body["fields"]) == {"email", "password"}
-    # SEC-08: the submitted value never returns to the caller
     assert SUBMITTED_VALUE_SENTINEL not in response.text
     _assert_no_internal_detail(response.text)
 
@@ -391,7 +399,6 @@ def test_the_error_envelope_is_uniform_across_handlers(
 
     statuses = [response.status_code for response in collected]
     assert statuses == [422, 401, 400, 429, 500, 500]
-    # SEC-08: one envelope across every handler
     key_sets = [set(response.json()) for response in collected]
     assert key_sets == [ERROR_ENVELOPE_KEYS] * len(collected)
     for response in collected:
@@ -430,14 +437,12 @@ def test_the_credential_guard_answers_every_failure_alike(client):
 
     # SEC-08: an absent account is answered as 401, never as 404
     assert responses["subject_unresolved"].status_code != 404
-    # SEC-08: one detail and one challenge header across every path
     details = {response.json()["detail"] for response in collected}
     assert len(details) == 1
     challenges = {
         response.headers.get("WWW-Authenticate") for response in collected
     }
     assert challenges == {"Bearer"}
-    # SEC-08: the correlation identifier marks one occurrence
     identifiers = {response.json()["error_id"] for response in collected}
     assert len(identifiers) == len(collected)
 
@@ -457,7 +462,6 @@ def test_the_correlation_identifier_joins_the_response_and_the_log(
         for record in caplog.records
         if error_id in record.getMessage()
     ]
-    # SEC-08: the correlation identifier joins response and log
     assert len(matching) == 1
     record = matching[0]
     assert record.levelno >= logging.ERROR
@@ -465,13 +469,152 @@ def test_the_correlation_identifier_joins_the_response_and_the_log(
     # SEC-08: diagnostics reach the log, not the caller
     assert "RuntimeError" in message
     assert "origin=" in message
-    assert EXCEPTION_TEXT_SENTINEL not in message
+    # SEC-08: the record resolves the reference into a usable diagnosis -
+    # the exception text, the traceback and the raising frame
+    assert EXCEPTION_TEXT_SENTINEL in message
+    assert "Traceback (most recent call last)" in message
+    assert "in _raising_get_db" in message
+    # SEC-08: the reply carries the reference and nothing else
+    assert EXCEPTION_TEXT_SENTINEL not in response.text
+    _assert_no_internal_detail(response.text)
+
+
+def test_the_diagnostic_record_redacts_every_planted_secret(
+    client, failing_database, caplog
+):
+    """A traceback quoting secrets reaches the log with them removed."""
+    caplog.set_level(logging.ERROR)
+    minted_token = create_access_token({"sub": "1"})
+    planted = RuntimeError(
+        "{0} signing_key={1} dsn={2} authorization: Bearer {3}"
+        " session={4}".format(
+            EXCEPTION_TEXT_SENTINEL,
+            PLANTED_SIGNING_KEY,
+            PLANTED_DSN,
+            PLANTED_BEARER,
+            minted_token,
+        )
+    )
+
+    with failing_database(planted):
+        response = client.get("/listings/")
+
+    assert response.status_code == 500
+    error_id = response.json()["error_id"]
+    matching = [
+        record
+        for record in caplog.records
+        if error_id in record.getMessage()
+    ]
+    # SEC-08: redaction does not split or duplicate the single record
+    assert len(matching) == 1
+    message = matching[0].getMessage()
+
+    # SEC-08: the diagnosis survives redaction
+    assert EXCEPTION_TEXT_SENTINEL in message
+    assert "Traceback (most recent call last)" in message
+    assert REDACTION_MARKER in message
+
+    # SEC-08: no planted secret reaches the record in any shape
+    for secret in (
+        PLANTED_SIGNING_KEY,
+        PLANTED_DSN_CREDENTIAL,
+        PLANTED_BEARER,
+        minted_token,
+    ):
+        assert secret not in message, secret
+        assert secret not in caplog.text, secret
+
+    # SEC-08: a redacted value never returns to the caller either
+    assert PLANTED_SIGNING_KEY not in response.text
+    assert minted_token not in response.text
+    _assert_no_internal_detail(response.text)
+
+
+def test_the_diagnostic_record_redacts_a_configured_secret(
+    client, failing_database, caplog, monkeypatch
+):
+    """A traceback quoting a held setting value reaches the log without it."""
+    caplog.set_level(logging.ERROR)
+    held = {
+        "SECRET_KEY": "zzz-held-signing-key-3061-abcdefghijklmnopqrstuv",
+        "PAYPAL_CLIENT_SECRET": "zzz-held-paypal-credential-3062",
+        "SENDGRID_API_KEY": "zzz-held-sendgrid-credential-3063",
+        "ZILLOW_API_KEY": "zzz-held-zillow-credential-3064",
+        "DATABASE_URL": PLANTED_DSN,
+    }
+    for name, value in held.items():
+        monkeypatch.setattr(settings, name, value)
+
+    planted = RuntimeError(
+        "{0} {1}".format(
+            EXCEPTION_TEXT_SENTINEL,
+            " ".join(value for value in held.values()),
+        )
+    )
+    with failing_database(planted):
+        response = client.get("/listings/")
+
+    assert response.status_code == 500
+    message = "\n".join(record.getMessage() for record in caplog.records)
+    assert EXCEPTION_TEXT_SENTINEL in message
+    assert REDACTION_MARKER in message
+
+    # SEC-08: the held values are read when the record is built, so a value
+    # rotated after import is still removed
+    for name, value in held.items():
+        if name == "DATABASE_URL":
+            assert PLANTED_DSN_CREDENTIAL not in message
+            continue
+        assert value not in message, name
+    assert EXCEPTION_TEXT_SENTINEL not in response.text
+
+
+@pytest.mark.parametrize(
+    "status_code,diagnostics_expected", [(503, True), (418, False)]
+)
+def test_a_raised_status_opens_the_diagnostic_channel_at_500(
+    client, failing_database, caplog, status_code, diagnostics_expected
+):
+    """A raised 5xx is diagnosed in the log; a raised 4xx is not."""
+    caplog.set_level(logging.WARNING)
+    raised = StarletteHTTPException(
+        status_code=status_code, detail=EXCEPTION_TEXT_SENTINEL
+    )
+
+    with failing_database(raised):
+        response = client.get("/listings/")
+
+    assert response.status_code == status_code
+    body = _assert_uniform_envelope(response)
+    # SEC-08: the raised detail is replaced by the status phrase
+    assert EXCEPTION_TEXT_SENTINEL not in response.text
+    _assert_no_internal_detail(response.text)
+
+    matching = [
+        record
+        for record in caplog.records
+        if body["error_id"] in record.getMessage()
+    ]
+    assert len(matching) == 1
+    message = matching[0].getMessage()
+    assert ("Traceback (most recent call last)" in message) is (
+        diagnostics_expected
+    )
+    if diagnostics_expected:
+        # SEC-08: a server fault is recorded at the severity a 500 alert
+        # already watches
+        assert matching[0].levelno >= logging.ERROR
 
 
 def test_the_log_withholds_the_password_the_token_and_the_cookie(
     client, failing_database, caplog
 ):
-    """No log record for a failed request repeats a submitted secret."""
+    """No log record and no reply repeats a submitted secret.
+
+    Both channels are checked against the whole serialized reply, so a
+    token echoed in any envelope field fails the case.
+    """
     caplog.set_level(logging.ERROR)
     cookie_token = create_access_token({"sub": "1"})
     header_token = create_access_token({"sub": "2"})
@@ -488,15 +631,16 @@ def test_the_log_withholds_the_password_the_token_and_the_cookie(
         )
 
     assert response.status_code == 500
-    assert response.json()["detail"] == GENERIC_SERVER_DETAIL
+    body = _assert_uniform_envelope(response)
+    assert body["detail"] == GENERIC_SERVER_DETAIL
+    assert body["fields"] == []
     assert caplog.records
-    # SEC-08: no submitted secret reaches the log
     assert POLICY_PASSWORD not in caplog.text
     assert cookie_token not in caplog.text
     assert header_token not in caplog.text
-    # SEC-08: no submitted secret returns to the caller
     assert POLICY_PASSWORD not in response.text
     assert cookie_token not in response.text
+    assert header_token not in response.text
 
 
 def test_each_error_carries_its_own_correlation_identifier(
@@ -509,7 +653,6 @@ def test_each_error_carries_its_own_correlation_identifier(
 
     assert first.status_code == 500
     assert second.status_code == 500
-    # SEC-08: the correlation identifier marks one occurrence
     assert first.json()["error_id"] != second.json()["error_id"]
 
 
@@ -522,7 +665,6 @@ def test_the_harness_session_override_survives_a_forced_failure(
     with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
         assert client.get("/listings/").status_code == 500
 
-    # SEC-08: the harness override is the same object again
     assert app.dependency_overrides[get_db] is harness_override
     restored = client.get("/listings/")
     assert restored.status_code == 200

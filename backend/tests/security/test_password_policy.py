@@ -1,10 +1,15 @@
 """SEC-04 regression tests for the server-side password policy.
 
-Every case reaches the policy through ``POST /auth/register``, whose
-body FastAPI validates against ``UserCreate`` before the route hashes
-anything. The matching client-side rule in
+Registration cases reach the policy through ``POST /auth/register``,
+whose body FastAPI validates against ``UserCreate`` before the route
+hashes anything. The matching client-side rule in
 ``frontend/src/utils/validators.ts`` runs in no browser today, so the
 server holds the only copy that a caller cannot bypass.
+
+Login cases pin the other edge of the policy. ``UserLogin`` carries no
+policy rule: an account whose credential predates the policy still
+authenticates, and a shape the hasher itself refuses receives the
+counted uniform 401 that a wrong secret receives.
 
 The cases run at two layers. The HTTP layer pins the status code, the
 field name and the absence of any database row. The schema layer pins
@@ -14,18 +19,21 @@ The stored value is checked too. Every ceiling below is a bcrypt input
 limit, so the scheme that produced the hash is part of the policy rather
 than an implementation detail behind it.
 """
+import logging
+from datetime import datetime
+
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import text
 
-from backend.app.core.security import verify_password
-from backend.app.schema.user import UserCreate
+from backend.app.api.endpoints import auth as auth_endpoint
+from backend.app.core.security import get_password_hash, verify_password
+from backend.app.schema.user import UserCreate, UserLogin
 
 # There is no /api prefix: router.py applies /auth and main.py includes
 # the router without one.
 REGISTER_PATH = "/auth/register"
 
-# Address for the schema-level cases, which send no request.
 SCHEMA_EMAIL = "policy-probe@example.com"
 
 MIN_LENGTH = 12
@@ -35,7 +43,6 @@ MAX_BYTES = 72
 SPECIALS = "!@#$%^&*()_+-=[]{};':\"\\|,.<>/?"
 SPECIAL_COUNT = 30
 
-# Punctuation the client rule leaves out of its character class.
 EXCLUDED_PUNCTUATION = ("~", "`", " ")
 
 # One uppercase, ten lowercase and one digit. Appending any member of
@@ -62,7 +69,6 @@ ACCENTED_BYTES = 74
 EMOJI_OVER_CEILING = COMPLIANT + "\U0001f600" * 16
 EMOJI_BYTES = 76
 
-# SEC-04: one table feeds both the HTTP cases and the schema cases
 REJECTED_CASES = (
     ("eleven_characters", ELEVEN_CHARACTERS),
     ("empty", EMPTY),
@@ -270,10 +276,7 @@ def test_rejected_password_creates_no_user_row(
 def test_rejection_does_not_echo_the_submitted_password(
     client, unique_email, password
 ):
-    """The 422 body names the rejected field and withholds the value.
-
-    An echoed password would reach client logs and proxy records.
-    """
+    """The 422 body names the password field and omits the submitted value."""
     response = _register(client, unique_email, password)
 
     assert response.status_code == 422
@@ -368,3 +371,172 @@ def test_one_password_stored_twice_yields_two_hashes(
     # SEC-04: both still verify the shared password
     assert verify_password(COMPLIANT, first)
     assert verify_password(COMPLIANT, second)
+
+
+# ---------------------------------------------------------------------
+# SEC-04: the policy governs registration only. A credential minted
+# before it reaches authentication and receives the uniform 401.
+# ---------------------------------------------------------------------
+LOGIN_PATH = "/auth/login"
+
+# The frozen login response body, set in auth.py
+LOGIN_BODY_KEYS = {"access_token", "token_type"}
+
+# The shared error envelope every handler in main.py emits
+ENVELOPE_KEYS = {"detail", "error_id", "fields"}
+
+# The one raised detail the credential path logs for every refusal
+UNIFORM_LOGIN_DETAIL = "Incorrect email or password"
+
+# Shapes the hasher itself refuses: bcrypt rejects a NUL byte and
+# passlib caps a secret at 4096 characters.
+NUL_BYTE_PASSWORD = COMPLIANT + "\x00tail"
+PAST_PASSLIB_CEILING = "A" * 5000
+UNPARSEABLE_STORED_HASH = "not-a-bcrypt-digest"
+
+LEGACY_CREDENTIAL_PARAMS = [
+    pytest.param(ONE_BYTE_OVER_CEILING, id="one_byte_over_ceiling"),
+    pytest.param(ACCENTED_OVER_CEILING, id="accented_over_ceiling"),
+    pytest.param(EMOJI_OVER_CEILING, id="emoji_over_ceiling"),
+    pytest.param(THREE_CLASSES + "~", id="tilde_only"),
+    pytest.param(ELEVEN_CHARACTERS, id="eleven_characters"),
+]
+
+HASHER_REFUSAL_PARAMS = [
+    pytest.param(NUL_BYTE_PASSWORD, id="nul_byte"),
+    pytest.param(PAST_PASSLIB_CEILING, id="past_passlib_ceiling"),
+]
+
+
+def _login(client, email, password):
+    return client.post(
+        LOGIN_PATH, json={"email": email, "password": password}
+    )
+
+
+def _plant_account(session, email, password=None, stored_hash=None):
+    """Insert one account row, bypassing the request schema."""
+    digest = (
+        stored_hash
+        if stored_hash is not None
+        else get_password_hash(password)
+    )
+    session.execute(
+        text(
+            "INSERT INTO users (email, hashed_password, created_at) "
+            "VALUES (:email, :digest, :created_at)"
+        ),
+        {
+            "email": email,
+            "digest": digest,
+            "created_at": datetime.utcnow(),
+        },
+    )
+    session.commit()
+
+
+def _without_error_id(response):
+    body = dict(response.json())
+    body.pop("error_id", None)
+    return body
+
+
+def test_login_schema_admits_a_credential_the_policy_rejects():
+    """UserLogin accepts a value UserCreate refuses.
+
+    The byte ceiling and the character classes govern registration. A
+    stored credential minted before them stays usable.
+    """
+    with pytest.raises(ValidationError):
+        UserCreate(email=SCHEMA_EMAIL, password=ONE_BYTE_OVER_CEILING)
+
+    model = UserLogin(email=SCHEMA_EMAIL, password=ONE_BYTE_OVER_CEILING)
+
+    assert model.password == ONE_BYTE_OVER_CEILING
+
+
+@pytest.mark.parametrize("password", LEGACY_CREDENTIAL_PARAMS)
+def test_a_credential_predating_the_policy_authenticates(
+    client, db_session, unique_email, password
+):
+    """An account the policy would now refuse still logs in."""
+    _plant_account(db_session, unique_email, password=password)
+
+    response = _login(client, unique_email, password)
+
+    assert response.status_code == 200, response.text
+    # SEC-06: the frozen login body is unchanged
+    assert set(response.json()) == LOGIN_BODY_KEYS
+
+
+@pytest.mark.parametrize("password", HASHER_REFUSAL_PARAMS)
+def test_a_shape_the_hasher_refuses_returns_the_uniform_401(
+    client, db_session, unique_email, password
+):
+    """A refused shape answers 401, never 500 and never 422."""
+    _plant_account(db_session, unique_email, password=COMPLIANT)
+
+    refused = _login(client, unique_email, password)
+    wrong_secret = _login(client, unique_email, COMPLIANT + "z")
+
+    assert refused.status_code == 401, refused.text
+    assert wrong_secret.status_code == 401
+    assert set(refused.json()) == ENVELOPE_KEYS
+    # SEC-08: one reply covers a refused shape and a wrong secret
+    assert _without_error_id(refused) == _without_error_id(wrong_secret)
+    assert password not in refused.text
+
+
+def test_an_unparseable_stored_hash_returns_the_uniform_401(
+    client, db_session, unique_email
+):
+    """A stored digest the hasher cannot parse answers 401, never 500."""
+    _plant_account(
+        db_session, unique_email, stored_hash=UNPARSEABLE_STORED_HASH
+    )
+
+    response = _login(client, unique_email, COMPLIANT)
+
+    assert response.status_code == 401, response.text
+    assert set(response.json()) == ENVELOPE_KEYS
+    assert UNPARSEABLE_STORED_HASH not in response.text
+
+
+def test_a_refused_shape_is_counted_against_the_account(
+    client, db_session, unique_email
+):
+    """A hasher refusal consumes one attempt from the account counter."""
+    _plant_account(db_session, unique_email, password=COMPLIANT)
+    account_key = auth_endpoint._account_key(unique_email)
+
+    response = _login(client, unique_email, NUL_BYTE_PASSWORD)
+
+    assert response.status_code == 401
+    # SEC-07: the refusal is a counted attempt, not a free probe
+    assert auth_endpoint._login_failures[account_key][0] == 1
+
+
+def test_the_refusal_reaches_the_log_under_the_client_reference(
+    client, db_session, unique_email, caplog
+):
+    """One record ties the refusal to the reference the caller holds."""
+    caplog.set_level(logging.WARNING)
+    _plant_account(db_session, unique_email, password=COMPLIANT)
+
+    response = _login(client, unique_email, NUL_BYTE_PASSWORD)
+
+    assert response.status_code == 401
+    error_id = response.json()["error_id"]
+    matching = [
+        record.getMessage()
+        for record in caplog.records
+        if error_id in record.getMessage()
+    ]
+    assert len(matching) == 1
+    # SEC-08: the record names the refusing hasher error; the reply does not
+    assert "hasher=" in matching[0]
+    assert UNIFORM_LOGIN_DETAIL in matching[0]
+    assert UNIFORM_LOGIN_DETAIL not in response.text
+    # SEC-07: no submitted secret and no address reach the record
+    assert NUL_BYTE_PASSWORD not in matching[0]
+    assert unique_email not in matching[0]

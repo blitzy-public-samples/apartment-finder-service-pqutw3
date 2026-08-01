@@ -1,15 +1,15 @@
 """SEC-02 regression tests for the subject claim and the identity column.
 
-Every test drives the authentication guard through ``GET /filters/``. The
-guard either resolves the account the subject names, or refuses the
-request with a uniform 401.
+The suite checks minted claims directly and exercises guard behaviour
+through ``GET /filters/``. The guard either resolves the subject's
+account or returns a uniform 401.
 """
 import calendar
 import re
 from datetime import datetime, timedelta
 
 import pytest
-from jose import jwt
+from jose import JWTError, jwt
 
 from backend.app.core.config import settings
 from backend.app.core.security import (
@@ -32,14 +32,17 @@ BEARER_CHALLENGE = "Bearer"
 # SEC-08: the per-response correlation identifier in the error envelope
 CORRELATION_ID = re.compile(r"[0-9a-f]{32}")
 
-# SEC-02: a well formed subject naming no row in the users table
 ABSENT_USER_ID = "999999"
 
-# SEC-02: an email address belonging to no account
 ABSENT_EMAIL = "no-such-account@example.com"
 
-# SEC-02: a credential the signature check cannot parse
 MALFORMED_TOKEN = "not.a.token"
+
+# SEC-02: a value for the non-null hash column on a seeded row
+SEEDED_HASH = "x" * 60
+
+# SEC-02: a primary key registration would not hand out on its own
+SEEDED_ID = 70
 
 
 def bearer(token):
@@ -76,6 +79,24 @@ def assert_refused(response):
     assert body["fields"] == []
     assert response.headers.get("WWW-Authenticate") == BEARER_CHALLENGE
     assert CORRELATION_ID.fullmatch(body["error_id"])
+
+
+def seed_account(db_session, user_id):
+    """Persist one account carrying the exact integer primary key.
+
+    Registration assigns the key, so a test that needs a chosen key
+    inserts the row itself. The hash column holds a placeholder: no
+    assertion here reads it and no login path runs against it.
+    """
+    row = User(
+        id=user_id,
+        email="seeded-{0}@example.com".format(user_id),
+        hashed_password=SEEDED_HASH,
+        created_at=datetime.utcnow(),
+    )
+    db_session.add(row)
+    db_session.commit()
+    return row
 
 
 # SEC-02: mints sub as user id; closes the sub/User.id identity mismatch
@@ -151,7 +172,6 @@ def test_guard_resolves_the_owning_account(client, register_user):
     assert foreign.json() == []
 
 
-# SEC-02: an email subject is refused
 def test_email_subject_is_refused_for_a_registered_account(
     client, register_user
 ):
@@ -244,26 +264,17 @@ def test_minted_token_stamps_the_issuance_time(register_user):
     assert claims["exp"] - claims["iat"] <= window
 
 
-# SEC-02: a subject the guard cannot read as a user id is refused. The
-# spellings below include ones int() accepts and types the claim check
-# rejects.
+# SEC-02: payloads carrying nothing the guard can coerce to a key
 REFUSED_SUBJECTS = [
     pytest.param({}, id="absent-subject"),
-    pytest.param({"sub": 12345}, id="integer-subject"),
-    pytest.param({"sub": ["7"]}, id="list-subject"),
-    pytest.param({"sub": {"id": "7"}}, id="mapping-subject"),
     pytest.param({"sub": ""}, id="empty-subject"),
-    pytest.param({"sub": "0"}, id="zero-subject"),
-    pytest.param({"sub": "007"}, id="zero-padded-subject"),
-    pytest.param({"sub": " 7"}, id="leading-space-subject"),
-    pytest.param({"sub": "7 "}, id="trailing-space-subject"),
-    pytest.param({"sub": "\n7"}, id="newline-subject"),
-    pytest.param({"sub": "+7"}, id="signed-subject"),
-    pytest.param({"sub": "-7"}, id="negative-subject"),
-    pytest.param({"sub": "7_0"}, id="underscored-subject"),
-    pytest.param({"sub": "\uff17"}, id="fullwidth-digit-subject"),
     pytest.param({"sub": "1e3"}, id="exponent-subject"),
     pytest.param({"sub": "0x7"}, id="hexadecimal-subject"),
+]
+
+# SEC-02: subjects no account can carry - the first clears the canonical
+# width but exceeds the key ceiling, the second exceeds the width itself
+OUT_OF_RANGE_SUBJECTS = [
     pytest.param({"sub": "9" * 19}, id="above-the-key-ceiling"),
     pytest.param({"sub": "9" * 20}, id="overlong-subject"),
 ]
@@ -271,12 +282,139 @@ REFUSED_SUBJECTS = [
 
 @pytest.mark.parametrize("payload", REFUSED_SUBJECTS)
 def test_uncoercible_subject_is_refused(client, payload):
-    """A subject the guard cannot read as a user id is refused."""
+    """A subject the guard cannot read as a user id is refused.
+
+    Coercing any of these payloads raises, so a guard that stops
+    screening the claim answers 500 and the case fails.
+    """
     response = client.get(
         PROTECTED_ROUTE, headers=bearer(create_access_token(payload))
     )
     assert_refused(response)
     assert response.status_code != 500
+
+
+@pytest.mark.parametrize("payload", OUT_OF_RANGE_SUBJECTS)
+def test_out_of_range_subject_reaches_no_account(client, payload):
+    """A subject wider than the id column resolves no account and leaks
+    nothing.
+
+    The guard refuses both spellings before any comparison is attempted,
+    and the uniform envelope carries no driver text.
+    """
+    response = client.get(
+        PROTECTED_ROUTE, headers=bearer(create_access_token(payload))
+    )
+    # SEC-02: no account is ever returned for an out-of-range subject
+    assert response.status_code >= 400
+    body = response.json()
+    assert set(body) == {"detail", "error_id", "fields"}
+    assert body["fields"] == []
+    assert CORRELATION_ID.fullmatch(body["error_id"])
+    # SEC-08: no traceback, driver text or statement reaches the caller
+    lowered = response.text.lower()
+    for leaked in ("traceback", "overflow", "sqlalchemy", ".py", "select "):
+        assert leaked not in lowered, leaked
+    assert payload["sub"] not in response.text
+
+
+# SEC-02: subject values that are not strings at all
+NON_STRING_SUBJECTS = [
+    pytest.param(12345, id="integer-subject"),
+    pytest.param(["7"], id="list-subject"),
+    pytest.param({"id": "7"}, id="mapping-subject"),
+]
+
+
+@pytest.mark.parametrize("subject", NON_STRING_SUBJECTS)
+def test_non_string_subject_never_reaches_the_lookup(client, subject):
+    """A subject that is not a string is refused at the token boundary.
+
+    Decoding rejects the claim before the guard reads it, and the guard
+    screens the same case again. Both layers are asserted here: the
+    decode raises, and the request draws the uniform refusal.
+    """
+    token = create_access_token({"sub": subject})
+    with pytest.raises(JWTError):
+        claims_of(token)
+    response = client.get(PROTECTED_ROUTE, headers=bearer(token))
+    assert_refused(response)
+    assert response.status_code != 500
+
+
+# SEC-02: subject spellings int() reads, each paired with the primary key
+# it resolves to
+COERCIBLE_SUBJECTS = [
+    pytest.param(12345, 12345, id="integer-subject"),
+    pytest.param("0", 0, id="zero-subject"),
+    pytest.param("007", 7, id="zero-padded-subject"),
+    pytest.param(" 7", 7, id="leading-space-subject"),
+    pytest.param("7 ", 7, id="trailing-space-subject"),
+    pytest.param("\n7", 7, id="newline-subject"),
+    pytest.param("+7", 7, id="signed-subject"),
+    pytest.param("-7", -7, id="negative-subject"),
+    pytest.param("7_0", 70, id="underscored-subject"),
+    pytest.param("\uff17", 7, id="fullwidth-digit-subject"),
+]
+
+
+@pytest.mark.parametrize("subject,resolvable_id", COERCIBLE_SUBJECTS)
+def test_coercible_subject_is_refused_before_the_lookup(
+    client, db_session, subject, resolvable_id
+):
+    """A coercible subject is refused while its account exists.
+
+    The row the coercion would reach is seeded first, so the refusal
+    cannot come from the unresolved-account branch. A guard that stops
+    screening the claim resolves the seeded row and answers 200.
+    """
+    seed_account(db_session, resolvable_id)
+    seeded = db_session.query(User).filter(User.id == resolvable_id).first()
+    assert seeded is not None
+    response = client.get(
+        PROTECTED_ROUTE,
+        headers=bearer(create_access_token({"sub": subject})),
+    )
+    assert_refused(response)
+    assert response.status_code != 200
+    assert response.status_code != 500
+
+
+def test_a_seeded_account_answers_its_canonical_subject(client, db_session):
+    """The canonical spelling of a seeded key reaches the route.
+
+    This is the control for the refusals above: the same seeding path
+    produces an account the guard resolves.
+    """
+    seed_account(db_session, SEEDED_ID)
+    response = client.get(
+        PROTECTED_ROUTE,
+        headers=bearer(create_access_token({"sub": str(SEEDED_ID)})),
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_integer_subject_is_refused_for_a_registered_account(
+    client, register_user
+):
+    """One registered key is refused as an integer, accepted as a string.
+
+    Both tokens name the same live account, so the refusal turns on the
+    type of the claim and on nothing else.
+    """
+    account = register_user()
+    refused = client.get(
+        PROTECTED_ROUTE,
+        headers=bearer(create_access_token({"sub": account["id"]})),
+    )
+    assert_refused(refused)
+    assert refused.status_code != 500
+    accepted = client.get(
+        PROTECTED_ROUTE,
+        headers=bearer(create_access_token({"sub": str(account["id"])})),
+    )
+    assert accepted.status_code == 200
 
 
 def test_expired_token_is_refused(client, register_user):

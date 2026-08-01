@@ -1,10 +1,12 @@
 """Regression tests for SEC-07, the login throttle.
 
-Failed logins answer 401 up to the configured threshold and 429 beyond
-it, so repeated credential guessing against one account is bounded. The
-throttled reply carries the sanitized error envelope, and the server
-records the attempt under the correlation identifier the caller
-receives.
+Two controls answer a failed login. The limiter registered on the login
+route refuses the attempt past the configured threshold for one client
+address; an in-process counter refuses it for one account reached from
+many addresses. The cases below exercise each control on its own and
+both together, and check that every refusal carries the sanitized error
+envelope and reaches the server log under the correlation identifier the
+caller receives.
 
 The account counter keys on the normalized email address, and a
 successful login empties that counter.
@@ -16,12 +18,20 @@ directly, because the bound is reached below the HTTP layer. And the
 limiter the application registers is proven to be the one the harness
 empties, with its rejection driven through the app so the handler that
 answers it is under test.
+
+Both controls hold their state in the worker process that served the
+request. Neither survives a restart, and neither is shared between
+workers or replicas, so the bound measured here is the bound one worker
+applies. Durable shared lockout is recorded as deferred in
+``documentation/security/decision-log.md``.
 """
+import itertools
 import logging
 import time
 
 import pytest
-from conftest import reset_login_throttle
+from conftest import TEST_BASE_URL, reset_login_throttle
+from fastapi.testclient import TestClient
 from limits import parse as parse_rate_limit
 from limits.storage import MemoryStorage
 from slowapi.errors import RateLimitExceeded
@@ -39,6 +49,13 @@ from backend.app.main import (
 
 LOGIN_PATH = "/auth/login"
 REGISTER_PATH = "/auth/register"
+LOGOUT_PATH = "/auth/logout"
+
+# SEC-07: the key slowapi files a route limit under
+_LOGIN_ROUTE_KEY = "{0}.{1}".format(
+    auth_endpoint.login_user.__module__,
+    auth_endpoint.login_user.__name__,
+)
 
 # A secret no account registered in this module holds.
 WRONG_SECRET = "Nqz7!Bmtlie-Ovsxa"
@@ -76,6 +93,10 @@ FORBIDDEN_IN_BODY = (
 # unknown address and for a wrong secret alike.
 UNIFORM_LOGIN_DETAIL = "Incorrect email or password"
 
+# SEC-07: client addresses this module presents, none of them the address
+# the shared harness client carries
+_HOSTS = itertools.count(1)
+
 # SEC-07: the configured limit written in the notation the limiter
 # parses, so the rejection driven below carries the real threshold
 CONFIGURED_LIMIT = "{0}/{1} minute".format(
@@ -90,8 +111,8 @@ LIMITER_PROBE_KEY = "harness-limiter-probe"
 # SEC-07: an account key no route writes, seeded to observe the prune
 UNRELATED_ACCOUNT_KEY = "acct:unrelated-probe@example.com"
 
-# SEC-07: the smallest cap that still admits one full attempt, which
-# writes one account key and one address key
+# SEC-07: a cap smaller than the number of accounts the flood below
+# names, so the last attempt has to free a slot to be admitted
 PROBE_CAP = 3
 
 # SEC-07: addresses used only by the counter-cap cases; no account is
@@ -100,6 +121,7 @@ CAP_PROBE_EMAILS = (
     "cap-probe-1@example.com",
     "cap-probe-2@example.com",
     "cap-probe-3@example.com",
+    "cap-probe-4@example.com",
 )
 
 # SEC-07: keys standing in for other accounts under attack while the
@@ -155,36 +177,78 @@ def limiter_refuses_every_request():
 
 @pytest.fixture(autouse=True)
 def empty_login_counters(isolated_state):
-    """Empty both login counters around every test in this module."""
-    # SEC-07: no counter state crosses a test boundary
+    """Empty the account counter and every address budget."""
+    # SEC-07: no throttle state crosses a test boundary
     reset_login_throttle()
     yield
     reset_login_throttle()
+
+
+def _client_at_a_new_address():
+    """Return a client and the address it presents, used by no other."""
+    # SEC-07: a fresh address carries a full, unspent address budget
+    host = "throttle-probe-{0}".format(next(_HOSTS))
+    probe = TestClient(
+        app,
+        base_url=TEST_BASE_URL,
+        client=(host, 50000),
+        raise_server_exceptions=False,
+    )
+    return probe, host
 
 
 def _post_login(client, email, secret):
     return client.post(LOGIN_PATH, json={"email": email, "password": secret})
 
 
-def _keys_with_prefix(prefix):
-    return sorted(
-        key
-        for key in auth_endpoint._login_failures
-        if key.startswith(prefix)
+def _login_from_a_new_address(email, secret):
+    # SEC-07: one attempt per address, so the address budget never answers
+    # and the account counter is the only control under test
+    probe, _host = _client_at_a_new_address()
+    return _post_login(probe, email, secret)
+
+
+def _reset_address_layer():
+    # SEC-07: empties the limiter storage only, so the account counter is
+    # the sole control answering the next attempt
+    auth_endpoint.limiter.reset()
+
+
+def _clear_account_layer():
+    # SEC-07: empties the account counter only, so the route limiter is
+    # the sole control answering the next attempt
+    auth_endpoint._login_failures.clear()
+
+
+def _client_at(host):
+    """Return a client whose recorded address is ``host``."""
+    return TestClient(
+        app,
+        base_url=TEST_BASE_URL,
+        client=(host, 50000),
+        raise_server_exceptions=False,
     )
 
 
 def _account_keys():
-    return _keys_with_prefix(auth_endpoint._ACCOUNT_KEY_PREFIX)
-
-
-def _address_keys():
-    return _keys_with_prefix(auth_endpoint._ADDRESS_KEY_PREFIX)
+    return sorted(
+        key
+        for key in auth_endpoint._login_failures
+        if key.startswith(auth_endpoint._ACCOUNT_KEY_PREFIX)
+    )
 
 
 def _failure_count(key):
     entry = auth_endpoint._login_failures.get(key)
     return None if entry is None else entry[0]
+
+
+def _warning_messages(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == application_logger.name
+    ]
 
 
 def _without_correlation_id(reply):
@@ -205,34 +269,152 @@ def test_failed_logins_answer_401_until_the_threshold_then_429(
     account = register_user()
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
 
-    # SEC-07: one attempt past the configured threshold
     replies = [
         _post_login(client, account["email"], WRONG_SECRET)
         for _ in range(attempts + 1)
     ]
 
-    # SEC-07: the whole sequence, not the final status alone
     statuses = [reply.status_code for reply in replies]
     assert statuses == [401] * attempts + [429]
 
-    # SEC-08: every reply carries the sanitized envelope
     for reply in replies:
         assert set(reply.json()) == ENVELOPE_KEYS
         assert reply.json()[CORRELATION_KEY]
 
-    # SEC-08: the rejections differ only in the correlation identifier
     rejections = [_without_correlation_id(reply) for reply in replies[:-1]]
     assert all(body == rejections[0] for body in rejections)
+
+
+def test_the_login_route_carries_the_configured_address_budget():
+    """The login route declares the address budget the settings describe.
+
+    A budget declared on the route governs the request; the middleware
+    defers to it.
+    """
+    declared = [
+        item
+        for name, items in auth_endpoint.limiter._route_limits.items()
+        if name.endswith("login_user")
+        for item in items
+    ]
+    assert len(declared) == 1
+
+    # SEC-07: the threshold and the window come from the settings
+    limit = declared[0].limit
+    assert limit.amount == settings.LOGIN_RATE_LIMIT_ATTEMPTS
+    expected_window = settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES * 60
+    assert limit.get_expiry() == expected_window
+
+    # SEC-07: the budget keys on the client address, and no callable
+    # limit bypasses the declaration
+    assert auth_endpoint.limiter._key_func is get_remote_address
+    assert auth_endpoint.limiter._dynamic_route_limits == {}
+
+    # SEC-07: the limit is filed under the endpoint the application
+    # routes POST /auth/login to, so no stale key holds it
+    assert auth_endpoint.limiter._route_limits.get(_LOGIN_ROUTE_KEY)
+    served = [
+        "{0}.{1}".format(route.endpoint.__module__, route.endpoint.__name__)
+        for route in app.routes
+        if getattr(route, "path", None) == LOGIN_PATH
+    ]
+    assert served == [_LOGIN_ROUTE_KEY]
+
+
+def test_register_and_logout_carry_no_route_limit(client, register_user):
+    """Only the login route is throttled.
+
+    Registering and logging out more times than the login threshold
+    allows answers normally throughout.
+    """
+    attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
+
+    accounts = [register_user() for _ in range(attempts + 1)]
+    assert len({account["email"] for account in accounts}) == attempts + 1
+
+    statuses = [
+        client.post(LOGOUT_PATH).status_code for _ in range(attempts + 1)
+    ]
+    assert statuses == [200] * (attempts + 1)
+
+    # SEC-07: the login route is the only route carrying a limit
+    assert list(auth_endpoint.limiter._route_limits) == [_LOGIN_ROUTE_KEY]
+    assert auth_endpoint.limiter._dynamic_route_limits == {}
+    assert auth_endpoint.limiter._application_limits == []
+    assert auth_endpoint.limiter._default_limits == []
+
+
+def test_the_account_counter_bounds_a_changing_client_address(
+    register_user
+):
+    """Attempts against one account are bounded across client addresses.
+
+    Every attempt below arrives from an address no earlier attempt used,
+    so no address budget approaches its threshold.
+    """
+    account = register_user()
+    attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
+    canonical_key = auth_endpoint._account_key(account["email"])
+
+    statuses = [
+        _login_from_a_new_address(account["email"], WRONG_SECRET).status_code
+        for _ in range(attempts)
+    ]
+    assert statuses == [401] * attempts
+    assert _account_keys() == [canonical_key]
+    assert _failure_count(canonical_key) == attempts
+
+    # SEC-07: the account counter refuses an address that has spent
+    # nothing of its own budget, and the correct secret does not pass
+    throttled = _login_from_a_new_address(
+        account["email"], account["password"]
+    )
+    assert throttled.status_code == 429
+    assert set(throttled.json()) == ENVELOPE_KEYS
+
+
+def test_the_address_budget_bounds_a_changing_account(register_user):
+    """Attempts from one address are bounded across accounts.
+
+    Every attempt below names an account no earlier attempt named, so no
+    account counter approaches its threshold.
+    """
+    attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
+    accounts = [register_user() for _ in range(attempts + 1)]
+    probe, _host = _client_at_a_new_address()
+
+    statuses = [
+        _post_login(probe, account["email"], WRONG_SECRET).status_code
+        for account in accounts[:attempts]
+    ]
+    assert statuses == [401] * attempts
+
+    # SEC-07: one failure per account, so every account counter sits
+    # below the threshold
+    assert all(_failure_count(key) == 1 for key in _account_keys())
+    assert len(_account_keys()) == attempts
+
+    # SEC-07: the spent address budget answers an account that has never
+    # failed a login
+    unnamed = accounts[-1]
+    throttled = _post_login(probe, unnamed["email"], WRONG_SECRET)
+    assert throttled.status_code == 429
+    assert set(throttled.json()) == ENVELOPE_KEYS
+    unnamed_key = auth_endpoint._account_key(unnamed["email"])
+    assert unnamed_key not in _account_keys()
+
+    # SEC-07: the refusal is scoped to the spent address
+    elsewhere = _login_from_a_new_address(
+        unnamed["email"], unnamed["password"]
+    )
+    assert elsewhere.status_code == 200
 
 
 def test_throttled_reply_carries_the_uniform_envelope(
     client, register_user
 ):
-    """The throttled reply matches the shape of every other rejection.
-
-    Neither the threshold, the window, nor the stock limiter body
-    reaches the caller.
-    """
+    """The throttled reply matches the credential and schema-rejection
+    envelope and reveals no threshold or limiter detail."""
     account = register_user()
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
     window = settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES
@@ -251,8 +433,6 @@ def test_throttled_reply_carries_the_uniform_envelope(
     )
     assert invalid.status_code == 422
 
-    # SEC-08: one shape across the throttle, the credential rejection
-    # and the schema rejection
     body = throttled.json()
     assert set(body) == ENVELOPE_KEYS
     assert set(body) == set(rejected.json())
@@ -262,21 +442,17 @@ def test_throttled_reply_carries_the_uniform_envelope(
     assert body[CORRELATION_KEY] != rejected.json()[CORRELATION_KEY]
     assert body["fields"] == []
 
-    # SEC-07: the detail names neither the threshold nor the window
     assert str(attempts) not in body["detail"]
     assert str(window) not in body["detail"]
 
-    # SEC-07: the stock limiter body reaches no caller
     assert "error" not in body
     for marker in FORBIDDEN_IN_BODY:
         assert marker not in throttled.text
 
-    # SEC-08: no submitted value and no minted token reach the reply
     assert WRONG_SECRET not in throttled.text
     assert account["email"] not in throttled.text
     assert account["access_token"] not in throttled.text
 
-    # SEC-07: the limiter publishes no rate-limit headers
     assert not [
         name
         for name in throttled.headers
@@ -284,26 +460,29 @@ def test_throttled_reply_carries_the_uniform_envelope(
     ]
 
 
-def test_throttled_attempt_reaches_the_log(client, register_user, caplog):
+def test_the_account_throttle_reaches_the_log(register_user, caplog):
     """One record carries the correlation identifier the caller sees.
 
     No submitted secret, minted token, cookie value, email address or
-    client address appears in any record.
+    client address appears in any record. The account counter answers
+    here, because the limiter storage is emptied between attempts.
     """
     caplog.set_level(logging.WARNING, logger=application_logger.name)
     account = register_user()
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
+    client_address = "throttle-log-{0}".format(next(_HOSTS))
 
-    for _ in range(attempts):
-        _post_login(client, account["email"], WRONG_SECRET)
-    throttled = _post_login(client, account["email"], WRONG_SECRET)
+    with _client_at(client_address) as attempts_client:
+        for _ in range(attempts):
+            _reset_address_layer()
+            _post_login(attempts_client, account["email"], WRONG_SECRET)
+        _reset_address_layer()
+        throttled = _post_login(
+            attempts_client, account["email"], WRONG_SECRET
+        )
     assert throttled.status_code == 429
 
-    messages = [
-        record.getMessage()
-        for record in caplog.records
-        if record.name == application_logger.name
-    ]
+    messages = _warning_messages(caplog)
 
     # SEC-07: the throttled attempt is recorded, not dropped
     correlation_id = throttled.json()[CORRELATION_KEY]
@@ -330,25 +509,51 @@ def test_throttled_attempt_reaches_the_log(client, register_user, caplog):
     assert account["access_token"] not in joined
     assert account["email"] not in joined
 
-    address_keys = _address_keys()
-    assert len(address_keys) == 1
-    client_address = address_keys[0][
-        len(auth_endpoint._ADDRESS_KEY_PREFIX):
-    ]
-    assert client_address
+    # SEC-07: the address the harness sent reaches no record
     assert client_address not in joined
 
 
-def test_account_counter_keys_on_the_normalized_email(
-    client, register_user
+def test_the_address_throttle_reaches_the_log(
+    client, register_user, caplog
 ):
+    """The address budget records its refusal, rather than dropping it.
+
+    The record carries the correlation identifier the caller sees and no
+    submitted value.
+    """
+    caplog.set_level(logging.WARNING, logger=application_logger.name)
+    account = register_user()
+    attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
+
+    for _ in range(attempts):
+        _post_login(client, account["email"], WRONG_SECRET)
+    throttled = _post_login(client, account["email"], WRONG_SECRET)
+    assert throttled.status_code == 429
+
+    messages = _warning_messages(caplog)
+
+    # SEC-07: the refused attempt is recorded, not dropped
+    correlation_id = throttled.json()[CORRELATION_KEY]
+    throttle_records = [text for text in messages if correlation_id in text]
+    assert len(throttle_records) == 1
+    assert LOGIN_PATH in throttle_records[0]
+
+    # SEC-08: no submitted value and no minted token reach a record
+    joined = "\n".join(messages)
+    assert WRONG_SECRET not in joined
+    assert account["password"] not in joined
+    assert account["access_token"] not in joined
+    assert account["email"] not in joined
+
+
+def test_account_counter_keys_on_the_normalized_email(register_user):
     """Padded and uppercase spellings of one address share one counter."""
     account = register_user()
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
     padded_uppercase = "  {0}  ".format(account["email"].upper())
 
     statuses = [
-        _post_login(client, padded_uppercase, WRONG_SECRET).status_code
+        _login_from_a_new_address(padded_uppercase, WRONG_SECRET).status_code
         for _ in range(attempts)
     ]
     assert statuses == [401] * attempts
@@ -360,14 +565,14 @@ def test_account_counter_keys_on_the_normalized_email(
 
     # SEC-07: the exact spelling reaches the counter the padded,
     # uppercase spelling filled, and the correct secret does not clear it
-    refused = _post_login(client, account["email"], account["password"])
+    refused = _login_from_a_new_address(
+        account["email"], account["password"]
+    )
     assert refused.status_code == 429
     assert set(refused.json()) == ENVELOPE_KEYS
 
 
-def test_successful_login_empties_the_account_counter(
-    client, register_user
-):
+def test_successful_login_empties_the_account_counter(register_user):
     """A success resets the account counter, so later failures start
     from zero.
     """
@@ -380,44 +585,90 @@ def test_successful_login_empties_the_account_counter(
     canonical_key = auth_endpoint._account_key(account["email"])
 
     first_run = [
-        _post_login(client, account["email"], WRONG_SECRET).status_code
+        _login_from_a_new_address(account["email"], WRONG_SECRET).status_code
         for _ in range(below_threshold)
     ]
     assert first_run == [401] * below_threshold
     assert _failure_count(canonical_key) == below_threshold
 
-    accepted = _post_login(client, account["email"], account["password"])
+    accepted = _login_from_a_new_address(
+        account["email"], account["password"]
+    )
     assert accepted.status_code == 200
 
-    # SEC-07: authentication empties the account and address counters
+    # SEC-07: authentication empties the counter
     assert _account_keys() == []
-    assert _address_keys() == []
+    assert auth_endpoint._login_failures == {}
 
     # SEC-07: an emptied counter answers 401 again for a full run; a
-    # retained count would answer 429 on the second attempt here
+    # retained count would answer 429 on the second attempt here. The
+    # limiter storage is emptied first, because it counted the accepted
+    # attempt too, so the second run reaches the account counter.
+    _reset_address_layer()
     second_run = [
-        _post_login(client, account["email"], WRONG_SECRET).status_code
+        _login_from_a_new_address(account["email"], WRONG_SECRET).status_code
         for _ in range(below_threshold)
     ]
     assert second_run == [401] * below_threshold
     assert _failure_count(canonical_key) == below_threshold
 
 
-def test_counter_expiry_uses_the_configured_window(client, register_user):
+def test_a_success_leaves_the_address_budget_spent(register_user):
+    """A success clears the account counter and no part of the address
+    budget.
+
+    The address the success arrived from stays bound by what earlier
+    attempts spent.
+    """
+    attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
+    # SEC-07: one attempt of headroom for the success below
+    assert attempts >= 2
+    guessed = register_user()
+    holder = register_user()
+    probe, _host = _client_at_a_new_address()
+
+    failures = [
+        _post_login(probe, guessed["email"], WRONG_SECRET).status_code
+        for _ in range(attempts - 1)
+    ]
+    assert failures == [401] * (attempts - 1)
+
+    accepted = _post_login(probe, holder["email"], holder["password"])
+    assert accepted.status_code == 200
+    probe.cookies.clear()
+
+    # SEC-07: the guessed account sits below its threshold and the
+    # authenticated account holds no counter, so only the spent address
+    # budget can answer the next attempt
+    guessed_key = auth_endpoint._account_key(guessed["email"])
+    assert _failure_count(guessed_key) == attempts - 1
+    assert auth_endpoint._account_key(holder["email"]) not in _account_keys()
+
+    throttled = _post_login(probe, holder["email"], holder["password"])
+    assert throttled.status_code == 429
+    assert set(throttled.json()) == ENVELOPE_KEYS
+
+    # SEC-07: the refusal is scoped to the spent address
+    elsewhere = _login_from_a_new_address(
+        holder["email"], holder["password"]
+    )
+    assert elsewhere.status_code == 200
+
+
+def test_counter_expiry_uses_the_configured_window(register_user):
     """A counter entry expires one configured window after the attempt."""
     account = register_user()
     canonical_key = auth_endpoint._account_key(account["email"])
     window_seconds = settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES * 60
 
     before = time.monotonic()
-    rejected = _post_login(client, account["email"], WRONG_SECRET)
+    rejected = _login_from_a_new_address(account["email"], WRONG_SECRET)
     after = time.monotonic()
     assert rejected.status_code == 401
 
     count, expires_at = auth_endpoint._login_failures[canonical_key]
     assert count == 1
 
-    # SEC-07: the expiry comes from the configured window
     assert before + window_seconds <= expires_at
     assert expires_at <= after + window_seconds
 
@@ -453,9 +704,9 @@ def test_an_elapsed_counter_is_pruned_before_the_next_attempt(
 def test_the_counter_map_never_exceeds_the_cap(client, monkeypatch):
     """A flood of distinct accounts cannot grow the counter map.
 
-    Each attempt writes an account key and an address key, so an
-    unbounded map is a memory-exhaustion vector reachable by an
-    unauthenticated caller (CWE-367).
+    Each attempt writes one account key, so an unbounded map is a
+    memory-exhaustion vector reachable by an unauthenticated caller
+    (CWE-367).
     """
     monkeypatch.setattr(
         auth_endpoint, "_LOGIN_FAILURE_TRACKING_CAP", PROBE_CAP
@@ -469,13 +720,13 @@ def test_the_counter_map_never_exceeds_the_cap(client, monkeypatch):
 
     # SEC-07: the cap frees room instead of refusing a fresh attempt
     assert statuses == [401] * len(CAP_PROBE_EMAILS)
-    assert sizes == [2, PROBE_CAP, PROBE_CAP]
+    assert sizes == [1, 2, PROBE_CAP, PROBE_CAP]
 
-    # SEC-07: the address counter carries the lockout progress and is
-    # the last key eviction may take, so it survives every eviction
-    address_keys = _address_keys()
-    assert len(address_keys) == 1
-    assert _failure_count(address_keys[0]) == len(CAP_PROBE_EMAILS)
+    # SEC-07: the map never grows past the cap, and every retained key
+    # still carries the one attempt it counted
+    assert len(auth_endpoint._login_failures) == PROBE_CAP
+    assert _account_keys() == sorted(auth_endpoint._login_failures)
+    assert all(_failure_count(key) == 1 for key in _account_keys())
 
     # SEC-07: room came from the account keys closest to expiry
     retained = [
@@ -483,7 +734,7 @@ def test_the_counter_map_never_exceeds_the_cap(client, monkeypatch):
         for email in CAP_PROBE_EMAILS
         if auth_endpoint._account_key(email) in auth_endpoint._login_failures
     ]
-    assert len(retained) == PROBE_CAP - 1
+    assert len(retained) == PROBE_CAP
 
 
 def test_a_key_at_the_limit_is_never_evicted(monkeypatch):

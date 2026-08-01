@@ -1,8 +1,10 @@
 import logging
 import os
+import re
 import traceback
 import uuid
 from http import HTTPStatus
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError, StarletteHTTPException
@@ -11,11 +13,10 @@ from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
 from backend.app.api.endpoints.auth import limiter
 from backend.app.api.router import api_router
 from backend.app.core.config import settings
-from backend.app.db.database import engine, SessionLocal
+from backend.app.db.database import engine
 from backend.app.db.models import Base
 
 logger = logging.getLogger(__name__)
@@ -26,13 +27,6 @@ app = FastAPI()
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
-def get_db() -> Session:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 def create_tables():
     # SEC-11: the owner role provisions schema objects; this call issues DDL
     # only for absent tables and the application role holds no CREATE
@@ -40,12 +34,8 @@ def create_tables():
 
 
 class SanitizedServerErrorMiddleware:
-    # SEC-08: answers an unhandled exception from inside the CORS layer, so a
-    # 500 carries the same cross-origin headers as every other status and the
-    # response header set no longer identifies which component failed
-    # (CWE-209). The framework routes an Exception handler to
-    # ServerErrorMiddleware, which is built outside every application
-    # middleware.
+    # SEC-08: answers an unhandled exception with the sanitized envelope from
+    # inside the CORS layer (CWE-209)
     def __init__(self, app):
         self.app = app
 
@@ -100,12 +90,57 @@ create_tables()
 _REQUEST_LOCATIONS = ("body", "query", "path", "header", "cookie")
 _GENERIC_SERVER_DETAIL = "Internal server error"
 
-# SEC-08: server-log diagnostics are built from exception types and frame
-# locations only; exception messages carry SQL text, bound parameters,
-# credentials and tokens (CWE-209, CWE-532)
+# SEC-08: the client reference and the server diagnostics are two
+# channels joined by one correlation identifier. The type chain and the
+# frame summary below are the indexable part of a record.
 _MAX_LOGGED_CAUSES = 4
 _MAX_LOGGED_FRAMES = 6
 _APPLICATION_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# SEC-08: a diagnostic record carries the formatted traceback, which
+# quotes exception messages. Held secrets and secret-shaped text are
+# removed from it before it reaches a log handler (CWE-209, CWE-532).
+_REDACTED = "[redacted]"
+_MIN_SECRET_LENGTH = 8
+_SECRET_SETTING_NAMES = (
+    "SECRET_KEY",
+    "PAYPAL_CLIENT_SECRET",
+    "SENDGRID_API_KEY",
+    "ZILLOW_API_KEY",
+)
+_SECRET_SHAPES = (
+    # a JSON Web Token in compact serialization
+    (
+        re.compile(
+            r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*"
+        ),
+        _REDACTED,
+    ),
+    # the password component of a URL or a database connection string
+    (
+        re.compile(r"(://[^\s:/@]+:)[^\s@]+(@)"),
+        r"\g<1>" + _REDACTED + r"\g<2>",
+    ),
+    # the credential carried by an HTTP bearer authorization scheme
+    (
+        re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
+        r"\g<1>" + _REDACTED,
+    ),
+    # a credential named in assignment, keyword or mapping syntax. The name
+    # match ends an identifier: signing_key, client_secret and api-token are
+    # covered alongside key, secret and token. The lookahead skips a value
+    # a previous pattern already replaced; one marker per value.
+    (
+        re.compile(
+            r"(?i)([A-Za-z0-9_.\-]*(?:pass(?:word|wd|phrase)?|secret"
+            r"|token|key|credential|auth(?:orization)?|cookie)"
+            r"[\"']?\s*[:=]\s*)"
+            r"(?!\[redacted\])"
+            r"('[^']*'|\"[^\"]*\"|[^\s,;)}\]]+)"
+        ),
+        r"\g<1>" + _REDACTED,
+    ),
+)
 
 
 def _error_envelope(detail: str, error_id: str, fields=()) -> dict:
@@ -150,9 +185,9 @@ def _exception_chain(exc: BaseException) -> str:
 
 
 def _exception_origin(exc: BaseException) -> str:
-    # SEC-08: frame locations with source lookup disabled, so neither source
-    # text nor frame locals can reach the record. The innermost application
-    # frame is kept alongside the innermost frames overall.
+    # SEC-08: a compact single-line frame summary for indexing, with source
+    # lookup disabled. The innermost application frame is kept alongside the
+    # innermost frames overall.
     frames = traceback.StackSummary.extract(
         traceback.walk_tb(exc.__traceback__), lookup_lines=False
     )
@@ -167,6 +202,48 @@ def _exception_origin(exc: BaseException) -> str:
         "%s:%s:%s" % (frame.filename, frame.lineno, frame.name)
         for frame in selected
     )
+
+
+def _dsn_password(url: str) -> str:
+    # SEC-08: the credential a connection string carries inline
+    try:
+        return urlsplit(url).password or ""
+    except ValueError:
+        return ""
+
+
+def _secret_literals() -> tuple:
+    # SEC-08: the values this process holds that no record may quote
+    values = [
+        getattr(settings, name, None) for name in _SECRET_SETTING_NAMES
+    ]
+    values.append(_dsn_password(str(settings.DATABASE_URL or "")))
+    literals = {
+        str(value)
+        for value in values
+        if value and len(str(value)) >= _MIN_SECRET_LENGTH
+    }
+    # SEC-08: longest first; a shorter secret nested in a longer one leaves
+    # no remainder of the longer one in the record
+    return tuple(sorted(literals, key=len, reverse=True))
+
+
+def _redact(text: str) -> str:
+    # SEC-08: removes held secrets and secret-shaped text (CWE-532)
+    for literal in _secret_literals():
+        text = text.replace(literal, _REDACTED)
+    for pattern, replacement in _SECRET_SHAPES:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _diagnostics(exc: BaseException) -> str:
+    # SEC-08: the full formatted traceback, including the stack, the
+    # exception messages and the cause chain, with secrets removed
+    report = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    )
+    return _redact(report)
 
 
 def _audit_context(exc: BaseException) -> str:
@@ -202,11 +279,14 @@ def _validation_field_names(errors) -> list:
 def handle_validation_error(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
+    # SEC-08: a field path is submitted content; the rendered path list
+    # passes through the same redaction the diagnostic channel applies
     error_id = uuid.uuid4().hex
     fields = _validation_field_names(exc.errors())
     logger.warning(
         "error_id=%s validation rejected %s %s fields=%s",
-        error_id, request.method, request.url.path, fields,
+        error_id, request.method, request.url.path,
+        _redact("%s" % (fields,)),
     )
     return JSONResponse(
         status_code=422,
@@ -221,13 +301,20 @@ def handle_http_exception(
 ) -> JSONResponse:
     # SEC-08: preserves the raised status and replaces the raised detail.
     # One record carries the response error_id and the raiser's redacted
-    # audit context, so a throttled or rejected attempt is traceable from
-    # the client reference alone.
+    # audit context; a throttled or rejected attempt is traceable from the
+    # client reference alone. The diagnostic channel opens at 500. A 4xx
+    # traceback quotes the rejected request, and the caller already holds
+    # the client fault a 4xx states (CWE-209).
     error_id = uuid.uuid4().hex
-    logger.warning(
-        "error_id=%s http_exception status=%s on %s %s detail=%r%s",
+    server_fault = exc.status_code >= 500
+    diagnostics = (
+        "\ndiagnostics:\n%s" % _diagnostics(exc) if server_fault else ""
+    )
+    emit = logger.error if server_fault else logger.warning
+    emit(
+        "error_id=%s http_exception status=%s on %s %s detail=%s%s%s",
         error_id, exc.status_code, request.method, request.url.path,
-        exc.detail, _audit_context(exc),
+        _redact(repr(exc.detail)), _audit_context(exc), diagnostics,
     )
     return JSONResponse(
         status_code=exc.status_code,
@@ -239,11 +326,14 @@ def handle_http_exception(
 def handle_rate_limit_exceeded(
     request: Request, exc: RateLimitExceeded
 ) -> JSONResponse:
-    # SEC-07: throttled attempts are logged, not silently dropped
+    # SEC-07: throttled attempts are logged, not silently dropped. The
+    # record carries the response status, matching the record the
+    # account-keyed layer produces through handle_http_exception.
     error_id = uuid.uuid4().hex
     logger.warning(
-        "error_id=%s rate limit exceeded limit=%s on %s %s",
-        error_id, exc.detail, request.method, request.url.path,
+        "error_id=%s rate limit exceeded status=429 limit=%s on %s %s",
+        error_id, _redact(str(exc.detail)), request.method,
+        request.url.path,
     )
     return JSONResponse(
         status_code=429,
@@ -261,18 +351,19 @@ def _driver_error_code(exc: SQLAlchemyError) -> str:
 def handle_database_error(
     request: Request, exc: SQLAlchemyError
 ) -> JSONResponse:
-    # SEC-08: withholds bound parameter values and driver message text, which
-    # carry credentials and column values (CWE-532); records the exception
-    # type chain, SQLSTATE, frame locations, the route and the correlation id
+    # SEC-08: records the exception type chain, SQLSTATE, frame locations,
+    # the route, the correlation id and the redacted traceback. Bound
+    # parameter values are suppressed at the driver boundary and held
+    # secrets are removed from the traceback (CWE-532).
     error_id = uuid.uuid4().hex
     if hasattr(exc, "hide_parameters"):
         exc.hide_parameters = True
     logger.error(
         "error_id=%s database error on %s %s exception=%s sqlstate=%s"
-        " origin=%s",
+        " origin=%s\ndiagnostics:\n%s",
         error_id, request.method, request.url.path,
         _exception_chain(exc), _driver_error_code(exc),
-        _exception_origin(exc),
+        _exception_origin(exc), _diagnostics(exc),
     )
     return JSONResponse(
         status_code=500,
@@ -283,13 +374,15 @@ def handle_database_error(
 def handle_unhandled_exception(
     request: Request, exc: Exception
 ) -> JSONResponse:
-    # SEC-08: an arbitrary exception message can carry a token, a key or a
-    # personal identifier, so only types and frame locations are recorded
+    # SEC-08: the caller receives a reference; this record carries the
+    # diagnostics that reference resolves to - the type chain, the frame
+    # locations and the redacted traceback with its exception messages
     error_id = uuid.uuid4().hex
     logger.error(
-        "error_id=%s unhandled exception on %s %s exception=%s origin=%s",
+        "error_id=%s unhandled exception on %s %s exception=%s origin=%s"
+        "\ndiagnostics:\n%s",
         error_id, request.method, request.url.path,
-        _exception_chain(exc), _exception_origin(exc),
+        _exception_chain(exc), _exception_origin(exc), _diagnostics(exc),
     )
     return JSONResponse(
         status_code=500,

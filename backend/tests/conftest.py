@@ -1,9 +1,14 @@
-"""Pytest harness shared by every module under ``backend/tests``.
+"""Configure import paths, required settings, isolated SQLite state, and
+an HTTPS TestClient for backend tests.
 
-Wires the four things the security suite depends on: the import roots
+Wires the five things the security suite depends on: the import roots
 that resolve the application package, the settings the application reads
 at import time, a SQLite database bound to the route dependency the
-application actually uses, and an HTTPS test client.
+application actually uses, an HTTPS test client, and the exclusion of the
+three legacy modules whose collection error would abort the session.
+
+Rationale for every decision in this harness is recorded in
+``documentation/security/decision-log.md``, section 16.6.
 
 Module surface
 --------------
@@ -16,15 +21,13 @@ Module surface
 ``reset_login_throttle()``
     Empties the login-attempt counters and the rate-limiter storage.
 ``collect_ignore``
-    The pre-existing modules that abort collection for the whole
-    session, so the project's own coverage command reaches this suite.
+    The three legacy test modules excluded from collection.
 
 Fixtures
 --------
 ``isolated_state``
-    Autouse. Recreates the schema, empties the login counters, checks
-    the override targets the test engine and installs the ``get_db``
-    override for the span of one test.
+    Autouse. Recreates the schema, empties the login counters and
+    installs the ``get_db`` override for the span of one test.
 ``db_session``
     A session on ``test_engine`` for direct row inspection or seeding.
 ``client``
@@ -44,43 +47,25 @@ import os
 import sys
 from pathlib import Path
 
-# ---------------------------------------------------------------------
-# Import roots
-# ---------------------------------------------------------------------
 _TESTS_DIR = Path(__file__).resolve().parent
 _BACKEND_DIR = _TESTS_DIR.parent
 _REPO_ROOT = _BACKEND_DIR.parent
 
-# The repository root resolves the absolute ``backend.app.*`` imports the
-# application uses. The backend directory resolves the short ``app.*``
-# imports the pre-existing test modules use. pytest runs from either
-# directory, and no package marker exists under ``backend``.
+# Absolute ``backend.app.*`` and short ``app.*`` module paths both resolve.
 for _import_root in (str(_BACKEND_DIR), str(_REPO_ROOT)):
     if _import_root not in sys.path:
         sys.path.insert(0, _import_root)
 
-# ---------------------------------------------------------------------
-# Collection
-# ---------------------------------------------------------------------
-# The three modules below predate this suite and none of them imports:
-# they name top-level ``main``, ``services`` and ``app.tasks`` modules
-# that the package layout does not provide. pytest aborts the entire
-# session on a collection error, so leaving them collectable means the
-# project's own coverage command - `pytest --cov=./ --cov-report=xml`,
-# run verbatim by .github/workflows/ci.yml - executes zero tests and
-# publishes no coverage artifact, and this suite guards nothing in the
-# pipeline. Repairing them is out of scope, so they are excluded from
-# collection here instead. Each still fails the same way when named
-# directly, so nothing about their state is hidden.
+# The three modules below name top-level ``main``, ``services`` and
+# ``app.tasks`` modules the package layout does not provide. A collection
+# error aborts the whole session, so they are excluded here; each still
+# fails the same way when named directly.
 collect_ignore = [
     "test_api.py",
     "test_services.py",
     "test_tasks.py",
 ]
 
-# ---------------------------------------------------------------------
-# Harness HTTP identity and credentials
-# ---------------------------------------------------------------------
 # SEC-06: an HTTPS base URL; a Secure cookie is dropped over plain http
 TEST_BASE_URL = "https://testserver"
 
@@ -94,24 +79,9 @@ FOREIGN_ORIGIN = "https://foreign.example.com"
 # characters, one uppercase, one lowercase, one digit, one special
 VALID_PASSWORD = "Harness1!Passphrase"
 
-# ---------------------------------------------------------------------
-# Settings injection. Every name below is present in os.environ before
-# the first application import, which builds Settings() at module scope
-# in backend/app/core/config.py and opens a database connection through
-# create_tables() in backend/app/main.py.
-#
-# Two kinds of assignment appear below and the difference matters. The
-# four names the suite asserts against - the database URL, its transport
-# mode, the origin allow-list and the cookie Secure attribute - are
-# assigned outright, so a hostile ambient value cannot redirect a test
-# at a real database or widen the allow-list. Every remaining name uses
-# setdefault and therefore yields to an ambient value; assertions read
-# settings.* rather than the literals here, so an inherited value is
-# honoured rather than contradicted. One ambient value fails closed
-# instead: a SECRET_KEY below the configured floor is refused while
-# Settings() is built, which surfaces as a collection error rather than
-# a silently weak key.
-# ---------------------------------------------------------------------
+# Every value lands in os.environ before the first application import
+# below, which builds Settings() at module scope.
+
 # SEC-10: a SQLite URL, for which database.py builds no sslmode
 # connect argument; the SQLite driver rejects that keyword
 os.environ["DATABASE_URL"] = "sqlite://"
@@ -130,11 +100,9 @@ os.environ.setdefault("SECRET_KEY", "x" * 64)
 os.environ.setdefault("ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
 
-# SEC-07: the login throttle threshold and window
 os.environ.setdefault("LOGIN_RATE_LIMIT_ATTEMPTS", "5")
 os.environ.setdefault("LOGIN_RATE_LIMIT_WINDOW_MINUTES", "15")
 
-# SEC-09: the payment environment domain
 os.environ.setdefault("PAYPAL_MODE", "sandbox")
 
 # Placeholders for the settings the service layer reads at import time.
@@ -156,12 +124,8 @@ from backend.app.db.database import get_db  # noqa: E402
 from backend.app.db.models import Base  # noqa: E402
 from backend.app.main import app  # noqa: E402
 
-# ---------------------------------------------------------------------
-# Test database
-# ---------------------------------------------------------------------
 # StaticPool with check_same_thread disabled shares one in-memory
-# connection between the test thread and the portal thread TestClient
-# runs route handlers on.
+# connection between the test thread and the TestClient portal thread.
 test_engine = create_engine(
     "sqlite://",
     connect_args={"check_same_thread": False},
@@ -183,13 +147,7 @@ def _override_get_db():
 
 
 def _assert_override_targets_the_test_database():
-    """Check requests reach the database the tests inspect.
-
-    Without this the guarantee is incidental: only the handful of tests
-    that cross-check a row through ``db_session`` would notice an
-    override pointing somewhere else, so most of the suite would pass
-    against a database it never reads.
-    """
+    """Check requests reach the database the tests inspect."""
     installed = app.dependency_overrides.get(get_db)
     assert installed is _override_get_db, (
         "the get_db override is {0!r}, not the harness override".format(
@@ -207,13 +165,8 @@ def _assert_override_targets_the_test_database():
     )
 
 
-# ---------------------------------------------------------------------
-# Login throttle state
-# ---------------------------------------------------------------------
-# SEC-07: the login-attempt counters live in the module namespace of the
-# registered login route, keyed one per account and one per client
-# address. The account-keyed counter outlives a new client address, so
-# every test empties both.
+# SEC-07: account-keyed login-failure counter names in the login route
+# module namespace; the route limiter holds the address-keyed state
 _THROTTLE_STATE_NAMES = ("_login_failures",)
 
 
@@ -252,9 +205,6 @@ def reset_login_throttle():
         limiter_reset()
 
 
-# ---------------------------------------------------------------------
-# Per-test identities
-# ---------------------------------------------------------------------
 # SEC-07: a distinct client address and email per test keeps an
 # exhausted counter scoped to the test that exhausted it
 _CLIENT_HOSTS = itertools.count(1)
@@ -270,18 +220,14 @@ def _next_email():
     return "harness-user-{0}@example.com".format(next(_EMAILS))
 
 
-# ---------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def isolated_state():
     """Give one test an empty database and empty login counters."""
     Base.metadata.drop_all(bind=test_engine)
     Base.metadata.create_all(bind=test_engine)
     reset_login_throttle()
-    # SEC-02/SEC-05: routes and get_current_user both resolve
-    # backend.app.db.database.get_db, which is the only key FastAPI
-    # matches; the duplicate in backend/app/main.py reaches no route.
+    # SEC-02/SEC-05: overrides backend.app.db.database.get_db, the
+    # dependency every route and get_current_user resolve
     app.dependency_overrides[get_db] = _override_get_db
     _assert_override_targets_the_test_database()
     try:
@@ -304,8 +250,8 @@ def db_session(isolated_state):
 @pytest.fixture
 def client(isolated_state):
     """Yield an HTTPS test client reaching the SQLite test database."""
-    # SEC-08: raise_server_exceptions disabled, so the registered
-    # handlers deliver the sanitized envelope to the caller
+    # SEC-08: raise_server_exceptions disabled; handlers deliver the
+    # sanitized envelope as a response
     with TestClient(
         app,
         base_url=TEST_BASE_URL,
@@ -337,8 +283,8 @@ def register_user(client):
                 )
             )
         body = response.json()
-        # SEC-06: the route sets the session cookie. The client is
-        # handed back unauthenticated, so a test opts in explicitly.
+        # SEC-06: the route sets the session cookie; the client is
+        # handed back with an empty cookie jar
         client.cookies.clear()
         return {
             "id": body["user"]["id"],
