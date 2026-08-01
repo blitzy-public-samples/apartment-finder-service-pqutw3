@@ -5,6 +5,7 @@ from hashlib import sha256
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from backend.app.core.config import settings
 from backend.app.core.security import (
@@ -156,7 +157,15 @@ def register_user(
     new_user = User(email=user.email, hashed_password=hashed_password,
                     created_at=datetime.utcnow())
     db.add(new_user)
-    db.commit()
+    # SEC-08: a concurrent registration losing the unique-email race
+    # returns the same 400 the pre-check raises, never a 500 (CWE-367)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=400, detail="Email already registered"
+        )
     db.refresh(new_user)
     
     # Generate access token

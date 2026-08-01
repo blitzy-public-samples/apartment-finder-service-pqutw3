@@ -26,13 +26,18 @@ class Listing(BaseModel):
     created_at: datetime
     updated_at: datetime
     rent: float
-    broker_fee: float
-    square_footage: float
-    bedrooms: int
-    bathrooms: int
-    available_date: datetime
-    street_address: str
-    zillow_url: str
+    # optionality mirrors the nullable columns at models.py:26-32
+    broker_fee: Optional[float] = None
+    square_footage: Optional[float] = None
+    bedrooms: Optional[int] = None
+    bathrooms: Optional[int] = None
+    available_date: Optional[datetime] = None
+    street_address: Optional[str] = None
+    zillow_url: Optional[str] = None
+
+    class Config:
+        # listings.py:15 builds this model with from_orm
+        orm_mode = True
 
 
 class ListingCreate(BaseModel):

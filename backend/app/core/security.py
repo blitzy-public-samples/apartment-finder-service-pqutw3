@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import jwt
@@ -15,6 +16,11 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token', auto_error=False)
 
 # SEC-06: session cookie name; the auth routes set and clear this cookie
 SESSION_COOKIE_NAME = "access_token"
+
+# SEC-02: a sub claim must be the canonical decimal spelling of a User.id;
+# the ceiling is the signed 64-bit range the id column binds
+_CANONICAL_SUBJECT = re.compile(r"[1-9][0-9]{0,18}")
+_MAX_SUBJECT_ID = 2 ** 63 - 1
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -63,15 +69,20 @@ def get_current_user(
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    # SEC-02: coerces sub to int; closes the sub/User.id identity mismatch
-    try:
-        user_key = int(user_id)
-    except (ValueError, TypeError):
+    # SEC-02: coerces sub to int; closes the sub/User.id identity mismatch.
+    # A padded, signed, spaced, underscored, fullwidth or out-of-range
+    # spelling is rejected rather than coerced (CWE-287)
+    if (
+        not isinstance(user_id, str)
+        or not _CANONICAL_SUBJECT.fullmatch(user_id)
+        or int(user_id) > _MAX_SUBJECT_ID
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    user_key = int(user_id)
     user = db.query(User).filter(User.id == user_key).first()
     if user is None:
         # SEC-02/SEC-08: uniform 401 removes the account-state oracle

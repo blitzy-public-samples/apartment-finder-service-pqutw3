@@ -1,3 +1,4 @@
+import unicodedata
 from pydantic import BaseModel, EmailStr, StrictStr, validator
 from datetime import datetime
 from typing import Optional
@@ -47,6 +48,10 @@ class UserCreate(BaseModel):
             raise ValueError(
                 f"must not exceed {PASSWORD_MAX_BYTES} UTF-8 bytes"
             )
+        # SEC-04: rejects NUL and every other control character; bcrypt
+        # refuses such input and aborts the hash (auth.py:156)
+        if any(unicodedata.category(c) == "Cc" for c in value):
+            raise ValueError("must not contain control characters")
         if not any(c in PASSWORD_UPPERCASE for c in value):
             raise ValueError("must include at least one uppercase letter")
         if not any(c in PASSWORD_LOWERCASE for c in value):
