@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -9,16 +9,8 @@ from backend.app.core.security import get_current_user
 
 router = APIRouter()
 
-# signed 64-bit ceiling the OFFSET and LIMIT bindings accept; a wider or
-# negative value is rejected at the request boundary (CWE-20)
-MAX_PAGINATION_VALUE = 2 ** 63 - 1
-
 @router.get("/")
-def get_listings(
-    db: Session = Depends(get_db),
-    skip: int = Query(0, ge=0, le=MAX_PAGINATION_VALUE),
-    limit: int = Query(100, ge=0, le=MAX_PAGINATION_VALUE),
-) -> List[Listing]:
+def get_listings(db: Session = Depends(get_db), skip: int = 0, limit: int = 100) -> List[Listing]:
     listings = db.query(ListingModel).offset(skip).limit(limit).all()
     return [Listing.from_orm(listing) for listing in listings]
 

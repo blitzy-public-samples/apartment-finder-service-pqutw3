@@ -43,6 +43,10 @@ REGISTER_USER_KEYS = frozenset({"id", "email"})
 LOGIN_BODY_KEYS = frozenset({TOKEN_BODY_KEY, "token_type"})
 EXPECTED_TOKEN_TYPE = "bearer"
 
+# The key the register_user fixture in backend/tests/conftest.py stores the
+# token under; declared apart from the cookie name it currently matches
+FIXTURE_TOKEN_KEY = "access_token"
+
 BEARER_PREFIX = "Bearer "
 EXPECTED_AUTH_CHALLENGE = "Bearer"
 
@@ -192,7 +196,6 @@ def test_login_response_sets_the_httponly_session_cookie(
     morsel = _session_cookie_directive(response)
     _assert_cookie_security_attributes(morsel)
     _assert_cookie_lifetime(morsel)
-    # SEC-06: the cookie and the body carry the same token
     assert morsel.value == response.json()[TOKEN_BODY_KEY]
     assert client.cookies.get(SESSION_COOKIE_NAME) == morsel.value
 
@@ -284,13 +287,13 @@ def test_cookie_identity_answers_a_conflicting_bearer_header(
     login = _login(client, cookie_owner)
     assert login.status_code == 200, login.text
     assert client.cookies.get(SESSION_COOKIE_NAME) == (
-        login.json()["access_token"]
+        login.json()[TOKEN_BODY_KEY]
     )
 
     response = client.get(
         PROTECTED_ROUTE,
         headers={
-            "Authorization": BEARER_PREFIX + header_owner["access_token"]
+            "Authorization": BEARER_PREFIX + header_owner[FIXTURE_TOKEN_KEY]
         },
     )
 
@@ -310,7 +313,7 @@ def test_an_invalid_session_cookie_is_not_rescued_by_a_bearer_header(
 
     response = client.get(
         PROTECTED_ROUTE,
-        headers={"Authorization": BEARER_PREFIX + account["access_token"]},
+        headers={"Authorization": BEARER_PREFIX + account[FIXTURE_TOKEN_KEY]},
     )
 
     assert response.status_code == 401, response.text
@@ -339,11 +342,11 @@ def test_the_session_cookie_outranks_the_bearer_header(
         db_session, header_owner, name=HEADER_OWNER_FILTER_NAME
     )
 
-    client.cookies.set(SESSION_COOKIE_NAME, cookie_owner["access_token"])
+    client.cookies.set(SESSION_COOKIE_NAME, cookie_owner[FIXTURE_TOKEN_KEY])
     response = client.get(
         PROTECTED_ROUTE,
         headers={
-            "Authorization": BEARER_PREFIX + header_owner["access_token"]
+            "Authorization": BEARER_PREFIX + header_owner[FIXTURE_TOKEN_KEY]
         },
     )
 
@@ -353,11 +356,11 @@ def test_the_session_cookie_outranks_the_bearer_header(
 
     # SEC-06: swapping the two credentials swaps the answer, so the
     # order rather than the account is what decided
-    client.cookies.set(SESSION_COOKIE_NAME, header_owner["access_token"])
+    client.cookies.set(SESSION_COOKIE_NAME, header_owner[FIXTURE_TOKEN_KEY])
     mirrored = client.get(
         PROTECTED_ROUTE,
         headers={
-            "Authorization": BEARER_PREFIX + cookie_owner["access_token"]
+            "Authorization": BEARER_PREFIX + cookie_owner[FIXTURE_TOKEN_KEY]
         },
     )
 
@@ -379,7 +382,7 @@ def test_an_unusable_cookie_does_not_fall_back_to_the_header(
     login = _login(client, account)
     assert login.status_code == 200, login.text
     valid_header = {
-        "Authorization": BEARER_PREFIX + login.json()["access_token"]
+        "Authorization": BEARER_PREFIX + login.json()[TOKEN_BODY_KEY]
     }
     # SEC-06: a token whose lifetime has already elapsed
     expired_cookie = create_access_token(

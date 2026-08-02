@@ -648,7 +648,6 @@ def test_a_success_leaves_the_address_budget_spent(register_user):
     assert throttled.status_code == 429
     assert set(throttled.json()) == ENVELOPE_KEYS
 
-    # SEC-07: the refusal is scoped to the spent address
     elsewhere = _login_from_a_new_address(
         holder["email"], holder["password"]
     )

@@ -6,9 +6,10 @@ detail, and quote a correlation identifier the server log repeats.
 import json
 import logging
 from contextlib import contextmanager
+from datetime import datetime
 
 import pytest
-from conftest import ALLOWED_ORIGIN
+from conftest import ALLOWED_ORIGIN, test_engine
 from fastapi.exceptions import StarletteHTTPException
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -17,7 +18,9 @@ from backend.app.core.security import (
     SESSION_COOKIE_NAME,
     create_access_token,
 )
+from backend.app.db.database import engine as application_engine
 from backend.app.db.database import get_db
+from backend.app.db.models import Base, User
 from backend.app.main import app
 
 # SEC-08: the key set every handler registered in backend/app/main.py
@@ -27,6 +30,14 @@ ERROR_ENVELOPE_KEYS = {"detail", "error_id", "fields"}
 GENERIC_SERVER_DETAIL = "Internal server error"
 
 SUBMITTED_VALUE_SENTINEL = "zzz-sentinel-9137"
+
+# SEC-08: values bound into a real duplicate-key failure, shaped as the
+# address and the stored hash a registration writes
+BOUND_ADDRESS_SENTINEL = "zzz-bound-address-8827@example.test"
+BOUND_HASH_SENTINEL = "$2b$12$zzzBoundHashSentinel8827abcdefghijklmno"
+
+# SEC-08: the text SQLAlchemy substitutes for withheld bound values
+PARAMETERS_WITHHELD_MARKER = "SQL parameters hidden"
 
 # SEC-08: exception text the reply withholds and the server log carries
 EXCEPTION_TEXT_SENTINEL = "zzz-exception-text-4412"
@@ -215,7 +226,6 @@ def losing_the_commit_race(client):
         try:
             yield views
         finally:
-            # SEC-08: restores the single harness override key
             app.dependency_overrides[get_db] = harness_override
 
     try:
@@ -370,6 +380,78 @@ def test_a_lost_unique_address_race_answers_bad_request(
     _assert_no_internal_detail(response.text)
     # SEC-08: the open transaction is discarded rather than left behind
     assert views and views[-1].rolled_back
+
+
+def _bound_row():
+    """Return one insertable user row carrying both sentinels."""
+    return {
+        "email": BOUND_ADDRESS_SENTINEL,
+        "hashed_password": BOUND_HASH_SENTINEL,
+        "created_at": datetime.utcnow(),
+    }
+
+
+def _duplicate_key_failure(bound_engine):
+    """Return a real duplicate-key failure raised by one engine.
+
+    Both rows carry the same address, so the unique index refuses the
+    statement and the raised error holds the bound values.
+    """
+    Base.metadata.create_all(bind=bound_engine)
+    try:
+        with bound_engine.begin() as connection:
+            connection.execute(
+                User.__table__.insert(), [_bound_row(), _bound_row()]
+            )
+    except IntegrityError as failure:
+        return failure
+    raise AssertionError("the duplicate insert was accepted")
+
+
+def test_the_engine_withholds_bound_parameters_from_a_real_failure():
+    """A real duplicate-key failure on the application engine carries no
+    bound value.
+
+    The suppression sits on the engine, so it also covers the consumers
+    that never reach an HTTP handler: the listing task prints the
+    exception it catches.
+    """
+    # SEC-08: the engine-level setting, asserted directly
+    assert application_engine.hide_parameters is True
+
+    failure = _duplicate_key_failure(application_engine)
+    reported = str(failure)
+
+    assert BOUND_ADDRESS_SENTINEL not in reported
+    assert BOUND_HASH_SENTINEL not in reported
+    assert PARAMETERS_WITHHELD_MARKER in reported
+
+
+def test_the_handler_withholds_bound_parameters_from_a_real_failure(
+    client, failing_database, caplog
+):
+    """A parameter-bearing failure reaching the handler leaves no bound
+    value in the reply or the log.
+
+    The harness engine keeps its parameters, so the values reach the
+    handler and only its own suppression removes them.
+    """
+    caplog.set_level(logging.ERROR)
+    failure = _duplicate_key_failure(test_engine)
+    assert BOUND_ADDRESS_SENTINEL in str(failure)
+
+    with failing_database(failure):
+        response = client.get("/listings/")
+
+    assert response.status_code == 500
+    body = _assert_uniform_envelope(response)
+    assert body["detail"] == GENERIC_SERVER_DETAIL
+    # SEC-08: neither channel repeats a bound value
+    assert BOUND_ADDRESS_SENTINEL not in response.text
+    assert BOUND_HASH_SENTINEL not in response.text
+    assert caplog.records
+    assert BOUND_ADDRESS_SENTINEL not in caplog.text
+    assert BOUND_HASH_SENTINEL not in caplog.text
 
 
 def test_the_error_envelope_is_uniform_across_handlers(
@@ -587,7 +669,6 @@ def test_a_raised_status_opens_the_diagnostic_channel_at_500(
 
     assert response.status_code == status_code
     body = _assert_uniform_envelope(response)
-    # SEC-08: the raised detail is replaced by the status phrase
     assert EXCEPTION_TEXT_SENTINEL not in response.text
     _assert_no_internal_detail(response.text)
 

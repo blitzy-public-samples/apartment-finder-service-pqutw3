@@ -1,7 +1,9 @@
 """Request-validation regression tests for the write endpoints.
 
-Each test proves one endpoint refuses a body it does not declare, so a
-client cannot set a server-owned column by adding a key to the request.
+The endpoints and the request models are driven against unknown, missing,
+malformed, wrongly typed and empty declared fields. A body carrying an
+undeclared key is refused, so a client cannot set a server-owned column
+by adding a key to the request.
 
 The same file pins the contracts a validation change could quietly move:
 the set of paths and verbs the application declares, the pagination the
@@ -21,7 +23,10 @@ from conftest import test_engine
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from sqlalchemy import event, text
+from sqlalchemy.dialects import postgresql, sqlite
 
+from backend.app.db.models import Criteria as CriteriaModel
+from backend.app.db.models import Filter as FilterModel
 from backend.app.db.models import Listing as ListingModel
 from backend.app.main import _error_envelope, app
 from backend.app.schema.filter import Filter, FilterCreate
@@ -52,6 +57,17 @@ DECLARED_FILTER_BODY = {
     "name": "Two bedrooms",
     "criteria": [DECLARED_CRITERION],
 }
+
+# SEC-05: nested criterion values the request boundary refuses
+REFUSED_CRITERION_VALUES = (
+    pytest.param("value", 1500, id="value-number"),
+    pytest.param("value", True, id="value-boolean"),
+    pytest.param("value", 12.5, id="value-float"),
+    pytest.param("value", ["3000"], id="value-array"),
+    pytest.param("value", {"amount": "3000"}, id="value-object"),
+    pytest.param("field", 7, id="field-number"),
+    pytest.param("operator", False, id="operator-boolean"),
+)
 
 # SEC-05: every key below is declared by SubscriptionCreate
 EMPTY_PLAN_SUBSCRIPTION_BODY = {
@@ -105,21 +121,21 @@ DECLARED_FILTER_RESPONSE_KEYS = frozenset(Filter.__fields__)
 SEEDED_LISTING_COUNT = 5
 PAGE_SIZE = 2
 
-# SEC-05: the ceiling listings.py binds; one past it is refused
-PAGINATION_CEILING = 2 ** 63 - 1
-
-# SEC-05: pagination bounds the request boundary refuses
+# SEC-05: pagination bounds the request boundary refuses. The frozen
+# signature declares plain ints, so coercion runs before any statement is
+# built and both cases refuse under every dialect
 REFUSED_PAGINATION = (
-    pytest.param({"skip": -1}, "skip", id="negative-skip"),
-    pytest.param({"limit": -1}, "limit", id="negative-limit"),
     pytest.param({"skip": "abc"}, "skip", id="non-numeric-skip"),
     pytest.param({"limit": "abc"}, "limit", id="non-numeric-limit"),
-    pytest.param(
-        {"skip": PAGINATION_CEILING + 1}, "skip", id="skip-past-the-ceiling"
-    ),
-    pytest.param(
-        {"limit": PAGINATION_CEILING + 1}, "limit", id="limit-past-the-ceiling"
-    ),
+)
+
+# SEC-08: bounds the frozen signature passes through to the driver. A
+# value wider than a signed 64-bit binding fails inside the statement.
+# A negative bound diverges by dialect: SQLite clamps OFFSET and lifts
+# LIMIT, PostgreSQL 13 raises InvalidRowCountInLimitClause
+UNBOUND_PAGINATION = (
+    pytest.param({"skip": 2 ** 63}, id="skip-past-the-driver-range"),
+    pytest.param({"limit": 2 ** 63}, id="limit-past-the-driver-range"),
 )
 
 # SEC-05: a payload that would execute in a document but not in JSON
@@ -474,6 +490,52 @@ def test_filter_refuses_wrongly_typed_name(client, register_user):
     _assert_rejected(response, 422, "name")
 
 
+@pytest.mark.parametrize("key, value", REFUSED_CRITERION_VALUES)
+def test_filter_refuses_a_wrongly_typed_nested_criterion(
+    client, register_user, db_session, key, value
+):
+    """A nested criterion sent as the wrong type is refused, and no row
+    is written.
+
+    Criteria.field, .operator and .value all map to non-null varchar
+    columns, so a value the boundary coerces lands in the table as text
+    and the caller reads 200.
+    """
+    account = register_user()
+
+    response = client.post(
+        FILTER_PATH,
+        json={
+            "name": "Nested {0}".format(key),
+            "criteria": [dict(DECLARED_CRITERION, **{key: value})],
+        },
+        headers=_bearer(account["access_token"]),
+    )
+
+    _assert_rejected(response, 422, "criteria.0." + key)
+    db_session.expire_all()
+    assert db_session.query(CriteriaModel).count() == 0
+    assert db_session.query(FilterModel).count() == 0
+
+
+@pytest.mark.parametrize("key, value", REFUSED_CRITERION_VALUES)
+def test_filter_model_refuses_a_wrongly_typed_nested_criterion(key, value):
+    """The request model refuses the nested value on its own.
+
+    The refusal is located at the nested field, so a caller reaching the
+    model directly cannot pass a value the route would reject.
+    """
+    with pytest.raises(ValidationError) as raised:
+        FilterCreate(
+            name="Nested",
+            criteria=[dict(DECLARED_CRITERION, **{key: value})],
+        )
+
+    assert [error["loc"] for error in raised.value.errors()] == [
+        ("criteria", 0, key)
+    ]
+
+
 @pytest.mark.parametrize(
     "field, value",
     (
@@ -814,7 +876,6 @@ def test_create_model_refuses_unknown_key(model, payload, unknown_key):
     with pytest.raises(ValidationError) as raised:
         model(**payload)
     errors = raised.value.errors()
-    # SEC-05: unknown key rejected; closes the CWE-915 vector
     assert (unknown_key,) in [error["loc"] for error in errors]
     assert "value_error.extra" in [error["type"] for error in errors]
 
@@ -914,6 +975,11 @@ def test_public_listing_page_slices_by_skip_and_limit(client, db_session):
     No credentials are sent. Bounds that are accepted but ignored would
     return the whole table to every caller, which is a denial-of-service
     surface on a public path as the row count grows.
+
+    The row counts hold in every dialect: LIMIT and OFFSET bound them.
+    The disjointness and coverage below are scoped to the SQLite
+    harness - the statement carries no ORDER BY, and separate statements
+    against PostgreSQL are not ordered against each other.
     """
     seeded = _seed_listings(db_session, SEEDED_LISTING_COUNT)
 
@@ -929,7 +995,12 @@ def test_public_listing_page_slices_by_skip_and_limit(client, db_session):
     # the bounds decide the page size, so the last page is short
     assert [len(page) for page in pages] == [PAGE_SIZE, PAGE_SIZE, 1]
 
-    # the pages partition the table: disjoint, and covering it exactly
+    # every returned row is a seeded row, and no page repeats one
+    for page in pages:
+        assert set(page) <= set(seeded)
+        assert len(set(page)) == len(page)
+
+    # SQLite harness scope: the three pages partition the table here
     assert not set(pages[0]) & set(pages[1])
     assert not set(pages[1]) & set(pages[2])
     assert set(pages[0]) | set(pages[1]) | set(pages[2]) == set(seeded)
@@ -940,20 +1011,62 @@ def test_public_listing_page_slices_by_skip_and_limit(client, db_session):
     assert _listing_ids(empty) == []
 
 
+def test_the_public_read_statement_carries_no_ordering(db_session):
+    """The frozen read statement binds both pages and orders nothing.
+
+    Compiling against both dialects records the bound the endpoint
+    applies and the ordering it leaves unspecified, without a
+    PostgreSQL server.
+    """
+    query = (
+        db_session.query(ListingModel)
+        .offset(PAGE_SIZE)
+        .limit(PAGE_SIZE)
+    )
+
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        compiled = str(query.statement.compile(dialect=dialect)).upper()
+        assert "LIMIT" in compiled
+        assert "OFFSET" in compiled
+        assert "ORDER BY" not in compiled
+
+
 @pytest.mark.parametrize("bounds,field", REFUSED_PAGINATION)
 def test_public_listing_page_refuses_a_bound_outside_its_range(
     client, bounds, field
 ):
-    """A negative, non-numeric or oversized bound is refused.
+    """A non-numeric bound is refused at the request boundary.
 
-    A value the request boundary passes through reaches the OFFSET and
-    LIMIT bindings, where the driver refuses it only once the statement
-    runs and the failure surfaces as a server fault instead.
+    The declared int annotation coerces the query value ahead of the
+    statement, so this refusal holds under every dialect.
     """
     response = _read_listings(client, **bounds)
 
     # SEC-05: refused at the request boundary, never as a 500
     _assert_rejected(response, 422, field)
+
+
+@pytest.mark.parametrize("bounds", UNBOUND_PAGINATION)
+def test_public_listing_page_leaks_nothing_past_the_driver_range(
+    client, bounds
+):
+    """A bound the frozen signature passes through fails cleanly.
+
+    The signature declares plain ints and applies no ceiling, so a value
+    wider than a signed 64-bit binding reaches the statement. The
+    failure returns the uniform envelope carrying no driver text.
+    """
+    response = _read_listings(client, **bounds)
+
+    # SEC-08: the sanctioned residual surfaces sanitized, never raw
+    assert response.status_code == 500
+    body = response.json()
+    assert set(body) == {"detail", "error_id", "fields"}
+    assert body["detail"] == "Internal server error"
+    assert body["fields"] == []
+    lowered = response.text.lower()
+    for leaked in ("traceback", "overflow", "sqlalchemy", ".py", "select "):
+        assert leaked not in lowered, leaked
 
 
 # ---------------------------------------------------------------------

@@ -1,17 +1,18 @@
 """Configuration guards for the payment environment, the signing key and
 database transport, and the authorization of a payment reference.
 
-Three settings decide whether the application starts in a safe state: the
-payment environment, the signing key length, and the database transport
-mode. Every case builds ``Settings`` directly and inspects the field named
-in the validation error it raises.
+The validation cases build ``Settings`` directly for each guarded
+setting - the payment environment, the signing key length, the signing
+algorithm, the token lifetime, the login-throttle threshold and window,
+and the database transport mode - and inspect the field named in the
+validation error it raises.
 
 The transport cases execute ``backend/app/db/database.py`` against each
 database URL form and inspect the engine it builds; no case establishes a
 live encrypted database connection. The payment cases execute
 ``backend/app/services/paypal_service.py`` with the provider library
-replaced, so the configured environment is read by the code that talks to
-the provider rather than only validated in isolation.
+replaced, so the configured environment reaches the code that calls the
+provider.
 
 The authorization cases drive ``process_payment`` against fixed provider
 payloads. A reference authorizes a charge only when the state, the total,
@@ -289,7 +290,6 @@ def test_payment_creation_configures_the_environment_it_is_given(
     assert recorded[0]["mode"] == settings.PAYPAL_MODE
 
 
-# SEC-09: the payment service reads the configured environment
 @pytest.mark.parametrize("mode", ["sandbox", "live"])
 def test_payment_lookup_configures_the_environment_it_is_given(
     monkeypatch, mode
@@ -312,12 +312,10 @@ def test_payment_lookup_configures_the_environment_it_is_given(
 
     assert paypal_service._find_payment_resource("PAY-absent") is None
     assert len(recorded) == 1
-    # SEC-09: the environment is the configured one, not a literal
     assert recorded[0]["mode"] == mode
     assert recorded[0]["mode"] == settings.PAYPAL_MODE
 
 
-# SEC-09: the payment service reads the configured environment
 def test_the_payment_service_spells_no_environment_literal():
     """No source line in the payment service names an environment.
 
@@ -333,7 +331,6 @@ def test_the_payment_service_spells_no_environment_literal():
         assert literal not in source, literal
 
 
-# SEC-12: RFC 7518 sec. 3.2 key-length floor
 @pytest.mark.parametrize(
     "length", [0, 1, 8, 20, SIGNING_KEY_MIN_LENGTH - 1]
 )
@@ -389,7 +386,6 @@ FLOORS_ABOVE_THE_FIELD = sorted(
 )
 
 
-# SEC-12: RFC 7518 sec. 3.2 floor rises with the algorithm
 def test_the_stronger_algorithms_carry_a_higher_key_floor():
     """The floor table exceeds the field constraint for HS384 and HS512.
 
@@ -406,7 +402,6 @@ def test_the_stronger_algorithms_carry_a_higher_key_floor():
     ]
 
 
-# SEC-12: RFC 7518 sec. 3.2 floor rises with the algorithm
 @pytest.mark.parametrize("algorithm,minimum", FLOORS_ABOVE_THE_FIELD)
 def test_signing_key_one_byte_below_the_algorithm_floor_is_rejected(
     algorithm, minimum
@@ -430,7 +425,6 @@ def test_signing_key_one_byte_below_the_algorithm_floor_is_rejected(
     )
 
 
-# SEC-12: RFC 7518 sec. 3.2 floor rises with the algorithm
 @pytest.mark.parametrize(
     "algorithm,minimum", sorted(HMAC_KEY_MIN_BYTES.items())
 )
@@ -494,7 +488,6 @@ def test_positive_token_lifetime_is_accepted(minutes):
     assert built.ACCESS_TOKEN_EXPIRE_MINUTES == minutes
 
 
-# SEC-07: a threshold or window below one leaves guessing unbounded
 @pytest.mark.parametrize(
     "field",
     ["LOGIN_RATE_LIMIT_ATTEMPTS", "LOGIN_RATE_LIMIT_WINDOW_MINUTES"],
@@ -691,7 +684,6 @@ def test_charge_refuses_a_foreign_currency_total(currency, spent_references):
     assert authorize(resource) is False
 
 
-# SEC-09: the reported unit is bound to the charge (CWE-863)
 def test_charge_refuses_a_total_carrying_no_unit(spent_references):
     """A total PayPal reports with no currency does not authorize."""
     resource = {
@@ -704,7 +696,6 @@ def test_charge_refuses_a_total_carrying_no_unit(spent_references):
     assert authorize(resource) is False
 
 
-# SEC-09: the reported unit is bound to the charge (CWE-863)
 def test_charge_refuses_a_split_total_in_mixed_units(spent_references):
     """A split total summing correctly across two units does not authorize."""
     resource = {
@@ -720,7 +711,6 @@ def test_charge_refuses_a_split_total_in_mixed_units(spent_references):
     assert authorize(resource) is False
 
 
-# SEC-09: the reported unit is bound to the charge (CWE-863)
 def test_charge_admits_a_bound_unit_and_normalizes_its_spelling(
         spent_references):
     """A caller-bound unit authorizes, and its spelling is normalized."""
@@ -738,7 +728,6 @@ def test_charge_refuses_an_unidentified_payer(spent_references):
     assert authorize(resource) is False
 
 
-# SEC-09: the provider must name the payer (CWE-863)
 def test_charge_refuses_a_payer_the_caller_did_not_expect(spent_references):
     """A bound payer that differs from the reported one does not authorize."""
     resource = approved_payment()
@@ -763,7 +752,6 @@ def test_charge_refuses_an_agreement_for_another_plan(spent_references):
     assert authorize(resource, plan_id=BOUND_PLAN) is False
 
 
-# SEC-09: a reusable agreement is bound to one plan (CWE-863)
 def test_charge_refuses_an_agreement_naming_no_plan(spent_references):
     """An agreement reporting no plan identifier does not authorize."""
     resource = active_agreement(plan=None)
@@ -771,7 +759,6 @@ def test_charge_refuses_an_agreement_naming_no_plan(spent_references):
     assert authorize(resource, plan_id=BOUND_PLAN) is False
 
 
-# SEC-09: a reusable agreement is bound to one plan (CWE-863)
 def test_charge_admits_an_agreement_for_the_bound_plan(spent_references):
     """An agreement carrying the bound plan authorizes the charge."""
     assert refusal(active_agreement(), plan_id=BOUND_PLAN) is None
@@ -814,7 +801,6 @@ def test_a_spent_reference_drives_no_provider_call(spent_references):
     assert lookup.call_count == 1
 
 
-# SEC-09: a verified reference is spent once (CWE-294)
 def test_concurrent_attempts_on_one_reference_admit_one(spent_references):
     """Two attempts in flight on one reference authorize exactly once."""
     def lookup(reference):
@@ -837,7 +823,6 @@ def test_concurrent_attempts_on_one_reference_admit_one(spent_references):
     assert len(paypal_service._claimed_references) == 0
 
 
-# SEC-09: a verified reference is spent once (CWE-294)
 def test_the_ledger_records_no_provider_reference(spent_references):
     """The ledger holds a digest, never the reference PayPal issued."""
     assert authorize(approved_payment(), reference="PAY-SECRET") is True
@@ -855,7 +840,6 @@ def test_a_refused_reference_stays_available(spent_references):
     assert authorize(approved_payment(), reference="PAY-RETRY") is True
 
 
-# SEC-09: a verified reference is spent once (CWE-294)
 def test_the_consumption_ledger_stays_bounded(spent_references):
     """The ledger evicts its oldest entry rather than growing without end."""
     limit = paypal_service._CONSUMPTION_LIMIT
@@ -887,7 +871,6 @@ def test_every_provider_call_carries_a_timeout():
     assert paypal_service._REQUEST_TIMEOUT_SECONDS > 0
 
 
-# SEC-09: every provider call is bounded in time (CWE-400)
 def test_a_provider_timeout_refuses_the_charge(spent_references):
     """A provider call that times out refuses rather than raising."""
     class Stalled:

@@ -9,9 +9,11 @@ class ZipCode(BaseModel):
         orm_mode = True
 
 class Criteria(BaseModel):
-    field: str
-    operator: str
-    value: str
+    # SEC-05: strict types; a non-string nested value is refused, never
+    # coerced into the mapped varchar columns (CWE-20)
+    field: StrictStr
+    operator: StrictStr
+    value: StrictStr
 
     class Config:
         extra = "forbid"   # SEC-05: rejects unknown keys in nested criteria

@@ -1,46 +1,5 @@
 """Configure import paths, required settings, isolated SQLite state, and
-an HTTPS TestClient for backend tests.
-
-Wires the five things the security suite depends on: the import roots
-that resolve the application package, the settings the application reads
-at import time, a SQLite database bound to the route dependency the
-application actually uses, an HTTPS test client, and the exclusion of the
-three legacy modules whose collection error would abort the session.
-
-Rationale for every decision in this harness is recorded in
-``documentation/security/decision-log.md``, section 16.6.
-
-Module surface
---------------
-``TEST_BASE_URL``, ``ALLOWED_ORIGIN``, ``FOREIGN_ORIGIN``,
-``VALID_PASSWORD``
-    Constants describing the harness HTTP identity and a password that
-    satisfies the server-side policy.
-``test_engine``, ``TestingSessionLocal``
-    The SQLite engine and session factory every request is routed to.
-``reset_login_throttle()``
-    Empties the login-attempt counters and the rate-limiter storage.
-``collect_ignore``
-    The three legacy test modules excluded from collection.
-
-Fixtures
---------
-``isolated_state``
-    Autouse. Recreates the schema, empties the login counters and
-    installs the ``get_db`` override for the span of one test.
-``db_session``
-    A session on ``test_engine`` for direct row inspection or seeding.
-``client``
-    A ``TestClient`` on ``TEST_BASE_URL`` carrying a per-test client
-    address, with server exceptions delivered as responses.
-``unique_email``
-    One email address no other test has registered.
-``register_user``
-    Callable factory returning ``{"id", "email", "password",
-    "access_token"}`` for a freshly registered account.
-``registered_user``
-    A single account produced by ``register_user``.
-"""
+an HTTPS TestClient for backend tests."""
 import itertools
 import json
 import os
@@ -55,16 +14,6 @@ _REPO_ROOT = _BACKEND_DIR.parent
 for _import_root in (str(_BACKEND_DIR), str(_REPO_ROOT)):
     if _import_root not in sys.path:
         sys.path.insert(0, _import_root)
-
-# The three modules below name top-level ``main``, ``services`` and
-# ``app.tasks`` modules the package layout does not provide. A collection
-# error aborts the whole session, so they are excluded here; each still
-# fails the same way when named directly.
-collect_ignore = [
-    "test_api.py",
-    "test_services.py",
-    "test_tasks.py",
-]
 
 # SEC-06: an HTTPS base URL; a Secure cookie is dropped over plain http
 TEST_BASE_URL = "https://testserver"
@@ -105,8 +54,7 @@ os.environ.setdefault("LOGIN_RATE_LIMIT_WINDOW_MINUTES", "15")
 
 os.environ.setdefault("PAYPAL_MODE", "sandbox")
 
-# Placeholders for the settings the service layer reads at import time.
-# No test reaches these providers over the network.
+# Placeholders for the settings the service layer reads at import time
 os.environ.setdefault("PAYPAL_CLIENT_ID", "harness-paypal-client-id")
 os.environ.setdefault("PAYPAL_CLIENT_SECRET", "harness-paypal-token")
 os.environ.setdefault("ZILLOW_API_KEY", "harness-zillow-key")
@@ -138,7 +86,6 @@ Base.metadata.create_all(bind=test_engine)
 
 
 def _override_get_db():
-    # Matches the generator shape of backend.app.db.database.get_db
     session = TestingSessionLocal()
     try:
         yield session

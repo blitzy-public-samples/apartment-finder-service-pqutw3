@@ -44,6 +44,12 @@ SEEDED_HASH = "x" * 60
 # SEC-02: a primary key registration would not hand out on its own
 SEEDED_ID = 70
 
+# SEC-02: the widest key models.py can map. PostgreSQL provisions User.id
+# as SERIAL, whose sequence stops here; the value one past it is the
+# boundary the guard has to refuse
+MAPPED_KEY_CEILING = 2147483647
+ABOVE_MAPPED_KEY_CEILING = 2147483648
+
 
 def bearer(token):
     """Return the Authorization header carrying one token."""
@@ -273,7 +279,8 @@ REFUSED_SUBJECTS = [
 ]
 
 # SEC-02: subjects no account can carry - the first clears the canonical
-# width but exceeds the key ceiling, the second exceeds the width itself
+# width and exceeds the mapped 32-bit key ceiling, the second exceeds the
+# canonical width itself
 OUT_OF_RANGE_SUBJECTS = [
     pytest.param({"sub": "9" * 19}, id="above-the-key-ceiling"),
     pytest.param({"sub": "9" * 20}, id="overlong-subject"),
@@ -393,6 +400,55 @@ def test_a_seeded_account_answers_its_canonical_subject(client, db_session):
     )
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_the_mapped_key_ceiling_still_resolves(client, db_session):
+    """The widest key models.py maps sits inside the accepted range.
+
+    A guard that refuses the ceiling value itself fails this case.
+    """
+    seed_account(db_session, MAPPED_KEY_CEILING)
+    response = client.get(
+        PROTECTED_ROUTE,
+        headers=bearer(
+            create_access_token({"sub": str(MAPPED_KEY_CEILING)})
+        ),
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_a_subject_past_the_mapped_key_ceiling_is_refused(
+    client, db_session
+):
+    """One key past the mapped ceiling is refused while its row exists.
+
+    The harness column holds the value, so the refusal cannot come from
+    the unresolved-account branch. A guard carrying a wider ceiling
+    resolves the seeded row and answers 200. The refusal a client reads
+    is the one the unresolved-account branch returns.
+    """
+    seed_account(db_session, ABOVE_MAPPED_KEY_CEILING)
+    seeded = (
+        db_session.query(User)
+        .filter(User.id == ABOVE_MAPPED_KEY_CEILING)
+        .first()
+    )
+    assert seeded is not None
+    refused = client.get(
+        PROTECTED_ROUTE,
+        headers=bearer(
+            create_access_token({"sub": str(ABOVE_MAPPED_KEY_CEILING)})
+        ),
+    )
+    assert_refused(refused)
+    assert refused.status_code != 200
+    assert refused.status_code != 500
+    unresolved = client.get(
+        PROTECTED_ROUTE,
+        headers=bearer(create_access_token({"sub": ABSENT_USER_ID})),
+    )
+    assert refusal_signature(refused) == refusal_signature(unresolved)
 
 
 def test_integer_subject_is_refused_for_a_registered_account(

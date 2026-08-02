@@ -34,7 +34,6 @@ jobs:
         # CWE-1104: dependency advisory gate. Suppressed advisories, their
         # reachability assessments and the shared review trigger:
         # documentation/security/decision-log.md section 2.2
-        # --all also audits pip, setuptools and wheel, which plain freeze omits
         pip freeze --all > /tmp/frozen.txt
         pip-audit --strict --no-deps -r /tmp/frozen.txt \
           --ignore-vuln PYSEC-2026-1325 --ignore-vuln PYSEC-2026-2132 \
@@ -62,8 +61,8 @@ jobs:
       run: |
         if grep -rIn -E "localStorage|sessionStorage" frontend/src/; then exit 1; fi
 
-    # SEC-02 to SEC-12: the security regression suite, reached even after a
-    # step with a known non-zero baseline
+    # SEC-02 to SEC-12: the security regression suite; runs regardless of an
+    # earlier step's exit status
     - name: Run backend security tests
       if: always()
       run: |

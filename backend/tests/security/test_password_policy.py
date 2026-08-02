@@ -2,9 +2,8 @@
 
 Registration cases reach the policy through ``POST /auth/register``,
 whose body FastAPI validates against ``UserCreate`` before the route
-hashes anything. The matching client-side rule in
-``frontend/src/utils/validators.ts`` runs in no browser today, so the
-server holds the only copy that a caller cannot bypass.
+hashes anything. ``frontend/src/utils/validators.ts`` carries the
+matching client-side character set.
 
 Login cases pin the other edge of the policy. ``UserLogin`` carries no
 policy rule: an account whose credential predates the policy still
@@ -16,8 +15,7 @@ field name and the absence of any database row. The schema layer pins
 the character set and reports a direct failure when a rule moves.
 
 The stored value is checked too. Every ceiling below is a bcrypt input
-limit, so the scheme that produced the hash is part of the policy rather
-than an implementation detail behind it.
+limit, so the scheme that produced the hash is covered by these cases.
 """
 import logging
 from datetime import datetime

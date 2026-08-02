@@ -535,26 +535,35 @@ def test_the_filter_create_route_declares_its_response_model():
 def test_the_public_read_path_stays_open_and_paginates(client, db_session):
     """The public read path serves both pagination bounds unauthenticated.
 
-    Each paginated read is compared against the unpaginated one, so the
-    assertions hold whatever order the rows come back in.
+    The status codes and the row counts hold in every dialect: LIMIT and
+    OFFSET bound them. The identifier comparisons are scoped to the
+    SQLite harness - the statement carries no ORDER BY, and two
+    statements against PostgreSQL are not ordered against each other.
     """
-    seed_listings(db_session, SEEDED_LISTING_COUNT)
+    seeded = {
+        str(row.id)
+        for row in seed_listings(db_session, SEEDED_LISTING_COUNT)
+    }
 
     every = client.get(PUBLIC_READ_PATH)
     assert every.status_code == 200
     identifiers = [row["id"] for row in every.json()]
     assert len(identifiers) == SEEDED_LISTING_COUNT
+    assert set(identifiers) == seeded
 
     skipped = client.get(PUBLIC_READ_PATH, params={"skip": 2})
     assert skipped.status_code == 200
+    assert len(skipped.json()) == SEEDED_LISTING_COUNT - 2
     assert [row["id"] for row in skipped.json()] == identifiers[2:]
 
     limited = client.get(PUBLIC_READ_PATH, params={"limit": 2})
     assert limited.status_code == 200
+    assert len(limited.json()) == 2
     assert [row["id"] for row in limited.json()] == identifiers[:2]
 
     window = client.get(PUBLIC_READ_PATH, params={"skip": 1, "limit": 2})
     assert window.status_code == 200
+    assert len(window.json()) == 2
     assert [row["id"] for row in window.json()] == identifiers[1:3]
 
     beyond = client.get(

@@ -18,9 +18,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token', auto_error=False)
 SESSION_COOKIE_NAME = "access_token"
 
 # SEC-02: a sub claim must be the canonical decimal spelling of a User.id;
-# the ceiling is the signed 64-bit range the id column binds
+# the ceiling is the 32-bit range models.py maps that column to, which
+# PostgreSQL provisions as SERIAL
 _CANONICAL_SUBJECT = re.compile(r"[1-9][0-9]{0,18}")
-_MAX_SUBJECT_ID = 2 ** 63 - 1
+_MAX_SUBJECT_ID = 2 ** 31 - 1
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
