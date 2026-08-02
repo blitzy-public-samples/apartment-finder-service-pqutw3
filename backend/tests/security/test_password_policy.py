@@ -52,11 +52,8 @@ MAX_BYTES = 72
 SPECIALS = "!@#$%^&*()_+-=[]{};':\"\\|,.<>/?"
 SPECIAL_COUNT = 30
 
-# SEC-04: the client rule the server policy mirrors. AAP 0.5.4 makes
-# validators.ts the authoritative character set, so the parity tests read
-# it from disk rather than trusting the transcription above. The path is
-# resolved from this file, which keeps it correct whether pytest runs
-# from the repository root or from backend/ as ci.yml does.
+# SEC-04: the authoritative client rule the server policy mirrors. The
+# parity cases read it from disk, through a path resolved from this file.
 CLIENT_VALIDATOR = (
     Path(__file__).resolve().parents[3]
     / "frontend" / "src" / "utils" / "validators.ts"
@@ -239,9 +236,7 @@ def test_special_set_mirrors_the_client_rule():
     """The server set holds the same characters validators.ts:23 does.
 
     The client file is read and its character class parsed, so a
-    character added to or dropped from either side fails here. Asserting
-    the transcription against itself would agree with any set, which is
-    what leaves two copies of one rule free to drift apart.
+    character added to or dropped from either side fails here.
 
     Tilde, backtick and space stay outside the set on both sides, so the
     rule names an explicit set and not any punctuation.

@@ -99,11 +99,9 @@ LONG_KEY = KEY_CHARACTER * 64
 
 SIGNING_KEY_FIELD = "SECRET_KEY"
 
-# AAP 0.1.4: the eight environment variable names the user froze. Written
-# out rather than read from Settings.__fields__, because a set derived
-# from the model agrees with whatever the model declares - including a
-# frozen name renamed, retyped or dropped. New settings are additive, so
-# this tuple does not grow with them.
+# AAP 0.1.4: the eight environment variable names the user froze,
+# transcribed from that section. New settings are additive, so this tuple
+# does not grow with them.
 FROZEN_SETTING_NAMES = (
     "DATABASE_URL",
     "SECRET_KEY",
@@ -149,16 +147,15 @@ EXPECTED_SUPPRESSION_COUNT = 15
 # a step's own lines are indented deeper than its header
 STEP_BODY_INDENT = " " * 6
 
-# the two identifier namespaces the register uses. One advisory carries no
-# PYSEC identifier at all, which is why the second form is accepted.
+# the two identifier namespaces the register uses: PYSEC, and the GHSA
+# alias one advisory carries in place of a PYSEC identifier.
 ADVISORY_IDENTIFIER = re.compile(
     r"PYSEC-[0-9]{4}-[0-9]+|GHSA(?:-[2-9a-hjkmnp-z]{4}){3}"
 )
 
 # One line per credential shape the scan detects. Every value is invented
-# here and appears in no configuration. Each is assembled from fragments
-# so that this file - which the scan now reads like any other tracked
-# file - does not itself carry the text the scan looks for.
+# here and appears in no configuration. Each is assembled from fragments,
+# so the scan reading this file matches none of them.
 CREDENTIAL_POSITIVE_CONTROLS = (
     pytest.param(
         "DATABASE_URL=postgresql://postgres" + ":" + "postgres@db:5432/app",
@@ -201,6 +198,9 @@ DECISION_LOG = (
     REPOSITORY_ROOT / "documentation" / "security" / "decision-log.md"
 )
 REVIEW_TRIGGER = "a Python runtime upgrade"
+
+# Rule 1: the operational document that carries the residual register
+SECURITY_DOCUMENT = REPOSITORY_ROOT / "SECURITY.md"
 
 # SEC-01/SEC-11: the developer provisioning script. No case runs it - it
 # creates databases and cluster roles - so its guards are read as text.
@@ -353,11 +353,36 @@ APP_ROLE_PASSWORD_VERSION_ARGUMENT = "password_wo_version"
 APP_ROLE_PASSWORD_VERSION_VARIABLE = "db_app_password_version"
 STATE_PERSISTING_PASSWORD_ARGUMENT = "password ="
 
-# SEC-11: the least-privilege role the account is assigned, named through a
-# variable so no role name is a literal in the declaration
-APP_ROLE_GRANTED_ROLE_VARIABLE = "db_app_role"
-APP_ROLE_GRANTED_ROLE_REFERENCE = "[var.{0}]".format(
-    APP_ROLE_GRANTED_ROLE_VARIABLE
+# SEC-11: the arguments and variables the declaration must not carry. No
+# repository mechanism creates a custom database role or grants it anything,
+# so a role assignment leaves a default apply unable to create the account.
+ROLE_ASSIGNMENT_ARGUMENT = "database_roles"
+WITHDRAWN_ROLE_VARIABLE = "db_app_role"
+
+# SEC-11: the input variables the declaration does reference. A variable the
+# configuration never reads is a knob that changes nothing.
+REFERENCED_ROLE_VARIABLES = (
+    APP_ROLE_NAME_VARIABLE,
+    APP_ROLE_PASSWORD_VARIABLE,
+    APP_ROLE_PASSWORD_VERSION_VARIABLE,
+)
+
+# SEC-11: the role Cloud SQL grants every built-in user it creates, and the
+# statements SECURITY.md carries for narrowing the account out of band
+CLOUD_AUTOMATIC_ROLE = "cloudsqlsuperuser"
+CLOUD_PRIVILEGE_STATEMENTS = (
+    "REVOKE cloudsqlsuperuser FROM app_user;",
+    "ALTER ROLE app_user NOCREATEDB NOCREATEROLE;",
+    "REVOKE CREATE ON SCHEMA public FROM PUBLIC;",
+    'GRANT CONNECT ON DATABASE "main-database" TO app_user;',
+    "GRANT USAGE ON SCHEMA public TO app_user;",
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public"
+    " TO app_user;",
+    "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT,"
+    " UPDATE, DELETE ON TABLES TO app_user;",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON"
+    " SEQUENCES TO app_user;",
 )
 
 
@@ -594,8 +619,8 @@ def test_each_frozen_name_is_the_variable_the_application_reads(
     A field name in ``Settings`` is half the contract; what an operator
     sets is an environment variable. Removing one frozen name from the
     environment and rebuilding the settings shows which variable the
-    field reads, so a field bound to some other variable through an alias
-    fails here rather than satisfying a name check on the model alone.
+    field reads: a field bound to some other variable through an alias
+    fails this case.
     """
     monkeypatch.delenv(name, raising=False)
 
@@ -1022,10 +1047,8 @@ def test_the_dependency_audit_gate_keeps_its_shape():
     for flag in AUDIT_STEP_FLAGS:
         assert flag in step, flag
 
-    # the audited set is the manifest closure. Widening it to the runner's
-    # own tooling makes the verdict a property of the image rather than of
-    # the manifest, and a suppression register pinned to that wider set
-    # goes stale the moment the image moves
+    # CWE-1104: the audited set is the manifest closure, and the
+    # runner-dependent freeze flag is absent from the step
     assert FROZEN_CLOSURE_COMMAND in step
     assert RUNNER_DEPENDENT_FREEZE_FLAG not in step
 
@@ -1107,9 +1130,7 @@ def _tracked_files():
 def test_the_credential_scan_detects_each_credential_shape(line):
     """Each credential shape the scan names is matched by it.
 
-    The pattern is read out of the workflow rather than copied here, so a
-    weakened alternative fails this case instead of passing a copy that
-    nothing runs.
+    The pattern under test is read out of the workflow, not copied here.
     """
     assert _credential_scan_pattern().search(line), line
 
@@ -1119,9 +1140,7 @@ def test_the_credential_scan_detects_each_credential_shape(line):
 def test_the_credential_scan_passes_over_documented_placeholders(line):
     """A template line naming a variable without a value is not matched.
 
-    SEC-12 requires every variable to be documented by name. A pattern
-    that tripped on the template would force the template out of the
-    scan, which is how a scan stops covering the tree.
+    Each control below is a line the value-free template carries.
     """
     assert not _credential_scan_pattern().search(line), line
 
@@ -1129,11 +1148,8 @@ def test_the_credential_scan_passes_over_documented_placeholders(line):
 def test_the_credential_scan_matches_no_part_of_its_own_source():
     """The scan does not match the line that declares it.
 
-    Three of the four alternatives match their own written form, which is
-    why the scan previously excluded two files: without the exclusions it
-    reported its own source and failed every run. Each alternative is now
-    split by a one-character bracket expression, so the pattern matches
-    the same text without matching itself, and the exclusions are gone.
+    Each alternative is split by a one-character bracket expression, so
+    the pattern matches the same text without matching itself.
     """
     command = _credential_scan_command()
     pattern = _credential_scan_pattern()
@@ -1272,11 +1288,6 @@ def test_the_application_database_role_carries_no_literal_credential():
     assert '"' not in password
     assert '"' not in _hcl_argument(role, "name")
 
-    # SEC-11: the least-privilege role is named through a variable
-    assert _hcl_argument(
-        role, "database_roles"
-    ) == APP_ROLE_GRANTED_ROLE_REFERENCE
-
     # the role attaches to the instance the case above gates
     assert _hcl_argument(role, "instance") == "{0}.{1}.name".format(
         *CLOUD_SQL_INSTANCE
@@ -1294,8 +1305,41 @@ def test_the_application_database_role_carries_no_literal_credential():
     name_variable = _terraform_variable(APP_ROLE_NAME_VARIABLE)
     assert _hcl_argument(name_variable, "type") == "string"
 
-    role_variable = _terraform_variable(APP_ROLE_GRANTED_ROLE_VARIABLE)
-    assert _hcl_argument(role_variable, "type") == "string"
+
+# SEC-11: the declaration a default apply can satisfy, and the residual it
+# leaves for the documented out-of-band statements
+def test_the_cloud_application_account_is_creatable_and_its_residual_stated():
+    """The declaration assigns no role, and SECURITY.md carries the grants.
+
+    A role assignment names a role. Nothing in this repository creates one
+    or grants it anything, so an assignment leaves a default apply unable to
+    create the account at all. Cloud SQL also grants an elevated role to
+    every built-in user it creates, and this provider carries no grant or
+    revoke resource, so the restriction has to arrive out of band. This case
+    fails if the assignment returns, if the withdrawn variable returns, if a
+    referenced variable stops being read, or if the document stops carrying
+    any statement the account needs.
+    """
+    main_source = TERRAFORM_MAIN.read_text(encoding="utf-8")
+    variables_source = TERRAFORM_VARIABLES.read_text(encoding="utf-8")
+    role = _terraform_resource(*CLOUD_SQL_USER)
+
+    assert ROLE_ASSIGNMENT_ARGUMENT not in role
+    assert WITHDRAWN_ROLE_VARIABLE not in main_source
+    assert WITHDRAWN_ROLE_VARIABLE not in variables_source
+
+    # every variable this work declared is read by the declaration
+    for name in REFERENCED_ROLE_VARIABLES:
+        assert 'variable "{0}"'.format(name) in variables_source, name
+        assert "var.{0}".format(name) in main_source, name
+
+    assert SECURITY_DOCUMENT.is_file(), SECURITY_DOCUMENT
+    document = SECURITY_DOCUMENT.read_text(encoding="utf-8")
+
+    # the residual is named, not implied
+    assert CLOUD_AUTOMATIC_ROLE in document
+    for statement in CLOUD_PRIVILEGE_STATEMENTS:
+        assert statement in document, statement
 
 
 def _provisioning_source():
@@ -1334,10 +1378,10 @@ def test_the_application_role_is_granted_data_access_only():
     """Every privilege the application role receives is a data operation.
 
     SEC-11 replaces one account holding every privilege on the database
-    with two roles. The comparison is a set equality rather than a
-    presence check, so a privilege added to the application role later
-    fails this case instead of passing unnoticed. Nothing here runs the
-    script; it creates cluster roles, so the shipped statements are read.
+    with two roles. The granted set is compared whole, so a privilege
+    added to the application role later fails this case. Nothing here
+    runs the script; it creates cluster roles, so the shipped statements
+    are read.
     """
     statements = _provisioning_statements()
     granted = [line for line in statements if "app_user" in line]
@@ -1809,8 +1853,8 @@ def test_probe_engines_are_registered_for_disposal():
 def test_disposing_a_probe_engine_releases_its_pool():
     """A disposed probe engine reports an empty pool.
 
-    Disposal is asserted on the pool rather than on the call, so the
-    fixture's cleanup is shown to have an effect.
+    The pool is read after disposal, so the fixture's cleanup is shown to
+    have an effect.
     """
     module = load_database_module(SQLITE_URL, "require")
     engine = module.engine
@@ -1983,9 +2027,9 @@ def test_the_generated_secret_file_is_owner_only(tmp_path):
 def test_the_generated_secret_file_refuses_a_planted_symlink(tmp_path):
     """A symlink standing at .env stops the run before a key exists.
 
-    Replacing the link would be safe for the target, but refusing is
-    stronger: a name a developer did not create is never the destination
-    of a freshly generated credential, and nothing is written anywhere.
+    The link is neither followed nor replaced: a name the developer did
+    not create is never the destination of a freshly generated
+    credential, and nothing is written anywhere.
     """
     target = tmp_path / "victim.txt"
     target.write_text(PLANTED_TARGET_CONTENT)

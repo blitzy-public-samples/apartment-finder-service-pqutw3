@@ -8,13 +8,11 @@ the application actually uses, foreign-key enforcement on every SQLite
 connection, an HTTPS test client, and per-test isolation of the schema
 and the login-attempt counters.
 
-Collection is not filtered, so nothing here hides a failure. Any module
-in ``backend/tests`` that fails to import fails collection.
-``test_api.py``, ``test_services.py`` and ``test_tasks.py`` name
-top-level ``main``, ``services`` and ``app.tasks`` modules the package
-layout does not provide, so a full-suite run reports three collection
-errors. AAP 0.8.4 records that baseline as measured; AAP 0.9.2 places
-repairing those modules out of scope.
+Collection is not filtered. Any module in ``backend/tests`` that fails to
+import fails collection: ``test_api.py``, ``test_services.py`` and
+``test_tasks.py`` name top-level ``main``, ``services`` and ``app.tasks``
+modules the package layout does not provide, so a full-suite run reports
+three collection errors.
 
 Rationale for every decision in this harness is recorded in
 ``documentation/security/decision-log.md``, section 7.
@@ -110,9 +108,8 @@ _HARNESS_ENVIRONMENT = {
     # SEC-06: the session cookie carries the Secure attribute under test
     "COOKIE_SECURE": "true",
     # SEC-12: 64 bytes clears the RFC 7518 sec. 3.2 floor for HS256,
-    # HS384 and HS512 alike. Not a deployable key: it is a fixed literal
-    # in a tracked file, which is why it may never be defaulted from the
-    # environment instead.
+    # HS384 and HS512 alike. Not a deployable key: a fixed literal in a
+    # tracked file, carried by this harness only.
     "SECRET_KEY": "harness-only-signing-key-" + "x" * 39,
     "ALGORITHM": "HS256",
     "ACCESS_TOKEN_EXPIRE_MINUTES": "30",
@@ -131,8 +128,8 @@ _HARNESS_ENVIRONMENT = {
     "FROM_EMAIL": "harness@example.com",
 }
 
-# Declared optional, read by no test. An ambient value would be carried
-# into Settings unnoticed, so it is removed rather than overwritten.
+# Declared optional and read by no test. Removed from the environment, so
+# Settings carries no ambient value for it.
 _SCRUBBED_ENVIRONMENT = ("SENTRY_DSN",)
 
 os.environ.update(_HARNESS_ENVIRONMENT)

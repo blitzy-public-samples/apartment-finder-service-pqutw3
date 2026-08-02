@@ -74,17 +74,17 @@ resource "google_sql_database" "database" {
   instance = google_sql_database_instance.main.name
 }
 
-# SEC-11: application account separate from the instance admin account and
-# assigned the named least-privilege role. Cloud SQL grants built-in
-# PostgreSQL users cloudsqlsuperuser on creation and Terraform does not revoke
-# it, so SEC-11 stays partial here; SECURITY.md carries the REVOKE statement.
+# SEC-11: application account separate from the instance admin account.
+# Cloud SQL grants cloudsqlsuperuser to every built-in user it creates, and
+# this provider carries no grant or revoke resource, so the account is
+# separated here and restricted out of band. SECURITY.md section 3.2 carries
+# the statements.
 # SEC-12: password_wo is write-only, so the value never lands in state
 resource "google_sql_user" "app" {
   name                = var.db_app_user
   instance            = google_sql_database_instance.main.name
   password_wo         = var.db_app_password
   password_wo_version = var.db_app_password_version
-  database_roles      = [var.db_app_role]
 }
 
 # Resource definitions for Google Cloud Storage buckets

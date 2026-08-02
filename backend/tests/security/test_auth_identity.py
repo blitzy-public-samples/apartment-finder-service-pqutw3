@@ -310,8 +310,8 @@ REFUSED_SUBJECTS = [
 
 # SEC-02: subjects no account can carry. The first clears the canonical
 # width but exceeds the signed 32-bit ceiling of the INTEGER key; the
-# other three exceed the canonical width itself. The 64-bit spellings are
-# kept because the guard's earlier, wider ceiling accepted them.
+# other three exceed the canonical width itself, including both 64-bit
+# spellings.
 OUT_OF_RANGE_SUBJECTS = [
     pytest.param({"sub": str(2 ** 31)}, id="one-past-the-key-ceiling"),
     pytest.param({"sub": str(2 ** 63 - 1)}, id="at-the-64-bit-ceiling"),

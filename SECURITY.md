@@ -68,8 +68,13 @@ no value.
 
 [`.gitignore`](.gitignore) prevents recurrence, which is the control that separates remediation
 from cleanup. It excludes five secret-bearing patterns: `.env`, `secrets/`, `*.pem`, `*.key`, and
-`*credentials*.json`. It also excludes Terraform state and variable files, which carry the
-application database password.
+`*credentials*.json`. It also excludes Terraform state and variable files.
+
+Those Terraform exclusions no longer rest on the state file holding the database password. The
+shipped declaration passes the value through `password_wo` from an `ephemeral` variable, so it
+reaches neither state nor a plan file. They stay excluded for two reasons that still hold: a
+variable file is the conventional home for the value an operator supplies, and state records other
+resource attributes worth keeping out of version control.
 
 The `secrets/` entry matters more than it looks. The Compose stack mounts `./secrets` into the
 database proxy container and reads a Google service-account credential file from it. Nothing
@@ -146,9 +151,9 @@ reported, not gated.
 
 ### 2.4 Dependency vulnerability gate
 
-Ten advisories cannot be patched on this runtime, so the gate suppresses exactly those ten and
-fails on anything else. Section 3.1 lists each one with its reachability assessment, and the
-decision log carries the justification and the review trigger for each.
+Fifteen advisories cannot be patched on this runtime, so the gate suppresses exactly those fifteen
+and fails on anything else. Section 3.1 lists each one with its reachability assessment, and the
+decision log's register in section 2.2 carries the justification and the review trigger for each.
 
 ```bash
 pip freeze > /tmp/frozen.txt
@@ -157,12 +162,22 @@ pip-audit --strict --no-deps -r /tmp/frozen.txt \
   --ignore-vuln PYSEC-2026-161  --ignore-vuln PYSEC-2026-248 \
   --ignore-vuln PYSEC-2026-249  --ignore-vuln PYSEC-2026-2280 \
   --ignore-vuln PYSEC-2026-2281 --ignore-vuln PYSEC-2026-2275 \
-  --ignore-vuln PYSEC-2026-141  --ignore-vuln PYSEC-2026-142
+  --ignore-vuln PYSEC-2026-141  --ignore-vuln PYSEC-2026-142 \
+  --ignore-vuln PYSEC-2026-1374 --ignore-vuln PYSEC-2026-1375 \
+  --ignore-vuln PYSEC-2026-1845 --ignore-vuln PYSEC-2026-2270 \
+  --ignore-vuln GHSA-6v7p-g79w-8964
 ```
 
-Expected at the time of the analysis: no findings reported, ten ignored, successful exit. The gate
-was verified in both directions. Without the suppression list the same command exits non-zero, so
-it detects rather than merely passes. A gate verified only to pass is not a gate.
+This is the command `.github/workflows/ci.yml` runs, and `backend/tests/security/test_config_guards.py`
+compares the workflow's suppression set against the register in both directions, so neither can move
+without the other.
+
+Measured on 2026-08-02: `No known vulnerabilities found, 15 ignored`, exit 0. The gate was verified
+in both directions — without the suppression list the same command reports `Found 15 known
+vulnerabilities in 9 packages` and exits 1, so it detects rather than merely passes. A gate verified
+only to pass is not a gate. The reported set and the suppressed set match exactly, which is what
+makes a newly published advisory fail the build instead of being absorbed by an entry written for
+something else.
 
 The advisory database is a moving target, and the gate is built to fail when it moves. Re-running
 it today reports newly published advisories in the audit and test tooling and in one runtime pin.
@@ -171,10 +186,14 @@ carries a staleness check that fails when a suppressed identifier stops being re
 suppression list cannot quietly rot. Every new finding needs its own decision-log entry before it
 is suppressed.
 
-One naming detail will otherwise cost an implementer an afternoon. The tool reports Python
-advisory database identifiers. Suppressing by a GitHub advisory alias silently fails to match, and
-the gate then looks broken while it is in fact ignoring nothing. Use the `PYSEC-` identifiers
-exactly as written above.
+One naming detail is worth stating, because an earlier version of this document got it backwards.
+The tool reports Python advisory database identifiers, and it *does* match a suppression given as a
+GitHub advisory alias — measured, and recorded in DL-12. The gate depends on that behaviour: the
+`msgpack` advisory has no `PYSEC-` form at all, so `GHSA-6v7p-g79w-8964` is the only identifier that
+can express it, which is why DL-09 permits the mixed namespace. Copy the identifiers exactly as
+written above. The real failure mode is a typo: the tool accepts an identifier it does not recognise
+and silently suppresses nothing, turning a mistyped entry into a hole rather than an error, which is
+why the workflow shape-checks every identifier and cross-checks the register.
 
 ### 2.5 Style check
 
@@ -272,11 +291,15 @@ reproducible frontend advisory report is obtainable. Frontend posture rests inst
 The runtime ceiling is the most consequential finding in the version analysis, and it reframes what
 "patched" can mean for this project.
 
-An audit of the resolved dependency closure reports ten advisories in five packages. For every one
-of them, the release that fixes the advisory **cannot be installed on Python 3.9**. Each fix
+An audit of the resolved dependency closure reports fifteen advisories in nine packages. For every
+one of them, the release that fixes the advisory **cannot be installed on Python 3.9**. Each fix
 version was probed directly and each probe returned a `Requires-Python` rejection. A control test
 confirmed those rejections are genuine version gates rather than a network artifact: the pinned
 versions download cleanly from the same index in the same session.
+
+Ten of the fifteen reach the closure through the application's own runtime dependencies. The
+remaining five, listed separately below, arrive through the audit and test tooling or through the
+`python-dotenv` pin, and none of them is reachable from the served application at all.
 
 | Package | Pinned | Advisory | Fix release | Installable here | Reachability |
 | --- | --- | --- | --- | --- | --- |
@@ -291,17 +314,33 @@ versions download cleanly from the same index in the same session.
 | `urllib3` | 2.6.3 | PYSEC-2026-142 | 2.7.0 | No | Unreachable. Over-decompression requiring an optional compression backend that is not installed |
 | `urllib3` | 2.6.3 | PYSEC-2026-141 | 2.7.0 | No | Unreachable. Header leakage on cross-origin redirect through a proxy manager configuration this application never uses |
 
-Eight of the ten are unreachable, one is low and partial, and one is partial with a named
+Eight of those ten are unreachable, one is low and partial, and one is partial with a named
 compensating control.
+
+The five that arrive through tooling rather than through the application:
+
+| Package | Pinned | Advisory | Fix release | Installable here | Reachability |
+| --- | --- | --- | --- | --- | --- |
+| `msgpack` | 1.1.2 | GHSA-6v7p-g79w-8964 | 1.2.1 | No | Unreachable from the application. A reused `Unpacker` can crash after an error while decoding untrusted input. Enters through `pip-audit` only, via `CacheControl[filecache]`; the sole importer deserializes the audit tool's own HTTP response cache. The backend holds zero references to `msgpack`. This advisory has no `PYSEC-` form, which is why the gate carries a `GHSA-` entry |
+| `filelock` | 3.19.1 | PYSEC-2026-1375 | 3.20.1 | No | Unreachable from the network. A time-of-check-to-time-of-use symlink race during lock-file creation lets a **local** attacker truncate a file. Enters through `pip-audit` only; the backend holds zero references to `filelock` |
+| `filelock` | 3.19.1 | PYSEC-2026-1374 | 3.20.3 | No | Doubly unreachable. The race is specific to `SoftFileLock`, and the cache selects `FileLock` instead. Local attack vector, scored 5.6 Medium |
+| `pytest` | 8.4.2 | PYSEC-2026-1845 | 9.0.3 | No | Unreachable from the network. A predictable temporary directory lets a local user cause denial of service. Test-runner only; the container command runs `uvicorn`, so the runner never executes in a deployed environment. This one is the clearest argument for keeping development tooling out of the production image |
+| `python-dotenv` | 1.2.1 | PYSEC-2026-2270 | 1.2.2 | No | Unreachable. `set_key()` and `unset_key()` follow symbolic links when **rewriting** a `.env` file. Pydantic calls the read helper only, and `backend/` holds zero references to `dotenv`, `set_key` or `unset_key`. Local access plus operator interaction, scored 5.9 Medium |
+
+Thirteen of the fifteen are unreachable, one is low and partial, and one is partial with a named
+compensating control. Not one is reachable by an unauthenticated network caller against the served
+application.
 
 The single advisory that will never receive a patch is the `ecdsa` timing side channel, and it is
 unreachable by construction. This application signs tokens with HMAC-SHA256. The settings class
 restricts the algorithm to the HMAC family, which turns that from an assumption into an enforced
 invariant. No configuration change can quietly move signing onto the affected code path.
 
-**Review trigger, identical for all ten: a Python runtime upgrade.** At that point the suppression
-list should be emptied and the pins raised. Accepting an advisory without a scheduled
-reconsideration is how a temporary exception becomes permanent.
+**Review trigger, identical for all fifteen: a Python runtime upgrade.** At that point the
+suppression list should be emptied and the pins raised, and each advisory re-measured rather than
+re-accepted. Accepting an advisory without a scheduled reconsideration is how a temporary exception
+becomes permanent. Advisory data is a point-in-time snapshot, so the inventory needs re-measuring at
+every security review rather than copying forward.
 
 The upgrade is not performed here. Python 3.9 is hardcoded in four places: the backend container
 image, the pipeline's Python setup step, a Cloud Function runtime identifier in Terraform, and the
@@ -326,10 +365,50 @@ Cloud SQL instance is set to accept encrypted connections only, and the applicat
 and performs no server-identity check. Moving to `verify-full` with a distributed, rotatable root
 certificate is the recommended follow-on, and it is item 3 in section 4.
 
-**SEC-11 gained role separation, not row-level security.** The single all-privileges account was
-split into an owner role and a least-privilege application role, and the unrestricted grant is
-gone. Nothing in this work delivers row-level security. Per-tenant policies need a policy per
-table plus a session-variable convention, which is a data-layer redesign.
+**SEC-11 gained role separation, and least-privilege grants in one place only.** The two halves
+differ, so they are stated separately.
+
+*Locally, the grants are delivered and verified.*
+[`scripts/setup_dev_environment.sh`](scripts/setup_dev_environment.sh) replaces the single
+all-privileges account with an owner role that performs schema work and an application role limited
+to `CONNECT`, schema `USAGE`, and `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables plus `USAGE`,
+`SELECT` on sequences. `REVOKE CREATE ON SCHEMA public FROM PUBLIC` removes the default grant that
+would otherwise hand the application role the DDL those grants withhold, and two
+`ALTER DEFAULT PRIVILEGES` statements extend the same data operations to tables the owner creates
+later. `GRANT ALL PRIVILEGES` appears nowhere.
+
+*On Cloud SQL, the declaration separates the account and restricts nothing.*
+[`infrastructure/terraform/main.tf`](infrastructure/terraform/main.tf) declares
+`google_sql_user.app` with its name and password from input variables, so the application no longer
+shares the instance admin account. Two facts bound what that declaration can achieve. Cloud SQL
+grants `cloudsqlsuperuser` to every built-in PostgreSQL user it creates, and the Terraform Google
+provider exposes no resource for a `GRANT` or a `REVOKE`. A default `terraform apply` therefore
+creates a working but elevated account, and no Terraform argument narrows it.
+
+Restriction has to arrive out of band. Connect to `main-database` as the instance admin and run:
+
+```sql
+REVOKE cloudsqlsuperuser FROM app_user;
+ALTER ROLE app_user NOCREATEDB NOCREATEROLE;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT CONNECT ON DATABASE "main-database" TO app_user;
+GRANT USAGE ON SCHEMA public TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO app_user;
+```
+
+Substitute the value of `db_app_user` if it is not the default. The privilege set mirrors the local
+one the provisioning script issues and verifies; unlike that one, it was not executed against a
+Cloud SQL instance in this work, because no instance is provisioned here. Until an operator runs it,
+the cloud application role keeps the role-creation, database-creation and DDL rights the automatic
+grant confers. `backend/tests/security/test_config_guards.py` asserts that this block still carries
+every statement, and that the declaration carries no role-assignment argument that a default apply
+could not satisfy.
+
+*Row-level security is not delivered, on either side.* Per-tenant policies need a policy per table
+plus a session-variable convention, which is a data-layer redesign.
 
 **SEC-12 gained custody discipline, not a secret store.** Section 1.3 has the detail.
 
@@ -360,15 +439,27 @@ Two controls close it. The dependency is pinned exactly to 1.19.0, which separat
 concerns. The explicit cross-site-token option is deliberately left unset, which keeps the old
 behaviour switched off.
 
-**Two endpoints cannot create records, before or after this work.** `POST /listings/` and
-`POST /subscriptions/` fail for reasons that have nothing to do with security. The listing model
-has no owner column and two non-null timestamp columns that are never supplied. The subscription
-model has no plan column and a non-null status column that is never supplied. Repairing them means
-adding columns, which needs migration tooling this repository does not have, and that is feature
-work.
+**Three endpoints cannot persist records, before or after this work.** `POST /listings/`,
+`POST /subscriptions/` and `POST /filters/` all fail for reasons that have nothing to do with
+security.
 
-The honest criterion is narrower: both routes stay importable with their paths, verbs, and request
-contracts unchanged, and the new strict schemas close the mass-assignment vector on them.
+- `POST /listings/` — the listing model has no owner column, and two non-null timestamp columns are
+  never supplied.
+- `POST /subscriptions/` — the subscription model has no plan column, and a non-null status column is
+  never supplied.
+- `POST /filters/` — `filters.py:20` assigns `FilterCreate` models to the mapped `criteria`
+  relationship, which expects `Criteria` rows, and supplies no value for the non-null `created_at`
+  column. The request is validated and rejected-on-unknown-keys correctly, then the flush fails. The
+  route answers the uniform sanitized 500 of section 2 and **leaves no row**, which
+  `test_filter_creation_defect_answers_a_sanitized_fault` asserts together with a zero-row check.
+
+Repairing any of the three means adding or retyping columns, which needs migration tooling this
+repository does not have, and that is feature work rather than security work.
+
+The honest criterion is narrower: all three routes stay importable with their paths, verbs and
+request contracts unchanged; the new strict schemas close the mass-assignment vector on them; and
+the failure discloses nothing, because it surfaces through the same sanitized envelope every other
+error uses.
 
 **The pre-existing pipeline baseline, measured so that "no new failures" is an honest claim.**
 Style checking reported 129 findings before this work. The test suite collected zero tests with
@@ -415,8 +506,8 @@ in production is a one-line change whenever the team decides it should be gated.
 ## 4. Deferred follow-ons, in priority order
 
 1. **Migrate to Python 3.10 or newer. That upgrade is the single highest-priority follow-on.** The
-   upgrade is the only real remedy for the ten advisories in section 3.1, every one of which has a
-   fix release that the current runtime refuses to install. Section 3.1 is the justification. On
+   upgrade is the only real remedy for the fifteen advisories in section 3.1, every one of which has
+   a fix release that the current runtime refuses to install. Section 3.1 is the justification. On
    completion, empty the suppression list and raise the pins.
 2. Generate and commit a frontend lock file after auditing the transitive tree, and declare the two
    packages that are imported but never declared.

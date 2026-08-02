@@ -43,8 +43,8 @@ class Criteria(BaseModel):
         orm_mode = True    # SEC-05: reads the mapped criteria rows on response
 
 
-# SEC-05: bounded twin of Criteria for the write path. The read model above
-# stays unbounded so a row stored before these caps still serializes.
+# SEC-05: bounded twin of Criteria for the write path; the read model above
+# stays unbounded
 class CriteriaCreate(Criteria):
     field: constr(strict=True, max_length=MAX_CRITERION_FIELD)
     operator: constr(strict=True, max_length=MAX_CRITERION_OPERATOR)

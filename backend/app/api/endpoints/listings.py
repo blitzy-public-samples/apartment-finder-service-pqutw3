@@ -20,10 +20,9 @@ def create_listing(listing: ListingCreate, db: Session = Depends(get_db), curren
     # unknown key is refused before this line (CWE-915)
     #
     # This route cannot persist a row: models.py declares no owner column on
-    # Listing and two non-null timestamps this body never carries. AAP 0.8.3
-    # freezes the request contract and AAP 0.9.2 puts the schema change out of
-    # scope, so the mass-assignment vector is closed while the write still
-    # fails. documentation/security/decision-log.md carries the disposition.
+    # Listing and two non-null timestamps this body never carries. The write
+    # answers a sanitized 500 and leaves no row.
+    # documentation/security/decision-log.md carries the disposition.
     db_listing = ListingModel(**listing.dict(), owner_id=current_user.id)
     db.add(db_listing)
     db.commit()

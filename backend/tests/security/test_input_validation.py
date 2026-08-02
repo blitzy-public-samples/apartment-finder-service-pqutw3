@@ -104,10 +104,7 @@ EMPTY_PLAN_SUBSCRIPTION_BODY = {
     "start_date": "2030-01-01T00:00:00",
 }
 
-# SEC-08: the frozen sanitized-envelope contract, written out rather than
-# read back from the function that builds it. Deriving the expectation
-# from the code under test makes it agree with any shape that code
-# returns, including a renamed or dropped key.
+# SEC-08: the frozen sanitized-envelope contract, transcribed here.
 # test_the_frozen_envelope_contract_matches_the_application below is what
 # fails if the application's envelope moves.
 ENVELOPE_KEYS = frozenset({"detail", "error_id", "fields"})
@@ -169,10 +166,8 @@ DECLARED_ROUTES = frozenset({
 UNDECLARED_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 
 # AAP 0.8.3: the key set the filter route's declared response model
-# publishes. Written out rather than read from Filter.__fields__: derived
-# from the model, the assertion would accept whatever the model declares,
-# including a field added to it or the password hash the outbound user
-# model used to carry. A field added here is a deliberate contract change.
+# publishes, transcribed here. A field added to this set is a deliberate
+# contract change.
 DECLARED_FILTER_RESPONSE_KEYS = frozenset({
     "id",
     "user_id",
@@ -365,11 +360,10 @@ def _seed_listings(session, count):
 def seed_filter(session, user_id, name=DECLARED_FILTER_BODY["name"]):
     """Write one filter row with its criteria child and return its id.
 
-    ``POST /filters/`` cannot write a row for the reason AAP 0.8.3
-    records: the endpoint hands a mapped relationship a request model and
-    supplies no value for the non-null ``created_at`` column. The read
-    path is seeded through the session instead, matching how the listing
-    read path is seeded above.
+    ``POST /filters/`` cannot write a row: the endpoint hands a mapped
+    relationship a request model and supplies no value for the non-null
+    ``created_at`` column. The read path is seeded through the session,
+    as the listing read path above is.
     """
     row = FilterModel(
         name=name,
@@ -399,10 +393,9 @@ def _listing_ids(response):
 def test_the_frozen_envelope_contract_matches_the_application():
     """The hardcoded envelope contract is the one the application builds.
 
-    ENVELOPE_KEYS and _CORRELATION_KEY are written out at the top of this
-    module rather than read back from the function that builds the
-    envelope, so a change to that function fails here instead of quietly
-    redefining what every rejection case below asserts.
+    ENVELOPE_KEYS and _CORRELATION_KEY are transcribed at the top of this
+    module, so a change to the function that builds the envelope fails
+    this case.
     """
     built = _error_envelope("a detail", "a correlation id")
 
@@ -1291,8 +1284,8 @@ def test_the_filter_routes_publish_the_declared_response_model(
     assert published[0]["criteria"] == [DECLARED_CRITERION]
 
     # AAP 0.8.3: the declared model publishes exactly the frozen key set.
-    # A field added to Filter widens what this route returns, so it fails
-    # here rather than passing because the expectation was read from it.
+    # A field added to Filter widens what this route returns and fails
+    # this assertion.
     assert frozenset(Filter.__fields__) == DECLARED_FILTER_RESPONSE_KEYS
 
 
@@ -1662,9 +1655,8 @@ def test_declared_foreign_keys_are_enforced_under_test(db_session):
     """A child row naming no parent is refused by the database.
 
     SQLite ignores foreign keys unless the pragma is set per connection.
-    Without it the four declared foreign keys are inert under test, so a
-    harness that stands in for PostgreSQL would be weaker than what it
-    replaces and an orphaned row would insert cleanly.
+    Without it the four declared foreign keys are inert under test and an
+    orphaned row inserts cleanly.
     """
     from sqlalchemy.exc import IntegrityError
 

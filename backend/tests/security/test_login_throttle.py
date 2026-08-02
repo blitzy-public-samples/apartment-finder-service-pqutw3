@@ -129,9 +129,8 @@ RESERVED_ADDRESS_KEY = "addr:reserved-probe"
 def _registered_login_limit():
     """Return the limit object the login route actually carries.
 
-    Read from the limiter rather than rebuilt, so the rejection driven
-    below carries the shipped threshold and window instead of a copy
-    that could drift from them.
+    The value is read from the registered limiter, so the rejection
+    driven below carries the shipped threshold and window.
     """
     registered = app.state.limiter._route_limits[_LOGIN_ROUTE_KEY]
     assert len(registered) == 1, registered
@@ -698,7 +697,7 @@ def test_the_counter_map_never_exceeds_the_cap(client, monkeypatch):
 
     Each attempt writes one account key, so an unbounded map is a
     memory-exhaustion vector reachable by an unauthenticated caller
-    (CWE-367).
+    (CWE-400).
     """
     monkeypatch.setattr(
         auth_endpoint, "_LOGIN_FAILURE_TRACKING_CAP", PROBE_CAP
@@ -805,8 +804,7 @@ def test_the_registered_limiter_holds_its_state_in_process():
 
     # SEC-07: in-process storage; no cache service is provisioned. The
     # class is the one slowapi itself selects when no store is
-    # configured, read from a reference limiter rather than imported
-    # from a package the manifest does not declare.
+    # configured, read here from a reference limiter.
     in_process = Limiter(key_func=get_remote_address)
     assert in_process._storage_uri is None
     assert type(limiter._storage) is type(in_process._storage)
