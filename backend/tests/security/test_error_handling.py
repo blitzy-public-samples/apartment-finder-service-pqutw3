@@ -2,7 +2,15 @@
 
 Every error reply must carry the same envelope, withhold internal
 detail, and quote a correlation identifier the server log repeats.
+
+Two channels are checked, not one. The reply is checked for internal
+detail, and the server record is checked for text the caller supplied or
+a provider returned: a request path, a request method, an undeclared key
+name, a driver diagnostic and a statement. The record is also checked
+where it is written, because ``caplog`` attaches to the root logger and
+proves only that a message was built.
 """
+import io
 import json
 import logging
 from contextlib import contextmanager
@@ -21,7 +29,17 @@ from backend.app.core.security import (
 from backend.app.db.database import engine as application_engine
 from backend.app.db.database import get_db
 from backend.app.db.models import Base, User
-from backend.app.main import app
+from backend.app.main import (
+    _APPLICATION_LOGGER_NAME,
+    _ApplicationLogHandler,
+    _JOINED_LINE_MARKER,
+    _LOG_LEVEL,
+    _UNMATCHED_ROUTE,
+    _UNSERVED_METHOD,
+    _configure_application_logging,
+    app,
+    logger as application_logger,
+)
 
 # SEC-08: the key set every handler registered in backend/app/main.py
 # emits, whatever the status
@@ -97,8 +115,112 @@ _ALLOW_ORIGIN_HEADER = "Access-Control-Allow-Origin"
 _ALLOW_CREDENTIALS_HEADER = "Access-Control-Allow-Credentials"
 
 # SEC-08: the detail the duplicate-address guard raises. The boundary
-# replaces it with the status phrase, so it must not reach the caller.
+# replaces it with the status phrase; it reaches no caller.
 _DUPLICATE_INTERNAL_DETAIL = "Email already registered"
+
+# SEC-08: the text a PostgreSQL driver returns when a unique constraint
+# rejects a row. The diagnostic line quotes the column value, so the
+# provider hands back content the caller submitted.
+PLANTED_ROW_ADDRESS = "zzz-planted-row-6021@example.com"
+PLANTED_ROW_SECRET = "zzz-planted-row-value-6022"
+PLANTED_CONSTRAINT = "zzz_planted_unique_6023"
+PLANTED_STATEMENT = (
+    "INSERT INTO zzz_planted_6024 (email, hashed_password) VALUES "
+    "(%(email)s, %(hashed_password)s)"
+)
+PLANTED_SQLSTATE = "23505"
+
+# SEC-08: the request line a caller controls. A path segment and a query
+# value are attacker-chosen text; the record must name the route the
+# server matched instead (CWE-117).
+PLANTED_PATH = "/missing/{0}/{1}".format(
+    PLANTED_BEARER, PLANTED_ROW_ADDRESS
+)
+PLANTED_METHOD = "ZZZMETHOD-6025"
+PLANTED_QUERY_VALUE = "zzz-planted-query-6026"
+
+
+class _DuplicateAddress(Exception):
+    """A driver exception shaped like the one psycopg2 raises.
+
+    The message carries the constraint name and a diagnostic line quoting
+    the rejected column value, which is the shape that makes rendering a
+    database exception into a disclosure.
+    """
+
+    pgcode = PLANTED_SQLSTATE
+
+    def __str__(self):
+        return (
+            'duplicate key value violates unique constraint "{0}"\n'
+            'DETAIL:  Key (email)=({1}) already exists.\n'.format(
+                PLANTED_CONSTRAINT, PLANTED_ROW_ADDRESS
+            )
+        )
+
+
+def _driver_rejection():
+    """Return an IntegrityError carrying driver text and bound values."""
+    return IntegrityError(
+        PLANTED_STATEMENT,
+        {
+            "email": PLANTED_ROW_ADDRESS,
+            "hashed_password": PLANTED_ROW_SECRET,
+        },
+        _DuplicateAddress(),
+    )
+
+
+def _rejection_caught_and_reraised():
+    """Return a plain error whose context is a driver rejection.
+
+    A driver failure caught and re-raised as an ordinary error reaches the
+    generic handler, which renders the whole formatted report - including
+    the context exception's own message.
+    """
+    try:
+        raise _driver_rejection()
+    except SQLAlchemyError:
+        try:
+            raise RuntimeError(EXCEPTION_TEXT_SENTINEL)
+        except RuntimeError as reraised:
+            return reraised
+
+
+def _assert_no_provider_text(text):
+    """Assert one text quotes no driver diagnostic and no statement."""
+    for planted in (
+        PLANTED_ROW_ADDRESS,
+        PLANTED_ROW_SECRET,
+        PLANTED_CONSTRAINT,
+        PLANTED_STATEMENT,
+        "DETAIL:",
+        "duplicate key value",
+        "INSERT INTO zzz_planted_6024",
+    ):
+        assert planted not in text, planted
+
+
+def _owned_handler():
+    """Return the single diagnostic handler this application installs."""
+    owned = [
+        handler
+        for handler in logging.getLogger(_APPLICATION_LOGGER_NAME).handlers
+        if isinstance(handler, _ApplicationLogHandler)
+    ]
+    assert len(owned) == 1
+    return owned[0]
+
+
+def _record_naming(caplog, error_id):
+    """Return the single record quoting one correlation identifier."""
+    matching = [
+        record
+        for record in caplog.records
+        if error_id in record.getMessage()
+    ]
+    assert len(matching) == 1
+    return matching[0]
 
 
 def _bearer(token):
@@ -315,8 +437,8 @@ def test_a_body_that_is_not_json_reports_no_byte_offset(client):
     # SEC-08: an offset is a measurement of the body, never a field name
     assert body["fields"] == []
     # SEC-08: no number reaches the caller at all. The correlation
-    # identifier is excluded because it is random hex and carries no
-    # information about the request.
+    # identifier is excluded; it is random hex carrying no information
+    # about the request.
     reportable = json.dumps(
         {key: value for key, value in body.items() if key != "error_id"}
     )
@@ -378,7 +500,7 @@ def test_a_lost_unique_address_race_answers_bad_request(
     # SEC-08: the raised detail is replaced by the status phrase
     assert _DUPLICATE_INTERNAL_DETAIL not in response.text
     _assert_no_internal_detail(response.text)
-    # SEC-08: the open transaction is discarded rather than left behind
+    # SEC-08: the failed request's transaction is rolled back
     assert views and views[-1].rolled_back
 
 
@@ -642,7 +764,7 @@ def test_the_diagnostic_record_redacts_a_configured_secret(
     assert EXCEPTION_TEXT_SENTINEL in message
     assert REDACTION_MARKER in message
 
-    # SEC-08: the held values are read when the record is built, so a value
+    # SEC-08: the held values are read when the record is built; a value
     # rotated after import is still removed
     for name, value in held.items():
         if name == "DATABASE_URL":
@@ -750,3 +872,199 @@ def test_the_harness_session_override_survives_a_forced_failure(
     restored = client.get("/listings/")
     assert restored.status_code == 200
     assert restored.json() == []
+
+
+def test_a_database_error_withholds_the_driver_diagnostic(
+    client, failing_database, caplog
+):
+    """The record diagnoses a rejected row without quoting it.
+
+    A driver diagnostic names the column and the value that failed, and
+    the statement names the table and the row it wrote. Neither is a
+    server fact: both are the request, handed back by the provider.
+    """
+    caplog.set_level(logging.ERROR)
+    with failing_database(_driver_rejection()):
+        response = client.get("/listings/")
+
+    assert response.status_code == 500
+    body = _assert_uniform_envelope(response)
+    assert body["detail"] == GENERIC_SERVER_DETAIL
+    message = _record_naming(caplog, body["error_id"]).getMessage()
+
+    # SEC-08: the record identifies the failure by type and SQLSTATE
+    assert "sqlalchemy.exc.IntegrityError" in message
+    assert "_DuplicateAddress" in message
+    assert "sqlstate={0}".format(PLANTED_SQLSTATE) in message
+    assert "origin=" in message
+
+    # SEC-08: and quotes no provider text, on either channel
+    _assert_no_provider_text(message)
+    _assert_no_provider_text(caplog.text)
+    _assert_no_provider_text(response.text)
+    _assert_no_internal_detail(response.text)
+
+
+def test_a_reraised_database_error_withholds_the_driver_diagnostic(
+    client, failing_database, caplog
+):
+    """A rendered report drops the driver text its context carries.
+
+    The generic handler formats the whole exception report, so a driver
+    rejection caught and re-raised is still rendered - through the
+    context exception's own message and bound parameters.
+    """
+    caplog.set_level(logging.ERROR)
+    with failing_database(_rejection_caught_and_reraised()):
+        response = client.get("/listings/")
+
+    assert response.status_code == 500
+    body = _assert_uniform_envelope(response)
+    message = _record_naming(caplog, body["error_id"]).getMessage()
+
+    # SEC-08: the diagnosis survives - both exceptions and the traceback
+    assert "Traceback (most recent call last)" in message
+    assert EXCEPTION_TEXT_SENTINEL in message
+    assert "sqlalchemy.exc.IntegrityError" in message
+
+    # SEC-08: the rendered statement and parameter blocks are emptied
+    assert "[SQL: {0}]".format(REDACTION_MARKER) in message
+    assert "hide_parameters=True" in message
+
+    _assert_no_provider_text(message)
+    _assert_no_provider_text(caplog.text)
+    _assert_no_provider_text(response.text)
+    _assert_no_internal_detail(response.text)
+
+
+def test_an_unmatched_route_answers_the_sanitized_404(client, caplog):
+    """A path that matches nothing answers the shared envelope.
+
+    The reply is checked for the envelope, and the record is checked for
+    the path: an unmatched request line is entirely caller-supplied, so
+    writing it verbatim forges log content (CWE-117).
+    """
+    caplog.set_level(logging.WARNING)
+    response = client.get(PLANTED_PATH)
+
+    assert response.status_code == 404
+    body = _assert_uniform_envelope(response)
+    assert body["detail"] == "Not Found"
+    assert body["fields"] == []
+    _assert_no_internal_detail(response.text)
+
+    message = _record_naming(caplog, body["error_id"]).getMessage()
+    assert "status=404" in message
+    # SEC-08: no route matched, so the record names the marker
+    assert _UNMATCHED_ROUTE in message
+    for planted in (PLANTED_BEARER, PLANTED_ROW_ADDRESS, PLANTED_PATH):
+        assert planted not in message, planted
+        assert planted not in caplog.text, planted
+        assert planted not in response.text, planted
+
+
+def test_an_unserved_method_names_the_marker_not_the_method(client, caplog):
+    """A method the route does not serve is named by a marker."""
+    caplog.set_level(logging.WARNING)
+    response = client.request(PLANTED_METHOD, "/listings/")
+
+    assert response.status_code == 405
+    body = _assert_uniform_envelope(response)
+    assert body["detail"] == "Method Not Allowed"
+
+    message = _record_naming(caplog, body["error_id"]).getMessage()
+    assert "status=405" in message
+    # SEC-08: the verb is caller-supplied text, the route is not
+    assert _UNSERVED_METHOD in message
+    assert "/listings/" in message
+    assert PLANTED_METHOD not in message
+    assert PLANTED_METHOD not in caplog.text
+    assert PLANTED_METHOD not in response.text
+
+
+def test_a_matched_route_names_the_template_not_the_query(client, caplog):
+    """A rejected query value stays out of the record."""
+    caplog.set_level(logging.WARNING)
+    response = client.get(
+        "/listings/", params={"limit": PLANTED_QUERY_VALUE}
+    )
+
+    assert response.status_code == 422
+    body = _assert_uniform_envelope(response)
+    # SEC-08: the caller is told which field was rejected
+    assert body["fields"] == ["limit"]
+    assert PLANTED_QUERY_VALUE not in response.text
+
+    message = _record_naming(caplog, body["error_id"]).getMessage()
+    # SEC-08: the matched route reaches the record, the query does not
+    assert "/listings/" in message
+    assert "fields=limit" in message
+    assert PLANTED_QUERY_VALUE not in message
+    assert PLANTED_QUERY_VALUE not in caplog.text
+
+
+def test_the_application_logger_owns_a_configured_handler():
+    """The package logger carries a handler, a level and a format.
+
+    A server that configures only its own loggers leaves this package on
+    the last-resort handler, which emits the message alone - no level, no
+    timestamp and no logger name to file the record under (CWE-778).
+    """
+    package_logger = logging.getLogger(_APPLICATION_LOGGER_NAME)
+    assert package_logger.level == _LOG_LEVEL
+
+    handler = _owned_handler()
+    assert handler.level == _LOG_LEVEL
+    assert isinstance(handler.formatter, logging.Formatter)
+    assert handler.stream is not None
+
+    # SEC-08: every module logger resolves to it, and propagation is
+    # left intact so a deployment may add its own sink above
+    assert application_logger.name.startswith(
+        "{0}.".format(_APPLICATION_LOGGER_NAME)
+    )
+    assert application_logger.propagate is True
+    assert application_logger.getEffectiveLevel() == _LOG_LEVEL
+
+    # SEC-08: repeated configuration attaches no second handler
+    _configure_application_logging()
+    assert _owned_handler() is handler
+
+
+def test_the_owned_handler_records_one_line_without_a_root_handler(
+    client, failing_database
+):
+    """A diagnosed failure reaches the owned sink as a single line."""
+    handler = _owned_handler()
+    root_logger = logging.getLogger()
+    held_handlers = list(root_logger.handlers)
+    held_stream = handler.stream
+    captured = io.StringIO()
+
+    root_logger.handlers = []
+    handler.stream = captured
+    try:
+        with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
+            response = client.get("/listings/")
+    finally:
+        handler.stream = held_stream
+        root_logger.handlers = held_handlers
+
+    assert response.status_code == 500
+    error_id = response.json()["error_id"]
+    written = captured.getvalue()
+
+    # SEC-08: one record, one line, whatever the deployment configures
+    lines = written.splitlines()
+    assert len(lines) == 1
+    line = lines[0]
+    assert error_id in line
+    assert "ERROR" in line
+    assert application_logger.name in line
+
+    # SEC-08: the traceback is joined rather than split, so a collector
+    # keeps the diagnosis attached to the identifier
+    assert _JOINED_LINE_MARKER in line
+    assert "Traceback (most recent call last)" in line
+    assert EXCEPTION_TEXT_SENTINEL in line
+    assert EXCEPTION_TEXT_SENTINEL not in response.text

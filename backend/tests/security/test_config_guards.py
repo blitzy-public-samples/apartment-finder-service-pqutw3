@@ -1,5 +1,5 @@
 """Configuration guards for the payment environment, the signing key and
-database transport, and the authorization of a payment reference.
+database transport, and the subscription charge seam.
 
 The validation cases build ``Settings`` directly for each guarded
 setting - the payment environment, the signing key length, the signing
@@ -7,35 +7,36 @@ algorithm, the token lifetime, the login-throttle threshold and window,
 and the database transport mode - and inspect the field named in the
 validation error it raises.
 
-The transport cases execute ``backend/app/db/database.py`` against each
-database URL form and inspect the engine it builds; no case establishes a
-live encrypted database connection. The payment cases execute
+The database transport mode carries an explicit value in place of the
+driver's negotiated default; it is not restricted to a closed set of
+values. The transport cases execute ``backend/app/db/database.py`` against
+each database URL form and inspect the engine it builds; no case
+establishes a live encrypted database connection. The payment cases execute
 ``backend/app/services/paypal_service.py`` with the provider library
 replaced, so the configured environment reaches the code that calls the
 provider.
 
-The authorization cases drive ``process_payment`` against fixed provider
-payloads. A reference authorizes a charge only when the state, the total,
-the reported unit, the payer and, for a reusable billing agreement, the
-bound plan all match, and it authorizes one charge and no more. The
-consumption ledger holds per-process state, so a second worker keeps its
-own; the multi-worker limitation is recorded in the decision log under
-SEC-09.
-
-The route cases post to ``/subscriptions/`` and check the plan the
-endpoint hands to the verifier, along with the charge that plan admits
-and the charge it refuses.
+The charge cases drive ``process_payment`` through the signature
+``backend/app/api/endpoints/subscriptions.py`` calls, and drive the route
+itself. The seam carries no trusted plan, price or authenticated identity,
+so it authorizes nothing; the refusal and the absent local ledger are
+recorded in the decision log under SEC-09.
 """
 import asyncio
 import importlib.util
 import inspect
-import time
+import logging
+import os
+import re
+import shlex
+import stat
+from http import HTTPStatus
+import subprocess
+from pathlib import Path
 from unittest import mock
 
 import paypalrestsdk
-import paypalrestsdk.api
 import pytest
-import requests
 from pydantic import VERSION as PYDANTIC_VERSION
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event
@@ -48,6 +49,7 @@ from backend.app.core.config import (
     settings,
 )
 from backend.app.db import database
+from backend.app.db.models import Subscription as SubscriptionModel
 from backend.app.services import paypal_service
 
 # SEC-10: URL forms reaching each branch of the database.py conditional
@@ -68,8 +70,7 @@ LIBPQ_SSLMODES = (
 
 # SEC-10: values outside the driver's domain - a misspelling, a wrong
 # case, a padded spelling, an unknown word, the wildcard and the empty
-# string. A downgrade to a negotiated mode would still be inside the
-# domain, so a typo is the shape that has to be caught here.
+# string
 REJECTED_SSLMODES = (
     "",
     "requier",
@@ -97,6 +98,267 @@ KEY_CHARACTER = "a"
 LONG_KEY = KEY_CHARACTER * 64
 
 SIGNING_KEY_FIELD = "SECRET_KEY"
+
+# AAP 0.1.4: the eight environment variable names the user froze. Written
+# out rather than read from Settings.__fields__, because a set derived
+# from the model agrees with whatever the model declares - including a
+# frozen name renamed, retyped or dropped. New settings are additive, so
+# this tuple does not grow with them.
+FROZEN_SETTING_NAMES = (
+    "DATABASE_URL",
+    "SECRET_KEY",
+    "ALGORITHM",
+    "ACCESS_TOKEN_EXPIRE_MINUTES",
+    "ZILLOW_API_KEY",
+    "PAYPAL_CLIENT_ID",
+    "PAYPAL_CLIENT_SECRET",
+    "SENTRY_DSN",
+)
+
+FROZEN_SETTING_COUNT = 8
+
+# The one frozen name the model does not require. An empty value is a
+# valid choice for it: no error reporter is configured.
+OPTIONAL_FROZEN_NAME = "SENTRY_DSN"
+
+# Every path below is resolved from this file, so it holds whether pytest
+# runs from the repository root or from backend/ as ci.yml does.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+
+# SEC-12: the template that documents every variable by name and carries
+# no secret value
+ENVIRONMENT_TEMPLATE = REPOSITORY_ROOT / ".env.example"
+
+# SEC-01/SEC-12: the workflow carrying the credential scan, and the two
+# paths that scan formerly excluded. An exclusion made the gate blind to
+# any credential committed into either file, so the scan is read from the
+# workflow here and exercised in both directions.
+WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+FORMERLY_EXCLUDED_PATHS = (".github/workflows/ci.yml", "SECURITY.md")
+EXCLUSION_PATHSPEC = ":(exclude)"
+
+# CWE-1104: the dependency advisory gate. Every suppressed advisory is
+# unpatchable on the pinned Python version, so the register is complete
+# rather than growing; a new advisory fails the build.
+AUDIT_STEP_NAME = "Audit Python dependencies"
+AUDIT_STEP_FLAGS = ("--strict", "--no-deps")
+FROZEN_CLOSURE_COMMAND = "pip freeze > /tmp/frozen.txt"
+RUNNER_DEPENDENT_FREEZE_FLAG = "pip freeze --all"
+EXPECTED_SUPPRESSION_COUNT = 15
+
+# a step's own lines are indented deeper than its header
+STEP_BODY_INDENT = " " * 6
+
+# the two identifier namespaces the register uses. One advisory carries no
+# PYSEC identifier at all, which is why the second form is accepted.
+ADVISORY_IDENTIFIER = re.compile(
+    r"PYSEC-[0-9]{4}-[0-9]+|GHSA(?:-[2-9a-hjkmnp-z]{4}){3}"
+)
+
+# One line per credential shape the scan detects. Every value is invented
+# here and appears in no configuration. Each is assembled from fragments
+# so that this file - which the scan now reads like any other tracked
+# file - does not itself carry the text the scan looks for.
+CREDENTIAL_POSITIVE_CONTROLS = (
+    pytest.param(
+        "DATABASE_URL=postgresql://postgres" + ":" + "postgres@db:5432/app",
+        id="default-credential-pair",
+    ),
+    pytest.param(
+        "CREATE USER app WITH PASS" + "WORD 'seeded-role-secret';",
+        id="inline-sql-password-literal",
+    ),
+    pytest.param(
+        "SECRET_KEY=" + "seeded0signing0key0value",
+        id="assigned-signing-key",
+    ),
+    pytest.param(
+        "postgresql://svc:pass" + "word@db.internal:5432/appdb",
+        id="url-embedded-password",
+    ),
+)
+
+# Documented placeholders the scan must pass over. A template that named
+# every variable but tripped the gate would force the exclusions back.
+CREDENTIAL_NEGATIVE_CONTROLS = (
+    pytest.param(
+        "SECRET_KEY=<random-secret-min-32-chars>", id="template-key"
+    ),
+    pytest.param(
+        "DATABASE_URL=postgresql://<db-user>:<db-password>"
+        "@<db-host>:5432/<db-name>",
+        id="template-url",
+    ),
+    pytest.param(
+        "PAYPAL_CLIENT_SECRET=<paypal-client-secret>", id="template-paypal"
+    ),
+    pytest.param("SENTRY_DSN=", id="template-empty-value"),
+)
+
+# Rule 1: the register that justifies every suppressed advisory, and the
+# one condition under which all of them are re-measured
+DECISION_LOG = (
+    REPOSITORY_ROOT / "documentation" / "security" / "decision-log.md"
+)
+REVIEW_TRIGGER = "a Python runtime upgrade"
+
+# SEC-01/SEC-11: the developer provisioning script. No case runs it - it
+# creates databases and cluster roles - so its guards are read as text.
+PROVISIONING_SCRIPT = REPOSITORY_ROOT / "scripts" / "setup_dev_environment.sh"
+
+# SEC-11: every privilege the application role is granted. Data operations
+# on the owner's tables, and nothing that changes the schema.
+APP_ROLE_GRANTS = (
+    "GRANT CONNECT ON DATABASE dbname TO app_user;",
+    "GRANT USAGE ON SCHEMA public TO app_user;",
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public"
+    " TO app_user;",
+    "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;",
+)
+
+# SEC-11: the same data operations on tables the owner creates later, so a
+# later table does not silently arrive unreachable or over-shared
+APP_ROLE_DEFAULT_PRIVILEGES = (
+    "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public"
+    " GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;",
+    "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public"
+    " GRANT USAGE, SELECT ON SEQUENCES TO app_user;",
+)
+
+# SEC-11: the application role is created with a login and nothing else
+APP_ROLE_CREATION = "CREATE ROLE app_user WITH LOGIN"
+
+# SEC-11: schema public grants CREATE to PUBLIC by default, which would
+# hand the application role the DDL the grants above withhold
+REVOKED_FROM_PUBLIC = "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
+
+# SEC-11: the owner role performs schema work
+OWNER_ROLE_GRANT = "GRANT CREATE, USAGE ON SCHEMA public TO app_owner;"
+
+# SEC-11: privileges no provisioning statement may confer
+FORBIDDEN_PROVISIONING_SQL = (
+    "GRANT ALL",
+    "SUPERUSER",
+    "CREATEDB",
+    "CREATEROLE",
+    "BYPASSRLS",
+    "GRANT CREATE ON SCHEMA public TO app_user",
+)
+
+# SEC-11: a role password quoted directly after the keyword would be a
+# credential in a tracked file. The script passes values as psql variables
+# instead, so the keyword is followed by a colon. The fragments keep this
+# expression out of the repository credential scan's way.
+SQL_PASSWORD_LITERAL = re.compile("PASS" + "WORD +'")
+
+# SEC-11: the two forms that would place a role password in an argument
+# list, where any local process can read it
+ARGUMENT_LIST_PASSWORD_FORMS = ("-v owner_pw=", "-v app_pw=")
+
+# SEC-01: the guards that keep the generated secret file unreadable by
+# another user, and keep a symlink at .env from being written through
+SECRET_FILE_GUARDS = (
+    pytest.param("umask 077", id="owner-only-creation-mask"),
+    pytest.param("mktemp ./.env.tmp.XXXXXXXX", id="unpredictable-temp-name"),
+    pytest.param("trap 'rm -f \"$env_tmp\"' EXIT", id="temp-file-cleanup"),
+    pytest.param('chmod 600 "$env_tmp"', id="restricted-before-install"),
+    pytest.param('mv -f "$env_tmp" .env', id="atomic-install"),
+    pytest.param("secrets.token_urlsafe(48)", id="generated-signing-key"),
+    pytest.param("^[A-Za-z0-9_-]+$", id="generated-password-charset"),
+)
+
+# SEC-01: writing the secrets straight to the destination is the shape the
+# guards above replace
+DIRECT_SECRET_WRITE = "EOF > .env"
+
+# SEC-01/SEC-11: main runs these in this order, each stopping the run on
+# failure. The interpreter is prepared before anything uses it, and the
+# credentials exist before the roles that carry them.
+PROVISIONING_ORDER = (
+    "setup_virtual_env || exit 1",
+    "install_dependencies || exit 1",
+    "configure_env_vars || exit 1",
+    "init_database || exit 1",
+)
+
+# SEC-11: the grant batch reaches psql on standard input, and a failed
+# batch stops the run rather than leaving half-provisioned roles behind
+PSQL_INVOCATION = "} | psql -v ON_ERROR_STOP=1 -d dbname"
+GRANT_BATCH_STATUS = '[ "${PIPESTATUS[1]}" -ne 0 ]'
+
+# SEC-01/SEC-11: every command whose failure would leave the run
+# provisioning against state that does not exist (CWE-252)
+GUARDED_COMMANDS = (
+    "python3 -m venv venv",
+    "source venv/bin/activate",
+    'python3 -m pip install -r "$repo_root/backend/requirements.txt"',
+    "check_schema_prerequisites",
+    "createdb dbname",
+    'chmod 600 "$env_tmp"',
+    'mv -f "$env_tmp" .env',
+    "create_schema_as_owner",
+)
+
+# SEC-01/SEC-11: the two ways a step ends the run rather than continuing
+FAILURE_CONTROLS = ("return 1", "exit 1")
+
+# SEC-11: the manifest is resolved from the script's own location, so the
+# install does not depend on the directory the operator ran it from
+BACKEND_MANIFEST = '-r "$repo_root/backend/requirements.txt"'
+SCRIPT_RELATIVE_ROOT = (
+    'repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1'
+)
+
+# SEC-11: the owner role creates every schema object, so the application
+# role needs no DDL privilege to reach a populated database
+OWNER_BOOTSTRAP = "create_schema_as_owner"
+OWNER_BOOTSTRAP_PREREQUISITES = "check_schema_prerequisites"
+OWNER_CREDENTIAL_VARIABLE = "OWNER_DATABASE_URL"
+OWNER_SCHEMA_CREATION = "Base.metadata.create_all(bind=engine)"
+
+# SEC-10/SEC-11: the infrastructure declarations that carry the server
+# half of transport encryption and the separated application role. No
+# runtime case can reach them, so they are read as text.
+TERRAFORM_DIRECTORY = REPOSITORY_ROOT / "infrastructure" / "terraform"
+TERRAFORM_MAIN = TERRAFORM_DIRECTORY / "main.tf"
+TERRAFORM_VARIABLES = TERRAFORM_DIRECTORY / "variables.tf"
+
+# the resource type and local name of each gated declaration
+CLOUD_SQL_INSTANCE = ("google_sql_database_instance", "main")
+CLOUD_SQL_USER = ("google_sql_user", "app")
+
+# SEC-10: the only instance transport setting that refuses an unencrypted
+# connection. The alternatives permit one, so the value is exact.
+REQUIRED_SSL_MODE = "ENCRYPTED_ONLY"
+QUOTED_SSL_MODE = '"{0}"'.format(REQUIRED_SSL_MODE)
+
+# AAP 0.5.10: the superseded argument this configuration must not use
+DEPRECATED_SSL_ARGUMENT = "require_ssl"
+
+DECLARED_DATABASE_VERSION = "POSTGRES_13"
+QUOTED_DATABASE_VERSION = '"{0}"'.format(DECLARED_DATABASE_VERSION)
+
+# SEC-11: the input variables the application role draws its identity
+# from, so that no credential appears in a tracked file
+APP_ROLE_NAME_VARIABLE = "db_app_user"
+APP_ROLE_PASSWORD_VARIABLE = "db_app_password"
+APP_ROLE_NAME_REFERENCE = "var.{0}".format(APP_ROLE_NAME_VARIABLE)
+APP_ROLE_PASSWORD_REFERENCE = "var.{0}".format(APP_ROLE_PASSWORD_VARIABLE)
+
+# SEC-12: the write-only argument carrying the password, the counter that
+# makes a rotation reapply it, and the state-persisting argument that must
+# stay absent
+APP_ROLE_PASSWORD_ARGUMENT = "password_wo"
+APP_ROLE_PASSWORD_VERSION_ARGUMENT = "password_wo_version"
+APP_ROLE_PASSWORD_VERSION_VARIABLE = "db_app_password_version"
+STATE_PERSISTING_PASSWORD_ARGUMENT = "password ="
+
+# SEC-11: the least-privilege role the account is assigned, named through a
+# variable so no role name is a literal in the declaration
+APP_ROLE_GRANTED_ROLE_VARIABLE = "db_app_role"
+APP_ROLE_GRANTED_ROLE_REFERENCE = "[var.{0}]".format(
+    APP_ROLE_GRANTED_ROLE_VARIABLE
+)
 
 
 def valid_settings_kwargs(**overrides):
@@ -207,6 +469,13 @@ class StubPayment:
         return dict(self.created)
 
 
+# Every engine a probe builds is registered here so the autouse fixture
+# below can dispose it. Executing the database module creates a connection
+# pool, and an undisposed pool holds its connections for the rest of the
+# session - one leak per parametrized case.
+_PROBE_ENGINES = []
+
+
 def load_database_module(url, sslmode):
     """Execute the application database module against one settings pair."""
     specification = importlib.util.spec_from_file_location(
@@ -217,12 +486,40 @@ def load_database_module(url, sslmode):
         settings, "DB_SSLMODE", sslmode
     ):
         specification.loader.exec_module(module)
+    probe_engine = getattr(module, "engine", None)
+    if probe_engine is not None:
+        _PROBE_ENGINES.append(probe_engine)
     return module
+
+
+@pytest.fixture(autouse=True)
+def dispose_probe_engines():
+    """Dispose every engine a probe built in this test.
+
+    The application engine is never registered, so it is untouched.
+    """
+    _PROBE_ENGINES.clear()
+    try:
+        yield
+    finally:
+        while _PROBE_ENGINES:
+            _PROBE_ENGINES.pop().dispose()
 
 
 def test_pinned_validation_library_is_the_one_x_line():
     """The installed validation library is the pinned 1.x line."""
     assert PYDANTIC_VERSION.startswith("1."), PYDANTIC_VERSION
+
+
+def _documented_setting_names():
+    """Return every variable name the environment template documents."""
+    assert ENVIRONMENT_TEMPLATE.is_file(), ENVIRONMENT_TEMPLATE
+    source = ENVIRONMENT_TEMPLATE.read_text(encoding="utf-8")
+    return {
+        line.split("=", 1)[0].strip()
+        for line in source.splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    }
 
 
 def test_baseline_kwargs_supply_every_required_field():
@@ -235,6 +532,82 @@ def test_baseline_kwargs_supply_every_required_field():
     missing = required - set(valid_settings_kwargs())
     assert not missing, missing
     build_settings()
+
+
+def test_the_frozen_setting_names_are_declared_unchanged():
+    """``Settings`` still declares each of the eight frozen names.
+
+    AAP 0.1.4 freezes these names, so renaming or dropping one breaks the
+    deployment contract even when the field behind it survives under
+    another name. The names are written out above this test; reading them
+    from the model instead would make the assertion agree with a rename.
+    """
+    declared = set(Settings.__fields__)
+
+    for name in FROZEN_SETTING_NAMES:
+        assert name in declared, name
+
+    # a name added to the tuple is a deliberate change to the frozen set
+    assert len(FROZEN_SETTING_NAMES) == FROZEN_SETTING_COUNT
+    assert len(set(FROZEN_SETTING_NAMES)) == FROZEN_SETTING_COUNT
+
+    # AAP 0.1.4: new settings are additive, so the model declares more
+    assert declared > set(FROZEN_SETTING_NAMES)
+
+    # the shared mapping supplies every frozen name the model requires,
+    # and the one it does not require stays optional
+    baseline = set(valid_settings_kwargs())
+    assert set(FROZEN_SETTING_NAMES) - baseline == {OPTIONAL_FROZEN_NAME}
+    assert not Settings.__fields__[OPTIONAL_FROZEN_NAME].required
+    for name in FROZEN_SETTING_NAMES:
+        if name != OPTIONAL_FROZEN_NAME:
+            assert Settings.__fields__[name].required, name
+
+
+def test_every_declared_setting_is_documented_by_name():
+    """The environment template names every setting the code reads.
+
+    SEC-12 requires each variable to be documented by name with no value.
+    A setting the template omits reaches an operator only as a startup
+    failure, and a name the template carries that the code no longer
+    reads sends an operator to configure nothing, so the parity is
+    asserted in both directions.
+    """
+    documented = _documented_setting_names()
+
+    for name in FROZEN_SETTING_NAMES:
+        assert name in documented, name
+
+    undocumented = set(Settings.__fields__) - documented
+    assert not undocumented, undocumented
+
+    unread = documented - set(Settings.__fields__)
+    assert not unread, unread
+
+
+@pytest.mark.parametrize("name", FROZEN_SETTING_NAMES)
+def test_each_frozen_name_is_the_variable_the_application_reads(
+    name, monkeypatch
+):
+    """Each frozen name is decisive in the process environment.
+
+    A field name in ``Settings`` is half the contract; what an operator
+    sets is an environment variable. Removing one frozen name from the
+    environment and rebuilding the settings shows which variable the
+    field reads, so a field bound to some other variable through an alias
+    fails here rather than satisfying a name check on the model alone.
+    """
+    monkeypatch.delenv(name, raising=False)
+
+    if name == OPTIONAL_FROZEN_NAME:
+        # SEC-12: no configured error reporter is a valid state
+        assert Settings(_env_file=None).SENTRY_DSN is None
+        return
+
+    with pytest.raises(ValidationError) as caught:
+        Settings(_env_file=None)
+    named = [error["loc"] for error in caught.value.errors()]
+    assert (name,) in named, named
 
 
 # SEC-09: payment environment domain
@@ -295,43 +668,18 @@ def test_payment_creation_configures_the_environment_it_is_given(
     assert recorded[0]["mode"] == settings.PAYPAL_MODE
 
 
-@pytest.mark.parametrize("mode", ["sandbox", "live"])
-def test_payment_lookup_configures_the_environment_it_is_given(
-    monkeypatch, mode
-):
-    """Looking a reference up configures the provider with the setting.
-
-    The second configuration call in the service is on the verification
-    path, where a wrong environment would report a payment as
-    unauthorized or authorize against the wrong ledger.
-    """
-    recorded = recorded_paypal_configuration(monkeypatch, mode)
-
-    def absent(_reference):
-        return None
-
-    monkeypatch.setattr(paypalrestsdk.Payment, "find", staticmethod(absent))
-    monkeypatch.setattr(
-        paypalrestsdk.BillingAgreement, "find", staticmethod(absent)
-    )
-
-    assert paypal_service._find_payment_resource("PAY-absent") is None
-    assert len(recorded) == 1
-    assert recorded[0]["mode"] == mode
-    assert recorded[0]["mode"] == settings.PAYPAL_MODE
-
-
+# SEC-09: the payment service reads the configured environment
 def test_the_payment_service_spells_no_environment_literal():
     """No source line in the payment service names an environment.
 
-    A literal is what SEC-09 removed, and the two configuration calls
-    are the sites that would carry it back.
+    A literal is what SEC-09 removed, and the configuration call is the
+    site that would carry it back.
     """
     with open(paypal_service.__file__, encoding="utf-8") as handle:
         source = handle.read()
 
     configured = source.count('"mode": settings.PAYPAL_MODE')
-    assert configured == 2, configured
+    assert configured == 1, configured
     for literal in ('"mode": "sandbox"', '"mode": "live"'):
         assert literal not in source, literal
 
@@ -446,11 +794,13 @@ def test_signing_key_at_the_algorithm_floor_is_accepted(
 
 # SEC-12: the floor counts UTF-8 bytes, not characters
 def test_a_multibyte_key_is_measured_in_bytes():
-    """A key long enough in characters but short in bytes is rejected.
+    """The signing-key floor is measured in bytes, not in characters.
 
-    Neither direction may be decided by character count: half as many
-    two-byte characters clears the strongest floor, and one character
-    fewer than that floor in one-byte characters does not.
+    Both directions are checked. A key of half as many two-byte
+    characters carries exactly the strongest floor in bytes and is
+    accepted, even though its character count sits below that floor. A
+    key one byte under the floor is rejected, even though its character
+    count clears the 32-character minimum the field itself declares.
     """
     strongest = max(HMAC_KEY_MIN_BYTES, key=HMAC_KEY_MIN_BYTES.get)
     floor = HMAC_KEY_MIN_BYTES[strongest]
@@ -524,9 +874,12 @@ def test_throttle_settings_default_to_the_specified_limit(monkeypatch):
 def test_sslmode_argument_breaks_a_sqlite_connection():
     """The SQLite driver rejects an sslmode argument when it connects."""
     engine = create_engine(SQLITE_URL, connect_args={"sslmode": "require"})
-    with pytest.raises(TypeError) as caught:
-        engine.connect()
-    assert "sslmode" in str(caught.value)
+    try:
+        with pytest.raises(TypeError) as caught:
+            engine.connect()
+        assert "sslmode" in str(caught.value)
+    finally:
+        engine.dispose()
 
 
 def test_application_sqlite_engine_opens_a_connection():
@@ -580,8 +933,8 @@ def test_transport_mode_defaults_to_require(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", LIBPQ_SSLMODES)
-def test_transport_mode_accepts_every_driver_defined_mode(mode):
-    """Each transport mode the database driver defines is accepted."""
+def test_transport_mode_carries_every_driver_defined_mode(mode):
+    """Each transport mode the database driver defines round-trips."""
     assert build_settings(DB_SSLMODE=mode).DB_SSLMODE == mode
 
 
@@ -611,413 +964,1136 @@ def test_the_accepted_transport_domain_matches_the_declared_one():
         assert build_settings(DB_SSLMODE=mode).DB_SSLMODE == mode
 
 
+# ---------------------------------------------------------------------
+# SEC-09: the production charge seam
+# ---------------------------------------------------------------------
+SUBSCRIPTION_PATH = "/subscriptions/"
+
+# SEC-09: a body SubscriptionCreate accepts, carrying a named plan
+CHARGE_BODY = {
+    "plan_id": "PLAN-A",
+    "payment_method": "paypal",
+    "amount": 10.0,
+    "start_date": "2030-01-01T00:00:00",
+    "end_date": "2030-02-01T00:00:00",
+}
+
+# SEC-08: the key set every error handler emits
+ENVELOPE_KEYS = {"detail", "error_id", "fields"}
+
+# SEC-09: name fragments of a reference or consumption ledger
+LEDGER_NAME_FRAGMENTS = ("reference", "consum", "claim")
+
+
+def _workflow_step(name):
+    """Return the lines belonging to one workflow step.
+
+    The step is its own header plus every line indented under it, so a
+    comment written between two steps belongs to neither.
+    """
+    assert WORKFLOW.is_file(), WORKFLOW
+    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+    header = "- name: {0}".format(name)
+    matching = [index for index, line in enumerate(lines) if header in line]
+    assert len(matching) == 1, matching
+
+    collected = [lines[matching[0]]]
+    for line in lines[matching[0] + 1:]:
+        if line.strip() and not line.startswith(STEP_BODY_INDENT):
+            break
+        collected.append(line)
+    return "\n".join(collected)
+
+
+# CWE-1104: the dependency advisory gate keeps a passing direction
+def test_the_dependency_audit_gate_keeps_its_shape():
+    """The audit step fails on any advisory outside its register.
+
+    The gate is only useful if it can pass and can fail. Its passing
+    direction depends on the register being complete, and its failing
+    direction on the register being exact, so the count is written out
+    here: a suppression added without a decision-log entry fails this
+    case. Each identifier is also shape-checked, because the audit tool
+    accepts an identifier it does not recognise and silently suppresses
+    nothing, which turns a typo into a hole rather than an error.
+    """
+    step = _workflow_step(AUDIT_STEP_NAME)
+
+    for flag in AUDIT_STEP_FLAGS:
+        assert flag in step, flag
+
+    # the audited set is the manifest closure. Widening it to the runner's
+    # own tooling makes the verdict a property of the image rather than of
+    # the manifest, and a suppression register pinned to that wider set
+    # goes stale the moment the image moves
+    assert FROZEN_CLOSURE_COMMAND in step
+    assert RUNNER_DEPENDENT_FREEZE_FLAG not in step
+
+    suppressed = re.findall(r"--ignore-vuln\s+(\S+)", step)
+    assert len(suppressed) == EXPECTED_SUPPRESSION_COUNT, suppressed
+    assert len(set(suppressed)) == EXPECTED_SUPPRESSION_COUNT, suppressed
+    for identifier in suppressed:
+        assert ADVISORY_IDENTIFIER.fullmatch(identifier), identifier
+
+
+# Rule 1: every suppression carries a justified entry in the register
+def test_every_suppressed_advisory_is_justified_in_the_decision_log():
+    """No advisory is suppressed without a register entry, and none spare.
+
+    Suppressing an advisory is accepting a risk, and an acceptance with
+    no recorded reachability assessment and no review trigger is how a
+    temporary exception becomes permanent. The register and the gate are
+    compared in both directions, so neither can move without the other:
+    an identifier added to the workflow alone fails here, and an entry
+    left in the register after its suppression is dropped fails here too.
+    """
+    assert DECISION_LOG.is_file(), DECISION_LOG
+    log = DECISION_LOG.read_text(encoding="utf-8")
+
+    suppressed = set(
+        re.findall(r"--ignore-vuln\s+(\S+)", _workflow_step(AUDIT_STEP_NAME))
+    )
+    registered = {
+        row[1]
+        for row in re.findall(
+            r"^\|\s*(\d+)\s*\|[^|]*\|\s*`(" + ADVISORY_IDENTIFIER.pattern
+            + r")`\s*\|",
+            log,
+            re.MULTILINE,
+        )
+    }
+
+    assert registered == suppressed, sorted(
+        registered.symmetric_difference(suppressed)
+    )
+
+    # the register states the shared review trigger it accepts them under
+    assert REVIEW_TRIGGER in log
+
+
+def _credential_scan_command():
+    """Return the one workflow line that runs the credential scan."""
+    assert WORKFLOW.is_file(), WORKFLOW
+    source = WORKFLOW.read_text(encoding="utf-8")
+    running = [line for line in source.splitlines() if "git grep" in line]
+    assert len(running) == 1, running
+    return running[0]
+
+
+def _credential_scan_pattern():
+    """Return the compiled pattern the workflow scans tracked files with."""
+    quoted = re.findall(r'-E\s+"([^"]+)"', _credential_scan_command())
+    assert len(quoted) == 1, quoted
+    return re.compile(quoted[0])
+
+
+def _tracked_files():
+    """Return every path the repository tracks."""
+    listed = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=str(REPOSITORY_ROOT),
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    return [
+        REPOSITORY_ROOT / name
+        for name in listed.stdout.decode("utf-8").split("\0")
+        if name
+    ]
+
+
+# SEC-01/SEC-12: the credential scan detects each shape it claims to
+@pytest.mark.parametrize("line", CREDENTIAL_POSITIVE_CONTROLS)
+def test_the_credential_scan_detects_each_credential_shape(line):
+    """Each credential shape the scan names is matched by it.
+
+    The pattern is read out of the workflow rather than copied here, so a
+    weakened alternative fails this case instead of passing a copy that
+    nothing runs.
+    """
+    assert _credential_scan_pattern().search(line), line
+
+
+# SEC-12: a documented placeholder is not a credential
+@pytest.mark.parametrize("line", CREDENTIAL_NEGATIVE_CONTROLS)
+def test_the_credential_scan_passes_over_documented_placeholders(line):
+    """A template line naming a variable without a value is not matched.
+
+    SEC-12 requires every variable to be documented by name. A pattern
+    that tripped on the template would force the template out of the
+    scan, which is how a scan stops covering the tree.
+    """
+    assert not _credential_scan_pattern().search(line), line
+
+
+def test_the_credential_scan_matches_no_part_of_its_own_source():
+    """The scan does not match the line that declares it.
+
+    Three of the four alternatives match their own written form, which is
+    why the scan previously excluded two files: without the exclusions it
+    reported its own source and failed every run. Each alternative is now
+    split by a one-character bracket expression, so the pattern matches
+    the same text without matching itself, and the exclusions are gone.
+    """
+    command = _credential_scan_command()
+    pattern = _credential_scan_pattern()
+
+    assert not pattern.search(command), command
+
+    # no path is excluded, so every tracked file is scanned
+    assert EXCLUSION_PATHSPEC not in command
+    for path in FORMERLY_EXCLUDED_PATHS:
+        assert path not in command
+
+
+def test_the_credential_scan_reports_nothing_across_tracked_content():
+    """No tracked file carries a credential the scan detects.
+
+    This is the gate's passing direction, executed over the same content
+    the workflow reads: every tracked file, none excluded. A document or
+    a workflow added later is covered without editing this case.
+    """
+    pattern = _credential_scan_pattern()
+    reported = []
+
+    for path in _tracked_files():
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, FileNotFoundError):
+            # the workflow passes -I, which skips binary content likewise
+            continue
+        for number, line in enumerate(content.splitlines(), 1):
+            if pattern.search(line):
+                reported.append(
+                    "{0}:{1}".format(path.relative_to(REPOSITORY_ROOT), number)
+                )
+
+    assert not reported, reported
+
+
+def _hcl_block(source, header):
+    """Return the body of the one block whose header is ``header``."""
+    assert source.count(header) == 1, header
+    opened = source.index("{", source.index(header))
+    depth = 0
+    index = opened
+    while index < len(source):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opened + 1:index]
+        index += 1
+    raise AssertionError("unterminated block: {0}".format(header))
+
+
+def _hcl_argument(body, name):
+    """Return the value one argument is assigned inside a block body."""
+    assigned = re.compile(
+        r"^\s*" + re.escape(name) + r"\s*=\s*(\S.*?)\s*$", re.MULTILINE
+    )
+    found = assigned.findall(body)
+    assert len(found) == 1, (name, found)
+    return found[0]
+
+
+def _terraform_resource(kind, name):
+    """Return the body of one declared infrastructure resource."""
+    assert TERRAFORM_MAIN.is_file(), TERRAFORM_MAIN
+    source = TERRAFORM_MAIN.read_text(encoding="utf-8")
+    return _hcl_block(source, 'resource "{0}" "{1}"'.format(kind, name))
+
+
+def _terraform_variable(name):
+    """Return the body of one declared input variable."""
+    assert TERRAFORM_VARIABLES.is_file(), TERRAFORM_VARIABLES
+    source = TERRAFORM_VARIABLES.read_text(encoding="utf-8")
+    return _hcl_block(source, 'variable "{0}"'.format(name))
+
+
+# SEC-10: the server half of transport encryption lives in infrastructure
+def test_the_database_instance_refuses_unencrypted_connections():
+    """The Cloud SQL instance declares encrypted-only transport.
+
+    Every other transport case here inspects the client half, the engine
+    argument the application sends. AAP 0.5.10 requires both ends, and
+    the server end exists only as a declaration that no runtime case can
+    reach. ``terraform validate`` cannot stand in for this: the directory
+    carries pre-existing references to resources it never declares, so
+    the whole-directory command fails for reasons unrelated to transport.
+    Reading the declaration is what leaves the server end covered.
+    """
+    instance = _terraform_resource(*CLOUD_SQL_INSTANCE)
+    ip_configuration = _hcl_block(
+        _hcl_block(instance, "settings"), "ip_configuration"
+    )
+
+    assert _hcl_argument(ip_configuration, "ssl_mode") == QUOTED_SSL_MODE
+
+    # AAP 0.5.10: the superseded argument is deprecated and unused, so a
+    # configuration relying on it would not enforce anything
+    assert DEPRECATED_SSL_ARGUMENT not in instance
+
+    # the gated instance is the PostgreSQL one the application connects to
+    assert _hcl_argument(
+        instance, "database_version"
+    ) == QUOTED_DATABASE_VERSION
+
+
+# SEC-11: the application role is separate and carries no literal secret
+def test_the_application_database_role_carries_no_literal_credential():
+    """The application role is declared with its password from a variable.
+
+    SEC-11 separates the application account from the instance admin
+    account. Every identifying argument arrives from an input variable, so
+    no credential and no role name sits in a tracked file. SEC-12 carries
+    the password through the write-only argument, so the value reaches
+    neither state nor a plan file, and the variable is sensitive and
+    ephemeral with no default.
+    """
+    role = _terraform_resource(*CLOUD_SQL_USER)
+
+    assert _hcl_argument(role, "name") == APP_ROLE_NAME_REFERENCE
+    password = _hcl_argument(role, APP_ROLE_PASSWORD_ARGUMENT)
+    assert password == APP_ROLE_PASSWORD_REFERENCE
+
+    # SEC-12: the state-persisting argument is absent, so no apply writes
+    # the password into the state file
+    assert STATE_PERSISTING_PASSWORD_ARGUMENT not in role
+
+    # SEC-12: without the counter a rotated password is never reapplied,
+    # which would leave the account on the value it was created with
+    assert _hcl_argument(
+        role, APP_ROLE_PASSWORD_VERSION_ARGUMENT
+    ) == "var.{0}".format(APP_ROLE_PASSWORD_VERSION_VARIABLE)
+
+    # a quoted value in either argument would be a credential in the file
+    assert '"' not in password
+    assert '"' not in _hcl_argument(role, "name")
+
+    # SEC-11: the least-privilege role is named through a variable
+    assert _hcl_argument(
+        role, "database_roles"
+    ) == APP_ROLE_GRANTED_ROLE_REFERENCE
+
+    # the role attaches to the instance the case above gates
+    assert _hcl_argument(role, "instance") == "{0}.{1}.name".format(
+        *CLOUD_SQL_INSTANCE
+    )
+
+    password_variable = _terraform_variable(APP_ROLE_PASSWORD_VARIABLE)
+    assert _hcl_argument(password_variable, "sensitive") == "true"
+    assert _hcl_argument(password_variable, "type") == "string"
+    # SEC-12: an ephemeral value is held for the run only
+    assert _hcl_argument(password_variable, "ephemeral") == "true"
+    # a default would put a password in the file the variable exists to
+    # keep it out of
+    assert "default" not in password_variable
+
+    name_variable = _terraform_variable(APP_ROLE_NAME_VARIABLE)
+    assert _hcl_argument(name_variable, "type") == "string"
+
+    role_variable = _terraform_variable(APP_ROLE_GRANTED_ROLE_VARIABLE)
+    assert _hcl_argument(role_variable, "type") == "string"
+
+
+def _provisioning_source():
+    """Return the developer provisioning script as text."""
+    assert PROVISIONING_SCRIPT.is_file(), PROVISIONING_SCRIPT
+    return PROVISIONING_SCRIPT.read_text(encoding="utf-8")
+
+
+def _shell_function(name):
+    """Return the body of one function the provisioning script defines."""
+    source = _provisioning_source()
+    header = "\n{0}() {{\n".format(name)
+    assert source.count(header) == 1, name
+    body = source[source.index(header) + len(header):]
+    closed = body.index("\n}\n")
+    return body[:closed]
+
+
+def _provisioning_statements():
+    """Return the SQL statements the provisioning script sends to psql.
+
+    The batch is a quoted here-document, so the shell performs no
+    expansion on it and the tracked bytes are the statements the server
+    receives. Each statement is returned on one line, as shipped.
+    """
+    body = _shell_function("init_database")
+    opened = "cat <<'SQL'\n"
+    assert body.count(opened) == 1, opened
+    batch = body[body.index(opened) + len(opened):]
+    closed = batch.index("\nSQL\n")
+    return [line for line in batch[:closed].splitlines() if line.strip()]
+
+
+# SEC-11: the application role reaches table data and nothing else
+def test_the_application_role_is_granted_data_access_only():
+    """Every privilege the application role receives is a data operation.
+
+    SEC-11 replaces one account holding every privilege on the database
+    with two roles. The comparison is a set equality rather than a
+    presence check, so a privilege added to the application role later
+    fails this case instead of passing unnoticed. Nothing here runs the
+    script; it creates cluster roles, so the shipped statements are read.
+    """
+    statements = _provisioning_statements()
+    granted = [line for line in statements if "app_user" in line]
+
+    expected = set(APP_ROLE_GRANTS)
+    expected.update(APP_ROLE_DEFAULT_PRIVILEGES)
+    expected.add(APP_ROLE_CREATION)
+
+    # the creation statement carries a psql variable rather than a value,
+    # so it is compared by its privilege-bearing prefix
+    normalised = {
+        APP_ROLE_CREATION if line.startswith(APP_ROLE_CREATION) else line
+        for line in granted
+    }
+    assert normalised == expected, sorted(normalised.symmetric_difference(
+        expected
+    ))
+
+
+# SEC-11: the default grant on schema public would return the withheld DDL
+def test_the_default_public_schema_privilege_is_revoked():
+    """PUBLIC loses CREATE on schema public, and the owner keeps it.
+
+    A PostgreSQL 13 database grants CREATE on schema public to PUBLIC,
+    which every role holds. Granting the application role no DDL is
+    therefore not enough on its own: without this revoke the role creates
+    tables through the default grant. Revoking without granting the owner
+    explicitly would leave nobody able to create, so both statements are
+    required and the owner grant is the only CREATE on the schema.
+    """
+    statements = _provisioning_statements()
+
+    assert REVOKED_FROM_PUBLIC in statements
+    assert OWNER_ROLE_GRANT in statements
+
+    creating = [
+        line
+        for line in statements
+        if "SCHEMA public" in line and line.startswith("GRANT")
+        and "CREATE" in line
+    ]
+    assert creating == [OWNER_ROLE_GRANT], creating
+
+
+# SEC-11: no provisioning statement confers a broad privilege
+@pytest.mark.parametrize("privilege", FORBIDDEN_PROVISIONING_SQL)
+def test_the_provisioning_statements_confer_no_broad_privilege(privilege):
+    """No statement grants the privileges SEC-11 exists to remove.
+
+    The account this script used to create held every privilege on the
+    database. Each name below either restores that account or gives the
+    application role cluster-level authority, so each is checked against
+    the shipped statements case-insensitively.
+    """
+    batch = "\n".join(_provisioning_statements()).upper()
+
+    assert privilege.upper() not in batch, privilege
+
+
+# SEC-01/SEC-11: a role password in a tracked file is a disclosed password
+def test_the_provisioning_statements_carry_no_password_literal():
+    """Both role passwords reach the server as psql variables.
+
+    A generated value is only unexposed while it stays out of the file
+    that creates it. Each creation statement names a psql variable, which
+    the script assigns on standard input, so the tracked bytes carry no
+    password and the repository credential scan has nothing to report
+    here.
+    """
+    statements = _provisioning_statements()
+    batch = "\n".join(statements)
+
+    assert SQL_PASSWORD_LITERAL.search(batch) is None, batch
+
+    # each role is created with a variable reference, not a value
+    creating = [line for line in statements if line.startswith("CREATE ROLE")]
+    assert len(creating) == 2, creating
+    for line in creating:
+        assert ":'" in line, line
+
+
+# SEC-11: an argument list is readable by any local process (CWE-214)
+def test_the_role_passwords_never_enter_a_process_argument_list():
+    """The grant batch and its variable assignments arrive on stdin.
+
+    Passing either value with psql's own variable flag would place it in
+    an argument list, which any local process can read. The script writes
+    both assignments through the printf builtin, which runs inside the
+    shell and starts no process, and pipes them into psql ahead of the
+    quoted batch. The pipeline status of psql itself is checked, because
+    a pipeline reports only its last command by default and the batch is
+    the command that can fail.
+    """
+    body = _shell_function("init_database")
+
+    assert PSQL_INVOCATION in body
+    assert GRANT_BATCH_STATUS in body
+
+    for form in ARGUMENT_LIST_PASSWORD_FORMS:
+        assert form not in body, form
+
+    # both assignments are shell builtins reading from the script itself
+    assigning = [
+        line for line in body.splitlines() if line.strip().startswith("printf")
+    ]
+    assert len(assigning) == 2, assigning
+    for line in assigning:
+        assert "set owner_pw" in line or "set app_pw" in line, line
+
+    # neither value is expanded on the line that invokes psql
+    invocation = [
+        line for line in body.splitlines() if PSQL_INVOCATION in line
+    ]
+    assert len(invocation) == 1, invocation
+    assert "DB_OWNER_" not in invocation[0]
+    assert "DB_APP_" not in invocation[0]
+
+
+# SEC-01: the generated secret file is never readable by another user
+@pytest.mark.parametrize("guard", SECRET_FILE_GUARDS)
+def test_the_generated_secret_file_is_installed_under_a_restrictive_mask(
+    guard,
+):
+    """Each guard on the generated secret file is present as shipped.
+
+    Writing the values straight to the destination leaves a window in
+    which the file exists under the invoking user's default mask, and it
+    writes through any symlink already at that path. The script creates
+    an owner-only temporary file in the same directory, restricts it,
+    then renames it over the destination, which closes both.
+    """
+    assert guard in _shell_function("configure_env_vars"), guard
+
+
+def test_the_secrets_are_never_written_straight_to_the_destination():
+    """The here-document writes to the temporary file, not to .env.
+
+    This is the shape the guards above replace, so its absence is what
+    proves they are in the path rather than beside it.
+    """
+    body = _shell_function("configure_env_vars")
+
+    assert DIRECT_SECRET_WRITE not in body
+    assert 'cat << EOF > "$env_tmp"' in body
+
+
+# SEC-11: schema objects are owned by the role that holds DDL
+def test_the_schema_is_created_by_the_owner_role():
+    """The owner role creates the tables, over an environment credential.
+
+    The application role holds no DDL, so something else has to create
+    the schema. The owner bootstrap does, and its credential travels in
+    the environment of the interpreter it starts rather than in an
+    argument list. Its imports are checked before the first database
+    object exists, so a missing driver reports itself rather than leaving
+    a database with roles and no tables.
+    """
+    body = _shell_function(OWNER_BOOTSTRAP)
+
+    assert OWNER_CREDENTIAL_VARIABLE + "=" in body
+    assert 'os.environ["{0}"]'.format(OWNER_CREDENTIAL_VARIABLE) in body
+    assert OWNER_SCHEMA_CREATION in body
+
+    initialising = _shell_function("init_database")
+    assert "if ! {0}; then".format(OWNER_BOOTSTRAP) in initialising
+    assert "if ! {0}; then".format(
+        OWNER_BOOTSTRAP_PREREQUISITES
+    ) in initialising
+
+    # the prerequisite check runs before any database object is created
+    checked = initialising.index(OWNER_BOOTSTRAP_PREREQUISITES)
+    created = initialising.index("createdb dbname")
+    assert checked < created, (checked, created)
+
+    prerequisites = _shell_function(OWNER_BOOTSTRAP_PREREQUISITES)
+    for module in ("sqlalchemy", "psycopg2", "backend.app.db.models"):
+        assert 'importlib.import_module("{0}")'.format(module) in prerequisites
+
+
+# SEC-01/SEC-11: a failed step stops the run instead of continuing (CWE-252)
+def test_every_provisioning_step_stops_the_run_on_failure():
+    """Each step runs in order and aborts the run when it fails.
+
+    Order is load-bearing twice over. The interpreter is prepared and
+    populated before the credential step, which needs it to generate the
+    values, and the credentials exist before the roles that carry them.
+    Without the failure controls a broken step would leave the run
+    provisioning roles against credentials it never wrote.
+    """
+    body = _shell_function("main")
+    positions = []
+
+    for step in PROVISIONING_ORDER:
+        assert body.count(step) == 1, step
+        positions.append(body.index(step))
+
+    assert positions == sorted(positions), positions
+
+
+# SEC-01/SEC-11: a failed command aborts its step (CWE-252)
+@pytest.mark.parametrize("command", GUARDED_COMMANDS)
+def test_each_provisioning_command_aborts_its_step_on_failure(command):
+    """Each command that can fail is tested, and a failure returns.
+
+    Ordering alone does not make the sequence safe: an unguarded command
+    lets the run continue past a step that did nothing, which is how a
+    database ends up with roles and no tables, or a role created against
+    a credential no file records. Every command below is wrapped in the
+    same shape, and the guard returns rather than reporting success.
+    """
+    source = _provisioning_source()
+    guard = "if ! {0}; then".format(command)
+
+    assert source.count(guard) == 1, guard
+
+    body = source[source.index(guard) + len(guard):]
+    assert "return 1" in body[:body.index("\n    fi")], command
+
+
+# SEC-01/SEC-11: no guard reports a problem and then carries on (CWE-252)
+def test_no_provisioning_guard_continues_past_a_failure():
+    """Every conditional guard in the script ends the run.
+
+    The case above names the commands that exist today. This one holds
+    for a guard added later: whatever the script tests, the branch it
+    takes on failure returns or exits rather than printing a message and
+    continuing. A guard that only prints is how the script reported
+    success after provisioning nothing.
+    """
+    lines = _provisioning_source().splitlines()
+    continuing = []
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not (stripped.startswith("if ! ") or stripped.startswith("if [")):
+            continue
+        branch = []
+        for following in lines[index + 1:]:
+            if following.strip() == "fi":
+                break
+            branch.append(following.strip())
+        if not any(statement in FAILURE_CONTROLS for statement in branch):
+            continuing.append("{0}:{1}".format(index + 1, stripped))
+
+    assert not continuing, continuing
+
+
+# SEC-11: the manifest installed is the tracked one, not a relative guess
+def test_the_backend_manifest_is_resolved_from_the_script_location():
+    """The install targets the tracked manifest by absolute path.
+
+    A path relative to the working directory installs nothing when the
+    operator runs the script from anywhere but the repository root, and a
+    silent no-install leaves the owner bootstrap without a driver. The
+    script resolves its own location first, so the manifest it installs
+    is the tracked one wherever it is invoked from.
+    """
+    body = _shell_function("install_dependencies")
+
+    assert SCRIPT_RELATIVE_ROOT in body
+    assert BACKEND_MANIFEST in body
+
+    # the manifest the install names is the one the repository tracks
+    assert (REPOSITORY_ROOT / "backend" / "requirements.txt").is_file()
+
+    # the interpreter is the one the virtual environment put on the path
+    assert "python3 -m pip install" in body
+
+
+def test_the_provisioning_script_parses():
+    """The script is syntactically valid for the shell that runs it.
+
+    Every case above reads the script as text, which cannot tell a valid
+    guard from one inside an unclosed quotation. The shell's own parser
+    can, and it reads the file without running any statement in it.
+    """
+    parsed = subprocess.run(
+        ["bash", "-n", str(PROVISIONING_SCRIPT)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    assert parsed.returncode == 0, parsed.stdout.decode("utf-8")
+
+
 # SEC-09: identities the transaction-authorization cases bind against
 PAYER_IDENTITY = "PAYER-1"
 BOUND_PLAN = "PLAN-A"
 CHARGE_TOTAL = 10.00
 
 
-def approved_payment(total="10.00", currency="USD", state="approved",
-                     payer=PAYER_IDENTITY):
-    """Build the payload PayPal returns for a one-off payment."""
-    resource = {
-        "id": "PAY-1",
-        "state": state,
-        "transactions": [{"amount": {"total": total, "currency": currency}}],
-    }
-    if payer is not None:
-        resource["payer"] = {"payer_info": {"payer_id": payer}}
-    return resource
-
-
-def active_agreement(value="10.00", currency="USD", state="active",
-                     plan=BOUND_PLAN, payer=PAYER_IDENTITY):
-    """Build the payload PayPal returns for a reusable billing agreement."""
-    plan_body = {"payment_definitions": [
-        {"amount": {"value": value, "currency": currency}}]}
-    if plan is not None:
-        plan_body["id"] = plan
-    resource = {"id": "I-1", "state": state, "plan": plan_body}
-    if payer is not None:
-        resource["payer"] = {"payer_info": {"payer_id": payer}}
-    return resource
-
-
-def authorize(resource, amount=CHARGE_TOTAL, reference="PAY-1", **binding):
-    """Verify one charge against a fixed provider payload."""
+def charge(payment_method, amount):
+    """Call the charge seam exactly as the subscription route calls it."""
     loop = asyncio.new_event_loop()
     try:
-        with mock.patch.object(paypal_service, "_find_payment_resource",
-                               return_value=resource):
-            return loop.run_until_complete(paypal_service.process_payment(
-                reference, amount, **binding))
+        return loop.run_until_complete(
+            paypal_service.process_payment(payment_method, amount)
+        )
     finally:
         loop.close()
 
 
-def refusal(resource, amount=CHARGE_TOTAL, currency="USD", plan_id=None,
-            payer_id=None):
-    """Return the reason the authorization gate refuses one charge."""
-    return paypal_service._resource_authorizes_charge(
-        resource, amount, currency, plan_id, payer_id)
+def bearer(access_token):
+    """Return the request header that carries one access token."""
+    return {"Authorization": "Bearer " + access_token}
 
 
-@pytest.fixture
-def spent_references():
-    """Give one case an empty consumption ledger and leave it empty."""
-    def reset():
-        paypal_service._consumed_references.clear()
-        paypal_service._claimed_references.clear()
-    reset()
-    yield paypal_service._consumed_references
-    reset()
+# SEC-09: the seam signature is the one the route calls (CWE-863)
+def test_the_charge_seam_matches_the_call_the_route_makes():
+    """The seam takes the two positional arguments the route passes.
 
-
-# SEC-09: a reference matching every dimension authorizes the charge
-def test_charge_authorizes_a_matching_reference(spent_references):
-    """A payment matching amount, unit and payer authorizes the charge."""
-    assert refusal(approved_payment()) is None
-    assert authorize(approved_payment()) is True
-
-
-# SEC-09: the reported unit is bound to the charge (CWE-863)
-@pytest.mark.parametrize("currency", ["JPY", "EUR", "GBP", "ZWL"])
-def test_charge_refuses_a_foreign_currency_total(currency, spent_references):
-    """A total matching numerically in another unit does not authorize."""
-    resource = approved_payment(currency=currency)
-    assert refusal(resource) == "currency_mismatch"
-    assert authorize(resource) is False
-
-
-def test_charge_refuses_a_total_carrying_no_unit(spent_references):
-    """A total PayPal reports with no currency does not authorize."""
-    resource = {
-        "id": "PAY-1",
-        "state": "approved",
-        "transactions": [{"amount": {"total": "10.00"}}],
-        "payer": {"payer_info": {"payer_id": PAYER_IDENTITY}},
-    }
-    assert refusal(resource) == "currency_mismatch"
-    assert authorize(resource) is False
-
-
-def test_charge_refuses_a_split_total_in_mixed_units(spent_references):
-    """A split total summing correctly across two units does not authorize."""
-    resource = {
-        "id": "PAY-1",
-        "state": "approved",
-        "transactions": [
-            {"amount": {"total": "6.00", "currency": "USD"}},
-            {"amount": {"total": "4.00", "currency": "JPY"}},
-        ],
-        "payer": {"payer_info": {"payer_id": PAYER_IDENTITY}},
-    }
-    assert refusal(resource) == "currency_mismatch"
-    assert authorize(resource) is False
-
-
-def test_charge_admits_a_bound_unit_and_normalizes_its_spelling(
-        spent_references):
-    """A caller-bound unit authorizes, and its spelling is normalized."""
-    assert authorize(approved_payment(currency="JPY"), reference="PAY-JPY",
-                     currency="JPY") is True
-    assert authorize(approved_payment(currency="usd"), reference="PAY-USD",
-                     currency=" usd ") is True
-
-
-# SEC-09: the provider must name the payer (CWE-863)
-def test_charge_refuses_an_unidentified_payer(spent_references):
-    """A reference PayPal attributes to nobody does not authorize."""
-    resource = approved_payment(payer=None)
-    assert refusal(resource) == "payer_unidentified"
-    assert authorize(resource) is False
-
-
-def test_charge_refuses_a_payer_the_caller_did_not_expect(spent_references):
-    """A bound payer that differs from the reported one does not authorize."""
-    resource = approved_payment()
-    assert refusal(resource, payer_id="SOMEONE-ELSE") == "payer_mismatch"
-    assert authorize(resource, payer_id="SOMEONE-ELSE") is False
-    assert authorize(resource, payer_id=PAYER_IDENTITY) is True
-
-
-# SEC-09: a reusable agreement authorizes nothing until a plan is bound
-def test_charge_refuses_an_unbound_reusable_agreement(spent_references):
-    """An agreement reached with no plan bound does not authorize."""
-    resource = active_agreement()
-    assert refusal(resource) == "plan_unbound"
-    assert authorize(resource) is False
-
-
-# SEC-09: a reusable agreement is bound to one plan (CWE-863)
-def test_charge_refuses_an_agreement_for_another_plan(spent_references):
-    """An agreement carrying a different plan does not authorize."""
-    resource = active_agreement(plan="PLAN-B")
-    assert refusal(resource, plan_id=BOUND_PLAN) == "plan_mismatch"
-    assert authorize(resource, plan_id=BOUND_PLAN) is False
-
-
-def test_charge_refuses_an_agreement_naming_no_plan(spent_references):
-    """An agreement reporting no plan identifier does not authorize."""
-    resource = active_agreement(plan=None)
-    assert refusal(resource, plan_id=BOUND_PLAN) == "plan_mismatch"
-    assert authorize(resource, plan_id=BOUND_PLAN) is False
-
-
-def test_charge_admits_an_agreement_for_the_bound_plan(spent_references):
-    """An agreement carrying the bound plan authorizes the charge."""
-    assert refusal(active_agreement(), plan_id=BOUND_PLAN) is None
-    assert authorize(active_agreement(), plan_id=BOUND_PLAN) is True
-
-
-# SEC-09: a reusable agreement is bound to one plan and one unit
-def test_charge_refuses_a_bound_agreement_in_a_foreign_unit(spent_references):
-    """An agreement for the bound plan in another unit does not authorize."""
-    resource = active_agreement(currency="JPY")
-    assert refusal(resource, plan_id=BOUND_PLAN) == "currency_mismatch"
-    assert authorize(resource, plan_id=BOUND_PLAN) is False
-
-
-# SEC-09: a verified reference is spent once (CWE-294)
-def test_a_verified_reference_authorizes_one_charge_only(spent_references):
-    """Replaying a reference that already paid does not authorize again."""
-    resource = approved_payment()
-    outcomes = [authorize(resource, reference="PAY-REPLAY") for _ in range(3)]
-    assert outcomes == [True, False, False]
-    assert authorize(resource, reference="PAY-OTHER") is True
-    assert len(paypal_service._claimed_references) == 0
-
-
-# SEC-09: a spent reference reaches no provider call (CWE-294)
-def test_a_spent_reference_drives_no_provider_call(spent_references):
-    """A replayed reference is refused ahead of any provider request."""
-    lookup = mock.Mock(return_value=approved_payment())
-    loop = asyncio.new_event_loop()
-    try:
-        with mock.patch.object(paypal_service, "_find_payment_resource",
-                               lookup):
-            outcomes = [
-                loop.run_until_complete(paypal_service.process_payment(
-                    "PAY-ONCE", CHARGE_TOTAL))
-                for _ in range(4)]
-    finally:
-        loop.close()
-    assert outcomes == [True, False, False, False]
-    assert lookup.call_count == 1
-
-
-def test_concurrent_attempts_on_one_reference_admit_one(spent_references):
-    """Two attempts in flight on one reference authorize exactly once."""
-    def lookup(reference):
-        time.sleep(0.05)
-        return approved_payment()
-
-    async def both():
-        return await asyncio.gather(
-            paypal_service.process_payment("PAY-RACE", CHARGE_TOTAL),
-            paypal_service.process_payment("PAY-RACE", CHARGE_TOTAL))
-
-    loop = asyncio.new_event_loop()
-    try:
-        with mock.patch.object(paypal_service, "_find_payment_resource",
-                               side_effect=lookup):
-            outcomes = loop.run_until_complete(both())
-    finally:
-        loop.close()
-    assert sorted(outcomes) == [False, True]
-    assert len(paypal_service._claimed_references) == 0
-
-
-def test_the_ledger_records_no_provider_reference(spent_references):
-    """The ledger holds a digest, never the reference PayPal issued."""
-    assert authorize(approved_payment(), reference="PAY-SECRET") is True
-    assert "PAY-SECRET" not in spent_references
-    assert list(spent_references) == [
-        paypal_service._reference_key("PAY-SECRET")]
-
-
-# SEC-09: a refused reference is not consumed
-def test_a_refused_reference_stays_available(spent_references):
-    """A reference refused once is still usable when the charge matches."""
-    assert authorize(approved_payment(currency="JPY"),
-                     reference="PAY-RETRY") is False
-    assert len(paypal_service._claimed_references) == 0
-    assert authorize(approved_payment(), reference="PAY-RETRY") is True
-
-
-def test_the_consumption_ledger_stays_bounded(spent_references):
-    """The ledger evicts its oldest entry rather than growing without end."""
-    limit = paypal_service._CONSUMPTION_LIMIT
-    first = paypal_service._reference_key("PAY-0")
-    for index in range(limit + 1):
-        paypal_service._consume_reference(
-            paypal_service._reference_key("PAY-%d" % index))
-    assert len(spent_references) == limit
-    assert first not in spent_references
-
-
-# SEC-09: every provider call is bounded in time (CWE-400)
-def test_every_provider_call_carries_a_timeout():
-    """The transport supplies a timeout the provider SDK never sets."""
-    assert isinstance(paypalrestsdk.api.requests,
-                      paypal_service._BoundedTransport)
-    recorded = {}
-
-    class Recorder:
-        def request(self, *args, **kwargs):
-            recorded.update(kwargs)
-            raise requests.exceptions.Timeout("bounded")
-
-    bounded = paypal_service._BoundedTransport(
-        Recorder(), paypal_service._REQUEST_TIMEOUT_SECONDS)
-    with mock.patch.object(paypalrestsdk.api, "requests", bounded):
-        assert paypal_service._find_payment_resource("PAY-TIMEOUT") is None
-    assert recorded["timeout"] == paypal_service._REQUEST_TIMEOUT_SECONDS
-    assert paypal_service._REQUEST_TIMEOUT_SECONDS > 0
-
-
-def test_a_provider_timeout_refuses_the_charge(spent_references):
-    """A provider call that times out refuses rather than raising."""
-    class Stalled:
-        def request(self, *args, **kwargs):
-            raise requests.exceptions.Timeout("bounded")
-
-    bounded = paypal_service._BoundedTransport(
-        Stalled(), paypal_service._REQUEST_TIMEOUT_SECONDS)
-    loop = asyncio.new_event_loop()
-    try:
-        with mock.patch.object(paypalrestsdk.api, "requests", bounded):
-            outcome = loop.run_until_complete(
-                paypal_service.process_payment("PAY-STALL", CHARGE_TOTAL))
-    finally:
-        loop.close()
-    assert outcome is False
-
-
-# SEC-09: the binding parameters leave the caller contract unchanged
-def test_the_verification_call_contract_is_preserved():
-    """The two positional parameters stay first; the bindings are keyword."""
+    The route awaits ``process_payment(payment_method, amount)`` and
+    supplies nothing else. A keyword-only parameter or a third parameter
+    makes every production call raise.
+    """
     signature = inspect.signature(paypal_service.process_payment)
     parameters = list(signature.parameters.values())
-    positional = [p.name for p in parameters
-                  if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD]
-    keyword_only = {p.name for p in parameters
-                    if p.kind is inspect.Parameter.KEYWORD_ONLY}
+
+    positional = [
+        parameter.name
+        for parameter in parameters
+        if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ]
     assert positional == ["payment_method", "amount"]
-    assert keyword_only == {"currency", "plan_id", "payer_id"}
-    assert all(parameters[index].default is None
-               for index in range(2, len(parameters)))
+    assert len(parameters) == 2
     assert inspect.iscoroutinefunction(paypal_service.process_payment)
 
 
-# SEC-09: the route the browser reaches and the plan it names
-SUBSCRIPTION_ROUTE = "/subscriptions/"
-REQUESTED_PLAN = "P-REQUESTED"
-UNREQUESTED_PLAN = "P-OTHER"
-AGREEMENT_REFERENCE = "I-AGREEMENT"
-
-# SEC-09: the status the route answers when the charge does not authorize
-PAYMENT_REFUSED_STATUS = 400
-
-TERM_START = "2026-01-01T00:00:00"
-TERM_END = "2027-01-01T00:00:00"
-
-
-def subscription_body(plan_id=REQUESTED_PLAN, reference=AGREEMENT_REFERENCE,
-                      amount=CHARGE_TOTAL):
-    """Build the body a subscribing client posts."""
-    return {
-        "plan_id": plan_id,
-        "payment_method": reference,
-        "amount": amount,
-        "start_date": TERM_START,
-        "end_date": TERM_END,
-    }
+# SEC-09: no client-supplied plan or price authorizes a charge (CWE-863)
+@pytest.mark.parametrize(
+    "payment_method, amount",
+    (
+        ("paypal", 10.0),
+        ("paypal", 0.01),
+        ("paypal", 1000000.0),
+        ("credit_card", 10.0),
+        ("", 10.0),
+    ),
+    ids=(
+        "declared-total",
+        "smallest-total",
+        "large-total",
+        "other-method",
+        "empty-method",
+    ),
+)
+def test_the_charge_seam_refuses_every_attempt(payment_method, amount):
+    """No argument pair the route can build authorizes a charge."""
+    assert charge(payment_method, amount) is False
 
 
-def post_subscription(client, token, body):
-    """Post one subscription request as an authenticated caller."""
-    return client.post(
-        SUBSCRIPTION_ROUTE,
-        json=body,
-        headers={"Authorization": "Bearer {0}".format(token)},
+# SEC-09: a refused charge issues no provider call
+def test_the_charge_seam_reaches_no_provider(monkeypatch):
+    """The seam performs no provider configuration and no lookup."""
+    reached = []
+
+    def record(name):
+        def hook(*arguments):
+            reached.append(name)
+        return hook
+
+    monkeypatch.setattr(paypalrestsdk, "configure", record("configure"))
+    monkeypatch.setattr(
+        paypalrestsdk.Payment, "find", staticmethod(record("payment"))
+    )
+    monkeypatch.setattr(
+        paypalrestsdk.BillingAgreement,
+        "find",
+        staticmethod(record("agreement")),
     )
 
-
-def spent(reference):
-    """Report whether the ledger holds the reference as spent."""
-    return paypal_service._reference_key(
-        reference) in paypal_service._consumed_references
+    assert charge("paypal", 10.0) is False
+    assert reached == []
 
 
-# SEC-09: the route supplies the plan the authorization gate binds against
-def test_the_subscription_route_binds_the_requested_plan(
-        client, registered_user):
-    """The route hands the verifier the plan the request names.
+# SEC-09: the service holds no local authorization ledger (CWE-367)
+def test_the_payment_service_keeps_no_reference_ledger():
+    """No module attribute records a claimed or consumed reference.
 
-    The recorded call is inspected directly, so a route that drops the
-    keyword fails here even while the verifier's own cases pass.
+    A local ledger spends a reference before the caller commits its row,
+    and the caller holds no way to release one.
     """
-    recorded = {}
-
-    async def record(payment_method, amount, **binding):
-        recorded["positional"] = (payment_method, amount)
-        recorded["binding"] = binding
-        return True
-
-    body = subscription_body()
-    with mock.patch.object(subscription_route, "process_payment", record):
-        response = post_subscription(
-            client, registered_user["access_token"], body)
-
-    assert recorded["positional"] == (body["payment_method"], body["amount"])
-    assert set(recorded["binding"]) == {"plan_id"}
-    assert recorded["binding"]["plan_id"] == body["plan_id"]
-    assert response.status_code != PAYMENT_REFUSED_STATUS
+    for name in dir(paypal_service):
+        lowered = name.lower()
+        for fragment in LEDGER_NAME_FRAGMENTS:
+            assert fragment not in lowered, name
 
 
-# SEC-09: a reusable agreement for the requested plan authorizes the charge
-def test_the_route_authorizes_an_agreement_for_the_requested_plan(
-        client, registered_user, spent_references):
-    """An agreement carrying the requested plan clears the payment gate."""
-    body = subscription_body()
-    resource = active_agreement(plan=body["plan_id"])
+# SEC-09: the module grew no payment flow beyond the substitution
+def test_the_payment_service_declares_only_the_three_documented_callables():
+    """The service module exposes create, execute and the charge seam.
 
-    with mock.patch.object(paypal_service, "_find_payment_resource",
-                           return_value=resource):
-        response = post_subscription(
-            client, registered_user["access_token"], body)
+    AAP 0.5.13 scopes this module to the environment substitution, the
+    typing import and this wrapper. A fourth public callable would mean a
+    payment flow grew here that no caller asked for.
+    """
+    public = sorted(
+        name
+        for name, value in vars(paypal_service).items()
+        if not name.startswith("_") and callable(value)
+        and getattr(value, "__module__", None) == paypal_service.__name__
+    )
 
-    assert response.status_code != PAYMENT_REFUSED_STATUS
-    assert spent(body["payment_method"])
-
-
-# SEC-09: a reusable agreement for another plan authorizes nothing (CWE-863)
-def test_the_route_refuses_an_agreement_for_another_plan(
-        client, registered_user, spent_references):
-    """An agreement carrying a different plan is refused at the route."""
-    body = subscription_body()
-    resource = active_agreement(plan=UNREQUESTED_PLAN)
-
-    with mock.patch.object(paypal_service, "_find_payment_resource",
-                           return_value=resource):
-        response = post_subscription(
-            client, registered_user["access_token"], body)
-
-    assert response.status_code == PAYMENT_REFUSED_STATUS
-    assert not spent(body["payment_method"])
+    assert public == ["create_payment", "execute_payment", "process_payment"]
 
 
-# SEC-09: the route reaches no provider call without a credential
-def test_an_unauthenticated_subscription_reaches_no_provider_call(
-        client, spent_references):
-    """A request carrying no credential drives no provider lookup."""
-    lookup = mock.Mock(return_value=active_agreement())
-    body = subscription_body()
+# SEC-09: the route refuses the charge and writes no row
+def test_the_subscription_route_refuses_the_charge(
+    client, register_user, db_session
+):
+    """A subscription request is refused with the uniform envelope."""
+    account = register_user()
 
-    with mock.patch.object(paypal_service, "_find_payment_resource", lookup):
-        response = client.post(SUBSCRIPTION_ROUTE, json=body)
+    response = client.post(
+        SUBSCRIPTION_PATH,
+        json=CHARGE_BODY,
+        headers=bearer(account["access_token"]),
+    )
 
-    assert response.status_code == 401
-    assert lookup.call_count == 0
-    assert not spent(body["payment_method"])
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert set(body) == ENVELOPE_KEYS
+    # SEC-08: the refusal names no provider and no internal detail
+    assert body["detail"] == HTTPStatus(400).phrase
+    assert db_session.query(SubscriptionModel).count() == 0
+
+
+# SEC-09: the refusal is reached before any provider call
+def test_the_subscription_route_reaches_no_provider(
+    client, register_user, monkeypatch
+):
+    """The refused route issues no provider configuration."""
+    reached = []
+    monkeypatch.setattr(
+        paypalrestsdk,
+        "configure",
+        lambda configuration: reached.append("configure"),
+    )
+    account = register_user()
+
+    response = client.post(
+        SUBSCRIPTION_PATH,
+        json=CHARGE_BODY,
+        headers=bearer(account["access_token"]),
+    )
+
+    assert response.status_code == 400, response.text
+    assert reached == []
+
+
+# SEC-10: a probe engine holds a connection pool until it is disposed
+def test_probe_engines_are_registered_for_disposal():
+    """Loading the database module registers its engine for disposal.
+
+    An engine left undisposed keeps its pool, and the parametrized cases
+    above build one per case. The registry is what the autouse fixture
+    drains, so an unregistered engine would leak silently.
+    """
+    before = len(_PROBE_ENGINES)
+    module = load_database_module(POSTGRES_URL, "require")
+
+    assert len(_PROBE_ENGINES) == before + 1
+    assert _PROBE_ENGINES[-1] is module.engine
+
+    # the application engine is never registered, so it is never disposed
+    assert all(engine is not database.engine for engine in _PROBE_ENGINES)
+
+
+def test_disposing_a_probe_engine_releases_its_pool():
+    """A disposed probe engine reports an empty pool.
+
+    Disposal is asserted on the pool rather than on the call, so the
+    fixture's cleanup is shown to have an effect.
+    """
+    module = load_database_module(SQLITE_URL, "require")
+    engine = module.engine
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("select 1").scalar() == 1
+
+    pooled_before = engine.pool
+    engine.dispose()
+
+    # dispose() closes the pooled connections and recreates the pool, so
+    # the replacement is a different object holding nothing
+    assert engine.pool is not pooled_before
+
+
+# ---------------------------------------------------------------------
+# SEC-09: the provider client is held above the level its records use
+# ---------------------------------------------------------------------
+PROVIDER_LOGGER_NAME = "paypalrestsdk"
+
+
+def test_the_provider_logger_withholds_records_below_warning():
+    """The provider library is held above the level its records use.
+
+    The client records the request URL at INFO, and that URL carries the
+    caller-supplied reference; it records the authorization header, the
+    request body and the response body at DEBUG. Capping the library
+    logger is what keeps those out of the diagnostic channel (CWE-532).
+    """
+    assert paypal_service.PROVIDER_LOG_LEVEL == logging.WARNING
+    provider_logger = logging.getLogger(PROVIDER_LOGGER_NAME)
+    assert provider_logger.level == paypal_service.PROVIDER_LOG_LEVEL
+
+    # SEC-09: the child logger the SDK actually writes to inherits the cap
+    api_logger = logging.getLogger("{0}.api".format(PROVIDER_LOGGER_NAME))
+    assert api_logger.level == logging.NOTSET
+    assert api_logger.getEffectiveLevel() == logging.WARNING
+    assert not api_logger.isEnabledFor(logging.INFO)
+    assert not api_logger.isEnabledFor(logging.DEBUG)
+
+
+# SEC-09: the route awaits the service seam, not a local stand-in
+def test_the_subscription_route_awaits_the_service_seam():
+    """The subscription route is bound to the module-level charge seam.
+
+    A route holding its own callable would refuse nothing while the
+    service cases above still passed, so the binding is asserted rather
+    than assumed.
+    """
+    assert subscription_route.process_payment is paypal_service.process_payment
+
+
+# ---------------------------------------------------------------------
+# SEC-01/SEC-12: how the provisioning script writes the only credentials
+# a developer machine holds is part of the control
+# ---------------------------------------------------------------------
+# SEC-01: the alphabet the generated values are constrained to
+CREDENTIAL_ALPHABET = re.compile(r"\A[A-Za-z0-9_-]+\Z")
+
+# SEC-01: a permissive creation mask, so each case measures the script's own
+# guarantee rather than the mask it happened to inherit
+PERMISSIVE_UMASK = "022"
+
+# SEC-01: what a planted name standing at .env holds before the run
+PLANTED_TARGET_CONTENT = "zzz-planted-standing-name-8901\n"
+
+# SEC-11: the two bootstrap helpers reach a live cluster and an importable
+# repository root, neither of which a unit run provides. They are replaced
+# with successful no-ops so the psql batch between them executes as shipped;
+# their shipped bodies are covered by the statement cases above.
+PROVISIONING_BOOTSTRAP_STUBS = (
+    "check_schema_prerequisites() { return 0; }",
+    "create_schema_as_owner() { return 0; }",
+)
+
+
+def _run_provisioning(work_dir, functions, expect_status=0):
+    """Run named functions from the real provisioning script.
+
+    The script is sourced with its single bare ``main`` invocation removed,
+    so the named function bodies execute exactly as shipped without the
+    dependency installs and migrations the orchestration performs. Only
+    ``psql`` and ``createdb`` are replaced, and the replacement records the
+    argument vector and the standard input it received.
+    """
+    stub_dir = work_dir / "stub-bin"
+    capture_dir = work_dir / "capture"
+    stub_dir.mkdir()
+    capture_dir.mkdir()
+
+    (stub_dir / "psql").write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$@" > "$CAPTURE_DIR/psql.argv"\n'
+        'cat > "$CAPTURE_DIR/psql.stdin"\n'
+    )
+    (stub_dir / "createdb").write_text("#!/bin/bash\nexit 0\n")
+    for name in ("psql", "createdb"):
+        (stub_dir / name).chmod(0o755)
+
+    program = "umask {0}\nsource <(grep -v '^main$' {1})\n{2}\n".format(
+        PERMISSIVE_UMASK,
+        shlex.quote(str(PROVISIONING_SCRIPT)),
+        "\n".join(functions),
+    )
+    environment = dict(os.environ)
+    environment["PATH"] = "{0}{1}{2}".format(
+        stub_dir, os.pathsep, environment.get("PATH", "")
+    )
+    environment["CAPTURE_DIR"] = str(capture_dir)
+
+    completed = subprocess.run(
+        ["bash", "-c", program],
+        cwd=str(work_dir),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=120,
+    )
+    assert completed.returncode == expect_status, completed.stdout.decode()
+    return capture_dir, completed.stdout.decode()
+
+
+def _generated_values(work_dir):
+    """Return the values the script wrote into its environment file."""
+    written = (work_dir / ".env").read_text()
+    values = {}
+    for line in written.splitlines():
+        if "=" in line:
+            name, _, value = line.partition("=")
+            values[name] = value
+    return values
+
+
+def _meta_command_values(captured_stdin):
+    """Return the values set by the psql meta-commands on standard input.
+
+    Each value is shipped as a quoted SQL literal, so the quoting is
+    asserted here and stripped before the value is compared.
+    """
+    values = {}
+    for line in captured_stdin.splitlines():
+        if line.startswith("\\set "):
+            _, name, quoted = line.split(" ", 2)
+            assert quoted.startswith("'") and quoted.endswith("'"), quoted
+            values[name] = quoted[1:-1]
+    return values
+
+
+# SEC-01/SEC-12: the generated secret file is never world-readable (CWE-732)
+def test_the_generated_secret_file_is_owner_only(tmp_path):
+    """The file carrying the generated credentials is owner-only."""
+    _run_provisioning(tmp_path, ["configure_env_vars"])
+    written = tmp_path / ".env"
+
+    assert written.is_file()
+    mode = stat.S_IMODE(written.stat().st_mode)
+    # SEC-01: created under a restrictive mask and renamed into place, so no
+    # interval exists in which the mode is permissive
+    assert mode == 0o600, oct(mode)
+
+    values = _generated_values(tmp_path)
+    assert len(values["SECRET_KEY"]) >= 32
+    assert "app_user:" in values["DATABASE_URL"]
+
+    # SEC-01: the temporary name is removed, and it is covered by .gitignore
+    assert list(tmp_path.glob(".env.tmp.*")) == []
+
+
+# SEC-01/SEC-12: a planted symlink at .env is neither followed nor
+# replaced; the run refuses instead (CWE-59, CWE-367)
+def test_the_generated_secret_file_refuses_a_planted_symlink(tmp_path):
+    """A symlink standing at .env stops the run before a key exists.
+
+    Replacing the link would be safe for the target, but refusing is
+    stronger: a name a developer did not create is never the destination
+    of a freshly generated credential, and nothing is written anywhere.
+    """
+    target = tmp_path / "victim.txt"
+    target.write_text(PLANTED_TARGET_CONTENT)
+    target.chmod(0o644)
+    (tmp_path / ".env").symlink_to(target.name)
+
+    _, output = _run_provisioning(
+        tmp_path, ["configure_env_vars"], expect_status=1
+    )
+    assert "already present" in output, output
+
+    # SEC-01: the link is left standing and its target is untouched
+    assert (tmp_path / ".env").is_symlink()
+    assert target.read_text() == PLANTED_TARGET_CONTENT
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert "SECRET_KEY" not in target.read_text()
+
+    # SEC-01: no temporary secret file is left behind either
+    assert list(tmp_path.glob(".env.tmp.*")) == []
+
+
+# SEC-01/SEC-12: a planted hard link receives no secret (CWE-59, CWE-367)
+def test_the_generated_secret_file_refuses_a_planted_hard_link(tmp_path):
+    """A second name for .env keeps its content and gains no secret.
+
+    Redirecting into an existing name truncates that inode in place, so
+    any other name for it - a link made earlier, while the mode was still
+    permissive - would receive the secret. The pre-existence guard stops
+    the run before a credential is generated, so neither name changes.
+    """
+    standing = tmp_path / ".env"
+    standing.write_text(PLANTED_TARGET_CONTENT)
+    standing.chmod(0o644)
+    planted = tmp_path / "planted_link.txt"
+    os.link(str(standing), str(planted))
+    assert planted.stat().st_ino == standing.stat().st_ino
+
+    _, output = _run_provisioning(
+        tmp_path, ["configure_env_vars"], expect_status=1
+    )
+    assert "already present" in output, output
+
+    # SEC-01: both names still describe the planted inode, unchanged
+    assert standing.stat().st_ino == planted.stat().st_ino
+    assert standing.read_text() == PLANTED_TARGET_CONTENT
+    assert planted.read_text() == PLANTED_TARGET_CONTENT
+    assert "SECRET_KEY" not in planted.read_text()
+    assert stat.S_IMODE(planted.stat().st_mode) == 0o644
+    assert list(tmp_path.glob(".env.tmp.*")) == []
+
+
+# SEC-01/SEC-12: no role password reaches the argument vector (CWE-214)
+def test_no_role_password_reaches_the_process_arguments(tmp_path):
+    """Both role passwords travel on standard input, not in argv."""
+    capture_dir, _output = _run_provisioning(
+        tmp_path,
+        ["configure_env_vars"]
+        + list(PROVISIONING_BOOTSTRAP_STUBS)
+        + ["init_database"],
+    )
+    argv = (capture_dir / "psql.argv").read_text()
+    captured_stdin = (capture_dir / "psql.stdin").read_text()
+    supplied = _meta_command_values(captured_stdin)
+
+    # SEC-01: the arguments carry the failure mode and the database only
+    assert argv.split() == ["-v", "ON_ERROR_STOP=1", "-d", "dbname"]
+    assert set(supplied) == {"owner_pw", "app_pw"}
+
+    for name, value in supplied.items():
+        assert value, name
+        # SEC-01: an argument vector is readable by any local user
+        assert value not in argv, name
+
+    # SEC-01: the value the application itself will use is the same one, and
+    # it reaches neither the arguments nor any other channel
+    application_url = _generated_values(tmp_path)["DATABASE_URL"]
+    assert supplied["app_pw"] in application_url
+    assert supplied["app_pw"] not in argv
+
+    # SEC-11: the statements still bind the passwords through the variables,
+    # so moving the channel changed no privilege
+    assert captured_stdin.index("\\set owner_pw") < captured_stdin.index(
+        "CREATE ROLE app_owner"
+    )
+    assert "PASSWORD :'owner_pw'" in captured_stdin
+    assert "PASSWORD :'app_pw'" in captured_stdin
+    assert "GRANT ALL" not in captured_stdin
+
+
+# SEC-01: a generated value cannot end a meta-command and begin another
+def test_the_generated_credentials_use_a_constrained_alphabet(tmp_path):
+    """Every generated value stays inside the guarded alphabet."""
+    capture_dir, _output = _run_provisioning(
+        tmp_path,
+        ["configure_env_vars"]
+        + list(PROVISIONING_BOOTSTRAP_STUBS)
+        + ["init_database"],
+    )
+    supplied = _meta_command_values(
+        (capture_dir / "psql.stdin").read_text()
+    )
+    values = _generated_values(tmp_path)
+
+    for value in list(supplied.values()) + [values["SECRET_KEY"]]:
+        assert CREDENTIAL_ALPHABET.match(value), value
+        assert "\n" not in value
+        assert "'" not in value
+
+    # SEC-12: and the key clears the floor of every algorithm Settings
+    # accepts, not only the configured one
+    assert len(values["SECRET_KEY"]) >= max(HMAC_KEY_MIN_BYTES.values())

@@ -75,8 +75,21 @@ variable "db_app_user" {
   default     = "app_user"
 }
 
+variable "db_app_role" {
+  description = "The least-privilege database role assigned to the application account. Provision it on the instance before apply; SECURITY.md carries the statements."
+  type        = string
+  default     = "app_runtime"
+}
+
 variable "db_app_password" {
-  description = "The password for the application database role"
+  description = "The password for the application database role. Supply it through TF_VAR_db_app_password or -var; an ephemeral value is never written to state or to a plan file."
   type        = string
   sensitive   = true
+  ephemeral   = true
+}
+
+variable "db_app_password_version" {
+  description = "Increment to rotate the application database password. Terraform reapplies password_wo only when this value changes."
+  type        = number
+  default     = 1
 }

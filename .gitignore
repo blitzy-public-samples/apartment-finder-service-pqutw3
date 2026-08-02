@@ -8,13 +8,17 @@ secrets/
 *.key
 *credentials*.json
 
-# SEC-01, SEC-11: Terraform state and variable files carry db_app_password
+# SEC-01, SEC-11: Terraform state, plans and variable files carry db_app_password
 .terraform/
+.terraform.tfstate.lock.info
 *.tfstate
-*.tfstate.backup
-*.tfstate.d/
+*.tfstate.*
+*.tfplan
 *.tfvars
+*.tfvars.json
 !*.tfvars.example
+crash.log
+crash.*.log
 
 # Build, cache, and coverage artifacts
 __pycache__/

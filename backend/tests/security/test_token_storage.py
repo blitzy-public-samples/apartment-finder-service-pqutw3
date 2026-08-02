@@ -59,7 +59,7 @@ INTERNAL_401_DETAIL = "Could not validate credentials"
 
 SEEDED_FILTER_NAME = "session-cookie-owner-probe"
 
-# SEC-06: rows naming their owner, so a reply identifies which of two
+# SEC-06: rows naming their owner; a reply identifies which of two
 # valid credentials the guard resolved
 COOKIE_OWNER_FILTER_NAME = "cookie-owner-probe"
 HEADER_OWNER_FILTER_NAME = "header-owner-probe"
@@ -67,8 +67,8 @@ HEADER_OWNER_FILTER_NAME = "header-owner-probe"
 # SEC-06: a cookie value the signature check cannot parse
 UNPARSABLE_COOKIE = "not.a.jwt"
 
-# SEC-06: the cookie value logout leaves behind, which the guard must
-# treat as absent so a non-browser client keeps working
+# SEC-06: the cookie value logout leaves behind; the guard treats it as
+# absent and a non-browser client keeps working
 CLEARED_COOKIE = ""
 
 
@@ -163,7 +163,7 @@ def _send_with_one_cookie(client, cookie_value, headers):
 def test_the_session_cookie_name_matches_the_frozen_body_key():
     """The cookie name and the frozen response body key are one name."""
     # SEC-06: auth.py publishes the token under this key in the body and
-    # in the cookie, so a cookie rename cannot move the frozen contract
+    # in the cookie; a cookie rename moves no part of the frozen contract
     assert SESSION_COOKIE_NAME == "access_token"
     assert TOKEN_BODY_KEY == "access_token"
 
@@ -247,7 +247,7 @@ def test_cookie_only_request_authenticates(client, db_session, register_user):
     assert response.status_code == 200, response.text
     rows = response.json()
     assert [row["name"] for row in rows] == [SEEDED_FILTER_NAME]
-    assert rows[0]["user_id"] == str(account["id"])
+    assert rows[0]["user_id"] == account["id"]
 
 
 def test_bearer_header_authenticates_after_the_cookie_is_cleared(
@@ -272,7 +272,7 @@ def test_bearer_header_authenticates_after_the_cookie_is_cleared(
     response = client.send(request)
 
     assert response.status_code == 200, response.text
-    assert response.json()[0]["user_id"] == str(account["id"])
+    assert response.json()[0]["user_id"] == account["id"]
 
 
 def test_cookie_identity_answers_a_conflicting_bearer_header(
@@ -300,7 +300,7 @@ def test_cookie_identity_answers_a_conflicting_bearer_header(
     assert response.status_code == 200, response.text
     # SEC-06: the cookie identity answers, not the header identity
     owners = [row["user_id"] for row in response.json()]
-    assert owners == [str(cookie_owner["id"])]
+    assert owners == [cookie_owner["id"]]
 
 
 def test_an_invalid_session_cookie_is_not_rescued_by_a_bearer_header(

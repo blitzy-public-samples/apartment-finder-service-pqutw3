@@ -86,8 +86,8 @@ def _split_authority(netloc: str):
 def _is_valid_origin(origin: str) -> bool:
     # SEC-03: accepts only the exact serialization a browser sends in an
     # Origin header - scheme://host[:port] over http or https, in printable
-    # lowercase ASCII with no userinfo, wildcard, path, query or fragment -
-    # and rejects every other spelling instead of repairing it
+    # lowercase ASCII with no userinfo, wildcard, path, query or fragment.
+    # Every other spelling is rejected, never repaired (CWE-346)
     if not origin.isascii():
         return False
     if any(c.isspace() or not c.isprintable() for c in origin):

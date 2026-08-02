@@ -238,12 +238,16 @@ terraform fmt -check
 terraform validate
 ```
 
-**Expected: failure today, for reasons unrelated to this work.**
+**Expected: failure today, for two reasons unrelated to this work.**
 `infrastructure/terraform/outputs.tf` references seven resources that `main.tf` never declares:
-three storage buckets, two messaging topics, and two functions. The formatting check also reports
-that same file. Validate the changed database instance resource in isolation or through a targeted
-plan, and treat repair of the outputs file as separate cleanup. Naming this now is more useful
-than reporting a failure later and calling it a regression.
+three storage buckets, two messaging topics, and two functions. Separately, `main.tf:34` reads
+`var.gke_num_nodes`, which `variables.tf` declares nowhere. The formatting check reports the outputs
+file only; the two changed files pass it. Validate the changed database resources in isolation and
+treat both blockers as separate cleanup. Measured that way — the two changed files copied into a
+scratch module with a stub for the undeclared variable — `terraform validate` returns success, and a
+plan run without the application role's password stops at `No value for required variable` rather
+than falling back to one. Naming this now is more useful than reporting a failure later and calling
+it a regression.
 
 ### 2.8 Manual verification
 

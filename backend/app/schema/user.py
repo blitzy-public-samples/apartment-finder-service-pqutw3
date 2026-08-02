@@ -83,11 +83,8 @@ class UserLogin(BaseModel):
     _require_string_email = validator(
         "email", pre=True, allow_reuse=True)(_require_json_string)
 
-    # SEC-04: no policy validator here. A credential minted before the
-    # policy - including one past the 72-byte ceiling, which bcrypt verifies
-    # against its truncated form - reaches authentication and receives the
-    # counted uniform 401. A hasher refusal, NUL byte included, is mapped to
-    # that same 401 in backend/app/api/endpoints/auth.py (CWE-209).
+    # SEC-04: no policy validator here; every credential reaches
+    # authentication and any refusal is the counted uniform 401 (CWE-209)
 
     class Config:
         # SEC-05: rejects unknown keys; closes the CWE-915 vector

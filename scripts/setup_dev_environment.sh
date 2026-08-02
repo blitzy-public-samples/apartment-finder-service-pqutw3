@@ -28,7 +28,7 @@ install_dependencies() {
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
 
     echo "Installing project dependencies..."
-    
+
     # SEC-11: installs the tracked backend manifest with the active
     # interpreter; a failed install aborts the run (CWE-252)
     if ! python3 -m pip install -r "$repo_root/backend/requirements.txt"; then
@@ -46,7 +46,7 @@ install_dependencies() {
 # Set up virtual environments
 setup_virtual_env() {
     echo "Setting up virtual environment..."
-    
+
     # SEC-11: an unusable interpreter aborts the run (CWE-252)
     if ! python3 -m venv venv; then
         echo "Failed to create the virtual environment at ./venv. Install the python3 venv module, then rerun." >&2
@@ -64,6 +64,13 @@ setup_virtual_env() {
 # Configure environment variables
 configure_env_vars() {
     echo "Configuring environment variables..."
+
+    # SEC-01: an existing secret file is never replaced or written through
+    # (CWE-59, CWE-367)
+    if [ -e .env ] || [ -L .env ]; then
+        echo "An .env file is already present. Move it aside, then rerun." >&2
+        return 1
+    fi
     
     # SEC-01: credential values are generated at run time and never stored in this file
     # SEC-12: key length satisfies the 32-character floor on Settings.SECRET_KEY
@@ -131,6 +138,20 @@ EOF
     echo "The app_owner password was generated for this run only and is not retained. Issue ALTER ROLE app_owner WITH PASSWORD, or rerun setup, before further schema work."
 }
 
+# Verify the owner bootstrap can import what it needs
+check_schema_prerequisites() {
+    local repo_root
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
+
+    PYTHONPATH="$repo_root" python3 - <<'PY'
+import importlib
+
+importlib.import_module("sqlalchemy")
+importlib.import_module("psycopg2")
+importlib.import_module("backend.app.db.models")
+PY
+}
+
 # Create the database schema with the owner role
 create_schema_as_owner() {
     local repo_root
@@ -159,16 +180,26 @@ PY
 # Initialize local database
 init_database() {
     echo "Initializing local database..."
-    
+
+    # SEC-11: verifies the owner bootstrap's imports before the first
+    # database object exists, so a missing dependency does not leave a
+    # database and two roles behind (CWE-252)
+    if ! check_schema_prerequisites; then
+        echo "Cannot import SQLAlchemy, psycopg2 and backend.app.db.models with this interpreter. Install backend/requirements.txt, then rerun." >&2
+        return 1
+    fi
+
     if ! createdb dbname; then
         echo "Failed to create database dbname. Check the local PostgreSQL server, then rerun." >&2
         return 1
     fi
 
     # SEC-11: owner role performs schema work; application role is limited to table data operations
-    # SEC-11: both role passwords reach psql on standard input through the
-    # printf builtin; no value appears in any process argument list
-    # (CWE-214), and a failed grant batch aborts the run (CWE-252)
+    # SEC-11: PostgreSQL 13 grants CREATE on schema public to PUBLIC; the
+    # revoke below removes DDL capability from app_user
+    # SEC-11: the two role passwords reach psql on standard input through the
+    # printf builtin; neither value appears in any process argument list
+    # (CWE-214); a failed grant batch aborts the run (CWE-252)
     {
         printf "\\\\set owner_pw '%s'\\n" "$DB_OWNER_PASSWORD"
         printf "\\\\set app_pw '%s'\\n" "$DB_APP_PASSWORD"
@@ -176,6 +207,7 @@ init_database() {
 CREATE ROLE app_owner WITH LOGIN PASSWORD :'owner_pw';
 CREATE ROLE app_user WITH LOGIN PASSWORD :'app_pw';
 ALTER DATABASE dbname OWNER TO app_owner;
+ALTER SCHEMA public OWNER TO app_owner;
 GRANT CREATE, USAGE ON SCHEMA public TO app_owner;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT CONNECT ON DATABASE dbname TO app_user;
@@ -213,8 +245,8 @@ run_migrations() {
 # Main execution
 main() {
     check_software
-    # SEC-11: the interpreter is prepared and populated before the credential
-    # and database steps
+    # SEC-11: the interpreter that runs the owner bootstrap is prepared and
+    # populated before the credential and database steps
     setup_virtual_env || exit 1
     install_dependencies || exit 1
     # SEC-01/SEC-11: a failed credential or role provisioning step stops the run

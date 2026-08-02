@@ -192,9 +192,9 @@ def test_allow_listed_origin_is_echoed_with_credentials(client, origin):
     assert response.headers[_ALLOW_ORIGIN] != WILDCARD
     assert response.headers[_ALLOW_CREDENTIALS] == "true"
 
-    # SEC-03: an explicit allow-list makes the response origin-dependent,
-    # so a shared cache must key on Origin rather than serve one stored
-    # copy to every caller
+    # SEC-03: an explicit allow-list makes the response origin-dependent;
+    # a shared cache keys on Origin and serves no single stored copy to
+    # every caller
     assert "origin" in _header_tokens(response.headers[_VARY])
 
 
@@ -210,8 +210,8 @@ def test_preflight_from_an_allow_listed_origin_is_approved(client):
     assert response.headers[_MAX_AGE].isdigit()
     assert int(response.headers[_MAX_AGE]) > 0
 
-    # SEC-03: the cached decision is origin-dependent, so the cache key
-    # has to include the origin that earned it
+    # SEC-03: the cached decision is origin-dependent; the cache key
+    # includes the origin that earned it
     assert "origin" in _header_tokens(response.headers[_VARY])
 
 
@@ -540,8 +540,10 @@ def test_the_public_read_path_stays_open_and_paginates(client, db_session):
     SQLite harness - the statement carries no ORDER BY, and two
     statements against PostgreSQL are not ordered against each other.
     """
+    # Listing.id is declared int, matching the INTEGER primary key at
+    # models.py:22, so a served identifier is a JSON number
     seeded = {
-        str(row.id)
+        row.id
         for row in seed_listings(db_session, SEEDED_LISTING_COUNT)
     }
 

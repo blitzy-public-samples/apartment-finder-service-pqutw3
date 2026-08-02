@@ -1,5 +1,11 @@
 # Main Terraform configuration file for provisioning Google Cloud resources
 
+# SEC-12: write-only arguments and ephemeral variables keep the database
+# password out of state; both require Terraform 1.11 or newer
+terraform {
+  required_version = ">= 1.11.0"
+}
+
 # Provider configuration for Google Cloud
 provider "google" {
   project = var.project_id
@@ -68,11 +74,17 @@ resource "google_sql_database" "database" {
   instance = google_sql_database_instance.main.name
 }
 
-# SEC-11: application role separate from the instance admin account
+# SEC-11: application account separate from the instance admin account and
+# assigned the named least-privilege role. Cloud SQL grants built-in
+# PostgreSQL users cloudsqlsuperuser on creation and Terraform does not revoke
+# it, so SEC-11 stays partial here; SECURITY.md carries the REVOKE statement.
+# SEC-12: password_wo is write-only, so the value never lands in state
 resource "google_sql_user" "app" {
-  name     = var.db_app_user
-  instance = google_sql_database_instance.main.name
-  password = var.db_app_password
+  name                = var.db_app_user
+  instance            = google_sql_database_instance.main.name
+  password_wo         = var.db_app_password
+  password_wo_version = var.db_app_password_version
+  database_roles      = [var.db_app_role]
 }
 
 # Resource definitions for Google Cloud Storage buckets

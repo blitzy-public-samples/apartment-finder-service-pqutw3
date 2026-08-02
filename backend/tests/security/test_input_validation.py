@@ -10,13 +10,25 @@ the set of paths and verbs the application declares, the pagination the
 public read path applies, the response model the filter route declares,
 and the answer a duplicate address receives.
 
-The domain cases carry that further. A declared numeric field also has a
-range, and a value outside it - NaN, either infinity, a magnitude no
-float holds, or a figure beneath the field's floor - stops at the
-request boundary, ahead of the write path and ahead of the payment call.
+A nested body carries the same duty. A criterion inside a filter
+declares strict scalars, so a number, a boolean or any other JSON type
+is refused where a string is declared, and a NUL byte the driver cannot
+store is refused with it.
+
+The subscription amount also carries a domain. A value outside it - NaN,
+either infinity, a magnitude no float holds, or a figure at or beneath
+the floor - stops at the request boundary, ahead of the payment call.
+
+A rejection is also written down, and an undeclared key's name is text
+the caller chose. The last cases here read the record as well as the
+reply: the caller is told which key was refused, and the record names
+the position instead, bounded in count and in length.
 """
+import logging
+import re
 from contextlib import contextmanager
 from datetime import datetime
+from typing import List
 
 import pytest
 from conftest import test_engine
@@ -27,9 +39,24 @@ from sqlalchemy.dialects import postgresql, sqlite
 
 from backend.app.db.models import Criteria as CriteriaModel
 from backend.app.db.models import Filter as FilterModel
+from backend.app.api.endpoints import subscriptions as subscription_endpoint
 from backend.app.db.models import Listing as ListingModel
-from backend.app.main import _error_envelope, app
-from backend.app.schema.filter import Filter, FilterCreate
+from backend.app.main import (
+    _MAX_LOGGED_FIELDS,
+    _MAX_LOGGED_NAME_LENGTH,
+    _UNDECLARED_FIELD,
+    _error_envelope,
+    _loggable_field_names,
+    app,
+)
+from backend.app.schema.filter import (
+    MAX_CRITERIA,
+    MAX_CRITERION_VALUE,
+    MAX_FILTER_NAME,
+    Criteria,
+    Filter,
+    FilterCreate,
+)
 from backend.app.schema.listing import ListingCreate
 from backend.app.schema.subscription import SubscriptionCreate
 from backend.app.schema.user import UserCreate, UserLogin
@@ -77,16 +104,44 @@ EMPTY_PLAN_SUBSCRIPTION_BODY = {
     "start_date": "2030-01-01T00:00:00",
 }
 
-# SEC-08: the sanitized envelope backend/app/main.py builds, read from
-# the application rather than restated here
-ENVELOPE_KEYS = frozenset(_error_envelope("a detail", "a correlation id"))
+# SEC-08: the frozen sanitized-envelope contract, written out rather than
+# read back from the function that builds it. Deriving the expectation
+# from the code under test makes it agree with any shape that code
+# returns, including a renamed or dropped key.
+# test_the_frozen_envelope_contract_matches_the_application below is what
+# fails if the application's envelope moves.
+ENVELOPE_KEYS = frozenset({"detail", "error_id", "fields"})
 
-# SEC-08: the correlation key, located by the value it carries
-_CORRELATION_PROBE = "correlation-key-probe"
-_CORRELATION_KEY = next(
-    key
-    for key, value in _error_envelope("a detail", _CORRELATION_PROBE).items()
-    if value == _CORRELATION_PROBE
+# SEC-08: the correlation key the caller quotes to support, likewise fixed
+_CORRELATION_KEY = "error_id"
+
+# SEC-08: the detail an unhandled fault returns and the shape of the
+# correlation identifier beside it. Both are written out here for the
+# same reason as the key set above.
+SANITIZED_FAULT_DETAIL = "Internal server error"
+CORRELATION_ID = re.compile(r"[0-9a-f]{32}")
+
+# AAP 0.8.3: the status the listing write path answers with. The route
+# clears the request boundary and then fails on a model defect the AAP
+# places out of scope: ListingModel declares no owner_id column while
+# listings.py:23 passes one, and the model's non-null created_at and
+# updated_at columns are never supplied. Adding columns needs migration
+# tooling the repository does not carry (AAP 0.9.2), so what this module
+# pins is the answer the defect produces rather than a working write.
+KNOWN_LISTING_DEFECT_STATUS = 500
+
+# SEC-08: text the sanitized reply must not carry. The defect above
+# raises TypeError from a named module against a named column, and none
+# of that may reach the caller.
+WITHHELD_FAULT_TEXT = (
+    "traceback",
+    "typeerror",
+    "exceptiongroup",
+    "owner_id",
+    "listingmodel",
+    "backend/app",
+    "backend.app",
+    "insert into",
 )
 
 # AAP 0.8.3: the frozen public read path - unauthenticated, trailing
@@ -97,7 +152,7 @@ REGISTER_PATH = "/auth/register"
 
 # AAP 0.8.3: every path and verb the application declares. A verb absent
 # from this table is also absent from the method list CORSMiddleware
-# advertises, so declaring one would widen the surface silently.
+# advertises.
 DECLARED_ROUTES = frozenset({
     ("/auth/register", "POST"),
     ("/auth/login", "POST"),
@@ -114,32 +169,90 @@ DECLARED_ROUTES = frozenset({
 UNDECLARED_METHODS = frozenset({"PUT", "PATCH", "DELETE"})
 
 # AAP 0.8.3: the key set the filter route's declared response model
-# publishes, derived from the model so the two cannot drift
-DECLARED_FILTER_RESPONSE_KEYS = frozenset(Filter.__fields__)
+# publishes. Written out rather than read from Filter.__fields__: derived
+# from the model, the assertion would accept whatever the model declares,
+# including a field added to it or the password hash the outbound user
+# model used to carry. A field added here is a deliberate contract change.
+DECLARED_FILTER_RESPONSE_KEYS = frozenset({
+    "id",
+    "user_id",
+    "name",
+    "created_at",
+    "last_used",
+    "zip_codes",
+    "criteria",
+})
 
 # AAP 0.8.3: enough rows for three pages of two
 SEEDED_LISTING_COUNT = 5
 PAGE_SIZE = 2
 
-# SEC-05: pagination bounds the request boundary refuses. The frozen
-# signature declares plain ints, so coercion runs before any statement is
-# built and both cases refuse under every dialect
+# AAP 0.8.3: the frozen bounds are plain integers with no declared
+# range, so a value the integer conversion refuses is the only bound the
+# request boundary stops
 REFUSED_PAGINATION = (
     pytest.param({"skip": "abc"}, "skip", id="non-numeric-skip"),
     pytest.param({"limit": "abc"}, "limit", id="non-numeric-limit"),
 )
 
-# SEC-08: bounds the frozen signature passes through to the driver. A
-# value wider than a signed 64-bit binding fails inside the statement.
-# A negative bound diverges by dialect: SQLite clamps OFFSET and lifts
-# LIMIT, PostgreSQL 13 raises InvalidRowCountInLimitClause
-UNBOUND_PAGINATION = (
-    pytest.param({"skip": 2 ** 63}, id="skip-past-the-driver-range"),
-    pytest.param({"limit": 2 ** 63}, id="limit-past-the-driver-range"),
+# AAP 0.8.3: bounds inside the frozen domain, each answered as a page
+ADMITTED_PAGINATION = (
+    pytest.param({"skip": -1}, id="negative-skip"),
+    pytest.param({"limit": -1}, id="negative-limit"),
+    pytest.param({"limit": 0}, id="zero-limit"),
+    pytest.param({"skip": 2 ** 63 - 1}, id="widest-bindable-skip"),
 )
 
-# SEC-05: a payload that would execute in a document but not in JSON
+# the widest bound the driver binds is a signed 64-bit integer, so one
+# past it reaches the statement and the database handler answers it
+UNBINDABLE_BOUND = 2 ** 63
+
+# SEC-05: a payload that executes in a document and is inert in JSON
 SCRIPT_PAYLOAD = "<script>alert('filter-name')</script>"
+
+# SEC-05: an undeclared key whose name is the payload. A rejection that
+# copies the name into the record writes caller-chosen text to the log
+# (CWE-117), and the name here is shaped like an address and a bearer
+# value so a record quoting it is unmistakable.
+UNDECLARED_KEY_NAME = "zzz-undeclared-7301-victim@example.com"
+UNDECLARED_NESTED_NAME = "zzz-undeclared-7302-Bearer-token"
+
+# SEC-05: more nested rejections than one record may name
+FLOODING_CRITERION_COUNT = _MAX_LOGGED_FIELDS + 1
+
+
+class _RecordedPaymentCall:
+    """Stand in for the payment call and record every await of it."""
+
+    def __init__(self):
+        self.awaits = []
+
+    async def __call__(self, *args, **kwargs):
+        self.awaits.append((args, kwargs))
+        return False
+
+
+@pytest.fixture(autouse=True)
+def payment_call(monkeypatch):
+    """Replace the payment call the subscription route awaits."""
+    # SEC-05/SEC-09: subscriptions.py binds process_payment into the
+    # endpoint module namespace at import, so the name the route awaits is
+    # the one replaced here. The real callable reaches PayPal from a worker
+    # thread, so a body that slipped past the request boundary would make
+    # this suite perform provider I/O and depend on a network answer.
+    recorder = _RecordedPaymentCall()
+    monkeypatch.setattr(
+        subscription_endpoint, "process_payment", recorder
+    )
+    yield recorder
+    # SEC-05: no case in this module may reach the payment call. Every
+    # subscription body here is refused by the request schema or by the
+    # route's own guard, and both answer before the call.
+    assert recorder.awaits == [], (
+        "the payment call was awaited {0} time(s): {1!r}".format(
+            len(recorder.awaits), recorder.awaits
+        )
+    )
 
 
 def _bearer(access_token):
@@ -202,7 +315,7 @@ def _recorded_inserts(table):
 def _application_route_table():
     """Return every (path, verb) pair the application declares."""
     # the framework's own documentation routes are not APIRoute
-    # instances, so they never enter the comparison
+    # instances; they never enter the comparison
     return {
         (route.path, method)
         for route in app.routes
@@ -245,8 +358,30 @@ def _seed_listings(session, count):
     ]
     session.add_all(rows)
     session.commit()
-    # Listing.id is declared str, so the response spells it that way
-    return [str(row.id) for row in rows]
+    # Listing.id is declared int, matching the INTEGER primary key
+    return [row.id for row in rows]
+
+
+def seed_filter(session, user_id, name=DECLARED_FILTER_BODY["name"]):
+    """Write one filter row with its criteria child and return its id.
+
+    ``POST /filters/`` cannot write a row for the reason AAP 0.8.3
+    records: the endpoint hands a mapped relationship a request model and
+    supplies no value for the non-null ``created_at`` column. The read
+    path is seeded through the session instead, matching how the listing
+    read path is seeded above.
+    """
+    row = FilterModel(
+        name=name,
+        user_id=user_id,
+        created_at=datetime.utcnow(),
+        criteria=[
+            CriteriaModel(**DECLARED_CRITERION),
+        ],
+    )
+    session.add(row)
+    session.commit()
+    return row.id
 
 
 def _read_listings(client, **bounds):
@@ -256,6 +391,28 @@ def _read_listings(client, **bounds):
 
 def _listing_ids(response):
     return [entry["id"] for entry in response.json()]
+
+
+# ---------------------------------------------------------------------
+# The frozen envelope contract
+# ---------------------------------------------------------------------
+def test_the_frozen_envelope_contract_matches_the_application():
+    """The hardcoded envelope contract is the one the application builds.
+
+    ENVELOPE_KEYS and _CORRELATION_KEY are written out at the top of this
+    module rather than read back from the function that builds the
+    envelope, so a change to that function fails here instead of quietly
+    redefining what every rejection case below asserts.
+    """
+    built = _error_envelope("a detail", "a correlation id")
+
+    assert set(built) == ENVELOPE_KEYS
+    assert built["detail"] == "a detail"
+    assert built[_CORRELATION_KEY] == "a correlation id"
+    assert built["fields"] == []
+
+    # SEC-08: a rejected field name reaches the caller, nothing more
+    assert _error_envelope("d", "i", ["email"])["fields"] == ["email"]
 
 
 # ---------------------------------------------------------------------
@@ -359,7 +516,9 @@ def test_filter_refuses_undeclared_nested_key(client, register_user):
     _assert_rejected(response, 422, "criteria.0.id")
 
 
-def test_subscription_refuses_undeclared_key(client, register_user):
+def test_subscription_refuses_undeclared_key(
+    client, register_user, payment_call
+):
     """The subscription route refuses a body carrying an undeclared
     key."""
     account = register_user()
@@ -369,6 +528,8 @@ def test_subscription_refuses_undeclared_key(client, register_user):
         headers=_bearer(account["access_token"]),
     )
     _assert_rejected(response, 422, "user_id")
+    # SEC-05: the refusal lands ahead of the payment call
+    assert payment_call.awaits == []
 
 
 @pytest.mark.parametrize(
@@ -421,7 +582,9 @@ def test_listing_refuses_missing_rent(client, register_user):
     _assert_rejected(response, 422, "rent")
 
 
-def test_subscription_refuses_missing_plan(client, register_user):
+def test_subscription_refuses_missing_plan(
+    client, register_user, payment_call
+):
     """The subscription route refuses a body with no plan identifier."""
     account = register_user()
     response = client.post(
@@ -430,6 +593,8 @@ def test_subscription_refuses_missing_plan(client, register_user):
         headers=_bearer(account["access_token"]),
     )
     _assert_rejected(response, 422, "plan_id")
+    # SEC-05: the refusal lands ahead of the payment call
+    assert payment_call.awaits == []
 
 
 def test_register_refuses_malformed_email(client):
@@ -454,15 +619,15 @@ def test_register_refuses_wrongly_typed_password(client, unique_email):
     "field, value",
     (
         ("rent", "two thousand"),
-        ("rent", True),
+        ("rent", {"amount": 2400}),
         ("bedrooms", [2]),
-        ("street_address", 12),
+        ("street_address", {"line1": "1 Test Way"}),
     ),
     ids=(
-        "rent-string",
-        "rent-boolean",
+        "rent-unparsable-string",
+        "rent-object",
         "bedrooms-array",
-        "address-number",
+        "address-object",
     ),
 )
 def test_listing_refuses_wrongly_typed_field(
@@ -480,59 +645,113 @@ def test_listing_refuses_wrongly_typed_field(
 
 
 def test_filter_refuses_wrongly_typed_name(client, register_user):
-    """The filter route refuses a name sent as a number."""
+    """The filter route refuses a name sent as an array."""
     account = register_user()
     response = client.post(
         "/filters/",
-        json=dict(DECLARED_FILTER_BODY, name=5),
+        json=dict(DECLARED_FILTER_BODY, name=["Two bedrooms"]),
         headers=_bearer(account["access_token"]),
     )
     _assert_rejected(response, 422, "name")
 
 
-@pytest.mark.parametrize("key, value", REFUSED_CRITERION_VALUES)
-def test_filter_refuses_a_wrongly_typed_nested_criterion(
-    client, register_user, db_session, key, value
+# SEC-05: the nested scalars a criterion declares
+CRITERION_FIELDS = ("field", "operator", "value")
+
+# SEC-05: every JSON type a nested scalar is not. A permissive string
+# type coerces the first three of these into text and stores whatever
+# the caller sent under a name the operator never wrote.
+WRONG_NESTED_TYPES = (
+    pytest.param(3000, id="number"),
+    pytest.param(True, id="boolean"),
+    pytest.param(2.5, id="float"),
+    pytest.param(["3000"], id="array"),
+    pytest.param({"value": "3000"}, id="object"),
+    pytest.param(None, id="null"),
+)
+
+
+def _criterion_with(name, value):
+    """Return one filter body whose criterion carries a single value."""
+    return {
+        "name": DECLARED_FILTER_BODY["name"],
+        "criteria": [dict(DECLARED_CRITERION, **{name: value})],
+    }
+
+
+@pytest.mark.parametrize("name", CRITERION_FIELDS)
+@pytest.mark.parametrize("value", WRONG_NESTED_TYPES)
+def test_filter_refuses_a_wrongly_typed_criterion(
+    client, register_user, db_session, name, value
 ):
-    """A nested criterion sent as the wrong type is refused, and no row
-    is written.
-
-    Criteria.field, .operator and .value all map to non-null varchar
-    columns, so a value the boundary coerces lands in the table as text
-    and the caller reads 200.
-    """
+    """The filter route refuses a nested scalar sent as another type."""
     account = register_user()
-
     response = client.post(
-        FILTER_PATH,
-        json={
-            "name": "Nested {0}".format(key),
-            "criteria": [dict(DECLARED_CRITERION, **{key: value})],
-        },
+        "/filters/",
+        json=_criterion_with(name, value),
         headers=_bearer(account["access_token"]),
     )
-
-    _assert_rejected(response, 422, "criteria.0." + key)
-    db_session.expire_all()
-    assert db_session.query(CriteriaModel).count() == 0
+    # SEC-05: the nested type holds at the request boundary and the
+    # error names the position inside the list, not just the list
+    _assert_rejected(response, 422, "criteria.0.{0}".format(name))
     assert db_session.query(FilterModel).count() == 0
 
 
-@pytest.mark.parametrize("key, value", REFUSED_CRITERION_VALUES)
-def test_filter_model_refuses_a_wrongly_typed_nested_criterion(key, value):
-    """The request model refuses the nested value on its own.
-
-    The refusal is located at the nested field, so a caller reaching the
-    model directly cannot pass a value the route would reject.
-    """
+@pytest.mark.parametrize("name", CRITERION_FIELDS)
+@pytest.mark.parametrize("value", WRONG_NESTED_TYPES)
+def test_criterion_model_refuses_a_wrongly_typed_scalar(name, value):
+    """The criterion model refuses the same value with no route
+    involved."""
     with pytest.raises(ValidationError) as raised:
-        FilterCreate(
-            name="Nested",
-            criteria=[dict(DECLARED_CRITERION, **{key: value})],
-        )
+        Criteria(**dict(DECLARED_CRITERION, **{name: value}))
+    assert (name,) in [error["loc"] for error in raised.value.errors()]
 
-    assert [error["loc"] for error in raised.value.errors()] == [
-        ("criteria", 0, key)
+
+@pytest.mark.parametrize("name", CRITERION_FIELDS)
+def test_filter_refuses_a_nul_byte_in_a_criterion(
+    client, register_user, db_session, name
+):
+    """The filter route refuses a NUL byte inside a criterion."""
+    account = register_user()
+    response = client.post(
+        "/filters/",
+        json=_criterion_with(name, "re\x00nt"),
+        headers=_bearer(account["access_token"]),
+    )
+    # SEC-05: the byte the driver cannot store never reaches the commit,
+    # so an authenticated caller cannot force a server fault with it
+    _assert_rejected(response, 422, "criteria.0.{0}".format(name))
+    assert db_session.query(FilterModel).count() == 0
+
+
+@pytest.mark.parametrize("name", CRITERION_FIELDS)
+def test_criterion_model_refuses_a_nul_byte(name):
+    """The criterion model refuses a NUL byte in each scalar."""
+    with pytest.raises(ValidationError) as raised:
+        Criteria(**dict(DECLARED_CRITERION, **{name: "re\x00nt"}))
+    assert (name,) in [error["loc"] for error in raised.value.errors()]
+
+
+def test_filter_refuses_a_nul_byte_in_the_name(
+    client, register_user, db_session
+):
+    """The filter route refuses a NUL byte in the filter name."""
+    account = register_user()
+    response = client.post(
+        "/filters/",
+        json=dict(DECLARED_FILTER_BODY, name="Two\x00bedrooms"),
+        headers=_bearer(account["access_token"]),
+    )
+    _assert_rejected(response, 422, "name")
+    assert db_session.query(FilterModel).count() == 0
+
+
+def test_filter_admits_a_declared_criterion():
+    """The filter model admits a criterion of declared strings."""
+    model = FilterCreate(**DECLARED_FILTER_BODY)
+    assert model.name == DECLARED_FILTER_BODY["name"]
+    assert [criterion.dict() for criterion in model.criteria] == [
+        DECLARED_CRITERION
     ]
 
 
@@ -540,17 +759,17 @@ def test_filter_model_refuses_a_wrongly_typed_nested_criterion(key, value):
     "field, value",
     (
         ("amount", "free"),
-        ("start_date", 20300101),
-        ("payment_method", 5),
+        ("start_date", "not-a-date"),
+        ("payment_method", ["paypal"]),
     ),
     ids=(
-        "amount-string",
-        "start-date-number",
-        "payment-method-number",
+        "amount-unparsable-string",
+        "start-date-unparsable-string",
+        "payment-method-array",
     ),
 )
 def test_subscription_refuses_wrongly_typed_field(
-    client, register_user, field, value
+    client, register_user, payment_call, field, value
 ):
     """The subscription route refuses a declared field sent as the
     wrong type."""
@@ -561,42 +780,18 @@ def test_subscription_refuses_wrongly_typed_field(
         headers=_bearer(account["access_token"]),
     )
     _assert_rejected(response, 422, field)
+    # SEC-05: the refusal lands ahead of the payment call
+    assert payment_call.awaits == []
 
 
 # ---------------------------------------------------------------------
-# A number arrives outside its domain
+# The subscription amount arrives outside its domain
 # ---------------------------------------------------------------------
 # SEC-05: the wire spellings a JSON body carries for a value no float holds
 NON_FINITE_LITERALS = ("NaN", "Infinity", "-Infinity", "1e309", "-1e309")
 
 # SEC-05: a magnitude float() refuses outright, raising OverflowError
 UNREPRESENTABLE_MAGNITUDE = 10 ** 400
-
-LISTING_DOMAIN_CASES = (
-    ("rent", 0),
-    ("rent", -500.0),
-    ("rent", UNREPRESENTABLE_MAGNITUDE),
-    ("broker_fee", -1.0),
-    ("broker_fee", UNREPRESENTABLE_MAGNITUDE),
-    ("square_footage", 0),
-    ("square_footage", -650.0),
-    ("square_footage", UNREPRESENTABLE_MAGNITUDE),
-    ("bedrooms", -1),
-    ("bathrooms", -2),
-)
-
-LISTING_DOMAIN_IDS = (
-    "rent-zero",
-    "rent-negative",
-    "rent-unrepresentable",
-    "broker-fee-negative",
-    "broker-fee-unrepresentable",
-    "square-footage-zero",
-    "square-footage-negative",
-    "square-footage-unrepresentable",
-    "bedrooms-negative",
-    "bathrooms-negative",
-)
 
 SUBSCRIPTION_DOMAIN_CASES = (
     ("amount", 0),
@@ -610,84 +805,15 @@ SUBSCRIPTION_DOMAIN_IDS = (
     "amount-unrepresentable",
 )
 
-# SEC-05: the lowest value each listing field admits
-BOUNDARY_LISTING_BODY = {
-    "rent": 0.01,
-    "broker_fee": 0.0,
-    "square_footage": 0.5,
-    "bedrooms": 0,
-    "bathrooms": 0,
-    "street_address": "1 Test Way",
-}
-
 # SEC-05: a named plan, keeping the empty-plan path out of these cases
 NAMED_PLAN = "monthly"
-
-
-@pytest.mark.parametrize(
-    "field, value", LISTING_DOMAIN_CASES, ids=LISTING_DOMAIN_IDS
-)
-def test_listing_refuses_out_of_domain_number(
-    client, register_user, db_session, field, value
-):
-    """The listing route refuses a number outside its field domain."""
-    account = register_user()
-    response = client.post(
-        "/listings/",
-        json=dict(DECLARED_LISTING_BODY, **{field: value}),
-        headers=_bearer(account["access_token"]),
-    )
-    # SEC-05: the domain holds at the request boundary, with no server
-    # fault and no row written
-    _assert_rejected(response, 422, field)
-    assert db_session.query(ListingModel).count() == 0
-
-
-@pytest.mark.parametrize(
-    "field, value", LISTING_DOMAIN_CASES, ids=LISTING_DOMAIN_IDS
-)
-def test_listing_model_refuses_out_of_domain_number(field, value):
-    """The listing model refuses the same number with no route
-    involved."""
-    with pytest.raises(ValidationError) as raised:
-        ListingCreate(**dict(DECLARED_LISTING_BODY, **{field: value}))
-    assert (field,) in [error["loc"] for error in raised.value.errors()]
-
-
-@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
-def test_listing_refuses_every_non_finite_rent(
-    client, register_user, db_session, literal
-):
-    """The listing route refuses each wire spelling of a non-finite
-    rent."""
-    account = register_user()
-    body = (
-        '{"rent": %s, "bedrooms": 2, "bathrooms": 1,'
-        ' "street_address": "1 Test Way"}' % literal
-    )
-    response = _post_raw(
-        client, "/listings/", body, account["access_token"]
-    )
-    # SEC-05: NaN and both infinities stop at the request boundary
-    _assert_rejected(response, 422, "rent")
-    assert db_session.query(ListingModel).count() == 0
-
-
-def test_listing_admits_the_lowest_value_each_field_allows():
-    """The listing model admits a no-fee studio at the domain floor."""
-    model = ListingCreate(**BOUNDARY_LISTING_BODY)
-    assert model.rent == 0.01
-    assert model.broker_fee == 0.0
-    assert model.square_footage == 0.5
-    assert model.bedrooms == 0
-    assert model.bathrooms == 0
 
 
 @pytest.mark.parametrize(
     "field, value", SUBSCRIPTION_DOMAIN_CASES, ids=SUBSCRIPTION_DOMAIN_IDS
 )
 def test_subscription_refuses_out_of_domain_amount(
-    client, register_user, field, value
+    client, register_user, payment_call, field, value
 ):
     """The subscription route refuses an amount outside its domain."""
     account = register_user()
@@ -702,6 +828,8 @@ def test_subscription_refuses_out_of_domain_amount(
     )
     # SEC-05: the amount domain holds ahead of the payment call
     _assert_rejected(response, 422, field)
+    # SEC-05: the refusal lands ahead of the payment call
+    assert payment_call.awaits == []
 
 
 @pytest.mark.parametrize(
@@ -723,7 +851,7 @@ def test_subscription_model_refuses_out_of_domain_amount(field, value):
 
 @pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
 def test_subscription_refuses_every_non_finite_amount(
-    client, register_user, literal
+    client, register_user, payment_call, literal
 ):
     """The subscription route refuses each wire spelling of a non-finite
     amount."""
@@ -737,6 +865,8 @@ def test_subscription_refuses_every_non_finite_amount(
     )
     # SEC-05: NaN and both infinities stop ahead of the payment call
     _assert_rejected(response, 422, "amount")
+    # SEC-05: the refusal lands ahead of the payment call
+    assert payment_call.awaits == []
 
 
 @pytest.mark.parametrize(
@@ -745,7 +875,7 @@ def test_subscription_refuses_every_non_finite_amount(
     ids=("end-before-start", "end-equals-start"),
 )
 def test_subscription_refuses_an_unordered_term(
-    client, register_user, end_date
+    client, register_user, payment_call, end_date
 ):
     """The subscription route refuses a term that ends before it
     begins."""
@@ -761,6 +891,8 @@ def test_subscription_refuses_an_unordered_term(
     )
     # SEC-05: the term order holds at the request boundary
     _assert_rejected(response, 422, "end_date")
+    # SEC-05: the refusal lands ahead of the payment call
+    assert payment_call.awaits == []
 
 
 def test_subscription_admits_an_ordered_term_and_an_open_one():
@@ -799,7 +931,7 @@ def test_filter_empty_name_and_criteria_answer_bad_request(
 
 
 def test_subscription_empty_plan_answers_bad_request(
-    client, register_user
+    client, register_user, payment_call
 ):
     """The subscription route answers 400 when the plan identifier
     arrives empty."""
@@ -812,19 +944,49 @@ def test_subscription_empty_plan_answers_bad_request(
     # SEC-05: an empty declared value reaches subscriptions.py:20-21
     _assert_rejected(response, 400)
     assert response.status_code != 422
+    # SEC-05: the refusal lands ahead of the payment call
+    assert payment_call.awaits == []
 
 
 def test_declared_listing_body_writes_no_row(
     client, register_user, db_session
 ):
-    """A body of declared fields alone still writes no listing row."""
+    """A body of declared fields alone still writes no listing row.
+
+    The status is asserted exactly. A test that only ruled out a 2xx
+    would also pass on a 401, a 422, a 429 or a 502, and each of those
+    means something different: the guard refused the caller, the request
+    boundary refused the body, the throttle answered, or a dependency
+    did. Ruling out success alone therefore keeps passing after the
+    contract moves, which is what makes the exact status the assertion.
+    """
     account = register_user()
     response = client.post(
         "/listings/",
         json=DECLARED_LISTING_BODY,
         headers=_bearer(account["access_token"]),
     )
-    assert not (200 <= response.status_code < 300), response.text
+
+    # AAP 0.8.3: every key in the body is declared, so the request
+    # boundary admits it and the failure that follows is the known model
+    # defect KNOWN_LISTING_DEFECT_STATUS documents - not a rejection
+    assert response.status_code == KNOWN_LISTING_DEFECT_STATUS, response.text
+
+    # SEC-08: the defect answers through the uniform sanitized envelope,
+    # so a caller cannot tell a model defect from any other server fault
+    reported = response.json()
+    assert set(reported) == ENVELOPE_KEYS
+    assert reported["detail"] == SANITIZED_FAULT_DETAIL
+    assert reported["fields"] == []
+    assert CORRELATION_ID.fullmatch(reported[_CORRELATION_KEY]), response.text
+
+    # SEC-08: no exception type, module path, column name or statement
+    # text reaches the caller
+    lowered = response.text.lower()
+    for withheld in WITHHELD_FAULT_TEXT:
+        assert withheld not in lowered, response.text
+
+    # SEC-05: the failed write leaves no row behind
     assert db_session.query(ListingModel).count() == 0
 
 
@@ -992,7 +1154,7 @@ def test_public_listing_page_slices_by_skip_and_limit(client, db_session):
         for offset in (0, PAGE_SIZE, 2 * PAGE_SIZE)
     ]
 
-    # the bounds decide the page size, so the last page is short
+    # the bounds decide the page size; the last page is short
     assert [len(page) for page in pages] == [PAGE_SIZE, PAGE_SIZE, 1]
 
     # every returned row is a seeded row, and no page repeats one
@@ -1032,13 +1194,13 @@ def test_the_public_read_statement_carries_no_ordering(db_session):
 
 
 @pytest.mark.parametrize("bounds,field", REFUSED_PAGINATION)
-def test_public_listing_page_refuses_a_bound_outside_its_range(
+def test_public_listing_page_refuses_a_non_numeric_bound(
     client, bounds, field
 ):
-    """A non-numeric bound is refused at the request boundary.
+    """A bound that is not an integer is refused at the boundary.
 
-    The declared int annotation coerces the query value ahead of the
-    statement, so this refusal holds under every dialect.
+    The refusal names the bound, so a caller learns which one it sent
+    wrongly without any statement text reaching the response.
     """
     response = _read_listings(client, **bounds)
 
@@ -1046,41 +1208,104 @@ def test_public_listing_page_refuses_a_bound_outside_its_range(
     _assert_rejected(response, 422, field)
 
 
-@pytest.mark.parametrize("bounds", UNBOUND_PAGINATION)
-def test_public_listing_page_leaks_nothing_past_the_driver_range(
-    client, bounds
+@pytest.mark.parametrize("bounds", ADMITTED_PAGINATION)
+def test_public_listing_page_admits_the_frozen_numeric_domain(
+    client, db_session, bounds
 ):
-    """A bound the frozen signature passes through fails cleanly.
+    """Every integer bound inside the frozen domain answers a page.
 
-    The signature declares plain ints and applies no ceiling, so a value
-    wider than a signed 64-bit binding reaches the statement. The
-    failure returns the uniform envelope carrying no driver text.
+    AAP 0.8.3 freezes the skip and limit contract, so this case fails if
+    a narrower domain is reintroduced and starts refusing a bound the
+    public read path accepted.
     """
+    _seed_listings(db_session, SEEDED_LISTING_COUNT)
+
     response = _read_listings(client, **bounds)
 
-    # SEC-08: the sanctioned residual surfaces sanitized, never raw
+    assert response.status_code == 200, response.text
+    assert isinstance(response.json(), list)
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    (
+        pytest.param({"skip": UNBINDABLE_BOUND}, id="skip"),
+        pytest.param({"limit": UNBINDABLE_BOUND}, id="limit"),
+    ),
+)
+def test_an_unbindable_bound_answers_a_sanitized_fault(
+    client, db_session, bounds
+):
+    """A bound past the driver's range answers the uniform envelope.
+
+    The frozen contract declares no ceiling, so the value reaches the
+    statement. SEC-08 is what keeps the failure from carrying the
+    statement, the driver name or a traceback back to the caller.
+    """
+    _seed_listings(db_session, SEEDED_LISTING_COUNT)
+
+    response = _read_listings(client, **bounds)
+
     assert response.status_code == 500
     body = response.json()
-    assert set(body) == {"detail", "error_id", "fields"}
-    assert body["detail"] == "Internal server error"
-    assert body["fields"] == []
-    lowered = response.text.lower()
-    for leaked in ("traceback", "overflow", "sqlalchemy", ".py", "select "):
-        assert leaked not in lowered, leaked
+    # SEC-08: one envelope shape, a correlation identifier, no internals
+    assert set(body) == ENVELOPE_KEYS
+    assert body[_CORRELATION_KEY]
+    leaked = response.text.lower()
+    for fragment in ("select ", "sqlite", "sqlalchemy", "traceback", "offset"):
+        assert fragment not in leaked
 
 
 # ---------------------------------------------------------------------
 # The filter route's declared response model
 # ---------------------------------------------------------------------
-def test_filter_creation_returns_the_declared_response_model(
+def test_the_filter_routes_publish_the_declared_response_model(
+    client, register_user, db_session
+):
+    """Both filter routes declare the model, and a read publishes it.
+
+    AAP 0.8.3 freezes the response model these routes declare. The
+    declaration is what filters the response, and dropping it would
+    widen the body without moving any status code. The create route
+    cannot write a row, so the published key set is read back from a
+    seeded one.
+    """
+    account = register_user()
+
+    # AAP 0.8.3: both routes still declare the model they always had
+    assert _route_for(FILTER_PATH, "POST").response_model is Filter
+    assert _route_for(FILTER_PATH, "GET").response_model == List[Filter]
+
+    seed_filter(db_session, account["id"])
+
+    response = client.get(
+        FILTER_PATH, headers=_bearer(account["access_token"])
+    )
+
+    assert response.status_code == 200, response.text
+    published = response.json()
+    assert len(published) == 1
+    assert set(published[0]) == DECLARED_FILTER_RESPONSE_KEYS
+    # SEC-05: the nested criterion is read through the declared model,
+    # so a wider mapped row cannot publish a column the model omits
+    assert published[0]["criteria"] == [DECLARED_CRITERION]
+
+    # AAP 0.8.3: the declared model publishes exactly the frozen key set.
+    # A field added to Filter widens what this route returns, so it fails
+    # here rather than passing because the expectation was read from it.
+    assert frozenset(Filter.__fields__) == DECLARED_FILTER_RESPONSE_KEYS
+
+
+def test_filter_creation_defect_answers_a_sanitized_fault(
     client, register_user
 ):
-    """A successful filter creation returns the declared key set.
+    """The create path's pre-existing defect discloses nothing.
 
-    The declaration is what filters the response, so the route object is
-    asserted alongside the body: the handler already builds the model by
-    hand, and a dropped declaration would return the same keys while
-    filtering nothing.
+    AAP 0.8.3 records that this route cannot write a row, for reasons
+    outside the security scope: the endpoint hands a mapped relationship
+    a request model and supplies no value for the non-null ``created_at``
+    column. The strict schema still closes the mass-assignment vector,
+    and the fault must surface as the uniform sanitized envelope.
     """
     account = register_user()
 
@@ -1090,17 +1315,30 @@ def test_filter_creation_returns_the_declared_response_model(
         headers=_bearer(account["access_token"]),
     )
 
-    assert response.status_code == 200, response.text
-    assert set(response.json()) == DECLARED_FILTER_RESPONSE_KEYS
+    # SEC-08: one uniform envelope, no internal detail
+    assert response.status_code == 500, response.text
+    body = response.json()
+    assert set(body) == ENVELOPE_KEYS
+    assert body["detail"] == "Internal server error"
+    assert body["fields"] == []
+    assert body[_CORRELATION_KEY]
 
-    # AAP 0.8.3: the route still declares the model it published
-    assert _route_for(FILTER_PATH, "POST").response_model is Filter
+    served = response.text
+    for leaked in (
+        "Traceback",
+        "_sa_instance_state",
+        "sqlalchemy",
+        "INSERT INTO",
+        "filters.py",
+        "site-packages",
+    ):
+        assert leaked not in served, served
 
 
 def test_a_stored_script_payload_round_trips_inside_json(
-    client, register_user
+    client, register_user, db_session
 ):
-    """A script payload stored as a filter name comes back verbatim.
+    """A script payload held as a filter name comes back verbatim.
 
     The response is JSON, so the value sits in no markup context on the
     server and nothing here executes server-side. Pinning it records
@@ -1108,25 +1346,339 @@ def test_a_stored_script_payload_round_trips_inside_json(
     served as a document.
     """
     account = register_user()
-    credentials = _bearer(account["access_token"])
 
-    created = client.post(
-        FILTER_PATH,
-        json=dict(DECLARED_FILTER_BODY, name=SCRIPT_PAYLOAD),
-        headers=credentials,
+    # SEC-05: the request boundary admits the payload as declared text,
+    # with no server-side rewrite
+    admitted = FilterCreate(**dict(DECLARED_FILTER_BODY, name=SCRIPT_PAYLOAD))
+    assert admitted.name == SCRIPT_PAYLOAD
+
+    seed_filter(db_session, account["id"], name=SCRIPT_PAYLOAD)
+
+    read_back = client.get(
+        FILTER_PATH, headers=_bearer(account["access_token"])
     )
-    assert created.status_code == 200, created.text
-
-    read_back = client.get(FILTER_PATH, headers=credentials)
-    assert read_back.status_code == 200
+    assert read_back.status_code == 200, read_back.text
 
     # SEC-05: the payload is carried as data, never as markup
-    for response in (created, read_back):
-        content_type = response.headers["content-type"]
-        assert content_type.startswith("application/json"), content_type
-        assert "html" not in content_type
+    content_type = read_back.headers["content-type"]
+    assert content_type.startswith("application/json"), content_type
+    assert "html" not in content_type
 
-    # SEC-05: stored and returned unchanged, so no server-side rewrite
+    # SEC-05: stored and returned unchanged; no server-side rewrite
     # hides it from a caller that has to escape it
-    assert created.json()["name"] == SCRIPT_PAYLOAD
     assert [entry["name"] for entry in read_back.json()] == [SCRIPT_PAYLOAD]
+
+
+def _validation_record(caplog, response):
+    """Return the single record quoting one reply's correlation value."""
+    error_id = response.json()[_CORRELATION_KEY]
+    matching = [
+        record
+        for record in caplog.records
+        if error_id in record.getMessage()
+    ]
+    assert len(matching) == 1, [
+        record.getMessage() for record in caplog.records
+    ]
+    return matching[0].getMessage()
+
+
+def test_an_undeclared_key_name_reaches_no_record(
+    client, unique_email, caplog
+):
+    """The caller is told which key was refused; the record is not.
+
+    Both channels are read in one case, because the two answers differ on
+    purpose. The reply names the key so a client can correct the request.
+    The record names its position, because the key itself is text the
+    caller chose and a record is read by tooling that trusts it.
+    """
+    caplog.set_level(logging.WARNING)
+    response = client.post(
+        REGISTER_PATH,
+        json={
+            "email": unique_email,
+            "password": POLICY_PASSWORD,
+            UNDECLARED_KEY_NAME: "x",
+        },
+    )
+
+    # SEC-05: the reply keeps the contract the client depends on
+    _assert_rejected(response, 422, UNDECLARED_KEY_NAME)
+
+    message = _validation_record(caplog, response)
+    assert "validation rejected" in message
+    assert REGISTER_PATH in message
+    assert "fields={0}".format(_UNDECLARED_FIELD) in message
+    assert "count=1" in message
+
+    # SEC-05: nothing the caller named reaches the record
+    assert UNDECLARED_KEY_NAME not in message
+    assert UNDECLARED_KEY_NAME not in caplog.text
+    assert unique_email not in caplog.text
+    assert POLICY_PASSWORD not in caplog.text
+
+
+def test_a_nested_undeclared_key_is_located_but_not_named(
+    client, register_user, caplog
+):
+    """A nested rejection keeps the declared path and drops the leaf."""
+    caplog.set_level(logging.WARNING)
+    account = register_user()
+    response = client.post(
+        FILTER_PATH,
+        json=dict(
+            DECLARED_FILTER_BODY,
+            criteria=[
+                dict(DECLARED_CRITERION, **{UNDECLARED_NESTED_NAME: "x"})
+            ],
+        ),
+        headers=_bearer(account["access_token"]),
+    )
+
+    _assert_rejected(
+        response, 422, "criteria.0.{0}".format(UNDECLARED_NESTED_NAME)
+    )
+
+    message = _validation_record(caplog, response)
+    # SEC-05: the declared path is a server fact and stays; the leaf is
+    # the caller's word and goes
+    assert "criteria.0.{0}".format(_UNDECLARED_FIELD) in message
+    assert UNDECLARED_NESTED_NAME not in message
+    assert UNDECLARED_NESTED_NAME not in caplog.text
+
+
+def test_a_declared_field_name_reaches_the_record(client, unique_email,
+                                                  caplog):
+    """A refused declared field is named, so the record still diagnoses."""
+    caplog.set_level(logging.WARNING)
+    response = client.post(
+        REGISTER_PATH, json={"email": unique_email}
+    )
+
+    _assert_rejected(response, 422, "password")
+
+    message = _validation_record(caplog, response)
+    # SEC-05: the name is declared by the schema, so it is the server's
+    # own vocabulary and withholding it would remove the diagnosis
+    assert "fields=password" in message
+    assert _UNDECLARED_FIELD not in message
+
+
+def test_many_rejections_bound_one_record(client, register_user, caplog):
+    """A body full of rejections produces a bounded record."""
+    caplog.set_level(logging.WARNING)
+    account = register_user()
+    response = client.post(
+        FILTER_PATH,
+        json=dict(
+            DECLARED_FILTER_BODY,
+            criteria=[
+                _without(DECLARED_CRITERION, "field")
+                for _ in range(FLOODING_CRITERION_COUNT)
+            ],
+        ),
+        headers=_bearer(account["access_token"]),
+    )
+
+    assert response.status_code == 422, response.text
+    assert len(_rejected_fields(response)) == FLOODING_CRITERION_COUNT
+
+    message = _validation_record(caplog, response)
+    named = message.split("fields=")[1].split(" count=")[0]
+    withheld = FLOODING_CRITERION_COUNT - _MAX_LOGGED_FIELDS
+
+    # SEC-05: the record names a fixed maximum and counts the rest, so a
+    # large body cannot inflate one line without limit (CWE-532)
+    assert named.endswith(",+{0}".format(withheld))
+    assert named.count("criteria.") == _MAX_LOGGED_FIELDS
+    assert "count={0}".format(FLOODING_CRITERION_COUNT) in message
+
+
+@pytest.mark.parametrize(
+    "error_type,expected",
+    [
+        ("value_error.missing", "{0}.leaf"),
+        ("value_error.extra", "{0}." + _UNDECLARED_FIELD),
+    ],
+)
+def test_a_long_field_path_is_truncated_in_the_record(error_type, expected):
+    """Every part of a logged path is capped in length."""
+    overlong = "z" * (_MAX_LOGGED_NAME_LENGTH * 5)
+    rendered = _loggable_field_names(
+        [{"loc": ("body", overlong, "leaf"), "type": error_type}]
+    )
+
+    capped = overlong[:_MAX_LOGGED_NAME_LENGTH]
+    assert rendered == expected.format(capped)
+    assert len(capped) == _MAX_LOGGED_NAME_LENGTH
+    assert overlong not in rendered
+
+
+# ---------------------------------------------------------------------
+# The filter write path bounds what one request can store
+# ---------------------------------------------------------------------
+def test_filter_criteria_beyond_the_cap_are_refused(client, register_user):
+    """A criteria list longer than the cap stops at the boundary.
+
+    An unbounded list lets one authenticated request write arbitrarily
+    many child rows, so the cap is the control and the boundary is where
+    it has to be enforced (CWE-770).
+    """
+    account = register_user()
+    oversized = dict(
+        DECLARED_FILTER_BODY,
+        criteria=[DECLARED_CRITERION] * (MAX_CRITERIA + 1),
+    )
+
+    response = client.post(
+        FILTER_PATH, json=oversized, headers=_bearer(account["access_token"])
+    )
+
+    _assert_rejected(response, 422, "criteria")
+
+
+def test_filter_criteria_at_the_cap_are_admitted(client, register_user):
+    """A criteria list exactly at the cap clears the request boundary.
+
+    The cap refuses one entry more, so the boundary case proves the cap is
+    a bound rather than an off-by-one refusal. AAP 0.8.3 records that this
+    route cannot write a row, so admission is asserted as the absence of a
+    422 plus acceptance by the request model itself; the pre-existing write
+    defect still answers the uniform sanitized 500.
+    """
+    account = register_user()
+    at_cap = dict(
+        DECLARED_FILTER_BODY, criteria=[DECLARED_CRITERION] * MAX_CRITERIA
+    )
+
+    # SEC-05: the request model admits the list at the cap
+    admitted = FilterCreate(**at_cap)
+    assert len(admitted.criteria) == MAX_CRITERIA
+
+    response = client.post(
+        FILTER_PATH, json=at_cap, headers=_bearer(account["access_token"])
+    )
+
+    # SEC-05: no field is rejected, so the cap did not refuse this list
+    assert response.status_code != 422, response.text
+    assert response.status_code == 500, response.text
+    body = response.json()
+    assert set(body) == ENVELOPE_KEYS
+    assert body["fields"] == []
+
+
+def test_filter_criterion_text_beyond_its_cap_is_refused(
+    client, register_user
+):
+    """A criterion value longer than its cap stops at the boundary."""
+    account = register_user()
+    oversized = dict(
+        DECLARED_FILTER_BODY,
+        criteria=[
+            dict(DECLARED_CRITERION, value="9" * (MAX_CRITERION_VALUE + 1))
+        ],
+    )
+
+    response = client.post(
+        FILTER_PATH, json=oversized, headers=_bearer(account["access_token"])
+    )
+
+    # the handler names the offending nested criterion, not a bare field
+    _assert_rejected(response, 422, "criteria.0.value")
+
+
+def test_filter_name_beyond_its_cap_is_refused(client, register_user):
+    """A filter name longer than its cap stops at the boundary."""
+    account = register_user()
+    oversized = dict(DECLARED_FILTER_BODY, name="n" * (MAX_FILTER_NAME + 1))
+
+    response = client.post(
+        FILTER_PATH, json=oversized, headers=_bearer(account["access_token"])
+    )
+
+    _assert_rejected(response, 422, "name")
+
+
+def test_an_empty_filter_name_still_answers_bad_request(
+    client, register_user
+):
+    """The empty-name path is unchanged by the length cap.
+
+    A maximum length must not acquire a minimum: the route answers 400
+    for an empty name and that contract is asserted elsewhere too.
+    """
+    account = register_user()
+
+    response = client.post(
+        FILTER_PATH,
+        json={"name": "", "criteria": []},
+        headers=_bearer(account["access_token"]),
+    )
+
+    assert response.status_code == 400, response.text
+
+
+# ---------------------------------------------------------------------
+# Identifiers are served with the type their column declares
+# ---------------------------------------------------------------------
+def test_identifiers_are_served_as_integers(
+    client, register_user, db_session
+):
+    """Every served identifier is a JSON number, not a string.
+
+    The columns are INTEGER, so a string identifier would force a
+    caller to coerce before comparing and would misreport the contract.
+    """
+    account = register_user()
+    credentials = _bearer(account["access_token"])
+
+    # AAP 0.8.3: the create route cannot write a row, so the read path is
+    # seeded through the session and the served types are read from it
+    seeded_id = seed_filter(db_session, account["id"])
+    served = client.get(FILTER_PATH, headers=credentials)
+    assert served.status_code == 200, served.text
+
+    published = served.json()
+    assert len(published) == 1
+    filter_body = published[0]
+    assert isinstance(filter_body["id"], int)
+    assert filter_body["id"] == seeded_id
+    assert isinstance(filter_body["user_id"], int)
+    assert filter_body["user_id"] == account["id"]
+
+    _seed_listings(db_session, 1)
+    listings = _read_listings(client)
+    assert listings.status_code == 200
+    assert [isinstance(entry["id"], int) for entry in listings.json()] == [
+        True
+    ]
+
+
+# ---------------------------------------------------------------------
+# The harness enforces the foreign keys the models declare
+# ---------------------------------------------------------------------
+def test_declared_foreign_keys_are_enforced_under_test(db_session):
+    """A child row naming no parent is refused by the database.
+
+    SQLite ignores foreign keys unless the pragma is set per connection.
+    Without it the four declared foreign keys are inert under test, so a
+    harness that stands in for PostgreSQL would be weaker than what it
+    replaces and an orphaned row would insert cleanly.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from backend.app.db.models import Criteria as CriteriaModel
+
+    enabled = db_session.execute(text("PRAGMA foreign_keys")).scalar()
+    assert enabled == 1, enabled
+
+    # filter_id names no filters row, so the constraint has to refuse it
+    db_session.add(
+        CriteriaModel(
+            filter_id=987654, field="rent", operator="lt", value="1"
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()

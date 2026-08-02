@@ -18,7 +18,9 @@ The stored value is checked too. Every ceiling below is a bcrypt input
 limit, so the scheme that produced the hash is covered by these cases.
 """
 import logging
+import re
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -26,7 +28,16 @@ from sqlalchemy import text
 
 from backend.app.api.endpoints import auth as auth_endpoint
 from backend.app.core.security import get_password_hash, verify_password
-from backend.app.schema.user import UserCreate, UserLogin
+from backend.app.schema.user import (
+    PASSWORD_DIGITS,
+    PASSWORD_LOWERCASE,
+    PASSWORD_MAX_BYTES,
+    PASSWORD_MIN_LENGTH,
+    PASSWORD_SPECIAL_CHARACTERS,
+    PASSWORD_UPPERCASE,
+    UserCreate,
+    UserLogin,
+)
 
 # There is no /api prefix: router.py applies /auth and main.py includes
 # the router without one.
@@ -40,6 +51,28 @@ MAX_BYTES = 72
 # SEC-04: 30-character special set mirrors validators.ts:23
 SPECIALS = "!@#$%^&*()_+-=[]{};':\"\\|,.<>/?"
 SPECIAL_COUNT = 30
+
+# SEC-04: the client rule the server policy mirrors. AAP 0.5.4 makes
+# validators.ts the authoritative character set, so the parity tests read
+# it from disk rather than trusting the transcription above. The path is
+# resolved from this file, which keeps it correct whether pytest runs
+# from the repository root or from backend/ as ci.yml does.
+CLIENT_VALIDATOR = (
+    Path(__file__).resolve().parents[3]
+    / "frontend" / "src" / "utils" / "validators.ts"
+)
+
+# The four class rules and the length rule validators.ts declares, named
+# by the identifier each is assigned to
+CLIENT_UPPERCASE_RULE = "hasUppercase"
+CLIENT_LOWERCASE_RULE = "hasLowercase"
+CLIENT_DIGIT_RULE = "hasNumber"
+CLIENT_SPECIAL_RULE = "hasSpecialChar"
+CLIENT_LENGTH_RULE = "minLength"
+
+# validators.ts:22 names the digit class by its shorthand rather than by
+# an explicit range
+CLIENT_DIGIT_SHORTHAND = "\\d"
 
 EXCLUDED_PUNCTUATION = ("~", "`", " ")
 
@@ -134,7 +167,7 @@ def _user_row_count(session, email):
 
 
 def _stored_password_hash(session, email):
-    # SEC-04: reads the column the route wrote, so the assertion covers
+    # SEC-04: reads the column the route wrote; the assertion covers
     # what an attacker reaching the table would find
     return session.execute(
         text("SELECT hashed_password FROM users WHERE email = :email"),
@@ -149,16 +182,128 @@ def _modular_crypt_parts(stored):
     return identifier, cost, remainder
 
 
-def test_special_set_mirrors_the_client_rule():
-    """The server set holds the same 30 characters as validators.ts:23.
+def _client_rule_line(identifier):
+    """Return the line of validators.ts that declares one rule."""
+    assert CLIENT_VALIDATOR.is_file(), CLIENT_VALIDATOR
+    source = CLIENT_VALIDATOR.read_text(encoding="utf-8")
+    # the declaration, not the reference the return statement makes to it
+    declaration = "const {0}".format(identifier)
+    matches = [line for line in source.splitlines() if declaration in line]
+    # a rule declared twice would make the parse below ambiguous
+    assert len(matches) == 1, (identifier, matches)
+    return matches[0]
 
-    Tilde, backtick and space stay outside it, so the rule names an
-    explicit set and not any punctuation.
+
+def _client_regex_source(identifier):
+    """Return the source of the regular expression one rule tests with."""
+    line = _client_rule_line(identifier)
+    opened = line.index("/")
+    index = opened + 1
+    while index < len(line):
+        character = line[index]
+        if character == "\\":
+            # a backslash escapes the next character, including a slash
+            index += 2
+            continue
+        if character == "/":
+            return line[opened + 1:index]
+        index += 1
+    raise AssertionError("unterminated expression: {0}".format(line))
+
+
+def _client_class_members(source):
+    """Return every character one bracketed class admits, in order."""
+    assert source.startswith("[") and source.endswith("]"), source
+    body = source[1:-1]
+    members = []
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if character == "\\":
+            members.append(body[index + 1])
+            index += 2
+            continue
+        if character == "-" and members and index + 1 < len(body):
+            # an unescaped hyphen between two members names a range
+            first = ord(members.pop())
+            last = ord(body[index + 1])
+            members.extend(chr(code) for code in range(first, last + 1))
+            index += 2
+            continue
+        members.append(character)
+        index += 1
+    return members
+
+
+def test_special_set_mirrors_the_client_rule():
+    """The server set holds the same characters validators.ts:23 does.
+
+    The client file is read and its character class parsed, so a
+    character added to or dropped from either side fails here. Asserting
+    the transcription against itself would agree with any set, which is
+    what leaves two copies of one rule free to drift apart.
+
+    Tilde, backtick and space stay outside the set on both sides, so the
+    rule names an explicit set and not any punctuation.
     """
+    parsed = _client_class_members(
+        _client_regex_source(CLIENT_SPECIAL_RULE)
+    )
+
+    # the class names each character once, so a duplicate on either side
+    # is a drift rather than a harmless repeat
+    assert len(parsed) == SPECIAL_COUNT, "".join(parsed)
+    assert len(set(parsed)) == SPECIAL_COUNT, "".join(parsed)
+
+    # SEC-04: client, server and this module hold one set between them
+    assert set(parsed) == set(PASSWORD_SPECIAL_CHARACTERS)
+    assert set(parsed) == set(SPECIALS)
+    assert len(PASSWORD_SPECIAL_CHARACTERS) == SPECIAL_COUNT
     assert len(SPECIALS) == SPECIAL_COUNT
-    assert len(set(SPECIALS)) == SPECIAL_COUNT
+
     for character in EXCLUDED_PUNCTUATION:
+        assert character not in parsed
+        assert character not in PASSWORD_SPECIAL_CHARACTERS
         assert character not in SPECIALS
+
+
+def test_length_and_class_rules_mirror_the_client_rule():
+    """Every other policy rule the client declares holds on the server.
+
+    validators.ts:19-22 carries the minimum length and the uppercase,
+    lowercase and digit classes. Each is read from that file and compared
+    against the constant the server validator applies, so a rule relaxed
+    on one side fails here rather than passing on both.
+    """
+    length_rule = _client_rule_line(CLIENT_LENGTH_RULE)
+    declared = re.search(
+        r"const\s+minLength\s*=\s*(\d+)\s*;", length_rule
+    )
+    assert declared is not None, length_rule
+
+    # SEC-04: one minimum length across client, server and this module
+    assert int(declared.group(1)) == PASSWORD_MIN_LENGTH
+    assert MIN_LENGTH == PASSWORD_MIN_LENGTH
+
+    uppercase = _client_class_members(
+        _client_regex_source(CLIENT_UPPERCASE_RULE)
+    )
+    lowercase = _client_class_members(
+        _client_regex_source(CLIENT_LOWERCASE_RULE)
+    )
+    assert "".join(uppercase) == PASSWORD_UPPERCASE
+    assert "".join(lowercase) == PASSWORD_LOWERCASE
+
+    # the client names the digit class by shorthand, so the comparison is
+    # against what that shorthand admits
+    assert _client_regex_source(CLIENT_DIGIT_RULE) == CLIENT_DIGIT_SHORTHAND
+    assert PASSWORD_DIGITS == "0123456789"
+
+    # SEC-04: the byte ceiling is the one rule the server adds. A browser
+    # cannot see the hasher, so validators.ts declares no counterpart and
+    # this module pins the server constant alone.
+    assert MAX_BYTES == PASSWORD_MAX_BYTES
+    assert "72" not in _client_rule_line(CLIENT_LENGTH_RULE)
 
 
 def test_compliant_password_registers(client, db_session, unique_email):

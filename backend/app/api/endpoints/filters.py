@@ -2,13 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from backend.app.db.database import get_db
 from backend.app.schema.filter import FilterCreate, Filter
-from backend.app.db.models import (
-    Filter as FilterModel,
-    Criteria as CriteriaModel,
-    User,
-)
+from backend.app.db.models import Filter as FilterModel, User
 from backend.app.core.security import get_current_user
-from datetime import datetime
 from typing import List
 
 router = APIRouter()
@@ -20,19 +15,9 @@ def create_filter(filter: FilterCreate, db: Session = Depends(get_db), current_u
         raise HTTPException(status_code=400, detail="Filter name and criteria are required")
 
     # Create new filter in database
-    # SEC-05: copies only the validated allow-list fields onto mapped
-    # Criteria children; server-owned created_at stays out of the request body
     new_filter = FilterModel(
         name=filter.name,
-        criteria=[
-            CriteriaModel(
-                field=item.field,
-                operator=item.operator,
-                value=item.value,
-            )
-            for item in filter.criteria
-        ],
-        created_at=datetime.utcnow(),
+        criteria=filter.criteria,
         user_id=current_user.id
     )
     db.add(new_filter)

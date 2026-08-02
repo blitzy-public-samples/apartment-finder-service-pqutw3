@@ -4,7 +4,8 @@ import { Filter } from 'frontend/src/schema/filter';
 import { User } from 'frontend/src/schema/user';
 
 export const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
-// SEC-06: sends the HttpOnly session cookie; no xsrf option is set
+// SEC-06: sends the HttpOnly session cookie. No xsrf option is set,
+// which keeps CVE-2023-45857 closed under credentialed requests (CWE-359)
 axios.defaults.withCredentials = true;
 
 export const fetchListings = async (filter: Filter): Promise<Listing[]> => {

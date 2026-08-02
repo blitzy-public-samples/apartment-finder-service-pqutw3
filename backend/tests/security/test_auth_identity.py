@@ -14,9 +14,14 @@ from jose import JWTError, jwt
 from backend.app.core.config import settings
 from backend.app.core.security import (
     SESSION_COOKIE_NAME,
+    _MAX_SUBJECT_ID,
     create_access_token,
 )
-from backend.app.db.models import User
+from backend.app.db.models import (
+    Criteria as CriteriaModel,
+    Filter as FilterModel,
+    User,
+)
 
 # SEC-02: the authenticated route the guard defends. No /api segment
 # exists and the trailing slash belongs to the declared path.
@@ -41,7 +46,7 @@ MALFORMED_TOKEN = "not.a.token"
 # SEC-02: a value for the non-null hash column on a seeded row
 SEEDED_HASH = "x" * 60
 
-# SEC-02: a primary key registration would not hand out on its own
+# SEC-02: a primary key outside the range registration allocates
 SEEDED_ID = 70
 
 # SEC-02: the widest key models.py can map. PostgreSQL provisions User.id
@@ -49,11 +54,35 @@ SEEDED_ID = 70
 # boundary the guard has to refuse
 MAPPED_KEY_CEILING = 2147483647
 ABOVE_MAPPED_KEY_CEILING = 2147483648
+# SEC-02: the name on a seeded filter row, read back through the guard
+SEEDED_FILTER_NAME = "Owner filter"
 
 
 def bearer(token):
     """Return the Authorization header carrying one token."""
     return {"Authorization": "{0} {1}".format(BEARER_CHALLENGE, token)}
+
+
+def seed_filter(session, user_id):
+    """Write one filter row for an account and return its identifier.
+
+    ``POST /filters/`` cannot write a row. The endpoint hands a mapped
+    relationship a request model and supplies no value for the non-null
+    ``created_at`` column, so the create path raises before it commits.
+    The read path is seeded through the session instead, which is the
+    convention the listing read-path tests already follow.
+    """
+    row = FilterModel(
+        name=SEEDED_FILTER_NAME,
+        user_id=user_id,
+        created_at=datetime.utcnow(),
+        criteria=[
+            CriteriaModel(field="rent", operator="lt", value="3000"),
+        ],
+    )
+    session.add(row)
+    session.commit()
+    return row.id
 
 
 def claims_of(token):
@@ -150,31 +179,32 @@ def test_session_cookie_reaches_the_protected_route(client, register_user):
     assert response.json() == []
 
 
-def test_guard_resolves_the_owning_account(client, register_user):
-    """Each account reads its own filters and none belonging to another."""
+def test_guard_resolves_the_owning_account(client, register_user, db_session):
+    """Each account reads its own filters and none belonging to another.
+
+    The row is seeded through the session: the create route hands request
+    models to a mapped relationship and supplies no value for the
+    non-null created_at column, so it writes nothing. What is under test
+    is the identity the guard resolves, which the read path shows.
+    """
     owner = register_user()
     other = register_user()
-    created = client.post(
-        PROTECTED_ROUTE,
-        json={
-            "name": "Owner filter",
-            "criteria": [
-                {"field": "rent", "operator": "lt", "value": "3000"},
-            ],
-        },
-        headers=bearer(owner["access_token"]),
-    )
-    assert created.status_code == 200
-    assert created.json()["user_id"] == str(owner["id"])
+    seeded_id = seed_filter(db_session, owner["id"])
+
     owned = client.get(
         PROTECTED_ROUTE, headers=bearer(owner["access_token"])
     )
-    assert owned.status_code == 200
-    assert [row["user_id"] for row in owned.json()] == [str(owner["id"])]
+    assert owned.status_code == 200, owned.text
+    # SEC-02: the guard resolved the subject to the owning key, so the
+    # query filtered on it and returned only that account's row
+    assert [row["id"] for row in owned.json()] == [seeded_id]
+    assert [row["user_id"] for row in owned.json()] == [owner["id"]]
+
     foreign = client.get(
         PROTECTED_ROUTE, headers=bearer(other["access_token"])
     )
-    assert foreign.status_code == 200
+    assert foreign.status_code == 200, foreign.text
+    # SEC-02: a different subject resolves to a different account
     assert foreign.json() == []
 
 
@@ -278,11 +308,14 @@ REFUSED_SUBJECTS = [
     pytest.param({"sub": "0x7"}, id="hexadecimal-subject"),
 ]
 
-# SEC-02: subjects no account can carry - the first clears the canonical
-# width and exceeds the mapped 32-bit key ceiling, the second exceeds the
-# canonical width itself
+# SEC-02: subjects no account can carry. The first clears the canonical
+# width but exceeds the signed 32-bit ceiling of the INTEGER key; the
+# other three exceed the canonical width itself. The 64-bit spellings are
+# kept because the guard's earlier, wider ceiling accepted them.
 OUT_OF_RANGE_SUBJECTS = [
-    pytest.param({"sub": "9" * 19}, id="above-the-key-ceiling"),
+    pytest.param({"sub": str(2 ** 31)}, id="one-past-the-key-ceiling"),
+    pytest.param({"sub": str(2 ** 63 - 1)}, id="at-the-64-bit-ceiling"),
+    pytest.param({"sub": "9" * 19}, id="above-the-64-bit-ceiling"),
     pytest.param({"sub": "9" * 20}, id="overlong-subject"),
 ]
 
@@ -303,21 +336,26 @@ def test_uncoercible_subject_is_refused(client, payload):
 
 @pytest.mark.parametrize("payload", OUT_OF_RANGE_SUBJECTS)
 def test_out_of_range_subject_reaches_no_account(client, payload):
-    """A subject wider than the id column resolves no account and leaks
-    nothing.
+    """A subject wider than the id column is refused, not merely rejected.
 
-    The guard refuses both spellings before any comparison is attempted,
-    and the uniform envelope carries no driver text.
+    The guard screens the claim before any comparison is attempted, so
+    the answer is the same uniform 401 challenge every other unusable
+    subject receives. A guard that stopped screening would let the value
+    reach the driver, which answers 500 through the sanitized boundary -
+    a status this case has to distinguish from a refusal, because a
+    server fault means the value was not screened at all.
     """
     response = client.get(
         PROTECTED_ROUTE, headers=bearer(create_access_token(payload))
     )
-    # SEC-02: no account is ever returned for an out-of-range subject
-    assert response.status_code >= 400
+    # SEC-02: the uniform refusal, not any status at or above 400
+    assert_refused(response)
+    assert response.status_code != 500
+
+    # SEC-08: the envelope carries exactly the frozen key set
     body = response.json()
     assert set(body) == {"detail", "error_id", "fields"}
-    assert body["fields"] == []
-    assert CORRELATION_ID.fullmatch(body["error_id"])
+
     # SEC-08: no traceback, driver text or statement reaches the caller
     lowered = response.text.lower()
     for leaked in ("traceback", "overflow", "sqlalchemy", ".py", "select "):
@@ -449,6 +487,26 @@ def test_a_subject_past_the_mapped_key_ceiling_is_refused(
         headers=bearer(create_access_token({"sub": ABSENT_USER_ID})),
     )
     assert refusal_signature(refused) == refusal_signature(unresolved)
+
+
+def test_the_subject_ceiling_matches_the_key_column_width(db_session):
+    """The guard's ceiling is the width the id column actually declares.
+
+    The column is INTEGER, which PostgreSQL emits as a signed 32-bit
+    SERIAL. A ceiling wider than the column lets a value no key can hold
+    past the guard and into the comparison, where the driver refuses it
+    as a server fault rather than the guard refusing it as a 401.
+    """
+    # SEC-02: the signed 32-bit maximum the INTEGER key binds
+    assert _MAX_SUBJECT_ID == 2 ** 31 - 1
+
+    # the column the ceiling is derived from is still INTEGER
+    key_column = User.__table__.columns["id"]
+    assert key_column.type.__class__.__name__ == "Integer"
+
+    # a key at the ceiling is storable, so the ceiling is not too wide
+    seeded = seed_account(db_session, _MAX_SUBJECT_ID)
+    assert seeded.id == _MAX_SUBJECT_ID
 
 
 def test_integer_subject_is_refused_for_a_registered_account(

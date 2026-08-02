@@ -17,10 +17,12 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token', auto_error=False)
 # SEC-06: session cookie name; the auth routes set and clear this cookie
 SESSION_COOKIE_NAME = "access_token"
 
-# SEC-02: a sub claim must be the canonical decimal spelling of a User.id;
-# the ceiling is the 32-bit range models.py maps that column to, which
-# PostgreSQL provisions as SERIAL
-_CANONICAL_SUBJECT = re.compile(r"[1-9][0-9]{0,18}")
+# SEC-02: a sub claim must be the canonical decimal spelling of a User.id.
+# The ceiling is the signed 32-bit range of the INTEGER primary key declared
+# at models.py:10, which PostgreSQL emits as SERIAL. A wider ceiling lets a
+# value no key can hold reach the comparison, where the driver refuses it as
+# a server fault instead of the guard refusing it as a 401.
+_CANONICAL_SUBJECT = re.compile(r"[1-9][0-9]{0,9}")
 _MAX_SUBJECT_ID = 2 ** 31 - 1
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:

@@ -32,11 +32,9 @@ import time
 import pytest
 from conftest import TEST_BASE_URL, reset_login_throttle
 from fastapi.testclient import TestClient
-from limits import parse as parse_rate_limit
-from limits.storage import MemoryStorage
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from slowapi.wrappers import Limit
 
 from backend.app.api.endpoints import auth as auth_endpoint
 from backend.app.core.config import settings
@@ -97,13 +95,6 @@ UNIFORM_LOGIN_DETAIL = "Incorrect email or password"
 # the shared harness client carries
 _HOSTS = itertools.count(1)
 
-# SEC-07: the configured limit written in the notation the limiter
-# parses, so the rejection driven below carries the real threshold
-CONFIGURED_LIMIT = "{0}/{1} minute".format(
-    settings.LOGIN_RATE_LIMIT_ATTEMPTS,
-    settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES,
-)
-
 # SEC-07: a limiter storage key no route writes, so its presence and
 # absence are attributable to this module alone
 LIMITER_PROBE_KEY = "harness-limiter-probe"
@@ -112,11 +103,11 @@ LIMITER_PROBE_KEY = "harness-limiter-probe"
 UNRELATED_ACCOUNT_KEY = "acct:unrelated-probe@example.com"
 
 # SEC-07: a cap smaller than the number of accounts the flood below
-# names, so the last attempt has to free a slot to be admitted
+# names; the last attempt frees a slot to be admitted
 PROBE_CAP = 3
 
 # SEC-07: addresses used only by the counter-cap cases; no account is
-# registered for them, so every attempt is a credential failure
+# registered for them and every attempt is a credential failure
 CAP_PROBE_EMAILS = (
     "cap-probe-1@example.com",
     "cap-probe-2@example.com",
@@ -135,30 +126,31 @@ RESERVED_ACCOUNT_KEY = "acct:reserved@example.com"
 RESERVED_ADDRESS_KEY = "addr:reserved-probe"
 
 
+def _registered_login_limit():
+    """Return the limit object the login route actually carries.
+
+    Read from the limiter rather than rebuilt, so the rejection driven
+    below carries the shipped threshold and window instead of a copy
+    that could drift from them.
+    """
+    registered = app.state.limiter._route_limits[_LOGIN_ROUTE_KEY]
+    assert len(registered) == 1, registered
+    return registered[0]
+
+
 def _limiter_rejection():
     """Build the rejection slowapi raises when a route limit is hit."""
     # SEC-07: the real exception the registered handler is keyed on. Its
     # stock detail spells the threshold and the window, so it is also
     # the input that proves the sanitized envelope withholds them.
-    limit = Limit(
-        limit=parse_rate_limit(CONFIGURED_LIMIT),
-        key_func=get_remote_address,
-        scope=None,
-        per_method=False,
-        methods=None,
-        error_message=None,
-        exempt_when=None,
-        cost=1,
-        override_defaults=False,
-    )
-    return RateLimitExceeded(limit)
+    return RateLimitExceeded(_registered_login_limit())
 
 
 @pytest.fixture
 def limiter_refuses_every_request():
     """Make every request raise the limiter's own rejection."""
-    # SEC-07: raised while dependencies resolve, so the reservation
-    # never runs and no counter records the refused request
+    # SEC-07: raised while dependencies resolve; the reservation never
+    # runs and no counter records the refused request
     rejection = _limiter_rejection()
 
     def refuse():
@@ -202,20 +194,20 @@ def _post_login(client, email, secret):
 
 
 def _login_from_a_new_address(email, secret):
-    # SEC-07: one attempt per address, so the address budget never answers
+    # SEC-07: one attempt per address; the address budget never answers
     # and the account counter is the only control under test
     probe, _host = _client_at_a_new_address()
     return _post_login(probe, email, secret)
 
 
 def _reset_address_layer():
-    # SEC-07: empties the limiter storage only, so the account counter is
+    # SEC-07: empties the limiter storage only; the account counter is
     # the sole control answering the next attempt
     auth_endpoint.limiter.reset()
 
 
 def _clear_account_layer():
-    # SEC-07: empties the account counter only, so the route limiter is
+    # SEC-07: empties the account counter only; the route limiter is
     # the sole control answering the next attempt
     auth_endpoint._login_failures.clear()
 
@@ -311,7 +303,7 @@ def test_the_login_route_carries_the_configured_address_budget():
     assert auth_endpoint.limiter._dynamic_route_limits == {}
 
     # SEC-07: the limit is filed under the endpoint the application
-    # routes POST /auth/login to, so no stale key holds it
+    # routes POST /auth/login to; no stale key holds it
     assert auth_endpoint.limiter._route_limits.get(_LOGIN_ROUTE_KEY)
     served = [
         "{0}.{1}".format(route.endpoint.__module__, route.endpoint.__name__)
@@ -389,7 +381,7 @@ def test_the_address_budget_bounds_a_changing_account(register_user):
     ]
     assert statuses == [401] * attempts
 
-    # SEC-07: one failure per account, so every account counter sits
+    # SEC-07: one failure per account; every account counter sits
     # below the threshold
     assert all(_failure_count(key) == 1 for key in _account_keys())
     assert len(_account_keys()) == attempts
@@ -602,8 +594,8 @@ def test_successful_login_empties_the_account_counter(register_user):
 
     # SEC-07: an emptied counter answers 401 again for a full run; a
     # retained count would answer 429 on the second attempt here. The
-    # limiter storage is emptied first, because it counted the accepted
-    # attempt too, so the second run reaches the account counter.
+    # limiter storage counted the accepted attempt too and is emptied
+    # first; the second run then reaches the account counter.
     _reset_address_layer()
     second_run = [
         _login_from_a_new_address(account["email"], WRONG_SECRET).status_code
@@ -638,8 +630,8 @@ def test_a_success_leaves_the_address_budget_spent(register_user):
     probe.cookies.clear()
 
     # SEC-07: the guessed account sits below its threshold and the
-    # authenticated account holds no counter, so only the spent address
-    # budget can answer the next attempt
+    # authenticated account holds no counter; only the spent address
+    # budget answers the next attempt
     guessed_key = auth_endpoint._account_key(guessed["email"])
     assert _failure_count(guessed_key) == attempts - 1
     assert auth_endpoint._account_key(holder["email"]) not in _account_keys()
@@ -648,6 +640,7 @@ def test_a_success_leaves_the_address_budget_spent(register_user):
     assert throttled.status_code == 429
     assert set(throttled.json()) == ENVELOPE_KEYS
 
+    # SEC-07: the refusal is scoped to the spent address
     elsewhere = _login_from_a_new_address(
         holder["email"], holder["password"]
     )
@@ -692,7 +685,7 @@ def test_an_elapsed_counter_is_pruned_before_the_next_attempt(
 
     reply = _post_login(client, account["email"], WRONG_SECRET)
 
-    # SEC-07: the elapsed lockout is gone, so this is a fresh failure
+    # SEC-07: the elapsed lockout is gone; this is a fresh failure
     assert reply.status_code == 401
     assert _failure_count(canonical_key) == 1
 
@@ -717,7 +710,7 @@ def test_the_counter_map_never_exceeds_the_cap(client, monkeypatch):
         statuses.append(_post_login(client, email, WRONG_SECRET).status_code)
         sizes.append(len(auth_endpoint._login_failures))
 
-    # SEC-07: the cap frees room instead of refusing a fresh attempt
+    # SEC-07: the cap frees room and admits a fresh attempt
     assert statuses == [401] * len(CAP_PROBE_EMAILS)
     assert sizes == [1, 2, PROBE_CAP, PROBE_CAP]
 
@@ -792,7 +785,7 @@ def test_a_full_map_of_lockouts_denies_the_attempt(monkeypatch):
         RESERVED_ACCOUNT_KEY, RESERVED_ADDRESS_KEY
     )
 
-    # SEC-07: the attempt is refused rather than counted
+    # SEC-07: the attempt is refused and not counted
     assert admitted is False
 
     # SEC-07: no lockout was dropped and the map did not grow
@@ -810,8 +803,13 @@ def test_the_registered_limiter_holds_its_state_in_process():
     # SEC-07: the object the route module defines, not a second limiter
     assert limiter is auth_endpoint.limiter
 
-    # SEC-07: in-process storage; no cache service is provisioned
-    assert isinstance(limiter._storage, MemoryStorage)
+    # SEC-07: in-process storage; no cache service is provisioned. The
+    # class is the one slowapi itself selects when no store is
+    # configured, read from a reference limiter rather than imported
+    # from a package the manifest does not declare.
+    in_process = Limiter(key_func=get_remote_address)
+    assert in_process._storage_uri is None
+    assert type(limiter._storage) is type(in_process._storage)
 
 
 def test_the_harness_reset_empties_the_limiter_storage():
@@ -869,8 +867,8 @@ def test_a_limiter_rejection_answers_the_uniform_envelope(
     for marker in FORBIDDEN_IN_BODY:
         assert marker not in refused.text
 
-    # SEC-07: the refusal is raised before the reservation, so no
-    # counter records a request the caller never had answered
+    # SEC-07: the refusal is raised before the reservation; no counter
+    # records a request the caller never had answered
     assert auth_endpoint._login_failures == {}
 
 
@@ -898,7 +896,7 @@ def test_a_limiter_rejection_reaches_the_log(
     ]
 
     # SEC-07: exactly one record, carrying the threshold the client
-    # never sees and naming the throttle rather than a generic failure
+    # never sees and naming the throttle, not a generic failure
     assert len(records) == 1
     assert rejection.detail in records[0]
     assert "rate limit" in records[0]

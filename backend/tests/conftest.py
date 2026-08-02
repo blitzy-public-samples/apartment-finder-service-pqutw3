@@ -1,5 +1,60 @@
 """Configure import paths, required settings, isolated SQLite state, and
-an HTTPS TestClient for backend tests."""
+an HTTPS TestClient for backend tests.
+
+Wires the six things the security suite depends on: one canonical
+module object per application source file, the settings the application
+reads at import time, a SQLite database bound to the route dependency
+the application actually uses, foreign-key enforcement on every SQLite
+connection, an HTTPS test client, and per-test isolation of the schema
+and the login-attempt counters.
+
+Collection is not filtered, so nothing here hides a failure. Any module
+in ``backend/tests`` that fails to import fails collection.
+``test_api.py``, ``test_services.py`` and ``test_tasks.py`` name
+top-level ``main``, ``services`` and ``app.tasks`` modules the package
+layout does not provide, so a full-suite run reports three collection
+errors. AAP 0.8.4 records that baseline as measured; AAP 0.9.2 places
+repairing those modules out of scope.
+
+Rationale for every decision in this harness is recorded in
+``documentation/security/decision-log.md``, section 7.
+
+Module surface
+--------------
+``TEST_BASE_URL``, ``ALLOWED_ORIGIN``, ``FOREIGN_ORIGIN``,
+``VALID_PASSWORD``
+    Constants describing the harness HTTP identity and a password that
+    satisfies the server-side policy.
+``test_engine``, ``TestingSessionLocal``
+    The SQLite engine and session factory every request is routed to.
+``reset_login_throttle()``
+    Empties the login-attempt counters and the rate-limiter storage.
+``_assert_harness_integrity()``
+    Checks one module object per application source file, shared
+    settings, limiter, counter and ``get_db`` across both import paths,
+    and that no declared setting is left to the ambient environment.
+    Runs at import and again before every test.
+
+Fixtures
+--------
+``isolated_state``
+    Autouse. Recreates the schema, empties the login counters, installs
+    the ``get_db`` override and re-checks the harness invariants for the
+    span of one test.
+``db_session``
+    A session on ``test_engine`` for direct row inspection or seeding.
+``client``
+    A ``TestClient`` on ``TEST_BASE_URL`` carrying a per-test client
+    address, with server exceptions delivered as responses.
+``unique_email``
+    One email address no other test has registered.
+``register_user``
+    Callable factory returning ``{"id", "email", "password",
+    "access_token"}`` for a freshly registered account.
+``registered_user``
+    A single account produced by ``register_user``.
+"""
+import importlib
 import itertools
 import json
 import os
@@ -9,8 +64,16 @@ from pathlib import Path
 _TESTS_DIR = Path(__file__).resolve().parent
 _BACKEND_DIR = _TESTS_DIR.parent
 _REPO_ROOT = _BACKEND_DIR.parent
+_APP_DIR = _BACKEND_DIR / "app"
 
-# Absolute ``backend.app.*`` and short ``app.*`` module paths both resolve.
+# The repository root resolves ``backend.app.*``, the canonical package
+# path every application module and every security test imports. The
+# backend directory resolves the short ``app.*`` path the CI working
+# directory and the three legacy test modules use. Both roots stay on the
+# path; _install_canonical_aliases below makes the short path an alias of
+# the canonical one rather than a second copy of it.
+_CANONICAL_PACKAGE = "backend.app"
+_SHORT_PACKAGE = "app"
 for _import_root in (str(_BACKEND_DIR), str(_REPO_ROOT)):
     if _import_root not in sys.path:
         sys.path.insert(0, _import_root)
@@ -28,49 +91,187 @@ FOREIGN_ORIGIN = "https://foreign.example.com"
 # characters, one uppercase, one lowercase, one digit, one special
 VALID_PASSWORD = "Harness1!Passphrase"
 
-# Every value lands in os.environ before the first application import
-# below, which builds Settings() at module scope.
+# Every setting the application declares is assigned here, before the
+# first application import below, which builds Settings() at module
+# scope. Assignment is unconditional: os.environ.setdefault would let an
+# ambient value from the runner's environment or a CI secret decide what
+# the suite tests, so a run on a developer machine and a run in the
+# pipeline would assert against different configuration. Every value
+# below is a test-only sentinel that reaches no provider and signs no
+# token outside this process.
+_HARNESS_ENVIRONMENT = {
+    # SEC-10: a SQLite URL, for which database.py builds no sslmode
+    # connect argument; the SQLite driver rejects that keyword
+    "DATABASE_URL": "sqlite://",
+    "DB_SSLMODE": "disable",
+    # SEC-03: the fail-closed allow-list, in the JSON array form pydantic
+    # v1 parses for a list-typed environment value
+    "ALLOWED_ORIGINS": json.dumps([ALLOWED_ORIGIN]),
+    # SEC-06: the session cookie carries the Secure attribute under test
+    "COOKIE_SECURE": "true",
+    # SEC-12: 64 bytes clears the RFC 7518 sec. 3.2 floor for HS256,
+    # HS384 and HS512 alike. Not a deployable key: it is a fixed literal
+    # in a tracked file, which is why it may never be defaulted from the
+    # environment instead.
+    "SECRET_KEY": "harness-only-signing-key-" + "x" * 39,
+    "ALGORITHM": "HS256",
+    "ACCESS_TOKEN_EXPIRE_MINUTES": "30",
+    # SEC-07: the budget the throttle tests read back from Settings
+    "LOGIN_RATE_LIMIT_ATTEMPTS": "5",
+    "LOGIN_RATE_LIMIT_WINDOW_MINUTES": "15",
+    # SEC-09: the validated payment environment
+    "PAYPAL_MODE": "sandbox",
+    # Sentinels for the settings the service layer reads at import time.
+    # No test reaches any of these providers over the network.
+    "PAYPAL_CLIENT_ID": "harness-paypal-client-id",
+    "PAYPAL_CLIENT_SECRET": "harness-paypal-token",
+    "ZILLOW_API_KEY": "harness-zillow-key",
+    "ZILLOW_API_URL": "https://api.zillow.invalid/v1",
+    "SENDGRID_API_KEY": "harness-sendgrid-key",
+    "FROM_EMAIL": "harness@example.com",
+}
 
-# SEC-10: a SQLite URL, for which database.py builds no sslmode
-# connect argument; the SQLite driver rejects that keyword
-os.environ["DATABASE_URL"] = "sqlite://"
-os.environ["DB_SSLMODE"] = "disable"
+# Declared optional, read by no test. An ambient value would be carried
+# into Settings unnoticed, so it is removed rather than overwritten.
+_SCRUBBED_ENVIRONMENT = ("SENTRY_DSN",)
 
-# SEC-03: the fail-closed allow-list, in the JSON array form pydantic v1
-# parses for a list-typed environment value
-os.environ["ALLOWED_ORIGINS"] = json.dumps([ALLOWED_ORIGIN])
-
-# SEC-06: the session cookie carries the Secure attribute under test
-os.environ["COOKIE_SECURE"] = "true"
-
-# SEC-12: 64 bytes clears the RFC 7518 sec. 3.2 floor for HS256, HS384
-# and HS512 alike
-os.environ.setdefault("SECRET_KEY", "x" * 64)
-os.environ.setdefault("ALGORITHM", "HS256")
-os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
-
-os.environ.setdefault("LOGIN_RATE_LIMIT_ATTEMPTS", "5")
-os.environ.setdefault("LOGIN_RATE_LIMIT_WINDOW_MINUTES", "15")
-
-os.environ.setdefault("PAYPAL_MODE", "sandbox")
-
-# Placeholders for the settings the service layer reads at import time
-os.environ.setdefault("PAYPAL_CLIENT_ID", "harness-paypal-client-id")
-os.environ.setdefault("PAYPAL_CLIENT_SECRET", "harness-paypal-token")
-os.environ.setdefault("ZILLOW_API_KEY", "harness-zillow-key")
-os.environ.setdefault("ZILLOW_API_URL", "https://api.zillow.invalid/v1")
-os.environ.setdefault("SENDGRID_API_KEY", "harness-sendgrid-key")
-os.environ.setdefault("FROM_EMAIL", "harness@example.com")
+os.environ.update(_HARNESS_ENVIRONMENT)
+for _scrubbed in _SCRUBBED_ENVIRONMENT:
+    os.environ.pop(_scrubbed, None)
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy import create_engine, event, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
+
+def _install_canonical_aliases():
+    """Bind every short ``app.*`` name to its canonical module object.
+
+    Both import roots are on sys.path, so ``app.core.config`` and
+    ``backend.app.core.config`` name the same source file. Left alone,
+    importing both executes that file twice and yields two module
+    objects, two Settings instances, two login-failure counters and two
+    get_db functions - a test would then assert against state no request
+    reaches. Importing the application entry point first, then binding
+    each loaded module in sys.modules under its short name, makes the
+    second import a lookup. _assert_one_module_object_per_source_file
+    below is the enforcement: it fails the run if any application source
+    file is ever loaded twice, whichever name imported it.
+    """
+    importlib.import_module("{0}.main".format(_CANONICAL_PACKAGE))
+    for name, module in list(sys.modules.items()):
+        if name != _CANONICAL_PACKAGE and not name.startswith(
+            _CANONICAL_PACKAGE + "."
+        ):
+            continue
+        alias = _SHORT_PACKAGE + name[len(_CANONICAL_PACKAGE):]
+        sys.modules.setdefault(alias, module)
+
+
+_install_canonical_aliases()
+
+from backend.app.core.config import settings  # noqa: E402
 from backend.app.db.database import get_db  # noqa: E402
 from backend.app.db.models import Base  # noqa: E402
 from backend.app.main import app  # noqa: E402
+
+# The state a second module object would silently duplicate: the settings
+# every guard reads, the limiter the throttle asserts through, the
+# account-keyed failure counter the harness empties between tests, and
+# the session dependency every route resolves.
+_SHARED_OBJECTS = (
+    ("core.config", "settings"),
+    ("api.endpoints.auth", "limiter"),
+    ("api.endpoints.auth", "_login_failures"),
+    ("db.database", "get_db"),
+)
+
+# Resolving every loaded module's __file__ once per test would cost tens
+# of thousands of stat calls across a session; sys.modules entries keep
+# the same __file__ string, so the resolved path is cached by that string.
+_RESOLVED_SOURCES = {}
+
+
+def _resolve_once(source):
+    resolved = _RESOLVED_SOURCES.get(source)
+    if resolved is None:
+        resolved = Path(source).resolve()
+        _RESOLVED_SOURCES[source] = resolved
+    return resolved
+
+
+def _assert_one_module_object_per_source_file():
+    """Check no application source file is loaded under two names."""
+    by_source = {}
+    for name, module in list(sys.modules.items()):
+        source = getattr(module, "__file__", None)
+        if not source:
+            continue
+        resolved = _resolve_once(source)
+        if _APP_DIR not in resolved.parents:
+            continue
+        first_name, first_module = by_source.setdefault(
+            resolved, (name, module)
+        )
+        assert first_module is module, (
+            "{0} is loaded as both {1} and {2}, so the two names hold "
+            "separate settings, counters and dependencies".format(
+                resolved, *sorted((first_name, name))
+            )
+        )
+
+
+def _assert_short_imports_reach_the_canonical_objects():
+    """Check ``app.x`` and ``backend.app.x`` share their state."""
+    for suffix, attribute in _SHARED_OBJECTS:
+        canonical = importlib.import_module(
+            "{0}.{1}".format(_CANONICAL_PACKAGE, suffix)
+        )
+        short = importlib.import_module(
+            "{0}.{1}".format(_SHORT_PACKAGE, suffix)
+        )
+        assert short is canonical, (
+            "{0}.{1} and {2}.{1} are separate module objects".format(
+                _SHORT_PACKAGE, suffix, _CANONICAL_PACKAGE
+            )
+        )
+        assert getattr(short, attribute) is getattr(canonical, attribute), (
+            "{0} differs between {1}.{2} and {3}.{2}".format(
+                attribute, _SHORT_PACKAGE, suffix, _CANONICAL_PACKAGE
+            )
+        )
+    assert app.state.limiter is importlib.import_module(
+        "{0}.api.endpoints.auth".format(_CANONICAL_PACKAGE)
+    ).limiter, (
+        "the limiter registered on the application is not the limiter the "
+        "login route module holds"
+    )
+
+
+def _assert_every_setting_is_harness_controlled():
+    """Check no declared setting is left to the ambient environment."""
+    uncontrolled = sorted(
+        set(type(settings).__fields__)
+        - set(_HARNESS_ENVIRONMENT)
+        - set(_SCRUBBED_ENVIRONMENT)
+    )
+    assert not uncontrolled, (
+        "{0} reach Settings from the ambient environment; assign a "
+        "sentinel in _HARNESS_ENVIRONMENT or name them in "
+        "_SCRUBBED_ENVIRONMENT".format(", ".join(uncontrolled))
+    )
+
+
+def _assert_harness_integrity():
+    """Run every harness invariant the suite's conclusions rest on."""
+    _assert_one_module_object_per_source_file()
+    _assert_short_imports_reach_the_canonical_objects()
+    _assert_every_setting_is_harness_controlled()
+
+
+_assert_harness_integrity()
 
 # StaticPool with check_same_thread disabled shares one in-memory
 # connection between the test thread and the TestClient portal thread.
@@ -79,10 +280,41 @@ test_engine = create_engine(
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
 )
+
+
+@event.listens_for(test_engine, "connect")
+def _enforce_sqlite_foreign_keys(dbapi_connection, connection_record):
+    """Turn on foreign-key enforcement for every SQLite connection.
+
+    SQLite ignores foreign keys unless the pragma is set per connection,
+    so without this the four foreign keys the models declare are inert
+    under test and a row referencing no parent inserts cleanly. The
+    production engine is PostgreSQL, which enforces them always, so the
+    harness would otherwise be weaker than what it stands in for.
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+
+
+def _assert_foreign_keys_are_enforced():
+    """Check the pragma took effect on the shared connection."""
+    with test_engine.connect() as connection:
+        enabled = connection.execute(text("PRAGMA foreign_keys")).scalar()
+    assert enabled == 1, (
+        "SQLite foreign-key enforcement is off (PRAGMA foreign_keys="
+        "{0!r}), so the declared foreign keys are inert under "
+        "test".format(enabled)
+    )
+
+
 TestingSessionLocal = sessionmaker(
     autocommit=False, autoflush=False, bind=test_engine
 )
 Base.metadata.create_all(bind=test_engine)
+_assert_foreign_keys_are_enforced()
 
 
 def _override_get_db():
@@ -176,6 +408,7 @@ def isolated_state():
     # SEC-02/SEC-05: overrides backend.app.db.database.get_db, the
     # dependency every route and get_current_user resolve
     app.dependency_overrides[get_db] = _override_get_db
+    _assert_harness_integrity()
     _assert_override_targets_the_test_database()
     try:
         yield

@@ -51,7 +51,7 @@ before any of them could be tested. Four rows are labelled **Partial**, with the
 | **SEC-02** | Broken authentication through identity mismatch. CWE-287, CWE-863. A01:2021. High | The subject claim is minted as `str(user.id)` and coerced back with `int()` inside a guard that answers 401, so the claim and the queried column share a type. The bare 404 at `security.py:49-50` becomes a 401 carrying `WWW-Authenticate: Bearer`, an `iat` claim joins the existing `exp`, and the outbound user model retypes `id` from `str` to `int` and drops its password-hash field | `backend/app/core/security.py`, `backend/app/api/endpoints/auth.py`, `backend/app/schema/user.py`, `backend/tests/security/test_auth_identity.py` |
 | **SEC-03** | Permissive cross-origin policy with credentials. CWE-942, CWE-346. A05:2021. High | `ALLOWED_ORIGINS` becomes a required list whose validator rejects an empty list, `"*"`, the literal `"null"` and any entry that is not a full origin. Matching is exact string equality, with no reflection and no regular expression, and the two middleware wildcards give way to explicit method and header lists. A misconfigured allow-list stops startup | `backend/app/core/config.py`, `backend/app/main.py`, `.env.example`, `backend/tests/security/test_cors_policy.py` |
 | **SEC-04** | Weak password requirements. CWE-521. A07:2021. Medium | A validator on the new `UserCreate` model mirrors the client character set at `validators.ts:18-32`, twelve characters with an upper, a lower, a digit and a special character, and adds a hard maximum at the 72-byte bcrypt ceiling. The maximum is mandatory rather than defensive: at the pinned `bcrypt==4.3.0` a 100-character password is accepted silently, so the library supplies no protection | `backend/app/schema/user.py`, `backend/app/api/endpoints/auth.py`, `backend/tests/security/test_password_policy.py` |
-| **SEC-05** | Improper input validation and mass assignment. CWE-20, CWE-915. A03:2021, secondary A04:2021. High | `UserCreate`, `UserLogin`, `FilterCreate` and `ListingCreate` arrive alongside a new `subscription.py` module, and every create model sets `extra = "forbid"` so an unknown key is rejected rather than absorbed. That single setting is the mass-assignment control for `listings.py:23`, which expands the request body straight into a mapped constructor | `backend/app/schema/user.py`, `backend/app/schema/filter.py`, `backend/app/schema/listing.py`, `backend/app/schema/subscription.py`, `backend/app/api/endpoints/filters.py`, `backend/tests/security/test_input_validation.py` |
+| **SEC-05** | Improper input validation and mass assignment. CWE-20, CWE-915. A03:2021, secondary A04:2021. High | `UserCreate`, `UserLogin`, `FilterCreate` and `ListingCreate` arrive alongside a new `subscription.py` module, and every create model sets `extra = "forbid"` so an unknown key is rejected rather than absorbed. That single setting is the mass-assignment control for `listings.py:23`, which expands the request body straight into a mapped constructor | `backend/app/schema/user.py`, `backend/app/schema/filter.py`, `backend/app/schema/listing.py`, `backend/app/schema/subscription.py`, `backend/tests/security/test_input_validation.py` |
 | **SEC-06** | Session token in browser-accessible storage. CWE-522, CWE-1004. A07:2021. Medium | Both auth routes set an `HttpOnly`, `Secure`, `SameSite=Strict` cookie while leaving the JSON body untouched, and the guard reads that cookie before the bearer header, so non-browser clients still work. `POST /auth/logout` clears it, because script cannot delete a cookie it cannot read. The frontend drops browser storage, corrects its request path to `/auth/login`, exports `API_BASE_URL` and sends credentials; axios is pinned exactly and the cross-site-token option is deliberately left unset | `backend/app/core/security.py`, `backend/app/api/endpoints/auth.py`, `backend/app/core/config.py`, `frontend/src/services/auth.ts`, `frontend/src/services/api.ts`, `frontend/package.json`, `backend/tests/security/test_token_storage.py` |
 | **SEC-07** | Unrestricted authentication attempts. CWE-307. A07:2021. Medium. **Partial** | A limiter with in-memory storage applies five attempts per fifteen minutes to `POST /auth/login`, layered with an in-process counter keyed by normalized lowercase email so a distributed attempt on one account is also bounded. Throttled attempts are logged rather than silently dropped. **Gap**: the state is per-worker and lost on restart, so lockout is neither durable nor multi-replica-safe | `backend/app/main.py`, `backend/app/api/endpoints/auth.py`, `backend/app/core/config.py`, `backend/tests/security/test_login_throttle.py` |
 | **SEC-08** | Information exposure through an error message. CWE-209, CWE-497. A05:2021. Medium | Four global handlers replace the placeholder comment at `main.py:35`, sharing one response envelope and a correlation identifier while full diagnostics go to the server log. Uniformity is the requirement rather than the style, which is why the SEC-02 normalisation of the 404 into a 401 belongs here too: a differential response is an account-state oracle | `backend/app/main.py`, `backend/app/core/security.py`, `backend/tests/security/test_error_handling.py` |
@@ -94,8 +94,8 @@ unchanged. Controls are named, not re-explained; section 1 holds the mechanism.
 | `backend/app/db/database.py` | UPDATE | Passes the transport mode through `connect_args`, conditionally and only for PostgreSQL URLs | SEC-10 |
 | `backend/app/services/paypal_service.py` | UPDATE | Reads the payment environment from the validated setting. Also adds the missing typing import for both annotation sites and the async wrapper the subscription endpoint calls, clearing boot-blocker layers two and three | SEC-09 |
 | `backend/app/db/models.py` | REFERENCE | The authority for column types and nullability, and the reason no schema change is proposed: with no migration tooling, a new column or default never reaches an existing table. Verified byte-identical | Authority for SEC-02, SEC-05 |
-| `backend/app/api/endpoints/filters.py` | REFERENCE, delivered UPDATE | Planned as the reference pattern for a declared `response_model`, the one write endpoint that already had one. Delivered with an in-scope SEC-05 edit; see section 3.4 | SEC-05 |
-| `backend/app/api/endpoints/subscriptions.py` | REFERENCE, delivered UPDATE | Planned as the authority whose import at `:7` and its call site dictated the wrapper signature added to the payment service. Delivered with an in-scope SEC-09 edit; see section 3.4 | SEC-09 |
+| `backend/app/api/endpoints/filters.py` | REFERENCE | The reference pattern for a declared `response_model`, the one write endpoint that already had one. Verified byte-identical; an earlier edit here was withdrawn, see section 3.4 | Authority for SEC-05 |
+| `backend/app/api/endpoints/subscriptions.py` | REFERENCE | The authority whose import at `:7` and its call site dictated the wrapper signature added to the payment service. Verified byte-identical; an earlier edit here was withdrawn, see section 3.4 | Authority for SEC-09 |
 
 ### 2.3 Backend tests
 
@@ -165,8 +165,8 @@ of the twelve, and their presence is a rule obligation rather than a coverage ga
 
 Both directions are complete. Every one of `SEC-01` through `SEC-12` has at least one file in section
 1, and every file in section 2 traces to a finding, to the dependency prerequisite, to an enabling
-repair, or to Rule 1. The three additional paths in section 3.4 account for everything else the branch
-touches.
+repair, or to Rule 1. Section 3.4 records that nothing else the branch touches sits outside those
+thirty-nine paths.
 
 ### 3.2 Zero deletions, stated deliberately
 
@@ -188,18 +188,22 @@ tooling neither would ever reach an existing table.
 
 ### 3.4 Plan versus delivery
 
-Three paths departed from the planned classification. Each is recorded here so the difference reads
-as a decision, and each carries its reasoning in [`decision-log.md`](decision-log.md).
+**No path departs from the planned classification.** Delivery and plan agree exactly: 16 created, 18
+updated, 5 references left byte-identical, no deletions, across the same 39 paths section 3.1
+enumerates. Counting delivery rather than plan changes none of those five figures, so this subsection
+records a convergence rather than a difference.
 
-| Path | Planned | Delivered | Why, and where the reasoning sits | Closes |
-| --- | --- | --- | --- | --- |
-| `backend/app/api/endpoints/filters.py` | REFERENCE | UPDATE | The strict schema surfaced a create path that raised before persistence, and the defect was in the endpoint rather than the model. Log section 9, `DL-32` through `DL-35` — `DL-32` names the reclassification in as many words | SEC-05 |
-| `backend/app/api/endpoints/subscriptions.py` | REFERENCE | UPDATE | The hardened payment verifier refuses an unbound agreement, so its only caller had to name the plan it was charging for. Log section 19, `DL-201` | SEC-09 |
-| `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore` | not planned | CREATE, three files | Version-control exclusion does not filter a container build context, so the same secret classes were still reaching every image. Log section 15.9, `DL-127` through `DL-129` | SEC-01, SEC-12 |
+Three earlier departures were withdrawn, and each withdrawal is a decision in its own right rather
+than a quiet tidy-up.
 
-Counting delivery rather than plan gives 19 created files, 20 updated, 3 unchanged references and no
-deletions, across 42 distinct paths. The planned classification in sections 2 and 3.1 is the
-authoritative scope statement; this subsection is the difference between the two.
+| Path | Planned | Delivered | What changed, and where the reasoning sits |
+| --- | --- | --- | --- |
+| `backend/app/api/endpoints/filters.py` | REFERENCE | REFERENCE, byte-identical | The endpoint edit was reverted: a frozen reference file is not the place to repair a create path that cannot persist for schema reasons. The defect it addressed is recorded instead, with the sanitized fault the route now answers. Log section 9, `DL-32` |
+| `backend/app/api/endpoints/subscriptions.py` | REFERENCE | REFERENCE, byte-identical | The caller edit went with the payment verifier that required it. With the service back at its documented three-callable surface, nothing asks the caller to name a plan. Log section 19, `DL-201` |
+| `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore` | not planned | not delivered | Three unplanned files were removed. Build-context filtering is real but belongs to no finding in this pass, and the file map is the scope statement. Log section 15.9, `DL-127` through `DL-129` |
+
+The planned classification in sections 2 and 3.1 is the authoritative scope statement, and the tree
+now matches it with nothing left over.
 
 ### 3.5 What this matrix deliberately omits
 
@@ -253,9 +257,9 @@ that "no new failures" means something.
 
 | Measure | Before | Now |
 | --- | --- | --- |
-| Tests collected under `backend/` | 0, with 3 collection errors | 434 collected, with the same 3 collection errors |
-| `tests/security` result | did not exist | 434 passed |
-| Style findings under `backend/` | 129 | 113 |
+| Tests collected under `backend/` | 0, with 3 collection errors | 513 collected, with the same 3 collection errors |
+| `tests/security` result | did not exist | 513 passed |
+| Style findings under `backend/` | 129 | 111 |
 | Undefined names | 4 | 1 |
 
 The three pre-existing test modules still fail to import, for reasons that predate this work and are
@@ -269,7 +273,7 @@ failing.
 
 Plan review does not run today, and it has **two** independent pre-existing blockers rather than one.
 `outputs.tf` references nine resource addresses of which only two are declared in `main.tf`; the seven
-absent ones are three storage buckets, two messaging topics and two functions. Separately, `main.tf:28`
+absent ones are three storage buckets, two messaging topics and two functions. Separately, `main.tf:34`
 reads `var.gke_num_nodes`, which `variables.tf` declares nowhere.
 
 Both blockers predate this work and neither follows from it. Neither breaks an automated gate either,
