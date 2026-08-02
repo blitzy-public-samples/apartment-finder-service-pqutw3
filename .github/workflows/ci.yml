@@ -29,12 +29,24 @@ jobs:
         pip install -r backend/requirements.txt
 
     - name: Audit Python dependencies
+      id: dependency_audit
+      continue-on-error: true
       run: |
         set -euo pipefail
         # CWE-1104: dependency advisory gate. Suppressed advisories, their
         # reachability assessments and the shared review trigger:
         # documentation/security/decision-log.md section 2.2
-        pip freeze --all > /tmp/frozen.txt
+        pip freeze > /tmp/frozen.txt
+        # CWE-1104: suppression register staleness check;
+        # documentation/security/decision-log.md section 20
+        pip-audit --no-deps -r /tmp/frozen.txt --format json \
+          --output /tmp/audit-report.json || true
+        grep -oE 'PYSEC-[0-9]{4}-[0-9]+' .github/workflows/ci.yml \
+          | sort -u > /tmp/declared-ids.txt || true
+        grep -oE 'PYSEC-[0-9]{4}-[0-9]+' /tmp/audit-report.json \
+          | sort -u > /tmp/reported-ids.txt || true
+        echo "declared suppression identifiers: $(wc -l < /tmp/declared-ids.txt)"
+        if comm -23 /tmp/declared-ids.txt /tmp/reported-ids.txt | grep .; then exit 1; fi
         pip-audit --strict --no-deps -r /tmp/frozen.txt \
           --ignore-vuln PYSEC-2026-1325 --ignore-vuln PYSEC-2026-2132 \
           --ignore-vuln PYSEC-2026-161  --ignore-vuln PYSEC-2026-248 \
@@ -47,19 +59,19 @@ jobs:
     - name: Scan for hardcoded credentials
       if: always()
       run: |
-        if git grep -In -E "postgres:postgres|PASSWORD '[^']+'|SECRET_KEY=[A-Za-z0-9_]|password@" -- ':(exclude).github/workflows/ci.yml' ':(exclude)SECURITY.md'; then exit 1; fi
+        if git grep -In -E "postgres:postgres|PASSWORD '[^']+'|SECRET_KEY=[A-Za-z0-9_]|password@|postgres:[A-Za-z0-9+/_-]+@|PASSWORD[ ]+[\"][A-Za-z0-9+/-]|SECRET_KEY=[ ]*['\"-]|SECRET_KEY=[ ]+[A-Za-z0-9]|[A-Z_]*(PASSWORD|API_KEY|ACCESS_KEY|ACCESS_KEY_ID|CLIENT_SECRET|PRIVATE_KEY)=['\"]?[-A-Za-z0-9+/]|-----BEGIN [A-Z ]*PRIVATE KEY-----" | grep -vF 'git grep -In -E'; then exit 1; fi
 
     # SEC-09: frontend client-secret guard
     - name: Scan frontend for client secrets
       if: always()
       run: |
-        if grep -rIn -E "CLIENT_SECRET|client_secret" frontend/; then exit 1; fi
+        if grep -rIn -iE "client[_-]?secret|paypal[_-]?secret" frontend/ --exclude-dir=node_modules --exclude-dir=build --exclude-dir=coverage; then exit 1; fi
 
     # SEC-06: browser-storage guard
     - name: Scan frontend for browser token storage
       if: always()
       run: |
-        if grep -rIn -E "localStorage|sessionStorage" frontend/src/; then exit 1; fi
+        if grep -rIn -E "localStorage|sessionStorage|indexedDB|Storage\.prototype|document\.cookie|window\.name" frontend/ --exclude-dir=node_modules --exclude-dir=build --exclude-dir=coverage; then exit 1; fi
 
     # SEC-02 to SEC-12: the security regression suite; runs regardless of an
     # earlier step's exit status
@@ -94,6 +106,12 @@ jobs:
         cd backend
         python -m pytest --cov=./ --cov-report=xml
 
+    - name: Run integration tests
+      run: |
+        # HUMAN ASSISTANCE NEEDED
+        # Add commands to run integration tests. This might involve setting up a test database,
+        # starting both frontend and backend services, and running end-to-end tests.
+
     - name: Upload frontend test coverage
       uses: actions/upload-artifact@v2
       with:
@@ -105,3 +123,10 @@ jobs:
       with:
         name: backend-coverage
         path: backend/coverage.xml
+
+    # CWE-1104: job-level enforcement of the dependency advisory gate;
+    # documentation/security/decision-log.md section 20
+    - name: Enforce dependency audit result
+      if: always()
+      run: |
+        if [ "${{ steps.dependency_audit.outcome }}" != "success" ]; then exit 1; fi

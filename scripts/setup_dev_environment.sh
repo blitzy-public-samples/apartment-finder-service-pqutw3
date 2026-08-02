@@ -113,6 +113,13 @@ EOF
         return 1
     fi
 
+    # SEC-01: a .env path that is not a regular file absorbs the temporary
+    # file and the run still reports success (CWE-252)
+    if [ -e .env ] && [ ! -f .env ]; then
+        echo "Refusing to install .env: the path exists and is not a regular file. Remove or rename it, then rerun." >&2
+        return 1
+    fi
+
     if ! mv -f "$env_tmp" .env; then
         echo "Failed to install .env. Environment configuration aborted." >&2
         return 1
@@ -120,6 +127,8 @@ EOF
     trap - EXIT
     
     echo "Environment variables configured. Please update the values in .env file."
+    echo "This file carries four keys; .env.example documents the complete variable set."
+    echo "The app_owner password was generated for this run only and is not retained. Issue ALTER ROLE app_owner WITH PASSWORD, or rerun setup, before further schema work."
 }
 
 # Create the database schema with the owner role
