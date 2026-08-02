@@ -21,6 +21,10 @@ bound plan all match, and it authorizes one charge and no more. The
 consumption ledger holds per-process state, so a second worker keeps its
 own; the multi-worker limitation is recorded in the decision log under
 SEC-09.
+
+The route cases post to ``/subscriptions/`` and check the plan the
+endpoint hands to the verifier, along with the charge that plan admits
+and the charge it refuses.
 """
 import asyncio
 import importlib.util
@@ -36,6 +40,7 @@ from pydantic import VERSION as PYDANTIC_VERSION
 from pydantic import ValidationError
 from sqlalchemy import create_engine, event
 
+from backend.app.api.endpoints import subscriptions as subscription_route
 from backend.app.core.config import (
     DB_SSLMODES,
     HMAC_KEY_MIN_BYTES,
@@ -903,3 +908,116 @@ def test_the_verification_call_contract_is_preserved():
     assert all(parameters[index].default is None
                for index in range(2, len(parameters)))
     assert inspect.iscoroutinefunction(paypal_service.process_payment)
+
+
+# SEC-09: the route the browser reaches and the plan it names
+SUBSCRIPTION_ROUTE = "/subscriptions/"
+REQUESTED_PLAN = "P-REQUESTED"
+UNREQUESTED_PLAN = "P-OTHER"
+AGREEMENT_REFERENCE = "I-AGREEMENT"
+
+# SEC-09: the status the route answers when the charge does not authorize
+PAYMENT_REFUSED_STATUS = 400
+
+TERM_START = "2026-01-01T00:00:00"
+TERM_END = "2027-01-01T00:00:00"
+
+
+def subscription_body(plan_id=REQUESTED_PLAN, reference=AGREEMENT_REFERENCE,
+                      amount=CHARGE_TOTAL):
+    """Build the body a subscribing client posts."""
+    return {
+        "plan_id": plan_id,
+        "payment_method": reference,
+        "amount": amount,
+        "start_date": TERM_START,
+        "end_date": TERM_END,
+    }
+
+
+def post_subscription(client, token, body):
+    """Post one subscription request as an authenticated caller."""
+    return client.post(
+        SUBSCRIPTION_ROUTE,
+        json=body,
+        headers={"Authorization": "Bearer {0}".format(token)},
+    )
+
+
+def spent(reference):
+    """Report whether the ledger holds the reference as spent."""
+    return paypal_service._reference_key(
+        reference) in paypal_service._consumed_references
+
+
+# SEC-09: the route supplies the plan the authorization gate binds against
+def test_the_subscription_route_binds_the_requested_plan(
+        client, registered_user):
+    """The route hands the verifier the plan the request names.
+
+    The recorded call is inspected directly, so a route that drops the
+    keyword fails here even while the verifier's own cases pass.
+    """
+    recorded = {}
+
+    async def record(payment_method, amount, **binding):
+        recorded["positional"] = (payment_method, amount)
+        recorded["binding"] = binding
+        return True
+
+    body = subscription_body()
+    with mock.patch.object(subscription_route, "process_payment", record):
+        response = post_subscription(
+            client, registered_user["access_token"], body)
+
+    assert recorded["positional"] == (body["payment_method"], body["amount"])
+    assert set(recorded["binding"]) == {"plan_id"}
+    assert recorded["binding"]["plan_id"] == body["plan_id"]
+    assert response.status_code != PAYMENT_REFUSED_STATUS
+
+
+# SEC-09: a reusable agreement for the requested plan authorizes the charge
+def test_the_route_authorizes_an_agreement_for_the_requested_plan(
+        client, registered_user, spent_references):
+    """An agreement carrying the requested plan clears the payment gate."""
+    body = subscription_body()
+    resource = active_agreement(plan=body["plan_id"])
+
+    with mock.patch.object(paypal_service, "_find_payment_resource",
+                           return_value=resource):
+        response = post_subscription(
+            client, registered_user["access_token"], body)
+
+    assert response.status_code != PAYMENT_REFUSED_STATUS
+    assert spent(body["payment_method"])
+
+
+# SEC-09: a reusable agreement for another plan authorizes nothing (CWE-863)
+def test_the_route_refuses_an_agreement_for_another_plan(
+        client, registered_user, spent_references):
+    """An agreement carrying a different plan is refused at the route."""
+    body = subscription_body()
+    resource = active_agreement(plan=UNREQUESTED_PLAN)
+
+    with mock.patch.object(paypal_service, "_find_payment_resource",
+                           return_value=resource):
+        response = post_subscription(
+            client, registered_user["access_token"], body)
+
+    assert response.status_code == PAYMENT_REFUSED_STATUS
+    assert not spent(body["payment_method"])
+
+
+# SEC-09: the route reaches no provider call without a credential
+def test_an_unauthenticated_subscription_reaches_no_provider_call(
+        client, spent_references):
+    """A request carrying no credential drives no provider lookup."""
+    lookup = mock.Mock(return_value=active_agreement())
+    body = subscription_body()
+
+    with mock.patch.object(paypal_service, "_find_payment_resource", lookup):
+        response = client.post(SUBSCRIPTION_ROUTE, json=body)
+
+    assert response.status_code == 401
+    assert lookup.call_count == 0
+    assert not spent(body["payment_method"])
