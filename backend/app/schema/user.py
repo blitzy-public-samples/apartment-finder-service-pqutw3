@@ -18,7 +18,9 @@ class User(BaseModel):
     last_login: Optional[datetime]
 
 
-# SEC-04: policy constants mirror frontend/src/utils/validators.ts:19-23
+# SEC-04: length and character-class constants mirror
+# frontend/src/utils/validators.ts:19-23; the bcrypt byte ceiling is
+# server-only
 PASSWORD_MIN_LENGTH = 12
 PASSWORD_MAX_BYTES = 72
 PASSWORD_UPPERCASE = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"

@@ -343,8 +343,8 @@ EFFECTIVE_PRIVILEGE_PROBES = (
     "has_schema_privilege('app_user', 'public', 'USAGE')",
 )
 
-# SEC-11: the condition each probe raises on; a verification finding a
-# privilege stops the run
+# SEC-11: the refusal statements the batch carries; each probe raises when
+# it finds an unexpected privilege, stopping the run
 EFFECTIVE_PRIVILEGE_FAILURES = (
     "RAISE EXCEPTION 'PUBLIC still holds % on database %'",
     "RAISE EXCEPTION 'PUBLIC still holds % on schema public'",
@@ -1499,7 +1499,7 @@ def test_the_credential_scan_detects_each_credential_shape(line):
 def test_the_credential_scan_passes_over_documented_placeholders(line):
     """A template line naming a variable without a value is not matched.
 
-    Each control below is a line the value-free template carries.
+    Each control below is a placeholder-only line the template carries.
     """
     assert not _credential_scan_pattern().search(line), line
 
@@ -2581,9 +2581,10 @@ def test_charge_refuses_when_the_provider_lookup_raises(spent_references):
     assert len(paypal_service._claimed_references) == 0
 
 
-# SEC-09: a verified reference is spent once (CWE-294)
+# SEC-09: a reference retained in the ledger authorizes no second charge
+# (CWE-294)
 def test_a_verified_reference_authorizes_one_charge_only(spent_references):
-    """Replaying a reference that already paid does not authorize again."""
+    """A reference retained in the ledger does not authorize again."""
     resource = approved_payment()
     outcomes = [authorize(resource, reference="PAY-REPLAY") for _ in range(3)]
     assert outcomes == [True, False, False]
@@ -2591,9 +2592,10 @@ def test_a_verified_reference_authorizes_one_charge_only(spent_references):
     assert len(paypal_service._claimed_references) == 0
 
 
-# SEC-09: a spent reference reaches no provider call (CWE-294)
+# SEC-09: a reference retained in the ledger reaches no provider call
+# (CWE-294)
 def test_a_spent_reference_drives_no_provider_call(spent_references):
-    """A replayed reference is refused ahead of any provider request."""
+    """A retained replay is refused ahead of any provider request."""
     lookup = mock.Mock(return_value=approved_payment())
     loop = asyncio.new_event_loop()
     try:
@@ -2938,7 +2940,7 @@ PERMISSIVE_UMASK = "022"
 # SEC-01: what a planted name standing at .env holds before the run
 PLANTED_TARGET_CONTENT = "zzz-planted-standing-name-8901\n"
 
-# SEC-11: no-op stands-in for the two bootstrap helpers that reach a live
+# SEC-11: no-op stand-ins for the two bootstrap helpers that reach a live
 # cluster, so the psql batch between them executes as shipped
 PROVISIONING_BOOTSTRAP_STUBS = (
     "check_schema_prerequisites() { return 0; }",

@@ -579,7 +579,9 @@ Anything that already holds a copy — a captured `Authorization` header, a prox
 for a non-browser client — continues to authenticate after logout: verification checks the signature
 and the expiry and consults no revocation record. Closing that gap needs a `jti` claim plus a
 persisted deny list, and `DL-361` carries that boundary. The controls that remain are the short token
-lifetime and the `HttpOnly` cookie that keeps script from obtaining a copy. Read "logout invalidates
+lifetime and the `HttpOnly` attribute, which stops script reading the cookie. It does not stop script
+seeing a token: the frozen login and register bodies still return `access_token` to page code, and
+the remediation removed browser persistence rather than all script access. Read "logout invalidates
 the session" as ending the browser's session, not as revocation.
 
 **Enabling credentialed mode activates an `axios` advisory that was dormant.** CVE-2023-45857
@@ -683,7 +685,7 @@ closed with a residual is distinguishable from one closed outright.
 
 | # | Severity | What was wrong | What closed it | Residual |
 | --- | --- | --- | --- | --- |
-| SQ-01 | Major | The charge seam returned false unconditionally, so every subscription was denied, and the route no longer bound the requested plan | The provider-backed verifier was restored: a reference is claimed in a local ledger, resolved through the provider, and bound to state, amount, currency, payer and — for a reusable agreement — the requested plan, then spent once | The route still cannot persist a row; section 3.3 |
+| SQ-01 | Major | The charge seam returned false unconditionally, so every subscription was denied, and the route no longer bound the requested plan | The provider-backed verifier was restored: a reference is claimed in a local ledger, resolved through the provider, and bound to state, amount, currency, payer and — for a reusable agreement — the requested plan. A replay is then refused while the reference is retained in the worker-local ledger | The route still cannot persist a row; section 3.3. The ledger holds 4,096 digests per worker, evicts the oldest past that, and is lost on restart, so a replay is refused only while its digest is retained |
 | SQ-02 | Major | The listing number validator had lost its finiteness check, so `NaN`, `Infinity` and an overflowing literal were accepted | The finite check and its overflow branch were restored on all three float fields, with no value floor reintroduced | None |
 | SQ-03 | Major | The credential scan required no space around the separator, so the formatter-compliant spelling passed | The pattern became whitespace- and quote-aware and gained a lower-case branch, behind a reviewed allow-list; section 2.6 | None |
 | SQ-04 | Medium | The suppression staleness check read `PYSEC-` identifiers only, so the GitHub-namespace entry could rot unnoticed | The check now parses `id` and `aliases` from the audit report and fails on any declared identifier absent from both; section 2.4 | None |
@@ -695,7 +697,7 @@ closed with a residual is distinguishable from one closed outright.
 | SQ-10 | Low | The environment file was published by checking the destination and then moving over it, which a directory created after the check absorbs | The publish is a single `link(2)` call that fails when the destination exists in any form, followed by a check that the published path is the regular file the run wrote | None |
 | SQ-11 | Medium | This document, the decision log and the traceability matrix carried claims that were stale or stronger than the code | Every documented command was re-run and every count re-measured; the corrections are visible throughout sections 2 and 3 | None |
 | SQ-12 | Major | The login throttle keyed on a normalised address while the database lookup was exact, so case-variant accounts shared one counter | The counter is keyed on the stored identity, so counter identity and database identity are the same | Lockout state is in process; section 3.2 |
-| SQ-13 | Medium | An unknown address returned before the password hasher ran, which timed the difference between absent and wrong | Both branches perform one fixed-cost verification, against a per-process random stand-in hash when no row exists | None |
+| SQ-13 | Medium | An unknown address returned before the password hasher ran, which timed the difference between absent and wrong | Both branches perform one fixed-cost verification, against a per-process random stand-in hash when no row exists | Total request timing is not proven equal; the absent branch skips one query (DL-338) |
 | SQ-14 | Medium | Only schema `CREATE` was revoked from `PUBLIC`, leaving the database `CONNECT` and `TEMPORARY` privileges every role holds by default | Both are revoked, the effective ACLs are verified by the batch itself, and the cloud instructions carry the same correction; section 3.2 | Schema `USAGE` is deliberately left with `PUBLIC`, and section 3.2 says so |
 | SQ-15 | Medium | The database-password variable recommended `-var`, which puts the value in the process arguments and in shell history | The description now requires the environment variable or a gitignored variable file, and mentions the flag only to prohibit it; section 2.7 | None |
 

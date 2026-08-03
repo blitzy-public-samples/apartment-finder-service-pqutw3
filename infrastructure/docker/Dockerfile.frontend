@@ -1,6 +1,6 @@
 # Use an official Node.js runtime as the base image
-# Pinned Node line: 22, the lowest line the platform runtime policy
-# permits. DL-375
+# Pinned Node line: 22, the lowest platform-permitted line that builds
+# the pinned frontend toolchain. DL-375
 FROM node:22 as build
 
 # Set the working directory in the container

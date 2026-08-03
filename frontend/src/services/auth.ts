@@ -10,7 +10,8 @@ export interface AuthSession {
 export async function login(email: string, password: string): Promise<AuthSession> {
   try {
     const response = await axios.post(`${API_BASE_URL}/auth/login`, { email, password });
-    // SEC-06: the session token stays in the HttpOnly cookie (CWE-522)
+    // SEC-06: the client returns the frozen response body but does not persist
+    // its token; browser authentication uses the HttpOnly cookie (CWE-1004)
     const { access_token, token_type } = response.data;
     return { access_token, token_type };
   } catch (error) {

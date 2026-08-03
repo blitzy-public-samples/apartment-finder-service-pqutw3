@@ -135,9 +135,9 @@ configure_env_vars() {
         return 1
     fi
 
-    # SEC-01/SEC-12: an owner-only temporary file is renamed over .env, so
-    # no byte is world-readable and a symlink there is replaced
-    # (CWE-59, CWE-367, CWE-732)
+    # SEC-01/SEC-12: the owner-only temporary file is published with
+    # link(2); any existing destination is left unchanged and aborts the run
+    # (CWE-59, CWE-367, CWE-732). DL-352
     env_tmp=$(umask 077 && mktemp ./.env.tmp.XXXXXXXX)
     if [ -z "$env_tmp" ] || [ ! -f "$env_tmp" ]; then
         echo "Unable to create the environment file. Setup aborted." >&2

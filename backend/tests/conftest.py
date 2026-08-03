@@ -13,9 +13,9 @@ Collection is not filtered. ``test_api.py``, ``test_services.py`` and
 modules the package layout does not provide, so a full-suite run reports
 three collection errors.
 
-Rationale for every decision in this harness is recorded in
-``documentation/security/decision-log.md``, section 7, and in DL-376
-and DL-377.
+Rationale for this harness is indexed in
+``documentation/security/decision-log.md``, section 7, and in DL-376,
+DL-377, and DL-399.
 
 Module surface
 --------------

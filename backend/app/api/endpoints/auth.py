@@ -87,9 +87,9 @@ def _verified_credentials(db_user, submitted_password: str):
     # SEC-04/SEC-08: every hasher refusal is answered by the counted
     # uniform 401, never a 500 and never a distinguishable 422 (CWE-209,
     # CWE-307). Returns (matched, refusing exception type name)
-    # SEC-08: both branches perform one verification of equal scheme and
-    # cost; response time discloses no account state (CWE-208, CWE-203).
-    # DL-365
+    # SEC-08: both branches perform one verification with the stored scheme
+    # and cost; tests assert invocation count, not total response-time
+    # equality (CWE-208, CWE-203). DL-365
     stored_hash = (
         _ABSENT_ACCOUNT_HASH if db_user is None else db_user.hashed_password
     )

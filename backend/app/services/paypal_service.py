@@ -33,8 +33,9 @@ _EXPECTED_CURRENCY = "USD"
 # SEC-09: upper bound in seconds on one provider call (CWE-400)
 _REQUEST_TIMEOUT_SECONDS = 10.0
 
-# SEC-09: references already spent, oldest first; a verified reference
-# authorizes one charge and no more (CWE-294)
+# SEC-09: spent-reference digests retained in this worker, oldest first;
+# while retained, a verified reference authorizes no second charge
+# (CWE-294). Eviction past the limit and worker restart both drop state
 _CONSUMPTION_LIMIT = 4096
 _consumed_references = OrderedDict()
 _claimed_references = set()
@@ -286,7 +287,9 @@ def _release_reference(key: str) -> None:
 
 
 def _consume_reference(key: str) -> None:
-    # SEC-09: spends a verified reference so it authorizes no further charge
+    # SEC-09: records a verified reference in the bounded worker-local
+    # ledger; while the digest remains there it authorizes no further
+    # charge, and the oldest digest is evicted past the limit
     with _consumption_lock:
         _claimed_references.discard(key)
         _consumed_references[key] = True
@@ -327,8 +330,9 @@ async def process_payment(payment_method: str, amount: float, *,
                           payer_id: Optional[str] = None) -> bool:
     # SEC-09: approves only a reference PayPal confirms as authorized for this
     # exact charge - amount, unit, payer and, for a reusable agreement, the
-    # bound plan - and spends it once; every unverified, replayed, malformed
-    # or failing path returns False
+    # bound plan - and records it in the bounded worker-local ledger; every
+    # unverified, malformed or failing path returns False, as does a replay
+    # while the digest remains in that ledger
     if not isinstance(payment_method, str) or not payment_method.strip():
         return False
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):

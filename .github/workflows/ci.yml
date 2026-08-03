@@ -21,7 +21,8 @@ jobs:
     - name: Set up Node.js
       uses: actions/setup-node@v2
       with:
-        # Lowest Node line the platform runtime floor permits
+        # Lowest platform-permitted Node line that builds the pinned
+        # frontend toolchain
         node-version: '22'
 
     - name: Install Python dependencies

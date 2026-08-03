@@ -1,12 +1,13 @@
 """SEC-06 regression tests for session token storage.
 
-Both auth routes set the session cookie with HttpOnly, Secure and
-SameSite=Strict, and the register and login bodies keep the keys they
-had. The cases cover the cookie attributes, both response bodies, a
-cookie-only request, the bearer-header fallback, cookie precedence over
-a conflicting header, and logout. Every assertion here is a backend one.
-No test in this file runs browser script; it asserts the HttpOnly
-attribute, not what a browser does with it.
+The register and login routes set the session cookie with HttpOnly,
+Secure and SameSite=Strict, and both bodies keep the keys they had.
+HttpOnly stops page script reading the cookie; the frozen response body
+stays script-readable. The cases cover the cookie attributes, both
+response bodies, a cookie-only request, the bearer-header fallback,
+cookie precedence over a conflicting header, and logout. Every assertion
+here is a backend one. No test in this file runs browser script; it
+asserts the HttpOnly attribute, not what a browser does with it.
 """
 from datetime import datetime, timedelta
 from http import HTTPStatus
@@ -50,8 +51,8 @@ EXPECTED_AUTH_CHALLENGE = "Bearer"
 # SEC-06: a cookie value that carries no valid signature
 MALFORMED_COOKIE_TOKEN = "not-a-signed-token"
 
-# SEC-08: the detail get_current_user raises; the error boundary at
-# main.py:234 keeps it out of the response body
+# SEC-08: the global HTTP-exception handler keeps the raised detail
+# out of the response body
 INTERNAL_401_DETAIL = "Could not validate credentials"
 
 SEEDED_FILTER_NAME = "session-cookie-owner-probe"
@@ -86,7 +87,8 @@ def _session_cookie_directive(response):
 
 def _assert_cookie_security_attributes(morsel):
     """Check the session cookie's HttpOnly, Secure, SameSite and Path."""
-    # SEC-06: HttpOnly puts the token beyond page script
+    # SEC-06: HttpOnly prevents page script from reading the cookie; the
+    # frozen response body remains script-readable
     assert morsel["httponly"] is True, "the session cookie omits HttpOnly"
     # SEC-06: the Secure attribute follows settings.COOKIE_SECURE
     assert settings.COOKIE_SECURE, "COOKIE_SECURE is disabled under test"

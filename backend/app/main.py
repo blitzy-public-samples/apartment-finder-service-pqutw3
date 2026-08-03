@@ -194,7 +194,7 @@ create_tables()
 _REQUEST_LOCATIONS = ("body", "query", "path", "header", "cookie")
 _GENERIC_SERVER_DETAIL = "Internal server error"
 
-# SEC-08: substitutes a record carries in place of the client-supplied
+# SEC-08: substitutes the values a record carries for the client-supplied
 # request path and method (CWE-532). DL-364
 _UNMATCHED_ROUTE = "<unmatched>"
 _UNSERVED_METHOD = "<method>"
