@@ -1740,10 +1740,11 @@ repeated after section 41 and section 42 changed the file.
 reading is the one recorded: both soft violations are counted even though the second is the
 deliberate choice the special-handling clause permits.
 
-Measured on the shipped file: 402 four-column decision rows keyed `DL-01` through `DL-402`, with no
+Measured on the shipped file: 406 four-column decision rows keyed `DL-01` through `DL-406`, with no
 gap and no duplicate. Zero rows over 1,800 characters, the longest at 1,796. Zero sentences over 45
-words, at a median of 14 across roughly 4,700 of them, and zero body paragraphs over five sentences.
-The file is about 513,000 characters.
+words, at a median of 14 across roughly 4,900 of them, and zero body paragraphs over five sentences.
+The file is about 522,000 characters. `DL-406` carries the decision to refresh these figures with each
+later pass.
 
 The counts that move by a handful with any later edit are given to that precision on purpose, since
 this section is measuring the file it sits in.
@@ -2032,3 +2033,51 @@ had to be written for that to be true.
 - **DL-390 and DL-391, the two directions.** An edge-set comparison extracted from the matrix reports 82 edges in each direction with an empty difference both ways, five declared-asymmetric edges, and 47 unique paths at 20 created, 24 updated and 3 references.
 - **DL-394, the prose.** Zero body sentences over 45 words and zero body paragraphs over five sentences in all three documents, measured with fenced code and inline code excluded. The 30-to-45-word band is the recorded soft residual.
 - **Suite and style.** The security suite reports **689 passing cases and one pre-existing warning**, unchanged through every step of this pass, and `flake8` reports the same **109** findings with the same per-file distribution.
+
+---
+
+## 43. Corrections after the serial arithmetic and completeness review
+
+`documentation/security/traceability-matrix.md`, `SECURITY.md`,
+`documentation/security/decision-log.md`
+
+A serial review read the tree section 42 left behind and raised three minor findings, all in
+documentation. All three are closed here: rows are keyed from `DL-403`, each carries one decision, and
+the measurements sit in 43.5 rather than inside a cell.
+
+The first is a Direction B row shape that contradicted its own stated invariant. The second is a
+stale current-state test count. The third is a follow-on that named a root certificate without naming
+the configuration key pointing at it.
+
+### 43.1 The Direction B row shape
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-403** — Split the two grouped Direction B rows into one row per path, and state the row count beside the path count in section 2's preamble and in 3.1. | (a) Keep the grouped rows and reword the invariant to permit grouping by shared control. (b) Drop the invariant and let the edge measurement carry the coverage claim alone. (c) Make grouping the rule, collapsing every row that shares a mode and a finding. | The invariant is what makes coverage checkable by a reader with a text editor: one row per delivered path means an omitted path shows up as a missing row. Section 2 carried 44 rows for 47 paths, so the sentence was false as written even though every edge was present. Option (a) keeps the arithmetic honest but removes the property a reviewer counts, since a grouped cell can hide a fourth path. Option (b) leaves no claim a reader can check without running an extractor. Option (c) collapses rows that carry different contexts: the three ignore files govern three different build contexts, and the two schema files declare different bodies. | Five rows replace two, and the three ignore rows share one exclusion list, so the second and third name the first rather than repeating it. An edit to one therefore has two siblings to keep true. Row and path counts now have to move together: a new delivered path means a new row plus two count statements, and 43.5 measures both directions. |
+
+### 43.2 The current-state test count
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-404** — Correct the current-state count in `SECURITY.md` section 3.3 from 688 to 689, and leave the two 688 figures in section 41.11 of this log standing. | (a) Change all three occurrences to 689. (b) Keep the sentence and add a footnote explaining the difference. (c) Drop the figure and point at the verification commands in section 2. | Two of the three figures measure the tree section 41 describes, and 41.11 says so in its first line, so rewriting them would falsify a dated record rather than repair a stale claim. The third reports what the suite does now, and both invocations measure 689: the security run, and the full run with the collection-error flag. Option (a) erases the evidence that the count moved by one when the harness gained a case. Option (b) spends a paragraph on a one-digit correction. Option (c) removes a figure a reader can check against the command printed above it. | Two counts differing by one now sit in the same repository, and only the heading of 41.11 marks which is historical. A later change to the suite has to move five sites together, three in `SECURITY.md` and two in the matrix baseline table, and 43.5 lists all five. |
+
+### 43.3 The verify-full follow-on
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-405** — Name the configuration mechanism wherever `SECURITY.md` states the `verify-full` follow-on: the mode value, plus the certificate-authority path as `sslrootcert` in the engine connect arguments or `PGSSLROOTCERT` in the environment. | (a) Name the mode and the distributed certificate alone, as before. (b) Thread `sslrootcert` through `connect_args` now, behind a new optional setting. (c) Name only the default location the driver reads. | AAP 0.5.10 requires this document to name `verify-full` with a root-certificate path, and the mode alone is not actionable. The settings domain already admits `verify-full`, so an operator who sets it and stops either fails to connect or trusts whatever sits at the driver's default path. The guard case refuses a compound mode value, so the path has to travel separately. Option (b) adds a setting and a code path for a deferred follow-on, which the Minimal Change Clause keeps out of a documentation correction. Option (c) hides the parameter that makes a rotatable certificate possible, since a rotation job cannot write into every home directory. | The document now names a code site, the `connect_args` call in `backend/app/db/database.py`, so the follow-on and the sentence move together. Certificate distribution and rotation stay out of scope, so SEC-10 remains the partial remediation DL-249 records. |
+
+### 43.4 This log's own measurement
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-406** — Refresh section 40.8's measurement to the count this section leaves behind, and leave every per-pass evidence block at the figure it measured. | (a) Leave 40.8 reporting 402 rows. (b) Date the sentence rather than refreshing it. (c) Refresh every count in every evidence block to the current file. | 40.8 reports the prose verdict for this file in the present tense, and section 42 already refreshed the same sentence from 331 to 402. Leaving it would reproduce the stale current-state figure DL-404 corrects elsewhere. Option (b) makes a reader carry a date to decide whether a figure is live. Option (c) rewrites dated measurements that 43.5 and every earlier evidence block depend on being fixed at the moment they were taken. | Every later pass that adds a row has one sentence to refresh, and forgetting it recreates a stale count. The hedged figures in that paragraph absorb small movement, so only the exact ones need attention. |
+
+### 43.5 Measured evidence for section 43
+
+- **DL-403, the row shape.** Before: 44 Direction B rows for 47 unique paths, with two cells carrying three paths and two paths. After: 47 rows, 47 unique paths and zero multi-path cells, against the same 82 Direction A edges, 82 non-exempt Direction B edges, 5 exempt edges and 20 created, 24 updated and 3 reference modes. The split moved the row count and nothing else, because edges and modes are extracted per path rather than per row.
+- **DL-404, the five count sites.** The current-state figures sit at `SECURITY.md:163`, `:176` and `:629`, and in the matrix baseline table at `traceability-matrix.md:342-343`. All five read 689, which both invocations measure: the security run reports 689 passed with one pre-existing warning, and the full run reports 689 passed with the same three collection errors and exit 1. The two historical figures stay at 688, at `decision-log.md:1909` and `:1922`, both under the heading `41.11 Measured evidence for section 41`.
+- **DL-405, the mechanism as shipped.** `backend/app/core/config.py` admits `verify-full` in its transport domain and defaults to `require`, while the engine in `backend/app/db/database.py` passes `sslmode` alone, conditionally, for a PostgreSQL URL. The guard case rejects a mode value carrying a second parameter, so the certificate path cannot ride inside the setting. Measured on the shipped driver, `sslrootcert` reaches libpq through both `psycopg2.connect` and engine `connect_args` on psycopg2 2.9.12 with SQLAlchemy 2.0.51: the attempt ends in a refused connection, not a rejected keyword. The vendor documents `~/.postgresql/root.crt` as the default that the parameter and `PGSSLROOTCERT` override, and before this pass neither name appeared anywhere in the repository.
+- **DL-406, this file after the pass.** 406 four-column decision rows keyed `DL-01` through `DL-406`, with no gap and no duplicate. Zero rows over 1,800 characters, the longest at 1,796, and the longest single cell at 1,044. The file is about 522,000 characters.
+- **The three gates, run as the workflow runs them.** The credential scan reports 21 pattern matches and zero after the reviewed allow-list, the frontend client-secret guard reports zero, and the browser-storage guard reports zero. Neither corrected document carries a credential pattern, and `git diff --check` exits 0.
+- **Suite and style.** The security suite reports **689 passing cases and one pre-existing warning**, unchanged through this pass, and `flake8` reports the same **109** findings.

@@ -462,7 +462,10 @@ infrastructure.
 Cloud SQL instance is set to accept encrypted connections only, and the application requests
 `require` explicitly instead of inheriting the negotiated default. `require` guarantees encryption
 and performs no server-identity check. Moving to `verify-full` with a distributed, rotatable root
-certificate is the recommended follow-on, and it is item 3 in section 4.
+certificate is the recommended follow-on, and it is item 3 in section 4. That change sets
+`DB_SSLMODE=verify-full` and passes the certificate-authority path as `sslrootcert` in the engine
+connect arguments, or as `PGSSLROOTCERT` in the environment; libpq otherwise reads only
+`~/.postgresql/root.crt`.
 
 **SEC-11 gained role separation, and least-privilege grants in one place only.** The two halves
 differ, so they are stated separately.
@@ -623,7 +626,7 @@ Style checking reported 129 findings before this work, 4 of them undefined names
 collected zero tests with three collection errors, because all three existing test modules failed to
 import. The pipeline had never reached either step, because it failed at dependency installation.
 
-Measured now: style checking reports 109 findings with 1 undefined name, and the suite reports 688
+Measured now: style checking reports 109 findings with 1 undefined name, and the suite reports 689
 passed with the same three collection errors. Those three errors survive this work untouched. **A
 green pipeline is not on offer.**
 
@@ -706,7 +709,11 @@ closed with a residual is distinguishable from one closed outright.
 2. Generate and commit a frontend lock file after auditing the transitive tree, and declare the two
    packages that are imported but never declared.
 3. Move database transport to `verify-full` with a distributed, rotatable root certificate, so the
-   connection verifies server identity and not only encryption.
+   connection verifies server identity and not only encryption. Set `DB_SSLMODE=verify-full`, a value
+   the settings domain already admits, and give libpq the certificate-authority file path: add
+   `sslrootcert` to the `connect_args` in `backend/app/db/database.py`, or export `PGSSLROOTCERT`.
+   That engine passes `sslmode` alone today, so the mode without a path falls back to
+   `~/.postgresql/root.crt`.
 4. Provision a managed secret store with key management, and migrate the deployment pipeline to
    federated identity in place of the long-lived service-account key.
 5. Add per-service database roles and row-level security.

@@ -67,8 +67,9 @@ before any of them could be tested. Four rows are labelled **Partial**, with the
 
 ## 2. Direction B — file to control to finding
 
-One row per delivered path, grouped by directory: the thirty-nine of the planned change set plus the
-eight delivered outside it, which section 3.4 names with their departure recorded. **Mode** is `CREATE`, `UPDATE`
+One row per delivered path, forty-seven in all, grouped by directory: the thirty-nine of the planned
+change set plus the eight delivered outside it, which section 3.4 names with their departure
+recorded. **Mode** is `CREATE`, `UPDATE`
 or `REFERENCE`, where a reference file is read as an authority and deliberately left unchanged, and a
 mode reading *delivered* differs from the plan. Controls are named, not re-explained; section 1 holds
 the mechanism.
@@ -79,7 +80,9 @@ the mechanism.
 | --- | --- | --- | --- |
 | `.gitignore` | CREATE | Excludes the environment file, the secrets directory, certificates, keys and credential JSON, plus Terraform state and variable files. `password_wo` from an `ephemeral` variable keeps the database password out of both state and plan, so these two exclusions stand on the variable file being the conventional home for an operator-supplied value and on state recording other resource attributes | SEC-01, SEC-11, SEC-12 |
 | `.env.example` | CREATE | Documents every required variable by name, shape and purpose, with placeholder values only, including the JSON-array form the origin list expects. Carries both contracts: the backend settings, and a final section naming the two frontend build variables the client bundle embeds | SEC-01, SEC-03, SEC-10, SEC-12 |
-| `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore` | CREATE | One ignore file per build context. Each excludes the environment file and its temporary form, the `secrets/` directory, certificates, keys, credential JSON, virtual environments, dependency trees, caches and coverage output, so a broad `COPY . .` cannot carry an untracked secret into an image layer | SEC-12 |
+| `.dockerignore` | CREATE | The root build context, and the widest of the three ignore files: it also excludes both sub-context caches, virtual environments, dependency trees and the frontend build and coverage output. Excludes the environment file and its temporary form, the `secrets/` directory, certificates, keys and credential JSON, so a broad `COPY . .` cannot carry an untracked secret into an image layer | SEC-12 |
+| `backend/.dockerignore` | CREATE | The context `Dockerfile.backend` builds from, whose `COPY . .` would otherwise carry the whole backend tree. Excludes the same secret-bearing paths, plus the Python caches, egg metadata, virtual environments and coverage output | SEC-12 |
+| `frontend/.dockerignore` | CREATE | The context `Dockerfile.frontend` builds from, whose `COPY . .` would otherwise carry the whole frontend tree. Excludes the same secret-bearing paths, plus `node_modules/`, `build/` and `coverage/` | SEC-12 |
 | `SECURITY.md` | CREATE | Operator-facing custody procedure, verification commands, residual-risk register and the deferred follow-ons. Section 3.2 also carries the out-of-band `REVOKE` and `GRANT` statements that reduce the Cloud application account, which no provider resource can express | SEC-11, SEC-12 |
 
 ### 2.2 Backend application
@@ -126,7 +129,8 @@ longer exploitable.
 | --- | --- | --- | --- |
 | `frontend/src/services/auth.ts` | UPDATE | Removes all browser token storage, corrects the request path to `/auth/login`, and delegates logout to the server route that can clear an `HttpOnly` cookie. Declares the authentication response contract the frozen login body actually carries, as the exported `AuthSession` type, in place of a user object the body has never held | SEC-06 |
 | `frontend/src/services/api.ts` | UPDATE | Exports the base URL that the auth module already imported, and sends credentials so the browser transmits the session cookie; the cross-site-token option is deliberately left unset. Declares the wire type of each response instead of casting to one, maps the filter form's own value onto the writable-field allow-list before sending it, and declares no path the application does not serve — the call to an unmounted profile route is gone | SEC-06, SEC-05 |
-| `frontend/src/schema/listing.ts`, `frontend/src/schema/filter.ts` | **UPDATE, delivered** | Exported declarations of the bodies the read and write paths actually carry: integer identifiers, snake_case names, ISO-8601 date-time strings, and a separate `FilterCreate` naming the writable fields. `filter.ts` also declares the form's own value shape, so the mapper's input is a contract rather than an assumption | SEC-05 |
+| `frontend/src/schema/listing.ts` | **UPDATE, delivered** | Exported declaration of the body the read path actually carries: an integer key, snake_case names, ISO-8601 date-time strings and null for every nullable column. Also declares `ListingQuery`, the two pagination bounds that path reads, so no other query parameter is assumed | SEC-05 |
+| `frontend/src/schema/filter.ts` | **UPDATE, delivered** | Exported declaration of the filter body, with a separate `FilterCreate` naming the writable fields the create path accepts. Also declares the form's own value shape, so the mapper's input is a contract rather than an assumption | SEC-05 |
 | `frontend/package.json` | UPDATE | One line: the axios caret range becomes an exact pin, removing a declared floor that sat inside the CVE-2023-45857 range now that credentialed mode is enabled | SEC-06 prerequisite |
 | `frontend/src/utils/validators.ts` | REFERENCE | The authority for the password character set at `:18-32`, mirrored by the server validator so the two cannot drift. Verified byte-identical | Authority for SEC-04 |
 
@@ -173,13 +177,14 @@ The table below is the **planned** map. Delivery departs from it on two paths an
 | UPDATE | 18 | 10 under `backend/`, 3 under `frontend/`, 3 under `infrastructure/`, 1 under `scripts/`, 1 under `.github/` |
 | REFERENCE | 5 | 4 under `backend/`, 1 under `frontend/` |
 | DELETE | 0 | See section 3.2 |
-| **Total** | **39** | Section 2 carries one row for each |
+| **Total** | **39** | Each has its own row in section 2, which carries 47 |
 
 **Coverage is stated as measured, not asserted.** An edge-set comparison extracted from the two
 sections reports **82 edges in Direction A and 82 non-exempt edges in Direction B, with an empty
 difference in both directions**. It also reports **5 exempt edges across the 6 declared-asymmetric
-rows** below, and **47 unique paths at 20 CREATE, 24 UPDATE and 3 REFERENCE**. `DL-395` carries the
-decision to state the claim this way.
+rows** below, and **47 unique paths in 47 rows, at 20 CREATE, 24 UPDATE and 3 REFERENCE**. `DL-395`
+carries the decision to state the claim this way, and `DL-403` the row split that made those two
+counts equal.
 
 What that measurement covers: every one of `SEC-01` through `SEC-12` has at least one file in section
 1, and every file in section 2 traces to a finding, to the dependency prerequisite, to an enabling
