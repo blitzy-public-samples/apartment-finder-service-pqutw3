@@ -1,14 +1,23 @@
+import math
+
 from pydantic import BaseModel, StrictInt, StrictStr, validator
 from datetime import datetime
 from typing import Optional
 
 
 def _require_json_number(value):
-    # SEC-05: accepts a JSON number only; rejects strings and booleans
+    # SEC-05: accepts a finite JSON number only; rejects strings, booleans,
+    # NaN, the two infinities and a magnitude no float holds (CWE-20)
     if value is None:
         return value
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError("must be a JSON number")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
+        raise ValueError("must be a finite number")
     return value
 
 

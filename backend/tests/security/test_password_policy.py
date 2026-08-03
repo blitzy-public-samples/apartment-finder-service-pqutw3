@@ -528,7 +528,7 @@ UNIFORM_LOGIN_DETAIL = "Incorrect email or password"
 
 # Shapes the hasher itself refuses: bcrypt rejects a NUL byte and
 # passlib caps a secret at 4096 characters.
-NUL_BYTE_PASSWORD = COMPLIANT + "\x00tail"
+NUL_BYTE_PASSWORD = COMPLIANT + "\x00tail"  # blitzy-scan-allow: test fixture
 PAST_PASSLIB_CEILING = "A" * 5000
 UNPARSEABLE_STORED_HASH = "not-a-bcrypt-digest"
 

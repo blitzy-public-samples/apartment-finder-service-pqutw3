@@ -48,10 +48,17 @@ _AUDIT_MARKER_KEY = secrets.token_bytes(32)
 _SESSION_COOKIE_PATH = "/"
 _SESSION_COOKIE_SAMESITE = "strict"
 
+# SEC-08: stand-in hash the unknown-address branch verifies against. It
+# carries the scheme and cost every stored hash carries, and its secret is
+# random per process, so no submitted password can match it (CWE-208)
+_ABSENT_ACCOUNT_HASH = get_password_hash(secrets.token_urlsafe(32))
+
 
 def _account_key(email: str) -> str:
-    # SEC-07: one counter per account regardless of case or padding
-    return _ACCOUNT_KEY_PREFIX + (email or "").strip().lower()
+    # SEC-07: one counter per stored account identity; the key is the value
+    # the credential query filters on, so no case variant shares a counter
+    # with another account (CWE-307, CWE-287)
+    return _ACCOUNT_KEY_PREFIX + (email or "")
 
 
 def _account_marker(throttle_key: str) -> str:
@@ -81,15 +88,18 @@ def _verified_credentials(db_user, submitted_password: str):
     # SEC-04/SEC-08: every hasher refusal is answered by the counted
     # uniform 401, never a 500 and never a distinguishable 422 (CWE-209,
     # CWE-307). Returns (matched, refusing exception type name)
-    if db_user is None:
-        return False, ""
+    # SEC-08: an unknown address is verified against a stand-in hash of the
+    # same scheme and cost, so the two branches do equal hasher work and the
+    # response time does not disclose whether the account exists (CWE-208,
+    # CWE-203)
+    stored_hash = (
+        _ABSENT_ACCOUNT_HASH if db_user is None else db_user.hashed_password
+    )
     try:
-        matched = verify_password(
-            submitted_password, db_user.hashed_password
-        )
+        matched = verify_password(submitted_password, stored_hash)
     except ValueError as refusal:
         return False, type(refusal).__name__
-    return matched, ""
+    return bool(matched and db_user is not None), ""
 
 
 class AccountThrottled(HTTPException):

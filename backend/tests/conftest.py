@@ -83,7 +83,7 @@ ALLOWED_ORIGIN = TEST_BASE_URL
 FOREIGN_ORIGIN = "https://foreign.example.com"
 
 # SEC-04: clears every rule in backend/app/schema/user.py
-VALID_PASSWORD = "Harness1!Passphrase"
+VALID_PASSWORD = "Harness1!Passphrase"  # blitzy-scan-allow: test fixture
 
 # Every setting the application declares, assigned unconditionally before
 # the first application import below. Every value is a test-only sentinel

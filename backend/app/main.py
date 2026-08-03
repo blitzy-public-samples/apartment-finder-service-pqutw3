@@ -33,11 +33,80 @@ _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 _JOINED_LINE_MARKER = "\\n"
 
 
+# SEC-08: control characters a record may not carry into any sink. A bare
+# carriage return rewrites a line on a terminal, and the C0 range carries
+# terminal escapes, so each is replaced rather than only the newline
+_CONTROL_CHARACTER_TRANSLATION = {
+    code: _JOINED_LINE_MARKER
+    for code in range(0x20)
+    if code != 0x20
+}
+_CONTROL_CHARACTER_TRANSLATION[0x7F] = _JOINED_LINE_MARKER
+
+
+def _single_line(text: str) -> str:
+    # SEC-08: one record occupies one line (CWE-117, CWE-778)
+    return text.translate(_CONTROL_CHARACTER_TRANSLATION)
+
+
+def _fold_record(record: logging.LogRecord) -> logging.LogRecord:
+    # SEC-08: renders one record's whole text - message, exception and stack
+    # - and folds it onto a single line, in place
+    rendered = record.getMessage()
+    if record.exc_info:
+        rendered = "%s\n%s" % (
+            rendered,
+            "".join(traceback.format_exception(*record.exc_info)),
+        )
+    if record.stack_info:
+        rendered = "%s\n%s" % (rendered, record.stack_info)
+    record.msg = _single_line(rendered)
+    record.args = ()
+    # SEC-08: the diagnostics are folded into the message already, so no
+    # formatter can append them again on a later line
+    record.exc_info = None
+    record.exc_text = None
+    record.stack_info = None
+    return record
+
+
+def _owns_record(name: str) -> bool:
+    # SEC-08: this package's records, and no other library's
+    return name == _APPLICATION_LOGGER_NAME or name.startswith(
+        "{0}.".format(_APPLICATION_LOGGER_NAME)
+    )
+
+
+def _install_single_line_records() -> None:
+    # SEC-08: folds every record this package creates at the moment it is
+    # created, which is before Logger.handle reaches any handler and
+    # therefore before propagation offers the record to an ancestor sink.
+    # Normalizing in the owned handler's formatter alone leaves a
+    # deployment or root handler emitting the raw multi-line record
+    # (CWE-117, CWE-778)
+    previous = logging.getLogRecordFactory()
+    if getattr(previous, "_folds_application_records", False):
+        return
+
+    def factory(name, level, fn, lno, msg, args, exc_info, func=None,
+                sinfo=None, **kwargs):
+        record = previous(
+            name, level, fn, lno, msg, args, exc_info, func, sinfo, **kwargs
+        )
+        if _owns_record(record.name):
+            _fold_record(record)
+        return record
+
+    factory._folds_application_records = True
+    logging.setLogRecordFactory(factory)
+
+
 class _SingleLineFormatter(logging.Formatter):
-    # SEC-08: one record occupies one line, so a multi-line traceback
-    # stays attached to its correlation identifier (CWE-778)
+    # SEC-08: the sink this module owns re-applies the same normalization,
+    # so a record reaching it from another factory is still one line, and so
+    # is any text the format string itself contributes (CWE-778)
     def format(self, record: logging.LogRecord) -> str:
-        return super().format(record).replace("\n", _JOINED_LINE_MARKER)
+        return _single_line(super().format(record))
 
 
 class _ApplicationLogHandler(logging.StreamHandler):
@@ -50,6 +119,7 @@ def _configure_application_logging() -> None:
     # none of which logging.lastResort emits (CWE-778)
     application_logger = logging.getLogger(_APPLICATION_LOGGER_NAME)
     application_logger.setLevel(_LOG_LEVEL)
+    _install_single_line_records()
     for handler in application_logger.handlers:
         if isinstance(handler, _ApplicationLogHandler):
             return

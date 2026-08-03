@@ -1,8 +1,8 @@
 """SEC-02 regression tests for the subject claim and the identity column.
 
 The suite checks minted claims directly and exercises guard behaviour
-through ``GET /filters/``. The guard either resolves the subject's
-account or returns a uniform 401.
+through ``/filters/``, which both persists and reads. The guard either
+resolves the subject's account or returns a uniform 401.
 """
 import calendar
 import re
@@ -17,11 +17,7 @@ from backend.app.core.security import (
     _MAX_SUBJECT_ID,
     create_access_token,
 )
-from backend.app.db.models import (
-    Criteria as CriteriaModel,
-    Filter as FilterModel,
-    User,
-)
+from backend.app.db.models import User
 
 # SEC-02: the authenticated route the guard defends. No /api segment
 # exists and the trailing slash belongs to the declared path.
@@ -57,32 +53,33 @@ ABOVE_MAPPED_KEY_CEILING = 2147483648
 # SEC-02: the name on a seeded filter row, read back through the guard
 SEEDED_FILTER_NAME = "Owner filter"
 
+# SEC-02: one valid create body, so the row under test arrives through the
+# route and therefore through the guard
+SEEDED_FILTER_BODY = {
+    "name": SEEDED_FILTER_NAME,
+    "criteria": [{"field": "rent", "operator": "lt", "value": "3000"}],
+}
+
 
 def bearer(token):
     """Return the Authorization header carrying one token."""
     return {"Authorization": "{0} {1}".format(BEARER_CHALLENGE, token)}
 
 
-def seed_filter(session, user_id):
-    """Write one filter row for an account and return its identifier.
+def create_filter(client, token):
+    """Create one filter through the route and return its identifier.
 
-    ``POST /filters/`` cannot write a row. The endpoint hands a mapped
-    relationship a request model and supplies no value for the non-null
-    ``created_at`` column, so the create path raises before it commits.
-    The read path is seeded through the session instead, which is the
-    convention the listing read-path tests already follow.
+    ``POST /filters/`` persists: it copies the validated allow-list onto
+    mapped criteria children and supplies the server-owned timestamp. The
+    row therefore arrives through the guard, which is what makes the
+    ownership assertion below cover the write path as well as the read
+    path.
     """
-    row = FilterModel(
-        name=SEEDED_FILTER_NAME,
-        user_id=user_id,
-        created_at=datetime.utcnow(),
-        criteria=[
-            CriteriaModel(field="rent", operator="lt", value="3000"),
-        ],
+    response = client.post(
+        PROTECTED_ROUTE, headers=bearer(token), json=SEEDED_FILTER_BODY
     )
-    session.add(row)
-    session.commit()
-    return row.id
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
 
 
 def claims_of(token):
@@ -179,17 +176,17 @@ def test_session_cookie_reaches_the_protected_route(client, register_user):
     assert response.json() == []
 
 
-def test_guard_resolves_the_owning_account(client, register_user, db_session):
+def test_guard_resolves_the_owning_account(client, register_user):
     """Each account reads its own filters and none belonging to another.
 
-    The row is seeded through the session: the create route hands request
-    models to a mapped relationship and supplies no value for the
-    non-null created_at column, so it writes nothing. What is under test
-    is the identity the guard resolves, which the read path shows.
+    The row is created through the route, so the guard resolves the
+    subject twice: once to own the row on the way in, and once to select
+    it on the way out. A row written straight to the session would assert
+    the read path only.
     """
     owner = register_user()
     other = register_user()
-    seeded_id = seed_filter(db_session, owner["id"])
+    created_id = create_filter(client, owner["access_token"])
 
     owned = client.get(
         PROTECTED_ROUTE, headers=bearer(owner["access_token"])
@@ -197,7 +194,7 @@ def test_guard_resolves_the_owning_account(client, register_user, db_session):
     assert owned.status_code == 200, owned.text
     # SEC-02: the guard resolved the subject to the owning key, so the
     # query filtered on it and returned only that account's row
-    assert [row["id"] for row in owned.json()] == [seeded_id]
+    assert [row["id"] for row in owned.json()] == [created_id]
     assert [row["user_id"] for row in owned.json()] == [owner["id"]]
 
     foreign = client.get(

@@ -142,9 +142,15 @@ cd backend && pip install -r requirements.txt
 ```
 
 Expected: every pin resolves with no conflict. Verified on Python 3.9.25. The manifest pins
-nineteen packages directly, fourteen for the runtime and five for test and audit tooling. The
-runtime closure resolves to roughly forty packages. The rest arrive transitively, pinned by the
-resolution rather than by hand, which is the right granularity without a lock file.
+nineteen packages directly, fourteen for the runtime and five for test and audit tooling.
+
+Two closure numbers matter, and confusing them understates what the audit covers. Installing the
+fourteen runtime pins alone resolves to **42 packages**. Installing the whole manifest, which is what
+a developer and the pipeline both do, produces an environment that `pip freeze` reports as **74
+packages** — and `pip freeze` is exactly what the dependency gate in section 2.4 reads, so 74 is the
+audited surface, not 42. Both figures were measured on Python 3.9.25. Everything beyond the nineteen
+direct pins arrives transitively, pinned by the resolution rather than by hand, which is the right
+granularity without a lock file.
 
 ### 2.2 Security regression tests
 
@@ -154,21 +160,27 @@ The primary gate for eleven of the twelve findings.
 cd backend && python -m pytest tests/security -q
 ```
 
-Expected: all tests pass. The suite covers the identity claim, the origin allow-list, the password
-policy, request validation, cookie attributes, login throttling, the error boundary, and the
-configuration guards.
+Measured: **688 passed**, no failures. The suite covers the identity claim, the origin allow-list,
+the password policy, request validation, cookie attributes, login throttling, the error boundary, the
+configuration guards, the charge seam, the provisioning script's publish and privilege statements,
+the build definitions, and the provider lock.
 
 ### 2.3 Full suite with coverage
 
-This matches the pipeline invocation.
+This matches the pipeline invocation. **The last flag is not optional.**
 
 ```bash
-cd backend && python -m pytest --cov=./ --cov-report=xml
+cd backend && python -m pytest --cov=./ --cov-report=xml --continue-on-collection-errors
 ```
 
-Expected: the new security tests pass and the three pre-existing test modules continue to fail
-collection. Those three failures predate this work and are explained in section 3.3. Coverage is
-reported, not gated.
+Measured: **688 passed with 3 collection errors**, exit 1. The three errors are the pre-existing test
+modules explained in section 3.3. Coverage is reported, not gated.
+
+Without `--continue-on-collection-errors` the same command exits 2 with
+`Interrupted: 3 errors during collection` and runs **zero tests** — the three pre-existing modules
+fail to import during collection, and pytest then abandons the run before reaching the security
+suite. A command that appears to run the tests while running none is worse than one that fails, which
+is why the flag belongs in the documented invocation and in the pipeline.
 
 ### 2.4 Dependency vulnerability gate
 
@@ -193,19 +205,23 @@ This is the command `.github/workflows/ci.yml` runs, and `backend/tests/security
 compares the workflow's suppression set against the register in both directions, so neither can move
 without the other.
 
-Measured on 2026-08-02: `No known vulnerabilities found, 15 ignored`, exit 0. The gate was verified
-in both directions — without the suppression list the same command reports `Found 15 known
+Measured again on 2026-08-03: `No known vulnerabilities found, 15 ignored`, exit 0. The gate was
+verified in both directions — without the suppression list the same command reports `Found 15 known
 vulnerabilities in 9 packages` and exits 1, so it detects rather than merely passes. A gate verified
-only to pass is not a gate. The reported set and the suppressed set match exactly, which is what
-makes a newly published advisory fail the build instead of being absorbed by an entry written for
-something else.
+only to pass is not a gate. The nine packages are `click`, `ecdsa`, `filelock`, `msgpack`, `pytest`,
+`python-dotenv`, `requests`, `starlette` and `urllib3`, and the fifteen identifiers reported are
+exactly the fifteen suppressed — no more and no fewer. That parity is what makes a newly published
+advisory fail the build instead of being absorbed by an entry written for something else.
 
-The advisory database is a moving target, and the gate is built to fail when it moves. Re-running
-it today reports newly published advisories in the audit and test tooling and in one runtime pin.
-That is the gate detecting, not a regression in this change set. `.github/workflows/ci.yml` also
-carries a staleness check that fails when a suppressed identifier stops being reported, so the
-suppression list cannot quietly rot. Every new finding needs its own decision-log entry before it
-is suppressed.
+The advisory database is a moving target, and the gate is built to fail when it moves. Every new
+finding needs its own decision-log entry before it is suppressed.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) also carries a staleness check for the
+opposite direction: it reads the audit's own JSON report and collects both `id` and `aliases` from
+every reported advisory, then fails naming any declared suppression that no longer appears in either.
+Parsing aliases as well as identifiers is what makes the check cover the `msgpack` entry, which exists
+only under the GitHub namespace; an earlier version matched `PYSEC-` identifiers alone, so that one
+suppression could have rotted silently. Verified in both directions by executing the shipped check
+against the real report and against a report with a declared identifier removed.
 
 One naming detail is worth stating, because an earlier version of this document got it backwards.
 The tool reports Python advisory database identifiers, and it *does* match a suppression given as a
@@ -224,10 +240,15 @@ The pipeline runs this, and creating the dependency manifest made it execute for
 cd backend && flake8 .
 ```
 
-Baseline: 129 findings, of which 8 are substantive and 4 are undefined names. After this work the
-undefined-name count falls from four to one, and the one that remains is the out-of-scope case in
-the subscriptions endpoint. No new category appears. **This command exits non-zero both before and
-after.** A green pipeline is not on offer, and section 3.3 explains why.
+Baseline: 129 findings, of which 4 are undefined names. Measured again on 2026-08-03: **109 findings,
+of which 4 are substantive and exactly 1 is an undefined name** — `datetime` at
+`app/api/endpoints/subscriptions.py:60`, the out-of-scope case section 3.3 records. The other three
+are unused imports in `app/api/endpoints/listings.py`, `app/tasks/listing_updater.py` and
+`tests/test_api.py`. The remaining 105 are blank-line, trailing-whitespace, line-length and
+missing-final-newline findings in files this work did not reformat. No new category appears: the
+category set is the same seven as the baseline. Both figures were measured by running the command
+above, the baseline against the tree as it stood before this work. **This command exits non-zero both
+before and after.** A green pipeline is not on offer, and section 3.3 explains why.
 
 ### 2.6 The three repository scans
 
@@ -256,11 +277,32 @@ Gate three matches six storage mechanisms, not two: `localStorage`, `sessionStor
 `Storage.prototype`, `document.cookie` and `window.name`. Its three original hits were in the
 frontend authentication service, one each for writing, removing and reading the stored token.
 
-**No file is excluded from gate one.** The pattern is written with one-character bracket expressions
-— `[:]` for a colon, `[W]` for a W, `[w]` for a w — so it matches the same text without matching the
-line that declares it. Nothing has to be exempted, which is what makes the gate cover the workflow
-and this document as well. Gate one is restricted to tracked content, so a local `.env` or an
-installed dependency tree produces no false hit.
+**Gate one excludes no file, and it runs in two stages.** The first stage is the pattern. It is
+written with one-character bracket expressions — `[:]` for a colon, `[W]` for a W, `[w]` for a w — so
+it matches the same text without matching the line that declares it, which is what lets the gate cover
+the workflow and this document as well. It matches an assignment with or without spaces around the
+separator and with or without a quote, so the formatter-compliant spelling `NAME = "value"` does not
+pass, and it covers the lower-case spelling when the value is quoted. Gate one reads tracked content
+only, so a local `.env` or an installed dependency tree produces no false hit.
+
+The second stage is a reviewed allow-list, and it is the reason the gate can be broad enough to catch
+that spelling without drowning in false positives. It admits four classes: a value read from
+configuration rather than written in the file (`= settings.`, `os.`, `var.`, `process.`, `self.`); a
+name that denotes a policy bound or a piece of metadata rather than a secret (`MIN_LENGTH`,
+`MAX_BYTES`, `UPPERCASE`, `LOWERCASE`, `DIGITS`, `SPECIAL_CHARACTERS`, `_VARIABLE`, `_ARGUMENT`,
+`_FIELD`, `_LITERAL`, `_REFERENCE`, `_PATTERN`); an upper-case placeholder token, of the form an
+example file uses in place of a real key; and a line carrying the reviewed-line marker with a reason
+beside it. The workflow holds the marker's exact text, and this document does not reproduce it, for
+the same reason it does not reproduce the pattern: a line quoting the marker would be admitted by it.
+
+Measured on 2026-08-03: the pattern matches **21 lines**, the allow-list admits all 21, and the gate
+reports **0**. Of the 21, five are the password-policy bounds in the request schema, three are values
+read from `settings.`, eight are constants and controls inside the guard tests, one is a line in the
+requirements document, and four are the marked lines. The marker appears on exactly **four**
+test-fixture passwords, all under `backend/tests/`, and on **no line of application source**;
+`backend/tests/security/test_config_guards.py` pins that count at four, requires every marked line to
+carry a reason and to be matched by the pattern, and asserts that the allow-list admits no credential
+shape from its own positive-control set.
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) holds the exact expression for all three, and
 this document describes rather than reproduces gate one: a pattern built from credential-shaped
@@ -285,6 +327,33 @@ scratch module with a stub for the undeclared variable — `terraform validate` 
 plan run without the application role's password stops at `No value for required variable` rather
 than falling back to one. Naming this now is more useful than reporting a failure later and calling
 it a regression.
+
+**The provider is bounded and locked.** `main.tf` declares `hashicorp/google` at `~> 7.42` and bounds
+the command line at `>= 1.11.0, < 2.0.0`. The write-only password argument needs that floor, and both
+upper bounds mean a major release that withdraws `ssl_mode`, `password_wo` or `password_wo_version`
+fails installation instead of applying a configuration that no longer enforces what it reads as
+enforcing. [`infrastructure/terraform/.terraform.lock.hcl`](infrastructure/terraform/.terraform.lock.hcl)
+is tracked and carries one directory hash for each platform an operator or the pipeline installs from
+— `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64` — beside the registry checksum set.
+Regenerate it after any constraint change, and commit the result:
+
+```bash
+cd infrastructure/terraform
+terraform providers lock \
+  -platform=linux_amd64 -platform=linux_arm64 \
+  -platform=darwin_amd64 -platform=darwin_arm64
+```
+
+Measured: the lock records version 7.42.0 under constraint `~> 7.42`, with four directory hashes and
+twelve registry checksums, and `terraform init -backend=false` selects that build. A checkout on a
+platform the lock omits fails installation rather than accepting an unverified provider.
+
+**Supply the application role's password through the environment or an ignored file, never on the
+command line.** `TF_VAR_db_app_password` and a gitignored `*.tfvars` file passed with `-var-file` are
+the two supported channels. A value passed with `-var` appears in the process arguments, which any
+local user can read for the life of the command, and in shell history afterwards. `.gitignore`
+excludes `*.tfvars` and `*.tfvars.json` while admitting `*.tfvars.example`, so a template stays
+committable and a filled-in file cannot be committed.
 
 ### 2.8 Manual verification
 
@@ -390,10 +459,27 @@ differ, so they are stated separately.
 [`scripts/setup_dev_environment.sh`](scripts/setup_dev_environment.sh) replaces the single
 all-privileges account with an owner role that performs schema work and an application role limited
 to `CONNECT`, schema `USAGE`, and `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables plus `USAGE`,
-`SELECT` on sequences. `REVOKE CREATE ON SCHEMA public FROM PUBLIC` removes the default grant that
-would otherwise hand the application role the DDL those grants withhold, and two
-`ALTER DEFAULT PRIVILEGES` statements extend the same data operations to tables the owner creates
-later. `GRANT ALL PRIVILEGES` appears nowhere.
+`SELECT` on sequences. Two revokes remove what PostgreSQL grants `PUBLIC` by default, and both are
+load-bearing: `REVOKE CREATE ON SCHEMA public FROM PUBLIC` removes the DDL those grants withhold, and
+`REVOKE CONNECT, TEMPORARY ON DATABASE dbname FROM PUBLIC` removes the database privileges every
+cluster role otherwise holds — without it any role reaches the database and the application role keeps
+a temporary-object capability the granted set never mentions. Two `ALTER DEFAULT PRIVILEGES`
+statements extend the same data operations to tables the owner creates later. `GRANT ALL PRIVILEGES`
+appears nowhere.
+
+The batch does not stop at issuing those statements. It ends with a block that reads the **effective**
+ACLs and raises if they disagree with the intent: `PUBLIC` must hold nothing on the database and
+nothing but `USAGE` on the schema, and the application role must hold `CONNECT` and schema `USAGE`
+while holding neither `TEMPORARY` nor schema `CREATE`. The block substitutes `acldefault` for a null
+ACL column, because an untouched `datacl` reads as empty while the default privileges still apply — a
+query reading the column alone would report a clean database that grants `PUBLIC` everything it
+started with. `psql` runs the batch with the stop-on-error setting, so a raise aborts provisioning
+rather than printing a warning nobody reads. Measured against PostgreSQL 13.23: before the revokes,
+`PUBLIC` held `CONNECT, TEMPORARY` on the database and a role with no explicit grant answered true to
+`CONNECT`, `TEMPORARY` and schema `CREATE`; afterwards `PUBLIC` held nothing on the database,
+`app_user` answered true only to `CONNECT` and schema `USAGE`, and the owner still connected. Schema
+`USAGE` is deliberately left with `PUBLIC`, since with `CONNECT` revoked no unprivileged role reaches
+the database to use it; removing it is outside this scope.
 
 *On Cloud SQL, the declaration separates the account and restricts nothing.*
 [`infrastructure/terraform/main.tf`](infrastructure/terraform/main.tf) declares
@@ -409,6 +495,7 @@ Restriction has to arrive out of band. Connect to `main-database` as the instanc
 REVOKE cloudsqlsuperuser FROM app_user;
 ALTER ROLE app_user NOCREATEDB NOCREATEROLE;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE CONNECT, TEMPORARY ON DATABASE "main-database" FROM PUBLIC;
 GRANT CONNECT ON DATABASE "main-database" TO app_user;
 GRANT USAGE ON SCHEMA public TO app_user;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
@@ -417,13 +504,45 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE O
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO app_user;
 ```
 
+**A database grants `CONNECT` and `TEMPORARY` to `PUBLIC` by default, so both revokes are load-bearing
+rather than defensive.** Without the second one, every role in the cluster can still reach the
+database and `app_user` keeps temporary-object capability beyond the privilege set above. Measured on
+PostgreSQL 13.23: before the revoke, `PUBLIC` held `CONNECT, TEMPORARY` on the database and
+`CREATE, USAGE` on schema `public`, and a role with no explicit grant at all answered true to
+`CONNECT`, `TEMPORARY` and schema `CREATE`. After the two revokes and the grants above, `PUBLIC` held
+nothing on the database and only `USAGE` on the schema, `app_user` answered true to `CONNECT` and
+schema `USAGE` and false to `TEMPORARY` and schema `CREATE`, and the database owner still connected.
+Schema `USAGE` is deliberately left with `PUBLIC`: with `CONNECT` revoked, no unprivileged role
+reaches the database to use it, and removing it is outside this scope.
+
+Verify the effective ACLs rather than trusting the statements, because a `GRANT` that silently applied
+to the wrong role reads the same as one that worked:
+
+```sql
+SELECT coalesce(string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type), 'none')
+         AS public_holds_on_database
+  FROM pg_database d, aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a
+ WHERE d.datname = current_database() AND a.grantee = 0;
+
+SELECT has_database_privilege('app_user', current_database(), 'CONNECT') AS connect_granted,
+       has_database_privilege('app_user', current_database(), 'TEMPORARY') AS temporary_granted,
+       has_schema_privilege('app_user', 'public', 'USAGE') AS schema_usage_granted,
+       has_schema_privilege('app_user', 'public', 'CREATE') AS schema_create_granted;
+```
+
+Expected: `none`, then `t, f, t, f`. Grantee zero is the `PUBLIC` pseudo-role, and substituting
+`acldefault` matters because an untouched `datacl` is null while the default privileges still apply —
+a query reading the column alone reports `none` for a database that grants `PUBLIC` everything it
+started with.
+
 Substitute the value of `db_app_user` if it is not the default. The privilege set mirrors the local
 one the provisioning script issues and verifies; unlike that one, it was not executed against a
-Cloud SQL instance in this work, because no instance is provisioned here. Until an operator runs it,
-the cloud application role keeps the role-creation, database-creation and DDL rights the automatic
-grant confers. `backend/tests/security/test_config_guards.py` asserts that this block still carries
-every statement, and that the declaration carries no role-assignment argument that a default apply
-could not satisfy.
+Cloud SQL instance in this work, because no instance is provisioned here. The two revokes and the
+verification queries were executed against a local PostgreSQL 13.23 server, which is where the
+measurements above come from. Until an operator runs the block, the cloud application role keeps the
+role-creation, database-creation and DDL rights the automatic grant confers.
+`backend/tests/security/test_config_guards.py` asserts that this block still carries every statement,
+and that the declaration carries no role-assignment argument that a default apply could not satisfy.
 
 *Row-level security is not delivered, on either side.* Per-tenant policies need a policy per table
 plus a session-variable convention, which is a data-layer redesign.
@@ -442,6 +561,17 @@ bearer header resists forgery inherently, because script must attach it delibera
 travels automatically. `SameSite=Strict` is the control. A full anti-forgery token scheme would
 touch every mutating endpoint and every client call site, which is the opposite of minimal, so the
 gap is recorded here rather than closed.
+
+**Logout clears the cookie; it does not revoke the token.** `POST /auth/logout` expires the session
+cookie, so the browser stops sending it, and that is the whole of what a server can do about a cookie
+it cannot read from script. The token itself stays valid until its `exp` claim passes. Anything that
+already holds a copy — a captured `Authorization` header, a proxy log, a token minted for a
+non-browser client — continues to authenticate after logout, because verification checks the signature
+and the expiry and consults no revocation record. Closing that gap needs a `jti` claim plus a
+persisted deny list, which is storage this repository does not have and a feature rather than a fix.
+The controls that remain are the short token lifetime and the `HttpOnly` cookie that keeps script from
+obtaining a copy in the first place. Stated here because "logout invalidates the session" would
+otherwise be read as revocation.
 
 **Enabling credentialed mode activates an `axios` advisory that was dormant.** CVE-2023-45857
 (High, 7.1, CWE-359) affects `axios` 1.0.0 through 1.5.1. In those versions the browser request
@@ -483,17 +613,27 @@ column was added or retyped to make that work, so nothing here depends on migrat
 cross-account isolation of the read path, and the refusal of a body naming an owner.
 
 **The pre-existing pipeline baseline, measured so that "no new failures" is an honest claim.**
-Style checking reported 129 findings before this work. The test suite collected zero tests with
-three collection errors, because all three existing test modules failed to import. The pipeline had
-never reached either step, because it failed at dependency installation.
+Style checking reported 129 findings before this work, 4 of them undefined names. The test suite
+collected zero tests with three collection errors, because all three existing test modules failed to
+import. The pipeline had never reached either step, because it failed at dependency installation.
 
-Those three collection errors survive this work untouched. **A green pipeline is not on offer.**
+Measured now: style checking reports 109 findings with 1 undefined name, and the suite reports 688
+passed with the same three collection errors. Those three errors survive this work untouched. **A
+green pipeline is not on offer.**
 
 **The frontend does not type-check or build**, for reasons unrelated to security. Two packages are
 imported but declared nowhere. One service module holds component markup and extends a component
 base class in a file whose extension cannot compile either. Several modules import through
 absolute paths that the TypeScript path configuration does not map. The pipeline invokes a lint
 script that the package manifest does not define.
+
+Measured, so the failure is attributable rather than assumed: the frontend image builds through
+`COPY package.json`, `npm install` and `COPY . .` and then fails in `npm run build` with
+`Module not found: Error: Can't resolve '@paypal/react-paypal-js' in '/app/src'`. That package is
+imported by the frontend payment service and declared in no manifest, which is the first of the two
+undeclared packages above; declaring it is item 2 in section 4. Type checking reports 18 errors, every
+one of them in `frontend/src/services/paypal.ts`, and the output is byte-identical before and after
+this work.
 
 The SEC-06 acceptance criterion is therefore verified by code inspection and by the backend cookie
 tests, not by a green frontend build.
@@ -511,8 +651,13 @@ also carries a decision-log entry.
 | The container cluster has neither private networking nor authorized-network restrictions | Network architecture work |
 | Pipeline actions are pinned to mutable major tags rather than immutable digests | Supply-chain hardening |
 | The database proxy image is superseded | Base-image currency |
-| Both container base images are past end of life | The runtime version freeze applies; see section 3.1 |
+| The backend base image `python:3.9-slim` is past end of life | The runtime version freeze applies; see section 3.1 |
 | Containers run as the root user | Container hardening |
+
+Only the backend base image is named above, because the frontend base image is not past end of life.
+`node:22` is in Node.js maintenance support until April 2027; `python:3.9-slim` tracks Python 3.9,
+whose upstream support ended in October 2025. An earlier version of this document said both were past
+end of life, which was true of neither image at the time it was written and is true of one now.
 
 An eighth observation was closed rather than deferred. The outbound user schema previously
 declared the password hash field, and that field is gone, removed alongside the SEC-02 identity
@@ -521,6 +666,31 @@ correction because the same model was already being changed.
 One further note, recorded rather than acted on: the application exposes interactive API
 documentation by default. That is normal for this framework and may well be intentional. Gating it
 in production is a one-line change whenever the team decides it should be gated.
+
+### 3.5 The second review's fifteen findings
+
+A security review of the delivered work raised fifteen findings: seven major, six medium and two low.
+All fifteen are closed. Each row names what was wrong, what closed it, and what remains — because a
+finding closed with a residual is not the same as one closed outright, and the difference is what a
+reader needs.
+
+| # | Severity | What was wrong | What closed it | Residual |
+| --- | --- | --- | --- | --- |
+| SQ-01 | Major | The charge seam returned false unconditionally, so every subscription was denied, and the route no longer bound the requested plan | The provider-backed verifier was restored: a reference is claimed in a local ledger, resolved through the provider, and bound to state, amount, currency, payer and — for a reusable agreement — the requested plan, then spent once | The route still cannot persist a row; section 3.3 |
+| SQ-02 | Major | The listing number validator had lost its finiteness check, so `NaN`, `Infinity` and an overflowing literal were accepted | The finite check and its overflow branch were restored on all three float fields, with no value floor reintroduced | None |
+| SQ-03 | Major | The credential scan required no space around the separator, so the formatter-compliant spelling passed | The pattern became whitespace- and quote-aware and gained a lower-case branch, behind a reviewed allow-list; section 2.6 | None |
+| SQ-04 | Medium | The suppression staleness check read `PYSEC-` identifiers only, so the GitHub-namespace entry could rot unnoticed | The check now parses `id` and `aliases` from the audit report and fails on any declared identifier absent from both; section 2.4 | None |
+| SQ-05 | Major | Both Compose services named a Dockerfile their build context does not contain, build arguments interpolated to empty, the backend received three of eleven required settings, and the port, healthcheck and entry point disagreed | Dockerfile paths corrected, every argument and setting moved to the fail-closed `${VAR:?message}` form, the complete settings contract injected, and the entry point, exposed port, published port and healthcheck reconciled and exercised against a built image | The frontend bundle still does not build; section 3.3 |
+| SQ-06 | Major | The filter client mapped over `criteria` as an array while its only caller supplies an object, so the flow failed before any request | An explicit mapper converts the form's value to the wire contract in the service layer, leaving the component and the request contract untouched | None |
+| SQ-07 | Major | The client declared a call to `/user/profile`, a route the application never mounts | The dead call was deleted, and a test now compares every path the client declares against the application's own route table | None |
+| SQ-08 | Medium | The configuration relied on an ambient Google provider with no version constraint and an untracked lock | A bounded provider range and a bounded command-line range are declared, and the lock is tracked with a directory hash for each of four platforms; section 2.7 | None |
+| SQ-09 | Low | Only the package-owned handler folded records, so a root or deployment handler could emit a multiline record | Records are folded at creation by a log-record factory scoped to this application, which runs before propagation | None |
+| SQ-10 | Low | The environment file was published by checking the destination and then moving over it, which a directory created after the check absorbs | The publish is a single `link(2)` call that fails when the destination exists in any form, followed by a check that the published path is the regular file the run wrote | None |
+| SQ-11 | Medium | This document, the decision log and the traceability matrix carried claims that were stale or stronger than the code | Every documented command was re-run and every count re-measured; the corrections are visible throughout sections 2 and 3 | None |
+| SQ-12 | Major | The login throttle keyed on a normalised address while the database lookup was exact, so case-variant accounts shared one counter | The counter is keyed on the stored identity, so counter identity and database identity are the same | Lockout state is in process; section 3.2 |
+| SQ-13 | Medium | An unknown address returned before the password hasher ran, which timed the difference between absent and wrong | Both branches perform one fixed-cost verification, against a per-process random stand-in hash when no row exists | None |
+| SQ-14 | Medium | Only schema `CREATE` was revoked from `PUBLIC`, leaving the database `CONNECT` and `TEMPORARY` privileges every role holds by default | Both are revoked, the effective ACLs are verified by the batch itself, and the cloud instructions carry the same correction; section 3.2 | Schema `USAGE` is deliberately left with `PUBLIC`, and section 3.2 says so |
+| SQ-15 | Medium | The database-password variable recommended `-var`, which puts the value in the process arguments and in shell history | The description now requires the environment variable or a gitignored variable file, and mentions the flag only to prohibit it; section 2.7 | None |
 
 ---
 
@@ -583,8 +753,18 @@ Everything below is preserved:
 - The public listing read path with its `skip` and `limit` pagination, and its public access.
 - The Redux store shape and the single-page application routing.
 - The Zillow ingestion scheduling and transform logic.
-- The PayPal sandbox checkout experience.
 - The database schema. No column was added or altered.
+
+**One item that belongs on no preservation list: the PayPal sandbox checkout experience.** No file in
+the frontend payment path was changed, the payment environment moved from a hardcoded literal to a
+validated setting whose default is `sandbox`, and the charge seam authorizes a reference the provider
+confirms for the requested amount, currency, payer and plan. What cannot be claimed is that the
+checkout works end to end, and two measured facts say why. The frontend bundle does not build, because
+the payment service imports a package no manifest declares, so the checkout screen cannot be exercised
+at all. And `POST /subscriptions/` cannot persist a row for the schema reasons in section 3.3, so a
+provider-confirmed charge clears the gate and then fails at insertion. Neither is caused by this work,
+and neither was working beforehand. The accurate statement is that the checkout path is unchanged and
+its two pre-existing blockers are unchanged with it.
 
 ---
 

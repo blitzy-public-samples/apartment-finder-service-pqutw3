@@ -73,7 +73,7 @@ REDACTION_MARKER = "[redacted]"
 # SEC-04: a synthetic fixture value clearing every rule in
 # backend/app/schema/user.py - at least twelve characters with one
 # uppercase, one lowercase, one digit and one listed special character
-POLICY_PASSWORD = "Sec08Fixture1!Value"
+POLICY_PASSWORD = "Sec08Fixture1!Value"  # blitzy-scan-allow: test fixture
 
 # SEC-08: markers of a leaked traceback, source location or SQL
 # statement, matched without regard to case
@@ -1019,16 +1019,19 @@ def test_the_application_logger_owns_a_configured_handler():
     assert handler.stream is not None
 
     # SEC-08: every module logger resolves to it, and propagation is
-    # left intact so a deployment may add its own sink above
+    # left intact so a deployment may add its own sink above. That sink is
+    # served the folded record, not the raw one - the case below drives it
     assert application_logger.name.startswith(
         "{0}.".format(_APPLICATION_LOGGER_NAME)
     )
-    assert application_logger.propagate is True
     assert application_logger.getEffectiveLevel() == _LOG_LEVEL
 
-    # SEC-08: repeated configuration attaches no second handler
+    # SEC-08: repeated configuration attaches no second handler and chains
+    # no second record factory
+    factory = logging.getLogRecordFactory()
     _configure_application_logging()
     assert _owned_handler() is handler
+    assert logging.getLogRecordFactory() is factory
 
 
 def test_the_owned_handler_records_one_line_without_a_root_handler(
@@ -1068,3 +1071,124 @@ def test_the_owned_handler_records_one_line_without_a_root_handler(
     assert "Traceback (most recent call last)" in line
     assert EXCEPTION_TEXT_SENTINEL in line
     assert EXCEPTION_TEXT_SENTINEL not in response.text
+
+
+@contextmanager
+def _ancestor_sink(only=_APPLICATION_LOGGER_NAME):
+    """Attach a root handler carrying the stock formatter.
+
+    This is the deployment shape the fold has to survive: a sink above the
+    package that knows nothing about this application's format. ``only``
+    admits one logger subtree, so a library record travelling the same
+    path does not join the text under assertion.
+    """
+    captured = io.StringIO()
+    sink = logging.StreamHandler(stream=captured)
+    sink.setLevel(logging.NOTSET)
+    sink.setFormatter(logging.Formatter())
+    sink.addFilter(logging.Filter(only))
+    root_logger = logging.getLogger()
+    held_handlers = list(root_logger.handlers)
+    held_level = root_logger.level
+
+    root_logger.handlers = [sink]
+    root_logger.setLevel(logging.NOTSET)
+    try:
+        yield captured
+    finally:
+        root_logger.handlers = held_handlers
+        root_logger.setLevel(held_level)
+
+
+def test_an_ancestor_handler_receives_one_line_too(client, failing_database):
+    """A root sink with the stock formatter records one line.
+
+    Folding inside the owned handler's formatter alone leaves this sink
+    emitting the raw multi-line record, so a collector reading it splits
+    one diagnosis into many lines and loses the correlation identifier on
+    all but the first (CWE-117, CWE-778).
+    """
+    with _ancestor_sink() as captured:
+        with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
+            response = client.get("/listings/")
+
+    assert response.status_code == 500
+    error_id = response.json()["error_id"]
+    written = captured.getvalue()
+
+    # SEC-08: one record, one line, at a sink this application never
+    # configured
+    lines = [line for line in written.splitlines() if line]
+    assert len(lines) == 1, written
+    line = lines[0]
+    assert error_id in line
+    assert _JOINED_LINE_MARKER in line
+    assert "Traceback (most recent call last)" in line
+    assert EXCEPTION_TEXT_SENTINEL in line
+    assert EXCEPTION_TEXT_SENTINEL not in response.text
+
+
+@pytest.mark.parametrize(
+    "planted",
+    (
+        "first\nsecond",
+        "first\r\nsecond",
+        "first\rsecond",
+        "carried\x1b[31mescape",
+        "carried\x7fdelete",
+        "carried\vvertical",
+    ),
+    ids=(
+        "newline",
+        "carriage-return-newline",
+        "bare-carriage-return",
+        "terminal-escape",
+        "delete",
+        "vertical-tab",
+    ),
+)
+def test_a_control_character_never_reaches_a_sink(planted):
+    """Every control character in a record is replaced before any sink.
+
+    A bare carriage return rewrites the line a terminal already printed,
+    and an escape sequence drives it, so a record carrying caller text
+    must not deliver either one (CWE-117).
+    """
+    with _ancestor_sink() as captured:
+        application_logger.error("planted=%s", planted)
+
+    written = captured.getvalue()
+    lines = [line for line in written.splitlines() if line]
+    assert len(lines) == 1, written
+    for character in "\n\r\x1b\x7f\v":
+        assert character not in lines[0], repr(character)
+    assert _JOINED_LINE_MARKER in lines[0]
+
+
+def test_the_fold_survives_exception_information_on_the_record():
+    """A record carrying exc_info reaches a sink as one line."""
+    with _ancestor_sink() as captured:
+        try:
+            raise RuntimeError(EXCEPTION_TEXT_SENTINEL)
+        except RuntimeError:
+            application_logger.error("planted failure", exc_info=True)
+
+    written = captured.getvalue()
+    lines = [line for line in written.splitlines() if line]
+    assert len(lines) == 1, written
+    assert "Traceback (most recent call last)" in lines[0]
+    assert EXCEPTION_TEXT_SENTINEL in lines[0]
+
+
+def test_a_record_from_another_library_is_left_alone():
+    """A record outside this package keeps its own text.
+
+    The fold is scoped by logger name, so a third-party record is neither
+    rewritten nor stripped of its exception information.
+    """
+    foreign = logging.getLogger("zzz_foreign_library.probe")
+    with _ancestor_sink(only="zzz_foreign_library") as captured:
+        foreign.error("first\nsecond")
+
+    written = captured.getvalue()
+    assert written.splitlines()[:2] == ["first", "second"]

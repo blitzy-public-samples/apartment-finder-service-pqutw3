@@ -8,8 +8,13 @@ both together, and check that every refusal carries the sanitized error
 envelope and reaches the server log under the correlation identifier the
 caller receives.
 
-The account counter keys on the normalized email address, and a
-successful login empties that counter.
+The account counter keys on the stored account identity - the same value
+the credential query filters on - so two accounts differing only in case
+are two counters, and a successful login empties its own counter alone.
+
+One further case here belongs to the response rather than the counter:
+an unknown address and a wrong secret both reach the hasher, so the
+reply time discloses no more than the reply text does.
 
 Two further layers are exercised here. The counter map is bounded, so a
 flood of distinct addresses cannot exhaust memory and cannot drop a
@@ -27,7 +32,7 @@ import logging
 import time
 
 import pytest
-from conftest import TEST_BASE_URL, reset_login_throttle
+from conftest import TEST_BASE_URL, VALID_PASSWORD, reset_login_throttle
 from fastapi.testclient import TestClient
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -534,30 +539,179 @@ def test_the_address_throttle_reaches_the_log(
     assert account["email"] not in joined
 
 
-def test_account_counter_keys_on_the_normalized_email(register_user):
-    """Padded and uppercase spellings of one address share one counter."""
+def test_account_counter_keys_on_the_stored_identity(register_user):
+    """Spellings the request model folds together share one counter.
+
+    ``EmailStr`` strips surrounding space and lowercases the domain, so
+    those spellings reach the credential query - and therefore the
+    counter - as one identity. The counter key is that value, so it names
+    exactly the row a successful attempt would authenticate.
+    """
     account = register_user()
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
-    padded_uppercase = "  {0}  ".format(account["email"].upper())
+    padded_uppercase_domain = "  {0}@{1}  ".format(
+        account["email"].split("@")[0], account["email"].split("@")[1].upper()
+    )
 
     statuses = [
-        _login_from_a_new_address(padded_uppercase, WRONG_SECRET).status_code
+        _login_from_a_new_address(
+            padded_uppercase_domain, WRONG_SECRET
+        ).status_code
         for _ in range(attempts)
     ]
     assert statuses == [401] * attempts
 
-    # SEC-07: counter keys on the normalized email
+    # SEC-07: the counter key is the stored identity the query filters on
     canonical_key = auth_endpoint._account_key(account["email"])
+    assert canonical_key.endswith(account["email"])
     assert _account_keys() == [canonical_key]
     assert _failure_count(canonical_key) == attempts
 
-    # SEC-07: the exact spelling reaches the counter the padded,
-    # uppercase spelling filled, and the correct secret does not clear it
+    # SEC-07: the exact spelling reaches the counter those spellings
+    # filled, and the correct secret does not clear it
     refused = _login_from_a_new_address(
         account["email"], account["password"]
     )
     assert refused.status_code == 429
     assert set(refused.json()) == ENVELOPE_KEYS
+
+
+# SEC-07: two stored accounts differing only in case are two identities
+def test_case_variant_accounts_do_not_share_a_counter(register_user):
+    """Exhausting one account's counter leaves the other's untouched.
+
+    The credential query filters on the stored address exactly, so
+    ``Victim@example.com`` and ``victim@example.com`` are two rows. A
+    counter folding them together would let an attacker lock an account
+    by guessing at a spelling they own.
+    """
+    attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
+    victim = register_user(email="throttle-victim@example.com")
+    variant = register_user(email="Throttle-Victim@example.com")
+    assert victim["email"] != variant["email"]
+    assert victim["id"] != variant["id"]
+
+    spent = [
+        _login_from_a_new_address(variant["email"], WRONG_SECRET).status_code
+        for _ in range(attempts)
+    ]
+    assert spent == [401] * attempts
+
+    # SEC-07: the variant's counter is exhausted and the victim's is empty
+    variant_key = auth_endpoint._account_key(variant["email"])
+    victim_key = auth_endpoint._account_key(victim["email"])
+    assert _account_keys() == [variant_key]
+    assert _failure_count(variant_key) == attempts
+    assert _failure_count(victim_key) is None
+
+    # SEC-07: the exhausted variant is refused, the victim is not
+    assert _login_from_a_new_address(
+        variant["email"], variant["password"]
+    ).status_code == 429
+    accepted = _login_from_a_new_address(
+        victim["email"], victim["password"]
+    )
+    assert accepted.status_code == 200, accepted.text
+
+
+# SEC-07: a success on one case variant clears only its own counter
+def test_a_success_on_one_variant_leaves_the_other_counter_standing(
+    register_user
+):
+    """Authenticating one variant does not reset the other's counter.
+
+    A shared key would let an attacker holding one spelling clear the
+    counter guarding the account they are guessing at.
+    """
+    attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
+    assert attempts >= 2
+    below_threshold = attempts - 1
+
+    victim = register_user(email="reset-victim@example.com")
+    attacker = register_user(email="Reset-Victim@example.com")
+    victim_key = auth_endpoint._account_key(victim["email"])
+    attacker_key = auth_endpoint._account_key(attacker["email"])
+
+    guesses = [
+        _login_from_a_new_address(victim["email"], WRONG_SECRET).status_code
+        for _ in range(below_threshold)
+    ]
+    assert guesses == [401] * below_threshold
+    assert _failure_count(victim_key) == below_threshold
+
+    accepted = _login_from_a_new_address(
+        attacker["email"], attacker["password"]
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    # SEC-07: the success emptied its own counter and no other
+    assert _failure_count(attacker_key) is None
+    assert _failure_count(victim_key) == below_threshold
+
+    # SEC-07: the victim's remaining allowance is one attempt, not a full
+    # window reopened by somebody else's success
+    assert _login_from_a_new_address(
+        victim["email"], WRONG_SECRET
+    ).status_code == 401
+    assert _login_from_a_new_address(
+        victim["email"], WRONG_SECRET
+    ).status_code == 429
+
+
+# SEC-08: both credential branches perform the same hasher work
+def test_an_unknown_address_and_a_wrong_secret_do_equal_hasher_work(
+    register_user, monkeypatch
+):
+    """An absent account is verified against a stand-in hash.
+
+    Returning before the hasher on the unknown-address branch leaves a
+    timing difference the uniform response text does not close, so the
+    account-existence oracle survives in the clock. The assertion counts
+    hasher invocations rather than measuring wall-clock time, which is
+    what a loaded runner makes unreliable.
+    """
+    account = register_user()
+    verified = []
+    original = auth_endpoint.verify_password
+
+    def record(submitted, stored):
+        verified.append(stored)
+        return original(submitted, stored)
+
+    monkeypatch.setattr(auth_endpoint, "verify_password", record)
+
+    wrong_secret = _login_from_a_new_address(account["email"], WRONG_SECRET)
+    unknown_address = _login_from_a_new_address(
+        "absent-{0}".format(account["email"]), WRONG_SECRET
+    )
+
+    # SEC-08: one reply shape, one hasher call, whichever branch answered
+    assert wrong_secret.status_code == 401
+    assert unknown_address.status_code == 401
+    assert _without_correlation_id(wrong_secret) == _without_correlation_id(
+        unknown_address
+    )
+    assert len(verified) == 2
+
+    # SEC-08: the stand-in carries the scheme and cost a stored hash does
+    stored_prefix = verified[0].rsplit("$", 1)[0]
+    assert verified[1].rsplit("$", 1)[0] == stored_prefix
+    assert verified[1] == auth_endpoint._ABSENT_ACCOUNT_HASH
+    assert verified[1] != account["password"]
+
+
+# SEC-08: no submitted secret matches the stand-in hash
+def test_the_stand_in_hash_authenticates_nobody(client):
+    """A login naming an absent account is refused, not admitted."""
+    response = _post_login(
+        client, "nobody-at-all@example.com", VALID_PASSWORD
+    )
+
+    assert response.status_code == 401
+    assert set(response.json()) == ENVELOPE_KEYS
+    assert auth_endpoint._verified_credentials(None, VALID_PASSWORD) == (
+        False, ""
+    )
 
 
 def test_successful_login_empties_the_account_counter(register_user):

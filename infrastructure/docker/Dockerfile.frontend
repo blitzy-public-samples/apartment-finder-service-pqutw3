@@ -7,11 +7,14 @@ FROM node:22 as build
 # Set the working directory in the container
 WORKDIR /app
 
-# Copy package.json and package-lock.json
-COPY package.json package-lock.json ./
+# Copy the dependency manifest
+# No lock file is tracked, so the install resolves from the manifest alone;
+# documentation/security/decision-log.md records that decision and the
+# residual it carries
+COPY package.json ./
 
 # Install dependencies
-RUN npm ci
+RUN npm install --no-audit --no-fund
 
 # Copy the rest of the application code
 COPY . .
@@ -41,7 +44,5 @@ CMD ["nginx", "-g", "daemon off;"]
 
 # HUMAN ASSISTANCE NEEDED
 # Please verify the following:
-# 1. Ensure that the Node.js version (14) is appropriate for your project
-# 2. Confirm that 'npm run build' is the correct command to build your React app
-# 3. Check if any environment variables need to be set during the build process
-# 4. Verify if any additional nginx configuration is required for your specific app
+# 1. Confirm that 'npm run build' is the correct command to build your React app
+# 2. Verify if any additional nginx configuration is required for your specific app

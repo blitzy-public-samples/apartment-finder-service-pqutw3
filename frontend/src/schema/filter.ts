@@ -28,3 +28,13 @@ export interface FilterCreate {
   name: string;
   criteria: Criteria[];
 }
+
+// The value the filter form holds while a user edits it. It is a UI model,
+// not a wire body: criteria arrive keyed by input name in camelCase, and the
+// zip-code field is a plain list of strings. frontend/src/services/api.ts
+// maps it to FilterCreate; nothing sends this shape to the server.
+export interface FilterFormValue {
+  name?: string;
+  zipCodes?: string[];
+  criteria: Record<string, string | number> | Criteria[];
+}

@@ -2,8 +2,19 @@
 
 # SEC-12: floor for the write-only argument and ephemeral variable that
 # keep the database password out of state (CWE-522)
+# SEC-10/SEC-11/SEC-12: bounded provider and CLI ranges plus the tracked
+# .terraform.lock.hcl beside this file; an ambient install can no longer
+# resolve to a build that withdraws ssl_mode, password_wo or google_sql_user
+# (CWE-1104)
 terraform {
-  required_version = ">= 1.11.0"
+  required_version = ">= 1.11.0, < 2.0.0"
+
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 7.42"
+    }
+  }
 }
 
 # Provider configuration for Google Cloud

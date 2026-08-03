@@ -24,8 +24,10 @@ the caller chose. The last cases here read the record as well as the
 reply: the caller is told which key was refused, and the record names
 the position instead, bounded in count and in length.
 """
+import json
 import logging
 import re
+import subprocess
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -63,7 +65,7 @@ from backend.app.schema.subscription import SubscriptionCreate
 from backend.app.schema.user import UserCreate, UserLogin
 
 # SEC-04: clears every rule in backend/app/schema/user.py
-POLICY_PASSWORD = "Validation1!Secret"
+POLICY_PASSWORD = "Validation1!Secret"  # blitzy-scan-allow: test fixture
 
 # SEC-05: every key below is declared by ListingCreate
 DECLARED_LISTING_BODY = {
@@ -847,6 +849,86 @@ def test_subscription_refuses_every_non_finite_amount(
     _assert_rejected(response, 422, "amount")
     # SEC-05: the refusal lands ahead of the payment call
     assert payment_call.awaits == []
+
+
+# ---------------------------------------------------------------------
+# A listing number arrives outside the float domain
+# ---------------------------------------------------------------------
+# SEC-05: every ListingCreate field declared as a float
+LISTING_FLOAT_FIELDS = ("rent", "broker_fee", "square_footage")
+
+
+def _listing_raw_body(field, literal):
+    """Return a listing document carrying one raw numeric literal.
+
+    The literal is written into the document text, because a JSON encoder
+    would refuse the spellings under test or rewrite them.
+    """
+    remaining = {
+        name: value
+        for name, value in DECLARED_LISTING_BODY.items()
+        if name != field
+    }
+    rendered = ['"{0}": {1}'.format(field, literal)]
+    rendered += [
+        '"{0}": {1}'.format(name, json.dumps(value))
+        for name, value in remaining.items()
+    ]
+    return "{" + ", ".join(rendered) + "}"
+
+
+@pytest.mark.parametrize("field", LISTING_FLOAT_FIELDS)
+@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
+def test_listing_refuses_every_non_finite_number(
+    client, register_user, db_session, field, literal
+):
+    """The listing route refuses each wire spelling of a non-finite
+    number.
+
+    Python's JSON decoder accepts ``NaN``, ``Infinity`` and ``-Infinity``
+    as float literals, and ``1e309`` overflows to an infinity, so none of
+    them is caught by declaring the field a float.
+    """
+    account = register_user()
+    response = _post_raw(
+        client,
+        "/listings/",
+        _listing_raw_body(field, literal),
+        account["access_token"],
+    )
+
+    # SEC-05: the value stops at the request boundary, ahead of the known
+    # model defect that answers KNOWN_LISTING_DEFECT_STATUS
+    _assert_rejected(response, 422, field)
+    assert db_session.query(ListingModel).count() == 0
+
+
+@pytest.mark.parametrize("field", LISTING_FLOAT_FIELDS)
+def test_listing_model_refuses_an_unrepresentable_magnitude(field):
+    """A magnitude no float holds is refused rather than raising.
+
+    ``math.isfinite`` raises ``OverflowError`` on an integer this large,
+    so the pre-validator has to answer for that case itself.
+    """
+    with pytest.raises(ValidationError) as raised:
+        ListingCreate(
+            **dict(DECLARED_LISTING_BODY, **{field: UNREPRESENTABLE_MAGNITUDE})
+        )
+
+    assert (field,) in [error["loc"] for error in raised.value.errors()]
+
+
+@pytest.mark.parametrize("field", LISTING_FLOAT_FIELDS)
+@pytest.mark.parametrize("value", (0, 0.0, -1.0, -12345.67))
+def test_listing_model_imposes_no_value_range(field, value):
+    """A finite number outside no declared range is admitted.
+
+    The finite check is a domain check on the float type, not a business
+    rule: the withdrawn value floors are not reinstated by it.
+    """
+    model = ListingCreate(**dict(DECLARED_LISTING_BODY, **{field: value}))
+
+    assert getattr(model, field) == value
 
 
 @pytest.mark.parametrize(
@@ -1836,6 +1918,239 @@ def test_the_public_read_path_publishes_numeric_identifiers(
     assert published
     assert isinstance(published[0]["id"], int)
     assert not isinstance(published[0]["id"], bool)
+
+
+# ---------------------------------------------------------------------
+# The filter form's own value, driven through the client it calls
+# ---------------------------------------------------------------------
+FRONTEND_FILTER_FORM = (
+    Path(__file__).resolve().parents[3]
+    / "frontend" / "src" / "components" / "FilterForm.tsx"
+)
+FRONTEND_FILTER_SCHEMA = FRONTEND_SCHEMA_DIR / "filter.ts"
+
+# the criteria the form's own inputs collect, one sample value per input
+SAMPLE_CRITERION_VALUES = ("1500", "3000")
+
+# the lowest Node release that erases type annotations without a build
+MINIMUM_NODE_MAJOR = 22
+
+
+def _form_criteria_inputs():
+    """Return the criteria keys the filter form's own inputs collect."""
+    assert FRONTEND_FILTER_FORM.is_file(), FRONTEND_FILTER_FORM
+    source = FRONTEND_FILTER_FORM.read_text(encoding="utf-8")
+    collected = [
+        re.search(r'name="([^"]+)"', block).group(1)
+        for block in re.findall(r"<input\b(.*?)/>", source, re.DOTALL)
+        if "handleCriteriaChange" in block
+    ]
+    assert collected, source
+    return collected
+
+
+def _form_zip_code_input():
+    """Report whether the form collects a zip-code list of its own."""
+    source = FRONTEND_FILTER_FORM.read_text(encoding="utf-8")
+    return "handleZipCodeChange" in source
+
+
+def _form_initial_state():
+    """Return the literal value the form holds before a user edits it."""
+    source = FRONTEND_FILTER_FORM.read_text(encoding="utf-8")
+    held = re.search(
+        r"useState<[^>]+>\(\s*initialFilter \|\|\s*(\{.*?\})\s*\)",
+        source,
+        re.DOTALL,
+    )
+    assert held, source
+    return held.group(1)
+
+
+def _node_major():
+    """Return the major version of the Node runtime on the path."""
+    reported = subprocess.run(
+        ["node", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    assert reported.returncode == 0, (
+        "Node is required to drive the browser client; "
+        ".github/workflows/ci.yml installs it before this step"
+    )
+    return int(reported.stdout.decode("utf-8").lstrip("v").split(".")[0])
+
+
+def _driven_client_call(driver_body, tmp_path):
+    """Run the real browser client with its HTTP library replaced.
+
+    The client module is copied verbatim except for two substitutions,
+    each asserted to apply exactly once: its HTTP library becomes a
+    recorder, and its two type-only imports become ``import type`` so the
+    runtime needs no module resolution. The mapping under test is
+    therefore the shipped source, not a transcription of it.
+    """
+    assert _node_major() >= MINIMUM_NODE_MAJOR, MINIMUM_NODE_MAJOR
+    source = FRONTEND_API_CLIENT.read_text(encoding="utf-8")
+
+    recorder = (
+        "const axios = { defaults: {}, "
+        "get: async () => ({ data: [] }), "
+        "post: async (url, body) => { "
+        "globalThis.__posted.push({ url, body }); return { data: body }; } };"
+    )
+    for original, replacement in (
+        ("import axios from 'axios';", recorder),
+        ("import {\n  Criteria,", "import type {\n  Criteria,"),
+        (
+            "import { Listing, ListingQuery } from '../schema/listing';",
+            "import type { Listing, ListingQuery }"
+            " from '../schema/listing';",
+        ),
+    ):
+        assert source.count(original) == 1, original
+        source = source.replace(original, replacement)
+
+    (tmp_path / "api.ts").write_text(source, encoding="utf-8")
+    (tmp_path / "driver.mjs").write_text(driver_body, encoding="utf-8")
+    run = subprocess.run(
+        ["node", "--experimental-strip-types", "driver.mjs"],
+        cwd=str(tmp_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert run.returncode == 0, run.stderr.decode("utf-8")
+    return json.loads(run.stdout.decode("utf-8").strip().splitlines()[-1])
+
+
+def _driven_filter_submission(tmp_path):
+    """Return the body the client posts for the form's own value."""
+    criteria = dict(zip(_form_criteria_inputs(), SAMPLE_CRITERION_VALUES))
+    assert len(criteria) == len(_form_criteria_inputs())
+    held = {"criteria": criteria}
+    if _form_zip_code_input():
+        held["zipCodes"] = ["11201", "11215"]
+
+    driver = (
+        "globalThis.__posted = [];\n"
+        "import { createFilter } from './api.ts';\n"
+        "const held = %s;\n"
+        "const returned = await createFilter(held);\n"
+        "console.log(JSON.stringify("
+        "{ posted: globalThis.__posted, returned }));\n"
+    ) % json.dumps(held)
+    return _driven_client_call(driver, tmp_path)
+
+
+def test_the_form_value_the_client_receives_is_the_shape_it_maps(tmp_path):
+    """The client maps the value the form actually holds.
+
+    The form keys its criteria by input name and keeps a zip-code list of
+    its own, so the client cannot treat that value as the wire body. This
+    case reads the form's own initial state and input names, then runs the
+    shipped client over them.
+    """
+    initial = _form_initial_state()
+    # the form's own value is a keyed object plus a zip-code list, neither
+    # of which the wire body declares
+    assert "criteria: {}" in initial, initial
+    assert "zipCodes" in initial, initial
+
+    declared = _declared_interface("filter.ts", "FilterFormValue")
+    assert set(declared) == {"name", "zipCodes", "criteria"}, declared
+
+    driven = _driven_filter_submission(tmp_path)
+    assert len(driven["posted"]) == 1, driven
+    posted = driven["posted"][0]
+    assert posted["url"].endswith("/filters/"), posted
+
+    # SEC-05: the client sends the allow-list POST /filters/ declares and
+    # nothing else - no zip-code list, no server-owned key
+    body = posted["body"]
+    assert set(body) == set(FilterCreate.__fields__), body
+    assert body["name"], body
+    for criterion in body["criteria"]:
+        assert set(criterion) == {"field", "operator", "value"}, criterion
+        assert all(
+            isinstance(entry, str) for entry in criterion.values()
+        ), criterion
+
+
+def test_the_driven_form_body_is_accepted_by_the_request_model(tmp_path):
+    """The body the client builds validates against the write model."""
+    body = _driven_filter_submission(tmp_path)["posted"][0]["body"]
+
+    model = FilterCreate(**body)
+
+    assert model.name == body["name"]
+    assert len(model.criteria) == len(body["criteria"])
+
+
+def test_the_driven_form_body_persists_through_the_route(
+    client, register_user, db_session, tmp_path
+):
+    """The route accepts the client's body and stores its criteria.
+
+    A mapper that produced a valid-looking body the route refuses would
+    pass a model-level case and still leave the flow broken.
+    """
+    body = _driven_filter_submission(tmp_path)["posted"][0]["body"]
+    account = register_user()
+
+    response = client.post(
+        FILTER_PATH, json=body, headers=_bearer(account["access_token"])
+    )
+
+    assert response.status_code == 200, response.text
+    served = response.json()
+    assert served["name"] == body["name"]
+    assert len(served["criteria"]) == len(body["criteria"])
+
+    stored = db_session.query(CriteriaModel).all()
+    assert len(stored) == len(body["criteria"])
+    assert {
+        (row.field, row.operator, row.value) for row in stored
+    } == {
+        (item["field"], item["operator"], item["value"])
+        for item in body["criteria"]
+    }
+
+
+def test_the_client_also_maps_a_wire_shaped_criteria_list(tmp_path):
+    """A caller already holding the wire shape is mapped unchanged."""
+    driver = (
+        "globalThis.__posted = [];\n"
+        "import { createFilter } from './api.ts';\n"
+        "const held = { name: 'Two bedrooms', criteria: ["
+        "{ field: 'bedrooms', operator: 'eq', value: '2' }] };\n"
+        "await createFilter(held);\n"
+        "console.log(JSON.stringify({ posted: globalThis.__posted }));\n"
+    )
+    driven = _driven_client_call(driver, tmp_path)
+
+    body = driven["posted"][0]["body"]
+    assert body == {
+        "name": "Two bedrooms",
+        "criteria": [
+            {"field": "bedrooms", "operator": "eq", "value": "2"}
+        ],
+    }
+
+
+def test_the_client_declares_no_route_the_application_does_not_serve():
+    """Every path the browser client requests is a declared route.
+
+    A client call to an absent path answers 404 for every caller, and a
+    generic type parameter on the response asserts a contract the server
+    never agreed to.
+    """
+    source = FRONTEND_API_CLIENT.read_text(encoding="utf-8")
+    requested = set(
+        re.findall(r"\$\{API_BASE_URL\}(/[^`']*)", source)
+    )
+    assert requested, source
+
+    served = {path for path, _verb in _application_route_table()}
+    for path in requested:
+        assert path in served, path
 
 
 def test_the_filter_body_publishes_numeric_identifiers(

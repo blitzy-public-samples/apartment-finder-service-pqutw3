@@ -61,11 +61,57 @@ setup_virtual_env() {
     echo "Virtual environment activated."
 }
 
+# SEC-01: publishes the generated file with link(2), which fails when the
+# destination already exists as a file, a directory or a symlink. Nothing is
+# checked first, so no window exists in which the destination can change
+# (CWE-367, CWE-59)
+publish_env_file() {
+    local source_file="$1"
+    local destination="$2"
+
+    if [ -z "$source_file" ] || [ -z "$destination" ]; then
+        echo "publish_env_file needs a source file and a destination." >&2
+        return 1
+    fi
+
+    PUBLISH_SOURCE="$source_file" PUBLISH_DESTINATION="$destination" python3 - <<'PY'
+import os
+import sys
+
+try:
+    os.link(os.environ["PUBLISH_SOURCE"], os.environ["PUBLISH_DESTINATION"])
+except OSError as error:
+    sys.stderr.write("Refusing to publish {0}: {1}\n".format(
+        os.environ["PUBLISH_DESTINATION"], error
+    ))
+    sys.exit(1)
+PY
+    local link_status=$?
+
+    if [ "$link_status" -ne 0 ]; then
+        return 1
+    fi
+
+    # SEC-01: the temporary name is dropped, leaving the destination as the
+    # only name for the inode the run created (CWE-732)
+    if ! rm -f "$source_file"; then
+        echo "Failed to remove $source_file after publishing $destination." >&2
+        return 1
+    fi
+
+    # SEC-01: the published path is the regular, non-empty file just linked
+    if [ ! -f "$destination" ] || [ -L "$destination" ] || [ ! -s "$destination" ]; then
+        echo "Refusing to report success: $destination is not the file setup wrote." >&2
+        return 1
+    fi
+}
+
 # Configure environment variables
 configure_env_vars() {
     echo "Configuring environment variables..."
 
-    # SEC-01: an existing secret file is never replaced or written through
+    # SEC-01: an existing secret file stops the run before any credential is
+    # generated; publish_env_file is what makes the refusal race-free
     # (CWE-59, CWE-367)
     if [ -e .env ] || [ -L .env ]; then
         echo "An .env file is already present. Move it aside, then rerun." >&2
@@ -120,15 +166,11 @@ EOF
         return 1
     fi
 
-    # SEC-01: refuses a .env path that is not a regular file, which would
-    # absorb the temporary file and still report success (CWE-252)
-    if [ -e .env ] && [ ! -f .env ]; then
-        echo "Refusing to install .env: the path exists and is not a regular file. Remove or rename it, then rerun." >&2
-        return 1
-    fi
-
-    if ! mv -f "$env_tmp" .env; then
-        echo "Failed to install .env. Environment configuration aborted." >&2
+    # SEC-01: an atomic no-clobber publish. A directory, symlink or file
+    # that appears at .env after the check above cannot absorb the
+    # temporary file or be written through (CWE-367, CWE-59)
+    if ! publish_env_file "$env_tmp" .env; then
+        echo "Failed to install .env. Remove or rename anything standing at .env, then rerun." >&2
         return 1
     fi
     trap - EXIT
@@ -194,8 +236,13 @@ init_database() {
     fi
 
     # SEC-11: owner role performs schema work; application role is limited
-    # to table data operations, and the revoke below removes the CREATE on
-    # schema public that PostgreSQL 13 grants to PUBLIC (CWE-250, CWE-269)
+    # to table data operations. The two revokes remove what PostgreSQL 13
+    # grants PUBLIC by default: CREATE on schema public, and CONNECT plus
+    # TEMPORARY on the database (CWE-250, CWE-269)
+    # SEC-11: the final block reads the effective ACLs rather than trusting
+    # the statements above, and aborts the batch when PUBLIC retains a
+    # database privilege or the application role holds more than the
+    # granted set (CWE-269)
     # SEC-11: both role passwords reach psql on standard input, so neither
     # appears in a process argument list (CWE-214); a failed grant batch
     # aborts the run (CWE-252)
@@ -209,12 +256,43 @@ ALTER DATABASE dbname OWNER TO app_owner;
 ALTER SCHEMA public OWNER TO app_owner;
 GRANT CREATE, USAGE ON SCHEMA public TO app_owner;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE CONNECT, TEMPORARY ON DATABASE dbname FROM PUBLIC;
 GRANT CONNECT ON DATABASE dbname TO app_user;
 GRANT USAGE ON SCHEMA public TO app_user;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;
 ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
 ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO app_user;
+DO $$
+DECLARE
+    held text;
+BEGIN
+    SELECT string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type) INTO held
+      FROM pg_database d, aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a
+     WHERE d.datname = current_database() AND a.grantee = 0;
+    IF held IS NOT NULL THEN
+        RAISE EXCEPTION 'PUBLIC still holds % on database %', held, current_database();
+    END IF;
+    SELECT string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type) INTO held
+      FROM pg_namespace n, aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a
+     WHERE n.nspname = 'public' AND a.grantee = 0 AND a.privilege_type <> 'USAGE';
+    IF held IS NOT NULL THEN
+        RAISE EXCEPTION 'PUBLIC still holds % on schema public', held;
+    END IF;
+    IF NOT has_database_privilege('app_user', current_database(), 'CONNECT') THEN
+        RAISE EXCEPTION 'app_user cannot connect to %', current_database();
+    END IF;
+    IF has_database_privilege('app_user', current_database(), 'TEMPORARY') THEN
+        RAISE EXCEPTION 'app_user retains TEMPORARY on %', current_database();
+    END IF;
+    IF has_schema_privilege('app_user', 'public', 'CREATE') THEN
+        RAISE EXCEPTION 'app_user retains CREATE on schema public';
+    END IF;
+    IF NOT has_schema_privilege('app_user', 'public', 'USAGE') THEN
+        RAISE EXCEPTION 'app_user cannot use schema public';
+    END IF;
+END
+$$;
 SQL
     } | psql -v ON_ERROR_STOP=1 -d dbname
     if [ "${PIPESTATUS[1]}" -ne 0 ]; then
