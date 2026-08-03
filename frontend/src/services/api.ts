@@ -24,12 +24,11 @@ export const fetchListings = async (
   }
 };
 
-// The name POST /filters/ stores when the form carries none. The route
-// refuses an empty name with 400, and the form collects no name field.
+// The name POST /filters/ stores when the form carries none. DL-366
 export const DEFAULT_FILTER_NAME = 'Saved filter';
 
 // The comparison each UI key prefix means on the wire. A key with neither
-// prefix compares for equality on the key itself.
+// prefix compares for equality on the key itself. DL-366
 const RANGE_OPERATORS: ReadonlyArray<[string, string]> = [
   ['min', 'gte'],
   ['max', 'lte'],
@@ -50,9 +49,8 @@ const criterionFromEntry = (key: string, value: string | number): Criteria => {
 };
 
 // SEC-05: builds the allow-list POST /filters/ declares, and nothing else.
-// The UI model keys criteria by input name; the wire body carries a list of
-// field, operator and value triples, so the two are mapped explicitly rather
-// than assumed to be the same shape.
+// Maps the UI model, which keys criteria by input name, onto the wire body,
+// which carries field, operator and value triples. DL-366
 export const toFilterCreate = (value: FilterFormValue): FilterCreate => {
   const submitted = value.criteria;
   const criteria: Criteria[] = Array.isArray(submitted)

@@ -3,12 +3,11 @@
 Every error reply must carry the same envelope, withhold internal
 detail, and quote a correlation identifier the server log repeats.
 
-Two channels are checked, not one. The reply is checked for internal
-detail, and the server record is checked for text the caller supplied or
-a provider returned: a request path, a request method, an undeclared key
-name, a driver diagnostic and a statement. The record is also checked
-where it is written, because ``caplog`` attaches to the root logger and
-proves only that a message was built.
+Two channels are checked. The reply is read for internal detail. The
+server record is read for text the caller supplied or a provider returned:
+a request path, a request method, an undeclared key name, a driver
+diagnostic and a statement. The record is checked at the handler that
+writes it as well as through ``caplog``. DL-379
 """
 import io
 import json
@@ -131,8 +130,8 @@ PLANTED_STATEMENT = (
 PLANTED_SQLSTATE = "23505"
 
 # SEC-08: the request line a caller controls. A path segment and a query
-# value are attacker-chosen text; the record must name the route the
-# server matched instead (CWE-117).
+# value are caller-supplied text, and the record names the matched route
+# (CWE-117).
 PLANTED_PATH = "/missing/{0}/{1}".format(
     PLANTED_BEARER, PLANTED_ROW_ADDRESS
 )
@@ -274,9 +273,9 @@ def _login_until_throttled(client, email):
 class _CommitLosesTheRace:
     """A session view whose commit reports a duplicate key.
 
-    Every other call reaches the real session, so the route's pre-check
-    query, its insert and its rollback all behave normally and only the
-    commit fails - which is the shape of a lost unique-address race.
+    Every other call reaches the real session: the route's pre-check
+    query, its insert and its rollback behave normally and the commit
+    alone fails. DL-378
     """
 
     def __init__(self, session):
@@ -298,7 +297,11 @@ class _CommitLosesTheRace:
 
 @pytest.fixture
 def failing_database(client):
-    """Yield a factory that makes the session dependency raise."""
+    """Yield a factory that makes the session dependency raise.
+
+    Replaces the one harness override key for the span of a context and
+    restores it afterwards. DL-378
+    """
     harness_override = app.dependency_overrides.get(get_db)
 
     def _restore():
@@ -423,8 +426,7 @@ def test_a_body_that_is_not_json_reports_no_byte_offset(client):
     """A body no parser accepts is refused without measuring it.
 
     The parser locates the failure by an offset into the submitted
-    content, so promoting that offset into the field list would publish
-    a measurement of the request body back to its sender.
+    content. The field list is asserted to carry no offset. DL-384
     """
     response = client.post(
         "/auth/register",
@@ -456,9 +458,8 @@ def test_a_sanitized_500_reaches_an_allow_listed_origin(
     """A 500 carries the cross-origin headers every other status does.
 
     The sanitized layer is registered ahead of the cross-origin
-    middleware, which nests it inside. Moving it outside would leave a
-    browser reading an opaque network failure instead of the envelope
-    and the correlation identifier inside it.
+    middleware, which nests it inside, so the envelope and the correlation
+    identifier reach the browser. DL-384
     """
     with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
         response = client.get(
@@ -482,9 +483,9 @@ def test_a_lost_unique_address_race_answers_bad_request(
 ):
     """A registration losing the unique-address race is not a 500.
 
-    The pre-check clears because no row holds the address yet, so only
-    the commit fails. The route answers with the same 400 the pre-check
-    raises, and the failed transaction is rolled back.
+    No row holds the address when the pre-check runs, and the commit
+    alone fails. The route answers with the same 400 the pre-check
+    raises, and the failed transaction is rolled back. DL-378
     """
     with losing_the_commit_race() as views:
         response = client.post(
@@ -516,7 +517,7 @@ def _bound_row():
 def _duplicate_key_failure(bound_engine):
     """Return a real duplicate-key failure raised by one engine.
 
-    Both rows carry the same address, so the unique index refuses the
+    Both rows carry the same address. The unique index refuses the
     statement and the raised error holds the bound values.
     """
     Base.metadata.create_all(bind=bound_engine)
@@ -534,9 +535,9 @@ def test_the_engine_withholds_bound_parameters_from_a_real_failure():
     """A real duplicate-key failure on the application engine carries no
     bound value.
 
-    The suppression sits on the engine, so it also covers the consumers
-    that never reach an HTTP handler: the listing task prints the
-    exception it catches.
+    The suppression sits on the engine, which also covers the consumers
+    that never reach an HTTP handler, such as the listing task printing
+    the exception it catches. DL-384
     """
     # SEC-08: the engine-level setting, asserted directly
     assert application_engine.hide_parameters is True
@@ -556,7 +557,7 @@ def test_the_handler_withholds_bound_parameters_from_a_real_failure(
     value in the reply or the log.
 
     The harness engine keeps its parameters, so the values reach the
-    handler and only its own suppression removes them.
+    handler and its own suppression is the one under assertion. DL-384
     """
     caplog.set_level(logging.ERROR)
     failure = _duplicate_key_failure(test_engine)
@@ -670,7 +671,7 @@ def test_the_correlation_identifier_joins_the_response_and_the_log(
     record = matching[0]
     assert record.levelno >= logging.ERROR
     message = record.getMessage()
-    # SEC-08: diagnostics reach the log, not the caller
+    # SEC-08: the log carries the diagnostics the caller never receives
     assert "RuntimeError" in message
     assert "origin=" in message
     # SEC-08: the record resolves the reference into a usable diagnosis -
@@ -815,8 +816,8 @@ def test_the_log_withholds_the_password_the_token_and_the_cookie(
 ):
     """No log record and no reply repeats a submitted secret.
 
-    Both channels are checked against the whole serialized reply, so a
-    token echoed in any envelope field fails the case.
+    Both channels are checked against the whole serialized reply, every
+    envelope field included.
     """
     caplog.set_level(logging.ERROR)
     cookie_token = create_access_token({"sub": "1"})
@@ -910,9 +911,9 @@ def test_a_reraised_database_error_withholds_the_driver_diagnostic(
 ):
     """A rendered report drops the driver text its context carries.
 
-    The generic handler formats the whole exception report, so a driver
-    rejection caught and re-raised is still rendered - through the
-    context exception's own message and bound parameters.
+    The generic handler formats the whole exception report, including a
+    re-raised driver rejection rendered through its context exception's
+    message and bound parameters. DL-384
     """
     caplog.set_level(logging.ERROR)
     with failing_database(_rejection_caught_and_reraised()):
@@ -1006,9 +1007,8 @@ def test_a_matched_route_names_the_template_not_the_query(client, caplog):
 def test_the_application_logger_owns_a_configured_handler():
     """The package logger carries a handler, a level and a format.
 
-    A server that configures only its own loggers leaves this package on
-    the last-resort handler, which emits the message alone - no level, no
-    timestamp and no logger name to file the record under (CWE-778).
+    The case reads the handler, the level and the format string off the
+    package logger (CWE-778). DL-364
     """
     package_logger = logging.getLogger(_APPLICATION_LOGGER_NAME)
     assert package_logger.level == _LOG_LEVEL
@@ -1018,9 +1018,9 @@ def test_the_application_logger_owns_a_configured_handler():
     assert isinstance(handler.formatter, logging.Formatter)
     assert handler.stream is not None
 
-    # SEC-08: every module logger resolves to it, and propagation is
-    # left intact so a deployment may add its own sink above. That sink is
-    # served the folded record, not the raw one - the case below drives it
+    # SEC-08: every module logger resolves to it, and propagation stays
+    # intact for a deployment sink above, which receives the folded
+    # record; the case below drives that path
     assert application_logger.name.startswith(
         "{0}.".format(_APPLICATION_LOGGER_NAME)
     )
@@ -1077,10 +1077,9 @@ def test_the_owned_handler_records_one_line_without_a_root_handler(
 def _ancestor_sink(only=_APPLICATION_LOGGER_NAME):
     """Attach a root handler carrying the stock formatter.
 
-    This is the deployment shape the fold has to survive: a sink above the
-    package that knows nothing about this application's format. ``only``
-    admits one logger subtree, so a library record travelling the same
-    path does not join the text under assertion.
+    The deployment shape under assertion: a sink above the package,
+    carrying no knowledge of this application's format. ``only`` admits
+    one logger subtree. DL-379
     """
     captured = io.StringIO()
     sink = logging.StreamHandler(stream=captured)
@@ -1103,10 +1102,8 @@ def _ancestor_sink(only=_APPLICATION_LOGGER_NAME):
 def test_an_ancestor_handler_receives_one_line_too(client, failing_database):
     """A root sink with the stock formatter records one line.
 
-    Folding inside the owned handler's formatter alone leaves this sink
-    emitting the raw multi-line record, so a collector reading it splits
-    one diagnosis into many lines and loses the correlation identifier on
-    all but the first (CWE-117, CWE-778).
+    The record reaching this sink is asserted to be one line
+    (CWE-117, CWE-778). DL-379
     """
     with _ancestor_sink() as captured:
         with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
@@ -1150,9 +1147,8 @@ def test_an_ancestor_handler_receives_one_line_too(client, failing_database):
 def test_a_control_character_never_reaches_a_sink(planted):
     """Every control character in a record is replaced before any sink.
 
-    A bare carriage return rewrites the line a terminal already printed,
-    and an escape sequence drives it, so a record carrying caller text
-    must not deliver either one (CWE-117).
+    The replacement covers every C0 code point and DEL, the carriage
+    return and the escape included (CWE-117). DL-364
     """
     with _ancestor_sink() as captured:
         application_logger.error("planted=%s", planted)
@@ -1183,8 +1179,8 @@ def test_the_fold_survives_exception_information_on_the_record():
 def test_a_record_from_another_library_is_left_alone():
     """A record outside this package keeps its own text.
 
-    The fold is scoped by logger name, so a third-party record is neither
-    rewritten nor stripped of its exception information.
+    The fold is scoped by logger name. A third-party record keeps its
+    text and its exception information.
     """
     foreign = logging.getLogger("zzz_foreign_library.probe")
     with _ancestor_sink(only="zzz_foreign_library") as captured:

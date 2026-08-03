@@ -39,25 +39,24 @@ _ACCOUNT_KEY_PREFIX = "acct:"
 _login_failures = {}
 _login_failures_lock = threading.Lock()
 
-# SEC-07: per-process key for the audit marker, so the marker is not a
-# recoverable digest of an email address (CWE-916)
+# SEC-07: per-process key for the audit marker (CWE-916). DL-365
 _AUDIT_MARKER_KEY = secrets.token_bytes(32)
 
-# SEC-06: HttpOnly/Secure/SameSite session cookie, shared by the set and
-# the clear; keeps the token out of script-readable storage (CWE-1004)
+# SEC-06: attributes of the HttpOnly/Secure/SameSite session cookie,
+# shared by the set and the clear; keeps the token out of script-readable
+# storage (CWE-1004). DL-365
 _SESSION_COOKIE_PATH = "/"
 _SESSION_COOKIE_SAMESITE = "strict"
 
-# SEC-08: stand-in hash the unknown-address branch verifies against. It
-# carries the scheme and cost every stored hash carries, and its secret is
-# random per process, so no submitted password can match it (CWE-208)
+# SEC-08: stand-in hash the unknown-address branch verifies against; the
+# scheme and cost of a stored hash, over a per-process random secret
+# (CWE-208). DL-365
 _ABSENT_ACCOUNT_HASH = get_password_hash(secrets.token_urlsafe(32))
 
 
 def _account_key(email: str) -> str:
-    # SEC-07: one counter per stored account identity; the key is the value
-    # the credential query filters on, so no case variant shares a counter
-    # with another account (CWE-307, CWE-287)
+    # SEC-07: one counter per stored account identity, keyed on the value
+    # the credential query filters on (CWE-307, CWE-287). DL-365
     return _ACCOUNT_KEY_PREFIX + (email or "")
 
 
@@ -88,10 +87,9 @@ def _verified_credentials(db_user, submitted_password: str):
     # SEC-04/SEC-08: every hasher refusal is answered by the counted
     # uniform 401, never a 500 and never a distinguishable 422 (CWE-209,
     # CWE-307). Returns (matched, refusing exception type name)
-    # SEC-08: an unknown address is verified against a stand-in hash of the
-    # same scheme and cost, so the two branches do equal hasher work and the
-    # response time does not disclose whether the account exists (CWE-208,
-    # CWE-203)
+    # SEC-08: both branches perform one verification of equal scheme and
+    # cost; response time discloses no account state (CWE-208, CWE-203).
+    # DL-365
     stored_hash = (
         _ABSENT_ACCOUNT_HASH if db_user is None else db_user.hashed_password
     )
@@ -117,9 +115,9 @@ def _prune_expired_login_failures(now: float) -> None:
 
 
 def _evict_unexhausted_login_keys(limit: int, needed: int) -> bool:
-    # SEC-07: frees slots from the keys closest to expiry that sit below the
-    # limit; a key at the limit is never evicted, and False means the map is
-    # full so the attempt is denied (CWE-307)
+    # SEC-07: frees slots from the keys closest to expiry that sit below
+    # the limit; a key at the limit is never evicted, and False denies the
+    # attempt (CWE-307). DL-365
     candidates = sorted(
         (entry[1], key) for key, entry in _login_failures.items()
         if entry[0] < limit
@@ -133,8 +131,8 @@ def _evict_unexhausted_login_keys(limit: int, needed: int) -> bool:
 
 def _reserve_login_attempt(*throttle_keys: str) -> bool:
     # SEC-07: counts the attempt and decides admission inside one critical
-    # section, so a concurrent burst shares no allowance (CWE-367). False
-    # means a key is at the limit or the map is full
+    # section; a concurrent burst shares no allowance (CWE-367). False
+    # means a key is at the limit or the map is full. DL-365
     now = time.monotonic()
     window = settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES * 60
     limit = settings.LOGIN_RATE_LIMIT_ATTEMPTS
@@ -251,7 +249,7 @@ def login_user(
         # SEC-07: the reserved attempt stands, counted once per account
         raise CredentialRejected(hasher_refusal)
     
-    # SEC-07: authentication succeeded, so the counter retains no state
+    # SEC-07: on success the counter retains no state
     _clear_login_failures(account_key)
 
     # Generate access token

@@ -17,7 +17,8 @@ Two companion documents carry information this file does not duplicate:
   weighed and the risks accepted. Where a statement below needs defending, the log holds the
   reasoning, and this document does not repeat it.
 - [`documentation/security/traceability-matrix.md`](documentation/security/traceability-matrix.md)
-  maps findings to files in both directions at full coverage.
+  maps findings to files in both directions. Its section 3.1 carries the coverage as measured: 82
+  edges in each direction with an empty difference both ways.
 
 One piece of context explains several numbers in this document. Before this work, the application
 could not start: five layers of import-time failure stood between the repository and a running
@@ -114,12 +115,11 @@ SEC-12 is a partial remediation. It delivers custody discipline, not a secret st
 - No managed secret store is provisioned, and no key-management service is configured.
 - The broad `COPY . .` in both container definitions is unchanged, so the build depends on the
   context exclusions rather than on an allow-list. Narrowing each copy to the application sources is
-  the stronger form and is recommended in section 4.
+  the stronger form, and section 4 carries it as a follow-on; `DL-129` carries the decision.
 - The deployment pipeline still authenticates with a long-lived service-account key rather than
   federated identity. `.github/workflows/cd.yml` passes that key to the Cloud SDK setup step and
-  exports it as the default credential. Migrating to federated identity needs provider-side
-  configuration that cannot be created or validated from this repository, so it is recommended in
-  section 4 rather than implemented.
+  exports it as the default credential. Section 4 carries the migration as a follow-on, and `DL-253`
+  carries this partial remediation's boundary.
 
 ---
 
@@ -160,7 +160,7 @@ The primary gate for eleven of the twelve findings.
 cd backend && python -m pytest tests/security -q
 ```
 
-Measured: **688 passed**, no failures. The suite covers the identity claim, the origin allow-list,
+Measured: **689 passed**, no failures. The suite covers the identity claim, the origin allow-list,
 the password policy, request validation, cookie attributes, login throttling, the error boundary, the
 configuration guards, the charge seam, the provisioning script's publish and privilege statements,
 the build definitions, and the provider lock.
@@ -173,7 +173,7 @@ This matches the pipeline invocation. **The last flag is not optional.**
 cd backend && python -m pytest --cov=./ --cov-report=xml --continue-on-collection-errors
 ```
 
-Measured: **688 passed with 3 collection errors**, exit 1. The three errors are the pre-existing test
+Measured: **689 passed with 3 collection errors**, exit 1. The three errors are the pre-existing test
 modules explained in section 3.3. Coverage is reported, not gated.
 
 Without `--continue-on-collection-errors` the same command exits 2 with
@@ -215,22 +215,22 @@ advisory fail the build instead of being absorbed by an entry written for someth
 
 The advisory database is a moving target, and the gate is built to fail when it moves. Every new
 finding needs its own decision-log entry before it is suppressed.
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) also carries a staleness check for the
-opposite direction: it reads the audit's own JSON report and collects both `id` and `aliases` from
-every reported advisory, then fails naming any declared suppression that no longer appears in either.
-Parsing aliases as well as identifiers is what makes the check cover the `msgpack` entry, which exists
-only under the GitHub namespace; an earlier version matched `PYSEC-` identifiers alone, so that one
-suppression could have rotted silently. Verified in both directions by executing the shipped check
-against the real report and against a report with a declared identifier removed.
 
-One naming detail is worth stating, because an earlier version of this document got it backwards.
-The tool reports Python advisory database identifiers, and it *does* match a suppression given as a
-GitHub advisory alias — measured, and recorded in DL-12. The gate depends on that behaviour: the
-`msgpack` advisory has no `PYSEC-` form at all, so `GHSA-6v7p-g79w-8964` is the only identifier that
-can express it, which is why DL-09 permits the mixed namespace. Copy the identifiers exactly as
-written above. The real failure mode is a typo: the tool accepts an identifier it does not recognise
-and silently suppresses nothing, turning a mistyped entry into a hole rather than an error, which is
-why the workflow shape-checks every identifier and cross-checks the register.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) also carries a staleness check for the
+opposite direction. It reads the audit's own JSON report, collects both `id` and `aliases` from every
+reported advisory, and fails naming any declared suppression that no longer appears in either. Reading
+aliases as well as identifiers is what covers the `msgpack` entry, which exists only under the GitHub
+namespace. Verified in both directions by executing the shipped check against the real report and
+against a report with a declared identifier removed; `DL-345` carries the decision.
+
+One naming detail is worth stating. The tool reports Python advisory database identifiers, and it
+*does* match a suppression given as a GitHub advisory alias; that behaviour is measured and recorded
+in `DL-12`. The `msgpack` advisory has no `PYSEC-` form at all, so `GHSA-6v7p-g79w-8964` is the only
+identifier that can express it, and `DL-09` carries the mixed namespace.
+
+Copy the identifiers exactly as written above. The failure mode a typo produces is silent: the tool
+accepts an identifier it does not recognise and suppresses nothing. The workflow therefore
+shape-checks every identifier and cross-checks the register, per `DL-402` and `DL-205`.
 
 ### 2.5 Style check
 
@@ -245,10 +245,12 @@ of which 4 are substantive and exactly 1 is an undefined name** — `datetime` a
 `app/api/endpoints/subscriptions.py:60`, the out-of-scope case section 3.3 records. The other three
 are unused imports in `app/api/endpoints/listings.py`, `app/tasks/listing_updater.py` and
 `tests/test_api.py`. The remaining 105 are blank-line, trailing-whitespace, line-length and
-missing-final-newline findings in files this work did not reformat. No new category appears: the
-category set is the same seven as the baseline. Both figures were measured by running the command
-above, the baseline against the tree as it stood before this work. **This command exits non-zero both
-before and after.** A green pipeline is not on offer, and section 3.3 explains why.
+missing-final-newline findings in files this work did not reformat.
+
+No new category appears: the category set is the same seven as the baseline. Both figures were
+measured by running the command above, the baseline against the tree as it stood before this work.
+**This command exits non-zero both before and after.** A green pipeline is not on offer, and section
+3.3 explains why.
 
 ### 2.6 The three repository scans
 
@@ -277,32 +279,39 @@ Gate three matches six storage mechanisms, not two: `localStorage`, `sessionStor
 `Storage.prototype`, `document.cookie` and `window.name`. Its three original hits were in the
 frontend authentication service, one each for writing, removing and reading the stored token.
 
-**Gate one excludes no file, and it runs in two stages.** The first stage is the pattern. It is
-written with one-character bracket expressions — `[:]` for a colon, `[W]` for a W, `[w]` for a w — so
-it matches the same text without matching the line that declares it, which is what lets the gate cover
-the workflow and this document as well. It matches an assignment with or without spaces around the
-separator and with or without a quote, so the formatter-compliant spelling `NAME = "value"` does not
-pass, and it covers the lower-case spelling when the value is quoted. Gate one reads tracked content
-only, so a local `.env` or an installed dependency tree produces no false hit.
+**Gate one excludes no file, and it runs in two stages.** The first stage is the pattern, written
+with one-character bracket expressions — `[:]` for a colon, `[W]` for a W, `[w]` for a w — so it
+matches the same text without matching the line that declares it. That property is what lets the gate
+cover the workflow and this document as well; `DL-207` carries it.
 
-The second stage is a reviewed allow-list, and it is the reason the gate can be broad enough to catch
-that spelling without drowning in false positives. It admits four classes: a value read from
-configuration rather than written in the file (`= settings.`, `os.`, `var.`, `process.`, `self.`); a
-name that denotes a policy bound or a piece of metadata rather than a secret (`MIN_LENGTH`,
-`MAX_BYTES`, `UPPERCASE`, `LOWERCASE`, `DIGITS`, `SPECIAL_CHARACTERS`, `_VARIABLE`, `_ARGUMENT`,
-`_FIELD`, `_LITERAL`, `_REFERENCE`, `_PATTERN`); an upper-case placeholder token, of the form an
-example file uses in place of a real key; and a line carrying the reviewed-line marker with a reason
-beside it. The workflow holds the marker's exact text, and this document does not reproduce it, for
-the same reason it does not reproduce the pattern: a line quoting the marker would be admitted by it.
+The pattern matches an assignment with or without spaces around the separator and with or without a
+quote, so the formatter-compliant spelling `NAME = "value"` does not pass, and it covers the lower-case
+spelling when the value is quoted. Gate one reads tracked content only, so a local `.env` or an
+installed dependency tree produces no false hit.
+
+The second stage is a reviewed allow-list, which is what keeps a pattern this broad from reporting
+legitimate content. It admits four classes:
+
+- a value read from configuration rather than written in the file: `= settings.`, `os.`, `var.`,
+  `process.`, `self.`;
+- a name that denotes a policy bound or a piece of metadata rather than a secret: `MIN_LENGTH`,
+  `MAX_BYTES`, `UPPERCASE`, `LOWERCASE`, `DIGITS`, `SPECIAL_CHARACTERS`, `_VARIABLE`, `_ARGUMENT`,
+  `_FIELD`, `_LITERAL`, `_REFERENCE`, `_PATTERN`;
+- an upper-case placeholder token, of the form an example file uses in place of a real key;
+- a line carrying the reviewed-line marker with a reason beside it.
+
+The workflow holds the marker's exact text and this document does not reproduce it, as it does not
+reproduce the pattern: a line quoting either would be matched or admitted by it. `DL-208` carries the
+pattern's breadth and the four spellings left uncovered.
 
 Measured on 2026-08-03: the pattern matches **21 lines**, the allow-list admits all 21, and the gate
 reports **0**. Of the 21, five are the password-policy bounds in the request schema, three are values
 read from `settings.`, eight are constants and controls inside the guard tests, one is a line in the
 requirements document, and four are the marked lines. The marker appears on exactly **four**
-test-fixture passwords, all under `backend/tests/`, and on **no line of application source**;
-`backend/tests/security/test_config_guards.py` pins that count at four, requires every marked line to
-carry a reason and to be matched by the pattern, and asserts that the allow-list admits no credential
-shape from its own positive-control set.
+test-fixture passwords, all under `backend/tests/`, and on **no line of application source**.
+`backend/tests/security/test_config_guards.py` pins that count at four and requires every marked line
+to carry a reason and to be matched by the pattern. It also asserts that the allow-list admits no
+credential shape from its own positive-control set.
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) holds the exact expression for all three, and
 this document describes rather than reproduces gate one: a pattern built from credential-shaped
@@ -319,22 +328,25 @@ terraform validate
 
 **Expected: failure today, for two reasons unrelated to this work.**
 `infrastructure/terraform/outputs.tf` references seven resources that `main.tf` never declares:
-three storage buckets, two messaging topics, and two functions. Separately, `main.tf:34` reads
+three storage buckets, two messaging topics, and two functions. Separately, `main.tf:45` reads
 `var.gke_num_nodes`, which `variables.tf` declares nowhere. The formatting check reports the outputs
-file only; the two changed files pass it. Validate the changed database resources in isolation and
-treat both blockers as separate cleanup. Measured that way — the two changed files copied into a
-scratch module with a stub for the undeclared variable — `terraform validate` returns success, and a
-plan run without the application role's password stops at `No value for required variable` rather
-than falling back to one. Naming this now is more useful than reporting a failure later and calling
-it a regression.
+file only; the two changed files pass it.
+
+Validate the changed database resources in isolation and treat both blockers as separate cleanup.
+`DL-256` carries the decision to leave the outputs file alone.
+
+Measured that way — the two changed files copied into a scratch module with a stub for the undeclared
+variable — `terraform validate` returns success. A plan run without the application role's password
+stops at `No value for required variable` rather than falling back to one.
 
 **The provider is bounded and locked.** `main.tf` declares `hashicorp/google` at `~> 7.42` and bounds
-the command line at `>= 1.11.0, < 2.0.0`. The write-only password argument needs that floor, and both
-upper bounds mean a major release that withdraws `ssl_mode`, `password_wo` or `password_wo_version`
-fails installation instead of applying a configuration that no longer enforces what it reads as
-enforcing. [`infrastructure/terraform/.terraform.lock.hcl`](infrastructure/terraform/.terraform.lock.hcl)
-is tracked and carries one directory hash for each platform an operator or the pipeline installs from
-— `linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64` — beside the registry checksum set.
+the command line at `>= 1.11.0, < 2.0.0`. The write-only password argument needs that floor. Under
+both upper bounds, a major release that withdraws `ssl_mode`, `password_wo` or `password_wo_version`
+fails installation rather than applying; `DL-350` and `DL-368` carry the bounds and the lock.
+
+[`infrastructure/terraform/.terraform.lock.hcl`](infrastructure/terraform/.terraform.lock.hcl) is
+tracked and carries one directory hash for each platform an operator or the pipeline installs from —
+`linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64` — beside the registry checksum set.
 Regenerate it after any constraint change, and commit the result:
 
 ```bash
@@ -459,27 +471,28 @@ differ, so they are stated separately.
 [`scripts/setup_dev_environment.sh`](scripts/setup_dev_environment.sh) replaces the single
 all-privileges account with an owner role that performs schema work and an application role limited
 to `CONNECT`, schema `USAGE`, and `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables plus `USAGE`,
-`SELECT` on sequences. Two revokes remove what PostgreSQL grants `PUBLIC` by default, and both are
-load-bearing: `REVOKE CREATE ON SCHEMA public FROM PUBLIC` removes the DDL those grants withhold, and
-`REVOKE CONNECT, TEMPORARY ON DATABASE dbname FROM PUBLIC` removes the database privileges every
-cluster role otherwise holds — without it any role reaches the database and the application role keeps
-a temporary-object capability the granted set never mentions. Two `ALTER DEFAULT PRIVILEGES`
-statements extend the same data operations to tables the owner creates later. `GRANT ALL PRIVILEGES`
-appears nowhere.
+`SELECT` on sequences. Two revokes remove what PostgreSQL grants `PUBLIC` by default:
+`REVOKE CREATE ON SCHEMA public FROM PUBLIC` and
+`REVOKE CONNECT, TEMPORARY ON DATABASE dbname FROM PUBLIC`. Two `ALTER DEFAULT PRIVILEGES` statements
+extend the same data operations to tables the owner creates later, and `GRANT ALL PRIVILEGES` appears
+nowhere. `DL-36` and `DL-353` carry the two revokes.
 
 The batch does not stop at issuing those statements. It ends with a block that reads the **effective**
-ACLs and raises if they disagree with the intent: `PUBLIC` must hold nothing on the database and
-nothing but `USAGE` on the schema, and the application role must hold `CONNECT` and schema `USAGE`
-while holding neither `TEMPORARY` nor schema `CREATE`. The block substitutes `acldefault` for a null
-ACL column, because an untouched `datacl` reads as empty while the default privileges still apply — a
-query reading the column alone would report a clean database that grants `PUBLIC` everything it
-started with. `psql` runs the batch with the stop-on-error setting, so a raise aborts provisioning
-rather than printing a warning nobody reads. Measured against PostgreSQL 13.23: before the revokes,
-`PUBLIC` held `CONNECT, TEMPORARY` on the database and a role with no explicit grant answered true to
-`CONNECT`, `TEMPORARY` and schema `CREATE`; afterwards `PUBLIC` held nothing on the database,
-`app_user` answered true only to `CONNECT` and schema `USAGE`, and the owner still connected. Schema
-`USAGE` is deliberately left with `PUBLIC`, since with `CONNECT` revoked no unprivileged role reaches
-the database to use it; removing it is outside this scope.
+access-control lists, or ACLs, and raises if they disagree with the intent. `PUBLIC` must hold nothing
+on the database and nothing but `USAGE` on the schema, and the application role must hold `CONNECT`
+and schema `USAGE` while holding neither `TEMPORARY` nor schema `CREATE`.
+
+The block substitutes `acldefault` for a null ACL column, since an untouched `datacl` reads as empty
+while the default privileges still apply. `psql` runs the batch with the stop-on-error setting, so a
+raise aborts provisioning. `DL-354` carries the verification block and `DL-355` the form the suite
+reads it in.
+
+Measured against PostgreSQL 13.23, and this is the one measurement behind every privilege figure in
+this section: before the revokes, `PUBLIC` held `CONNECT, TEMPORARY` on the database, and a role with
+no explicit grant answered true to `CONNECT`, `TEMPORARY` and schema `CREATE`. Afterwards `PUBLIC`
+held nothing on the database, `app_user` answered true only to `CONNECT` and schema `USAGE`, and the
+owner still connected. Schema `USAGE` is deliberately left with `PUBLIC`: with `CONNECT` revoked, no
+unprivileged role reaches the database to use it, and removing it is outside this scope.
 
 *On Cloud SQL, the declaration separates the account and restricts nothing.*
 [`infrastructure/terraform/main.tf`](infrastructure/terraform/main.tf) declares
@@ -504,19 +517,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE O
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO app_user;
 ```
 
-**A database grants `CONNECT` and `TEMPORARY` to `PUBLIC` by default, so both revokes are load-bearing
-rather than defensive.** Without the second one, every role in the cluster can still reach the
-database and `app_user` keeps temporary-object capability beyond the privilege set above. Measured on
-PostgreSQL 13.23: before the revoke, `PUBLIC` held `CONNECT, TEMPORARY` on the database and
-`CREATE, USAGE` on schema `public`, and a role with no explicit grant at all answered true to
-`CONNECT`, `TEMPORARY` and schema `CREATE`. After the two revokes and the grants above, `PUBLIC` held
-nothing on the database and only `USAGE` on the schema, `app_user` answered true to `CONNECT` and
-schema `USAGE` and false to `TEMPORARY` and schema `CREATE`, and the database owner still connected.
-Schema `USAGE` is deliberately left with `PUBLIC`: with `CONNECT` revoked, no unprivileged role
-reaches the database to use it, and removing it is outside this scope.
+**A database grants `CONNECT` and `TEMPORARY` to `PUBLIC` by default, so the block above issues both
+revokes.** Without the second, every role in the cluster still reaches the database and `app_user`
+keeps temporary-object capability beyond the privilege set above. The before-and-after figures are the
+ones measured for the local batch earlier in this section; the same statements produce the same
+privilege state, and schema `USAGE` is left with `PUBLIC` on this side too.
 
-Verify the effective ACLs rather than trusting the statements, because a `GRANT` that silently applied
-to the wrong role reads the same as one that worked:
+Verify the effective ACLs rather than trusting the statements: a `GRANT` that silently applied to the
+wrong role reads the same as one that worked.
 
 ```sql
 SELECT coalesce(string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type), 'none')
@@ -530,10 +538,8 @@ SELECT has_database_privilege('app_user', current_database(), 'CONNECT') AS conn
        has_schema_privilege('app_user', 'public', 'CREATE') AS schema_create_granted;
 ```
 
-Expected: `none`, then `t, f, t, f`. Grantee zero is the `PUBLIC` pseudo-role, and substituting
-`acldefault` matters because an untouched `datacl` is null while the default privileges still apply —
-a query reading the column alone reports `none` for a database that grants `PUBLIC` everything it
-started with.
+Expected: `none`, then `t, f, t, f`. Grantee zero is the `PUBLIC` pseudo-role, and the `acldefault`
+substitution is the same one the local batch uses, for the same null-column reason stated there.
 
 Substitute the value of `db_app_user` if it is not the default. The privilege set mirrors the local
 one the provisioning script issues and verifies; unlike that one, it was not executed against a
@@ -564,14 +570,14 @@ gap is recorded here rather than closed.
 
 **Logout clears the cookie; it does not revoke the token.** `POST /auth/logout` expires the session
 cookie, so the browser stops sending it, and that is the whole of what a server can do about a cookie
-it cannot read from script. The token itself stays valid until its `exp` claim passes. Anything that
-already holds a copy — a captured `Authorization` header, a proxy log, a token minted for a
-non-browser client — continues to authenticate after logout, because verification checks the signature
+it cannot read from script. The token itself stays valid until its `exp` claim passes.
+
+Anything that already holds a copy — a captured `Authorization` header, a proxy log, a token minted
+for a non-browser client — continues to authenticate after logout: verification checks the signature
 and the expiry and consults no revocation record. Closing that gap needs a `jti` claim plus a
-persisted deny list, which is storage this repository does not have and a feature rather than a fix.
-The controls that remain are the short token lifetime and the `HttpOnly` cookie that keeps script from
-obtaining a copy in the first place. Stated here because "logout invalidates the session" would
-otherwise be read as revocation.
+persisted deny list, and `DL-361` carries that boundary. The controls that remain are the short token
+lifetime and the `HttpOnly` cookie that keeps script from obtaining a copy. Read "logout invalidates
+the session" as ending the browser's session, not as revocation.
 
 **Enabling credentialed mode activates an `axios` advisory that was dormant.** CVE-2023-45857
 (High, 7.1, CWE-359) affects `axios` 1.0.0 through 1.5.1. In those versions the browser request
@@ -654,14 +660,13 @@ also carries a decision-log entry.
 | The backend base image `python:3.9-slim` is past end of life | The runtime version freeze applies; see section 3.1 |
 | Containers run as the root user | Container hardening |
 
-Only the backend base image is named above, because the frontend base image is not past end of life.
-`node:22` is in Node.js maintenance support until April 2027; `python:3.9-slim` tracks Python 3.9,
-whose upstream support ended in October 2025. An earlier version of this document said both were past
-end of life, which was true of neither image at the time it was written and is true of one now.
+Only the backend base image is named above. `node:22` is in Node.js maintenance support until April
+2027, while `python:3.9-slim` tracks Python 3.9, whose upstream support ended in October 2025.
+`DL-359` carries the correction to an earlier wording that named both, and `DL-269` carries the
+decision to leave the two versions alone.
 
-An eighth observation was closed rather than deferred. The outbound user schema previously
-declared the password hash field, and that field is gone, removed alongside the SEC-02 identity
-correction because the same model was already being changed.
+An eighth observation was closed rather than deferred: the outbound user schema no longer declares the
+password hash field. `DL-264` carries that decision.
 
 One further note, recorded rather than acted on: the application exposes interactive API
 documentation by default. That is normal for this framework and may well be intentional. Gating it
@@ -670,9 +675,8 @@ in production is a one-line change whenever the team decides it should be gated.
 ### 3.5 The second review's fifteen findings
 
 A security review of the delivered work raised fifteen findings: seven major, six medium and two low.
-All fifteen are closed. Each row names what was wrong, what closed it, and what remains — because a
-finding closed with a residual is not the same as one closed outright, and the difference is what a
-reader needs.
+All fifteen are closed. Each row names what was wrong, what closed it, and what remains, so a finding
+closed with a residual is distinguishable from one closed outright.
 
 | # | Severity | What was wrong | What closed it | Residual |
 | --- | --- | --- | --- | --- |
@@ -696,10 +700,9 @@ reader needs.
 
 ## 4. Deferred follow-ons, in priority order
 
-1. **Migrate to Python 3.10 or newer. That upgrade is the single highest-priority follow-on.** The
-   upgrade is the only real remedy for the fifteen advisories in section 3.1, every one of which has
-   a fix release that the current runtime refuses to install. Section 3.1 is the justification. On
-   completion, empty the suppression list and raise the pins.
+1. **Migrate to Python 3.10 or newer, the single highest-priority follow-on.** It is the only real
+   remedy for the fifteen advisories in section 3.1, every one of which has a fix release the current
+   runtime refuses to install. On completion, empty the suppression list and raise the pins.
 2. Generate and commit a frontend lock file after auditing the transitive tree, and declare the two
    packages that are imported but never declared.
 3. Move database transport to `verify-full` with a distributed, rotatable root certificate, so the
@@ -758,13 +761,14 @@ Everything below is preserved:
 **One item that belongs on no preservation list: the PayPal sandbox checkout experience.** No file in
 the frontend payment path was changed, the payment environment moved from a hardcoded literal to a
 validated setting whose default is `sandbox`, and the charge seam authorizes a reference the provider
-confirms for the requested amount, currency, payer and plan. What cannot be claimed is that the
-checkout works end to end, and two measured facts say why. The frontend bundle does not build, because
-the payment service imports a package no manifest declares, so the checkout screen cannot be exercised
-at all. And `POST /subscriptions/` cannot persist a row for the schema reasons in section 3.3, so a
-provider-confirmed charge clears the gate and then fails at insertion. Neither is caused by this work,
-and neither was working beforehand. The accurate statement is that the checkout path is unchanged and
-its two pre-existing blockers are unchanged with it.
+confirms for the requested amount, currency, payer and plan.
+
+What cannot be claimed is that the checkout works end to end, and two measured facts say why. The
+frontend bundle does not build: the payment service imports a package no manifest declares, so the
+checkout screen cannot be exercised at all. `POST /subscriptions/` cannot persist a row for the schema
+reasons in section 3.3, so a provider-confirmed charge clears the gate and then fails at insertion.
+Neither is caused by this work, and neither was working beforehand. The accurate statement is that the
+checkout path is unchanged and its two pre-existing blockers are unchanged with it.
 
 ---
 

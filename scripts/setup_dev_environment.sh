@@ -62,9 +62,8 @@ setup_virtual_env() {
 }
 
 # SEC-01: publishes the generated file with link(2), which fails when the
-# destination already exists as a file, a directory or a symlink. Nothing is
-# checked first, so no window exists in which the destination can change
-# (CWE-367, CWE-59)
+# destination exists as a file, a directory or a symlink. No check precedes
+# the call (CWE-367, CWE-59). DL-370
 publish_env_file() {
     local source_file="$1"
     local destination="$2"
@@ -110,9 +109,9 @@ PY
 configure_env_vars() {
     echo "Configuring environment variables..."
 
-    # SEC-01: an existing secret file stops the run before any credential is
-    # generated; publish_env_file is what makes the refusal race-free
-    # (CWE-59, CWE-367)
+    # SEC-01: an existing secret file stops the run before any credential
+    # is generated. publish_env_file carries the race-free refusal
+    # (CWE-59, CWE-367). DL-370
     if [ -e .env ] || [ -L .env ]; then
         echo "An .env file is already present. Move it aside, then rerun." >&2
         return 1
@@ -159,16 +158,15 @@ EOF
         return 1
     fi
 
-    # SEC-01: restricts the secret file to its owner; failing to do so
-    # aborts the run (CWE-732, CWE-252)
+    # SEC-01: restricts the secret file to its owner, and aborts the run
+    # on failure (CWE-732, CWE-252). DL-370
     if ! chmod 600 "$env_tmp"; then
         echo "Failed to restrict .env to the owning user. Secure or remove .env before continuing." >&2
         return 1
     fi
 
-    # SEC-01: an atomic no-clobber publish. A directory, symlink or file
-    # that appears at .env after the check above cannot absorb the
-    # temporary file or be written through (CWE-367, CWE-59)
+    # SEC-01: an atomic no-clobber publish of the owner-only temporary
+    # file (CWE-367, CWE-59). DL-370
     if ! publish_env_file "$env_tmp" .env; then
         echo "Failed to install .env. Remove or rename anything standing at .env, then rerun." >&2
         return 1
@@ -223,8 +221,8 @@ PY
 init_database() {
     echo "Initializing local database..."
 
-    # SEC-11: checks the owner bootstrap's imports before the first database
-    # object exists, so a failure leaves nothing behind (CWE-252)
+    # SEC-11: checks the owner bootstrap's imports before the first
+    # database object exists (CWE-252)
     if ! check_schema_prerequisites; then
         echo "Cannot import SQLAlchemy, psycopg2 and backend.app.db.models with this interpreter. Install backend/requirements.txt, then rerun." >&2
         return 1
@@ -243,7 +241,7 @@ init_database() {
     # the statements above, and aborts the batch when PUBLIC retains a
     # database privilege or the application role holds more than the
     # granted set (CWE-269)
-    # SEC-11: both role passwords reach psql on standard input, so neither
+    # SEC-11: both role passwords reach psql on standard input and neither
     # appears in a process argument list (CWE-214); a failed grant batch
     # aborts the run (CWE-252)
     {

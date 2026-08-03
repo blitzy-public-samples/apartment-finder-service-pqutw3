@@ -6,12 +6,10 @@ enabled. An origin outside the list gets no allow-origin header at all.
 An unsafe allow-list raises a validation error while ``Settings`` is
 built; the cases here assert that error, not a process exit.
 
-The allow-list arrives from the environment in production, and that path
-differs from passing a keyword: an unparsable value is refused before
-any validator sees it, and the guidance an operator needs travels on the
-cause and not in the message. Both spellings are covered here, so a
-rejection proved through a keyword is never mistaken for a rejection
-proved through the environment.
+Two branches are covered. A value passed as a keyword reaches the field
+validator. A value read from the environment is refused ahead of every
+validator when it will not parse, and the required form travels on the
+cause. DL-384
 """
 import json
 from datetime import datetime
@@ -218,8 +216,7 @@ def test_preflight_from_an_allow_listed_origin_is_approved(client):
 def test_preflight_advertises_an_explicit_method_list(client):
     """A preflight advertises exactly the three methods the routes serve.
 
-    The advertised set is compared whole, so an added verb fails the
-    case as surely as a missing one.
+    The advertised set is compared whole, an added verb included.
     """
     response = _preflight(client, _PRIMARY_ORIGIN)
     advertised = _header_tokens(response.headers[_ALLOW_METHODS])
@@ -246,8 +243,7 @@ def test_preflight_advertises_an_explicit_request_header_list(client):
     """A preflight advertises exactly the registered request headers
     together with the four Starlette always safelists.
 
-    The set is compared whole, so widening the registered allow-list
-    fails the case.
+    The set is compared whole.
     """
     response = _preflight(
         client,
@@ -346,10 +342,8 @@ def test_unsafe_allow_list_prevents_startup(unsafe_value):
     ALLOWED_ORIGINS. A JSON array, the form ``.env.example`` documents,
     is accepted.
 
-    Each value arrives as a keyword, so these cases reach the field
-    validator directly. The environment path a deployment uses is
-    covered separately below, because it refuses an unparsable value
-    before any validator runs.
+    Each value arrives as a keyword and reaches the field validator
+    directly. The environment path is covered separately below. DL-384
     """
     with pytest.raises(ValidationError) as raised:
         _build_settings_with_allow_list(unsafe_value)
@@ -379,8 +373,7 @@ def test_enumerated_allow_list_is_accepted(safe_value):
 def test_the_documented_environment_spelling_is_accepted(monkeypatch):
     """The JSON array form ``.env.example`` documents parses.
 
-    This is the path a deployment takes, so the documented spelling has
-    to work there and not only as a keyword.
+    This is the path a deployment takes.
     """
     monkeypatch.setenv(
         _ALLOW_LIST_VARIABLE, json.dumps(list(DOCUMENTED_ENV_ORIGINS))
@@ -398,10 +391,9 @@ def test_an_unparsable_environment_allow_list_names_the_required_form(
     """An unparsable environment value fails closed and says what to
     write.
 
-    The library refuses the value before the field validator runs and
-    reports only the lowercased variable name, so the guidance an
-    operator needs survives on the cause alone. Without it a failed
-    deployment reports a parser complaint about a character offset.
+    The library refuses the value ahead of the field validator and
+    reports the lowercased variable name alone, so the required form is
+    asserted on the cause. DL-384
     """
     monkeypatch.setenv(_ALLOW_LIST_VARIABLE, raw_value)
 
@@ -412,7 +404,7 @@ def test_an_unparsable_environment_allow_list_names_the_required_form(
     reported = str(raised.value)
     assert _ALLOW_LIST_VARIABLE.lower() in reported.lower()
 
-    # SEC-03: the required form is carried by the cause, not the message
+    # SEC-03: the cause carries the required form
     cause = raised.value.__cause__
     assert isinstance(cause, ValueError)
     guidance = str(cause)
@@ -429,8 +421,7 @@ def test_an_unsafe_environment_allow_list_prevents_startup(
     """A parsable but unsafe environment value is refused by name.
 
     A value that parses reaches the same field validator the keyword
-    cases exercise, so the wildcard and the opaque origin cannot enter
-    through the environment either.
+    cases exercise. The wildcard and the opaque origin are both refused.
     """
     monkeypatch.setenv(_ALLOW_LIST_VARIABLE, raw_value)
 
@@ -524,8 +515,7 @@ def test_the_application_route_map_is_unchanged():
 def test_the_filter_create_route_declares_its_response_model():
     """POST /filters/ still declares the response model it always had.
 
-    Dropping it would widen the response body without changing any
-    status code, so no request-level case would notice.
+    The declaration is read from the route object. DL-384
     """
     route = _route_for("/filters/", "POST")
 
@@ -535,13 +525,12 @@ def test_the_filter_create_route_declares_its_response_model():
 def test_the_public_read_path_stays_open_and_paginates(client, db_session):
     """The public read path serves both pagination bounds unauthenticated.
 
-    The status codes and the row counts hold in every dialect: LIMIT and
-    OFFSET bound them. The identifier comparisons are scoped to the
-    SQLite harness - the statement carries no ORDER BY, and two
-    statements against PostgreSQL are not ordered against each other.
+    The status codes and the row counts hold in every dialect, bounded by
+    LIMIT and OFFSET. The identifier comparisons are scoped to the SQLite
+    harness. DL-384
     """
     # Listing.id is declared int, matching the INTEGER primary key at
-    # models.py:22, so a served identifier is a JSON number
+    # models.py:22; a served identifier is a JSON number
     seeded = {
         row.id
         for row in seed_listings(db_session, SEEDED_LISTING_COUNT)

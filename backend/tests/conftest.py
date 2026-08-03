@@ -1,21 +1,21 @@
 """Configure import paths, required settings, isolated SQLite state, and
 an HTTPS TestClient for backend tests.
 
-Wires the six things the security suite depends on: one canonical
-module object per application source file, the settings the application
-reads at import time, a SQLite database bound to the route dependency
-the application actually uses, foreign-key enforcement on every SQLite
-connection, an HTTPS test client, and per-test isolation of the schema
-and the login-attempt counters.
+Wires six things the security suite depends on. One canonical module
+object per application source file, the settings the application reads at
+import time, and a SQLite database bound to the route dependency the
+application uses. Then foreign-key enforcement on every SQLite connection,
+an HTTPS test client, and per-test isolation of the schema and the
+login-attempt counters.
 
-Collection is not filtered. Any module in ``backend/tests`` that fails to
-import fails collection: ``test_api.py``, ``test_services.py`` and
+Collection is not filtered. ``test_api.py``, ``test_services.py`` and
 ``test_tasks.py`` name top-level ``main``, ``services`` and ``app.tasks``
 modules the package layout does not provide, so a full-suite run reports
 three collection errors.
 
 Rationale for every decision in this harness is recorded in
-``documentation/security/decision-log.md``, section 7.
+``documentation/security/decision-log.md``, section 7, and in DL-376
+and DL-377.
 
 Module surface
 --------------
@@ -135,10 +135,9 @@ from sqlalchemy.pool import StaticPool  # noqa: E402
 def _install_canonical_aliases():
     """Bind every short ``app.*`` name to its canonical module object.
 
-    The application entry point is imported first, then every loaded
-    module is bound in sys.modules under its short name, so the second
-    import is a lookup rather than a second execution.
-    _assert_one_module_object_per_source_file enforces that.
+    Imports the application entry point, then binds every loaded module
+    in sys.modules under its short name.
+    _assert_one_module_object_per_source_file checks the result. DL-376
     """
     importlib.import_module("{0}.main".format(_CANONICAL_PACKAGE))
     for name, module in list(sys.modules.items()):
@@ -157,8 +156,8 @@ from backend.app.db.database import get_db  # noqa: E402
 from backend.app.db.models import Base  # noqa: E402
 from backend.app.main import app  # noqa: E402
 
-# The state a second module object would duplicate: settings, limiter,
-# account-keyed failure counter and session dependency.
+# The state one module object per source file keeps single: settings,
+# limiter, account-keyed failure counter and session dependency. DL-376
 _SHARED_OBJECTS = (
     ("core.config", "settings"),
     ("api.endpoints.auth", "limiter"),
@@ -166,7 +165,8 @@ _SHARED_OBJECTS = (
     ("db.database", "get_db"),
 )
 
-# Resolved source paths, cached by the __file__ string sys.modules keeps
+# Resolved source paths, cached by the __file__ string sys.modules
+# keeps. DL-377
 _RESOLVED_SOURCES = {}
 
 

@@ -21,11 +21,13 @@ Neither companion document is restated here.
 
 Rule 1 conditions this artifact on a class of work: "For migrations or refactors, include a
 bidirectional traceability matrix mapping source constructs to target implementations — 100%
-coverage, no gaps." A security remediation is neither, in the ordinary sense. Two parts of it qualify
-on any reasonable reading: SEC-06 migrates the session token from browser storage to an `HttpOnly`
-cookie, and `backend/requirements.txt` migrates an implicit, unpinned dependency set into an explicit,
-pinned one. Rather than argue the boundary, the matrix covers all twelve findings in both directions.
-The broader reading costs a page and makes the coverage claim checkable instead of asserted.
+coverage, no gaps." Two parts of this work are migrations: SEC-06 moves the session token from browser
+storage to an `HttpOnly` cookie, and `backend/requirements.txt` moves an implicit, unpinned dependency
+set into an explicit, pinned one.
+
+**This matrix covers all twelve findings in both directions, not those two parts alone.** Section 3.1
+carries the measured coverage figures. [`decision-log.md`](decision-log.md) `DL-395` carries the
+decision behind the wider scope and behind stating the coverage as measured.
 
 ## How to read it
 
@@ -47,18 +49,18 @@ before any of them could be tested. Four rows are labelled **Partial**, with the
 
 | Finding | Weakness and severity | Control that closes it | Files carrying the control |
 | --- | --- | --- | --- |
-| **SEC-01** | Hardcoded credentials in a tracked file. CWE-798, CWE-540. A07:2021, secondary A05:2021. Critical | Environment indirection with no inline default replaces the literal at `docker-compose.yml:30`, so a missing value fails loudly instead of falling back. The Compose variable name at `:31` changes from `JWT_SECRET` to `SECRET_KEY`, the name the backend settings class actually reads. New exclusion and template files keep a generated secret file uncommittable, and the development script generates credentials instead of emitting them and publishes the result with a no-clobber link rather than a move over whatever stands there. The Compose definition carries the whole no-default settings contract in the fail-closed `${VAR:?message}` form, so an unset value stops the container start with a named message instead of interpolating to empty | `.gitignore`, `.env.example`, `infrastructure/docker/docker-compose.yml`, `scripts/setup_dev_environment.sh`, `.github/workflows/ci.yml` |
-| **SEC-02** | Broken authentication through identity mismatch. CWE-287, CWE-863. A01:2021. High | The subject claim is minted as `str(user.id)` and coerced back with `int()` inside a guard that answers 401, so the claim and the queried column share a type. The bare 404 at `security.py:49-50` becomes a 401 carrying `WWW-Authenticate: Bearer`, an `iat` claim joins the existing `exp`, and the outbound user model retypes `id` from `str` to `int` and drops its password-hash field | `backend/app/core/security.py`, `backend/app/api/endpoints/auth.py`, `backend/app/schema/user.py`, `backend/tests/security/test_auth_identity.py` |
+| **SEC-01** | Hardcoded credentials in a tracked file. CWE-798, CWE-540. A07:2021, secondary A05:2021. Critical | Environment indirection with no inline default replaces the literal at `docker-compose.yml:30` in the pre-fix tree, so a missing value fails loudly instead of falling back. The Compose variable name, at `:31` in that tree, changes from `JWT_SECRET` to `SECRET_KEY`, the name the backend settings class actually reads. New exclusion and template files keep a generated secret file uncommittable, and the development script generates credentials instead of emitting them and publishes the result with a no-clobber link rather than a move over whatever stands there. The Compose definition carries the whole no-default settings contract in the fail-closed `${VAR:?message}` form, so an unset value stops the container start with a named message instead of interpolating to empty. The config-guard module asserts this finding's shipped text directly: the credential-scan expressions and both gate stages, the generated-file mode guards, the publish primitive against a destination planted in three forms, and the order `main` runs the provisioning steps in | `.gitignore`, `.env.example`, `infrastructure/docker/docker-compose.yml`, `scripts/setup_dev_environment.sh`, `.github/workflows/ci.yml`, `backend/tests/security/test_config_guards.py` |
+| **SEC-02** | Broken authentication through identity mismatch. CWE-287, CWE-863. A01:2021. High | The subject claim is minted as `str(user.id)` and coerced back with `int()` inside a guard that answers 401, so the claim and the queried column share a type. The bare 404 at `security.py:49-50` in the pre-fix tree becomes a 401 carrying `WWW-Authenticate: Bearer`, at `:59` as shipped, an `iat` claim joins the existing `exp`, and the outbound user model retypes `id` from `str` to `int` and drops its password-hash field | `backend/app/core/security.py`, `backend/app/api/endpoints/auth.py`, `backend/app/schema/user.py`, `backend/tests/security/test_auth_identity.py` |
 | **SEC-03** | Permissive cross-origin policy with credentials. CWE-942, CWE-346. A05:2021. High | `ALLOWED_ORIGINS` becomes a required list whose validator rejects an empty list, `"*"`, the literal `"null"` and any entry that is not a full origin. Matching is exact string equality, with no reflection and no regular expression, and the two middleware wildcards give way to explicit method and header lists. A misconfigured allow-list stops startup | `backend/app/core/config.py`, `backend/app/main.py`, `.env.example`, `backend/tests/security/test_cors_policy.py` |
-| **SEC-04** | Weak password requirements. CWE-521. A07:2021. Medium | A validator on the new `UserCreate` model mirrors the client character set at `validators.ts:18-32`, twelve characters with an upper, a lower, a digit and a special character, and adds a hard maximum at the 72-byte bcrypt ceiling. The maximum is mandatory rather than defensive: at the pinned `bcrypt==4.3.0` a 100-character password is accepted silently, so the library supplies no protection | `backend/app/schema/user.py`, `backend/app/api/endpoints/auth.py`, `backend/tests/security/test_password_policy.py` |
-| **SEC-05** | Improper input validation and mass assignment. CWE-20, CWE-915. A03:2021, secondary A04:2021. High | `UserCreate`, `UserLogin`, `FilterCreate` and `ListingCreate` arrive alongside a new `subscription.py` module, and every create model sets `extra = "forbid"` so an unknown key is rejected rather than absorbed. That single setting is the mass-assignment control for `listings.py:26`, which expands the request body straight into a mapped constructor. A model closes nothing until a route binds it, so the two updated write endpoints are claimants in their own right: `auth.py:192` and `:236` bind `UserCreate` and `UserLogin`, and `listings.py:18` binds `ListingCreate` ahead of that expansion. `filters.py:17` bound `FilterCreate` before this work and supplies the reference pattern; `filters.py:25-37` is a delivered control in its own right, copying the validated allow-list onto mapped `Criteria` children and keeping `created_at` server-owned. Type validation alone is not the whole boundary: each declared float is also checked for finiteness, so `NaN`, `Infinity` and a literal no float can hold are refused rather than stored to compare false against everything afterwards. On the client side the service module maps the filter form's own value onto this contract, so the request that reaches the allow-list is the one the form produces | `backend/app/schema/user.py`, `backend/app/schema/filter.py`, `backend/app/schema/listing.py`, `backend/app/schema/subscription.py`, `backend/app/api/endpoints/auth.py`, `backend/app/api/endpoints/listings.py`, `backend/app/api/endpoints/filters.py`, `frontend/src/services/api.ts`, `frontend/src/schema/filter.ts`, `frontend/src/schema/listing.ts`, `backend/tests/security/test_input_validation.py` |
-| **SEC-06** | Session token in browser-accessible storage. CWE-522, CWE-1004. A07:2021. Medium | Both auth routes set an `HttpOnly`, `Secure`, `SameSite=Strict` cookie while leaving the JSON body untouched, and the guard reads that cookie before the bearer header, so non-browser clients still work. `POST /auth/logout` clears it, because script cannot delete a cookie it cannot read. The frontend drops browser storage, corrects its request path to `/auth/login`, exports `API_BASE_URL` and sends credentials; axios is pinned exactly and the cross-site-token option is deliberately left unset. A pipeline gate scans `frontend/` for browser storage on every run, so the removal cannot be undone silently. The client also declares no path the application does not serve: the call to an unmounted profile route is gone, and a case compares every path the client declares against the application's own route table. **Gap**: clearing the cookie ends the browser's session and revokes nothing — a token already copied elsewhere authenticates until it expires, because verification consults no revocation record | `backend/app/core/security.py`, `backend/app/api/endpoints/auth.py`, `backend/app/core/config.py`, `frontend/src/services/auth.ts`, `frontend/src/services/api.ts`, `frontend/package.json`, `.github/workflows/ci.yml`, `backend/tests/security/test_token_storage.py` |
-| **SEC-07** | Unrestricted authentication attempts. CWE-307. A07:2021. Medium. **Partial** | A limiter with in-memory storage applies five attempts per fifteen minutes to `POST /auth/login`, layered with an in-process counter keyed by the **exact stored identity** so a distributed attempt on one account is also bounded. Keying on the stored value is what makes counter identity and database identity the same: a folded key described a different account than the one being authenticated, which let a wrong-case attempt exhaust a victim's allowance and a success on another spelling clear it. Both credential branches also perform one fixed-cost password verification, against a per-process random stand-in hash when no row matches, so an unknown address is not answered faster than a wrong password. Throttled attempts are logged rather than silently dropped. **Gap**: the state is per-worker and lost on restart, so lockout is neither durable nor multi-replica-safe | `backend/app/main.py`, `backend/app/api/endpoints/auth.py`, `backend/app/core/config.py`, `backend/tests/security/test_login_throttle.py` |
-| **SEC-08** | Information exposure through an error message. CWE-209, CWE-497. A05:2021. Medium | Four global handlers replace the placeholder comment at `main.py:35`, sharing one response envelope and a correlation identifier while full diagnostics go to the server log. Uniformity is the requirement rather than the style, which is why the SEC-02 normalisation of the 404 into a 401 belongs here too: a differential response is an account-state oracle. On the log side, a record factory scoped to this application folds every record to one line at creation — before propagation — so a root or deployment handler cannot re-emit the multiline text a forged value would otherwise produce; a filter on the package logger would not have run at all, because ancestor filters are never consulted | `backend/app/main.py`, `backend/app/core/security.py`, `backend/tests/security/test_error_handling.py` |
-| **SEC-09** | Insecure default initialization of a resource. CWE-1188, CWE-798. A05:2021. High | `PAYPAL_MODE` is restricted to `sandbox` or `live`, and the service reads it from the settings class in place of the hardcoded literal and its manual-edit comment, which stood at `paypal_service.py:11`. A pipeline step asserts that no client-secret pattern appears under `frontend/`; the property already held, so the step converts an accident into an invariant. The charge seam is the second half of this row: a charge authorizes only against a reference the provider confirms for the requested amount, currency and payer, and for a reusable agreement only for the plan the request names, spent once through a local ledger that refuses a replay. An unconditional refusal stood there before, which is an authorization outage rather than a control. `subscriptions.py:24` binds the requested plan on the call, so the plan check has a value to compare | `backend/app/core/config.py`, `backend/app/services/paypal_service.py`, `backend/app/api/endpoints/subscriptions.py`, `.github/workflows/ci.yml`, `backend/tests/security/test_config_guards.py` |
-| **SEC-10** | Cleartext transmission to the database. CWE-319. A02:2021. High. **Partial** | The Cloud SQL instance gains `ip_configuration { ssl_mode = "ENCRYPTED_ONLY" }`, and the engine passes an environment-driven `sslmode` through `connect_args` for PostgreSQL URLs only, because SQLite raises `TypeError` on that argument. Both ends are needed: the Auth Proxy encrypts its own tunnel while the instance keeps accepting unencrypted direct connections until the mode is set. The deprecated `require_ssl` argument is not used. The provider that supplies the encryption argument is itself part of the control, so the configuration bounds it to one major line and the generated lock is tracked with a directory hash for each platform an operator or the pipeline installs from; an unbounded ambient install could otherwise resolve to a build where the argument no longer means what this configuration reads it as meaning. **Gap**: `require` encrypts but performs no server-identity check | `infrastructure/terraform/main.tf`, `infrastructure/terraform/.terraform.lock.hcl`, `backend/app/core/config.py`, `backend/app/db/database.py`, `infrastructure/docker/docker-compose.yml`, `.env.example`, `backend/tests/security/test_config_guards.py` |
-| **SEC-11** | Execution with unnecessary privileges. CWE-250, CWE-269. A01:2021. Medium. **Partial** | The two halves reach different depths. Locally the single all-privileges account splits into an owner role used for schema work and an application role holding only connect, schema usage and table data rights. Two revokes strip the defaults `PUBLIC` holds — `CREATE` on the schema, and `CONNECT` with `TEMPORARY` on the database — and the second is what makes the explicit connect grant mean something: without it every cluster role reached the database and the application role kept a temporary-object capability the granted set never mentions. The batch then reads the **effective** access lists and raises rather than trusting the statements it just issued, substituting the default list where the stored one is null, because an untouched list reads as empty while the defaults still apply. On Cloud SQL, Terraform declares a `google_sql_user` whose password comes from a variable rather than a literal, which separates the account from the instance admin and restricts nothing: the service grants `cloudsqlsuperuser` to every built-in user it creates and this provider carries no grant or revoke resource. **Gaps**: the cloud account stays elevated until an operator runs the statements `SECURITY.md` section 3.2 carries, schema `USAGE` is deliberately left with `PUBLIC`, and nothing here delivers row-level security | `scripts/setup_dev_environment.sh`, `infrastructure/terraform/main.tf`, `infrastructure/terraform/variables.tf`, `infrastructure/terraform/.terraform.lock.hcl`, `.gitignore`, `SECURITY.md`, `backend/tests/security/test_config_guards.py` |
-| **SEC-12** | Insufficiently protected credentials in custody. CWE-522. A05:2021. Medium. **Partial** | Exclusion rules and a value-free template keep secrets out of version control. `SECRET_KEY` gains a `min_length=32` floor grounded in RFC 7518 section 3.2, the three settings that raised `AttributeError` are declared, and a pipeline secret scan enforces the discipline on every run. Provisioning carries the same custody: the setup script generates values instead of emitting literals and creates the file under `umask 077`, and Terraform takes the database password from an `ephemeral`, `sensitive` variable with no default through the write-only `password_wo` argument, so the value reaches neither state nor a plan file. Build context carries the same custody: three context-local ignore files keep the environment file, the `secrets/` directory, certificates, keys, credential JSON, virtual environments, dependency trees, caches and coverage out of every image layer, which `.gitignore` cannot do for an untracked file. The variable's own description is a custody control too: it names the environment variable and a gitignored variable file as the two channels and prohibits the command-line flag, which would put the value in the process arguments any local user can read and in shell history. The generated environment file is published with a link call that fails when the destination exists in any form, so a directory or symlink appearing at that path cannot absorb the file or be written through, and no check precedes the act. **Gaps**: no managed secret store, deployment still authenticates with a long-lived credential, and both container definitions still copy their whole context rather than an allow-list | `.gitignore`, `.env.example`, `SECURITY.md`, `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore`, `infrastructure/docker/Dockerfile.backend`, `infrastructure/docker/Dockerfile.frontend`, `infrastructure/docker/docker-compose.yml`, `backend/app/core/config.py`, `.github/workflows/ci.yml`, `scripts/setup_dev_environment.sh`, `infrastructure/terraform/main.tf`, `infrastructure/terraform/variables.tf`, `infrastructure/terraform/.terraform.lock.hcl`, `backend/tests/security/test_config_guards.py` |
+| **SEC-04** | Weak password requirements. CWE-521. A07:2021. Medium | A validator on the new `UserCreate` model mirrors the client character set at `validators.ts:18-32`, twelve characters with an upper, a lower, a digit and a special character, and adds a hard maximum at the 72-byte bcrypt ceiling. The ceiling is measured, not nominal: at the pinned `bcrypt==4.3.0` a 100-character password is accepted silently. `DL-226` carries the byte-versus-character bound | `backend/app/schema/user.py`, `backend/app/api/endpoints/auth.py`, `backend/tests/security/test_password_policy.py` |
+| **SEC-05** | Improper input validation and mass assignment. CWE-20, CWE-915. A03:2021, secondary A04:2021. High | `UserCreate`, `UserLogin`, `FilterCreate` and `ListingCreate` arrive alongside a new `subscription.py` module, and every create model sets `extra = "forbid"` so an unknown key is rejected rather than absorbed. That single setting is the mass-assignment control for the expansion at `listings.py:21`, which passes the request body straight into a mapped constructor. A model closes nothing until a route binds it, so the two updated write endpoints are claimants in their own right: `auth.py:189` and `:233` bind `UserCreate` and `UserLogin`, and `listings.py:18` binds `ListingCreate` ahead of that expansion. `filters.py:17` bound `FilterCreate` before this work and supplies the reference pattern; `filters.py:25-37` is a delivered control in its own right, copying the validated allow-list onto mapped `Criteria` children and keeping `created_at` server-owned. Type validation alone is not the whole boundary: each declared float is also checked for finiteness, so `NaN`, `Infinity` and a literal no float can hold are refused at the boundary. `DL-335` carries the scope of that check. On the client side the service module maps the filter form's own value onto this contract, so the request that reaches the allow-list is the one the form produces. One claimant is an authority rather than a control: `subscriptions.py:4` names the models the created `schema/subscription.py` had to export, and its section 2 row records the same relation | `backend/app/schema/user.py`, `backend/app/schema/filter.py`, `backend/app/schema/listing.py`, `backend/app/schema/subscription.py`, `backend/app/api/endpoints/auth.py`, `backend/app/api/endpoints/listings.py`, `backend/app/api/endpoints/filters.py`, `backend/app/api/endpoints/subscriptions.py`, `frontend/src/services/api.ts`, `frontend/src/schema/filter.ts`, `frontend/src/schema/listing.ts`, `backend/tests/security/test_input_validation.py` |
+| **SEC-06** | Session token in browser-accessible storage. CWE-522, CWE-1004. A07:2021. Medium | Both auth routes set an `HttpOnly`, `Secure`, `SameSite=Strict` cookie while leaving the JSON body untouched, and the guard reads that cookie before the bearer header, so non-browser clients still work. `POST /auth/logout` clears it server-side, which `DL-255` records as an addition to the route set. The frontend drops browser storage, corrects its request path to `/auth/login`, exports `API_BASE_URL` and sends credentials; axios is pinned exactly and the cross-site-token option is deliberately left unset. A pipeline gate scans `frontend/` for browser storage on every run, so the removal cannot be undone silently. The client also declares no path the application does not serve: the call to an unmounted profile route is gone, and a case compares every path the client declares against the application's own route table. A second regression module asserts the guard's cookie-first read from the other side: a request carrying no session cookie is refused with 401 before anything reads the body. **Gap**: clearing the cookie ends the browser's session and revokes nothing — a token already copied elsewhere authenticates until it expires, because verification consults no revocation record | `backend/app/core/security.py`, `backend/app/api/endpoints/auth.py`, `backend/app/core/config.py`, `frontend/src/services/auth.ts`, `frontend/src/services/api.ts`, `frontend/package.json`, `.github/workflows/ci.yml`, `backend/tests/security/test_token_storage.py`, `backend/tests/security/test_input_validation.py` |
+| **SEC-07** | Unrestricted authentication attempts. CWE-307. A07:2021. Medium. **Partial** | A limiter with in-memory storage applies five attempts per fifteen minutes to `POST /auth/login`, layered with an in-process counter keyed by the **exact stored identity** so a distributed attempt on one account is also bounded. The counter key is the exact value the credential query filters on, so counter identity and database identity are one value; `DL-337` carries the correction from the earlier folded key. Both credential branches perform one fixed-cost password verification, against a per-process random stand-in hash when no row matches, so an unknown address is not answered faster than a wrong password. `DL-338` carries that branch. Throttled attempts are logged rather than silently dropped. **Gap**: the state is per-worker and lost on restart, so lockout is neither durable nor multi-replica-safe | `backend/app/main.py`, `backend/app/api/endpoints/auth.py`, `backend/app/core/config.py`, `backend/tests/security/test_login_throttle.py` |
+| **SEC-08** | Information exposure through an error message. CWE-209, CWE-497. A05:2021. Medium | Four global handlers replace the placeholder comment that stood at `main.py:35` in the pre-fix tree, sharing one response envelope and a correlation identifier while full diagnostics go to the server log. Uniformity is the requirement, so the SEC-02 normalisation of the 404 into a 401 belongs to this row as well: a differential response is an account-state oracle. `DL-241` carries it. On the log side, a record factory scoped to this application folds every record to one line at creation, before propagation, and every C0 control character and the delete character are translated. `DL-339` and `DL-340` carry the placement and the character set | `backend/app/main.py`, `backend/app/core/security.py`, `backend/tests/security/test_error_handling.py` |
+| **SEC-09** | Insecure default initialization of a resource. CWE-1188, CWE-798. A05:2021. High | `PAYPAL_MODE` is restricted to `sandbox` or `live`, and the service reads it from the settings class at `paypal_service.py:74` and `:303`, in place of the hardcoded literal and its manual-edit comment, which stood at `paypal_service.py:11` in the pre-fix tree. A pipeline step asserts that no client-secret pattern appears under `frontend/`; the property already held, so the step converts an accident into an invariant. The charge seam is the second half of this row. A charge authorizes only against a reference the provider confirms for the requested amount, currency and payer, and for a reusable agreement only for the plan the request names. It is spent once through a local ledger that refuses a replay, and `subscriptions.py:24` binds the requested plan on the call. `DL-332`, `DL-124` and `DL-201` carry these three | `backend/app/core/config.py`, `backend/app/services/paypal_service.py`, `backend/app/api/endpoints/subscriptions.py`, `.github/workflows/ci.yml`, `backend/tests/security/test_config_guards.py` |
+| **SEC-10** | Cleartext transmission to the database. CWE-319. A02:2021. High. **Partial** | The Cloud SQL instance gains `ip_configuration { ssl_mode = "ENCRYPTED_ONLY" }`, and the engine passes an environment-driven `sslmode` through `connect_args` for PostgreSQL URLs only, since SQLite raises `TypeError` on that argument. The control sits at both ends: the instance refuses unencrypted connections, and the engine requests encryption. `DL-245` carries the documented local exception for the Auth Proxy topology. The deprecated `require_ssl` argument is not used. The provider that supplies the encryption argument is part of the control: the configuration bounds it to one major line, and the generated lock is tracked with a directory hash for each of the four platforms an operator or the pipeline installs from. `DL-350` carries the lock decision. **Gap**: `require` encrypts but performs no server-identity check | `infrastructure/terraform/main.tf`, `infrastructure/terraform/.terraform.lock.hcl`, `backend/app/core/config.py`, `backend/app/db/database.py`, `infrastructure/docker/docker-compose.yml`, `.env.example`, `backend/tests/security/test_config_guards.py` |
+| **SEC-11** | Execution with unnecessary privileges. CWE-250, CWE-269. A01:2021. Medium. **Partial** | The two halves reach different depths. Locally the single all-privileges account splits into an owner role used for schema work and an application role holding only connect, schema usage and table data rights. Two revokes strip the defaults `PUBLIC` holds: `CREATE` on the schema, and `CONNECT` with `TEMPORARY` on the database. The batch then reads the **effective** access lists and raises rather than trusting the statements it just issued, substituting the default list where the stored one is null. `DL-36`, `DL-353` and `DL-354` carry those three. On Cloud SQL, Terraform declares a `google_sql_user` whose password comes from a variable rather than a literal, which separates the account from the instance admin and restricts nothing; the out-of-band statements in `SECURITY.md` section 3.2 are what narrow it, and `DL-293` carries the declaration. **Gaps**: the cloud account stays elevated until an operator runs the statements `SECURITY.md` section 3.2 carries, schema `USAGE` is deliberately left with `PUBLIC`, and nothing here delivers row-level security | `scripts/setup_dev_environment.sh`, `infrastructure/terraform/main.tf`, `infrastructure/terraform/variables.tf`, `infrastructure/terraform/.terraform.lock.hcl`, `.gitignore`, `SECURITY.md`, `backend/tests/security/test_config_guards.py` |
+| **SEC-12** | Insufficiently protected credentials in custody. CWE-522. A05:2021. Medium. **Partial** | Exclusion rules and a value-free template keep secrets out of version control. `SECRET_KEY` gains a `min_length=32` floor grounded in RFC 7518 section 3.2, the three settings that raised `AttributeError` are declared, and a pipeline secret scan enforces the discipline on every run. Provisioning carries the same custody. The setup script generates values instead of emitting literals and creates the file under `umask 077`, per `DL-40` and `DL-181`. Terraform takes the database password from an `ephemeral`, `sensitive` variable with no default through the write-only `password_wo` argument, so the value reaches neither state nor a plan file. Build context carries the same custody: three context-local ignore files keep the environment file, the `secrets/` directory, certificates, keys, credential JSON, virtual environments, dependency trees, caches and coverage out of every image layer, which `.gitignore` cannot do for an untracked file. The variable's own description is a custody control too: it names the environment variable and a gitignored variable file as the two supported channels and prohibits the command-line flag. `DL-369` carries that wording. The generated environment file is published with a link call that fails when the destination exists in any form, so a directory or symlink appearing at that path cannot absorb the file or be written through, and no check precedes the act. **Gaps**: no managed secret store, deployment still authenticates with a long-lived credential, and both container definitions still copy their whole context rather than an allow-list | `.gitignore`, `.env.example`, `SECURITY.md`, `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore`, `infrastructure/docker/Dockerfile.backend`, `infrastructure/docker/Dockerfile.frontend`, `infrastructure/docker/docker-compose.yml`, `backend/app/core/config.py`, `.github/workflows/ci.yml`, `scripts/setup_dev_environment.sh`, `infrastructure/terraform/main.tf`, `infrastructure/terraform/variables.tf`, `infrastructure/terraform/.terraform.lock.hcl`, `backend/tests/security/test_config_guards.py` |
 | **Prerequisite** | No dependency manifest, so the dependency surface had never been enumerated. CWE-1104. A06:2021 | `backend/requirements.txt` pins nineteen packages exactly, fourteen runtime and five for test and audit tooling. Two pins are load-bearing beyond version hygiene: `bcrypt==4.3.0` prevents a passlib capability probe that would break every password hash, and omitting a multipart parser keeps six advisories that cannot be patched on this runtime out of the closure | `backend/requirements.txt`, `.github/workflows/ci.yml` |
 
 ---
@@ -66,7 +68,7 @@ before any of them could be tested. Four rows are labelled **Partial**, with the
 ## 2. Direction B — file to control to finding
 
 One row per delivered path, grouped by directory: the thirty-nine of the planned change set plus the
-six delivered outside it, which section 3.4 names with their reasoning. **Mode** is `CREATE`, `UPDATE`
+eight delivered outside it, which section 3.4 names with their departure recorded. **Mode** is `CREATE`, `UPDATE`
 or `REFERENCE`, where a reference file is read as an authority and deliberately left unchanged, and a
 mode reading *delivered* differs from the plan. Controls are named, not re-explained; section 1 holds
 the mechanism.
@@ -89,7 +91,7 @@ the mechanism.
 | `backend/app/main.py` | UPDATE | Explicit method and header lists on the cross-origin middleware, the limiter registration and its exceeded handler, the four global exception handlers, and the record factory that folds every application record to one line before propagation. Also corrects the import source for `Base`, which is boot-blocker layer four | SEC-03, SEC-07, SEC-08 |
 | `backend/app/core/security.py` | UPDATE | Integer coercion of the subject inside a 401 guard, the uniform 401 with `WWW-Authenticate: Bearer`, the `iat` claim, and the cookie-before-header read | SEC-02, SEC-06, SEC-08 |
 | `backend/app/api/endpoints/auth.py` | UPDATE | Mints the subject as the user identifier, binds `UserCreate` and `UserLogin` so the password reaches a validating allow-list before hashing, sets and clears the session cookie, adds `POST /auth/logout`, and applies the login limit keyed on the exact stored identity. Both credential branches perform one fixed-cost verification, against a per-process random stand-in hash when no row matches. Also supplies the non-null `created_at` without which registration always failed | SEC-02, SEC-04, SEC-05, SEC-06, SEC-07 |
-| `backend/app/api/endpoints/listings.py` | UPDATE | The model import at `:7` extends to include `User`, resolving the annotation at `:18` and clearing boot-blocker layer two. The same signature binds `ListingCreate`, which is what makes the allow-list reach the expansion at `:26`; see the SEC-05 row in section 1. The route answers a sanitized 500 and persists nothing, for the schema reasons section 3.4 records | Enabling repair, SEC-05 |
+| `backend/app/api/endpoints/listings.py` | UPDATE | The model import at `:7` extends to include `User`, resolving the annotation at `:18` and clearing boot-blocker layer two. The same signature binds `ListingCreate`, so the allow-list reaches the expansion at `:21`; see the SEC-05 row in section 1. The route answers a sanitized 500 and persists nothing, for the schema reasons section 3.4 records | Enabling repair, SEC-05 |
 | `backend/app/schema/user.py` | UPDATE | Strict create and login models, the password policy with its byte ceiling, the integer identifier, and removal of the password-hash field from the outbound model | SEC-02, SEC-04, SEC-05 |
 | `backend/app/schema/filter.py` | UPDATE | Strict allow-list of writable filter fields, applied to the nested criteria as well | SEC-05 |
 | `backend/app/schema/listing.py` | UPDATE | Strict allow-list of writable listing fields, the control for the mass-assignment site, with a finiteness check on each declared float so a non-finite literal is refused at the boundary rather than stored | SEC-05 |
@@ -115,7 +117,7 @@ longer exploitable.
 | `backend/tests/security/test_token_storage.py` | CREATE | Asserts the three cookie attributes, that the JSON body keeps its exact key set, that a cookie-only request authenticates, that the bearer fallback still works, and that logout ends the session | SEC-06 |
 | `backend/tests/security/test_login_throttle.py` | CREATE | Asserts that the sixth consecutive failed login returns 429, that the throttled body uses the uniform envelope, and that throttled attempts are logged. Two stored accounts differing only in local-part case hold separate counters, and a success on one neither clears nor exhausts the other. An unknown address and a wrong password are asserted to do equal work at the hasher, by invocation count rather than by wall clock | SEC-07 |
 | `backend/tests/security/test_error_handling.py` | CREATE | Asserts a sanitized 500 carrying no traceback or internal detail, a 422 carrying field names only, envelope uniformity across handlers, and a correlation identifier in both response and log. A root handler with a stock formatter is attached and asserted to receive exactly one line, which is the assertion a formatter on the owned handler alone cannot satisfy | SEC-08 |
-| `backend/tests/security/test_config_guards.py` | CREATE | Asserts the payment-mode domain, the signing-key length floor, and that the transport argument is applied for PostgreSQL and withheld for SQLite. It drives the charge seam and the subscription route through their production paths, in both the authorizing and the refusing direction, and asserts the reference is spendable once. It holds the privilege split by reading the shipped statements — the granted set compared whole, both `PUBLIC` revokes present, no broad privilege conferred, no role password in a process argument list — and asserts the batch's own effective-access verification is there to catch a statement that applied to the wrong role. It executes the provisioning publish against a destination planted after the source exists, in three forms. It reads the pipeline's own expressions and executes both gates against planted controls. And it asserts the build definitions are consumable: each named image definition exists, no declared value interpolates to empty, the backend receives every required setting, and the exposed, published and probed ports agree | SEC-01, SEC-09, SEC-10, SEC-11, SEC-12 |
+| `backend/tests/security/test_config_guards.py` | CREATE | Asserts the payment-mode domain, the signing-key length floor, and that the transport argument is applied for PostgreSQL and withheld for SQLite. It drives the charge seam and the subscription route through their production paths, in both the authorizing and the refusing direction, and asserts the reference is spendable once. It holds the privilege split by reading the shipped statements: the granted set compared whole, both `PUBLIC` revokes present, no broad privilege conferred, and no role password in a process argument list. It also asserts the batch's own effective-access verification is present, which `DL-355` returns to the suite separately. It executes the provisioning publish against a destination planted after the source exists, in three forms. It reads the pipeline's own expressions and executes both gates against planted controls. And it asserts the build definitions are consumable: each named image definition exists, no declared value interpolates to empty, the backend receives every required setting, and the exposed, published and probed ports agree | SEC-01, SEC-09, SEC-10, SEC-11, SEC-12 |
 | `backend/tests/test_api.py` | REFERENCE | The authority for existing harness conventions. Verified byte-identical, and it still fails collection with the same import error as before, so the new harness did not change its outcome | Authority for the harness |
 
 ### 2.4 Frontend
@@ -124,7 +126,7 @@ longer exploitable.
 | --- | --- | --- | --- |
 | `frontend/src/services/auth.ts` | UPDATE | Removes all browser token storage, corrects the request path to `/auth/login`, and delegates logout to the server route that can clear an `HttpOnly` cookie. Declares the authentication response contract the frozen login body actually carries, as the exported `AuthSession` type, in place of a user object the body has never held | SEC-06 |
 | `frontend/src/services/api.ts` | UPDATE | Exports the base URL that the auth module already imported, and sends credentials so the browser transmits the session cookie; the cross-site-token option is deliberately left unset. Declares the wire type of each response instead of casting to one, maps the filter form's own value onto the writable-field allow-list before sending it, and declares no path the application does not serve — the call to an unmounted profile route is gone | SEC-06, SEC-05 |
-| `frontend/src/schema/listing.ts`, `frontend/src/schema/filter.ts` | UPDATE | Exported declarations of the bodies the read and write paths actually carry: integer identifiers, snake_case names, ISO-8601 date-time strings, and a separate `FilterCreate` naming the writable fields. `filter.ts` also declares the form's own value shape, so the mapper's input is a contract rather than an assumption | SEC-05 |
+| `frontend/src/schema/listing.ts`, `frontend/src/schema/filter.ts` | **UPDATE, delivered** | Exported declarations of the bodies the read and write paths actually carry: integer identifiers, snake_case names, ISO-8601 date-time strings, and a separate `FilterCreate` naming the writable fields. `filter.ts` also declares the form's own value shape, so the mapper's input is a contract rather than an assumption | SEC-05 |
 | `frontend/package.json` | UPDATE | One line: the axios caret range becomes an exact pin, removing a declared floor that sat inside the CVE-2023-45857 range now that credentialed mode is enabled | SEC-06 prerequisite |
 | `frontend/src/utils/validators.ts` | REFERENCE | The authority for the password character set at `:18-32`, mirrored by the server validator so the two cannot drift. Verified byte-identical | Authority for SEC-04 |
 
@@ -135,7 +137,7 @@ longer exploitable.
 | `infrastructure/docker/Dockerfile.frontend` | UPDATE | Declares a build argument for each frontend build variable ahead of `npm run build`, so both reach the bundle from the build environment and neither is a literal in the image definition. Resolves the install from the tracked manifest alone, since no lock file is tracked and an install demanding one cannot run from a clean checkout | SEC-12 |
 | `infrastructure/docker/Dockerfile.backend` | **UPDATE, delivered** | Places the build context where the application's own package path resolves and starts the process above it, so the image runs the module the application declares rather than one that does not exist, and exposes the port the definition publishes. Planned outside the map; see section 3.4 | SEC-12 |
 | `infrastructure/docker/docker-compose.yml` | UPDATE | Environment indirection in the fail-closed `${VAR:?message}` form for every build argument and every no-default setting, the corrected secret variable name, the complete backend settings contract, and the documented local transport exception for the Auth Proxy topology. Each service names the image definition that exists relative to its context, and each healthcheck names a program its own base image carries | SEC-01, SEC-10, SEC-12 |
-| `infrastructure/terraform/main.tf` | UPDATE | The encryption-only IP configuration on the Cloud SQL instance, a separate application database account whose password reaches neither state nor a plan file, and the bounded provider and command-line ranges that keep an ambient install from resolving to a build where those arguments no longer hold. It carries no privilege restriction, which is a provider limit rather than an omission | SEC-10, SEC-11, SEC-12 |
+| `infrastructure/terraform/main.tf` | UPDATE | The encryption-only IP configuration on the Cloud SQL instance, a separate application database account whose password reaches neither state nor a plan file, and the bounded provider and command-line ranges that pair with the tracked lock. It carries no privilege restriction, which is a provider limit rather than an omission; `DL-350` and `DL-368` carry both | SEC-10, SEC-11, SEC-12 |
 | `infrastructure/terraform/.terraform.lock.hcl` | **CREATE, delivered** | The provider selection itself: one directory hash for each of the four platforms an operator or the pipeline installs from, the registry checksum set, and the constraint the configuration declared when it was generated. A range admits many builds; this file chooses one. Planned outside the map; see section 3.4 | SEC-10, SEC-11, SEC-12 |
 | `infrastructure/terraform/variables.tf` | UPDATE | The application account's name, its write-only password and the counter that reapplies a rotation. Each one is read by `main.tf`; the configuration declares no variable it never reads. The password variable's description names the two supported input channels and prohibits the command-line flag that would expose the value in the process arguments and in shell history | SEC-11, SEC-12 |
 | `scripts/setup_dev_environment.sh` | UPDATE | Generated rather than literal credentials, published with a link that fails when anything already stands at the destination, and the owner plus application role split that replaces the unrestricted grant. Both default `PUBLIC` privilege sets are revoked, and the batch closes by reading the effective access lists and raising if they disagree. Three of the four original credential-scan hits were in this file | SEC-01, SEC-11, SEC-12 |
@@ -144,7 +146,7 @@ longer exploitable.
 
 | File | Mode | Control it carries | Closes |
 | --- | --- | --- | --- |
-| `.github/workflows/ci.yml` | UPDATE | The four enforcement gates and the authoritative definition of each scan pattern: the dependency audit with its justified suppressions and a staleness check that reads both identifiers and aliases from the audit's own report, the credential scan in its two stages — a pattern that matches an assignment with or without spaces and quotes, then a reviewed allow-list — the frontend client-secret guard, and the browser-storage guard. Its frontend install resolves from the manifest exactly as the image does | SEC-01, SEC-06, SEC-09, SEC-12, Prerequisite |
+| `.github/workflows/ci.yml` | UPDATE | The four enforcement gates, and the authoritative definition of each scan pattern. The dependency audit carries its justified suppressions and a staleness check that reads both identifiers and aliases from the audit's own report. The credential scan runs in two stages: a pattern matching an assignment with or without spaces and quotes, then a reviewed allow-list. The other two are the frontend client-secret guard and the browser-storage guard. Its frontend install resolves from the manifest exactly as the image does. `DL-345`, `DL-207`, `DL-208`, `DL-209` and `DL-210` carry the five | SEC-01, SEC-06, SEC-09, SEC-12, Prerequisite |
 
 ### 2.7 Security documentation
 
@@ -162,8 +164,8 @@ of the twelve, and their presence is a rule obligation rather than a coverage ga
 
 ### 3.1 The arithmetic
 
-The table below is the **planned** map. Delivery departs from it on one path and adds three, and
-section 3.4 carries both departures with their reasoning.
+The table below is the **planned** map. Delivery departs from it on two paths and adds eight; section
+3.4 carries every departure, and `DL-391` carries the decision behind the delivered arithmetic.
 
 | Mode | Count | Where they sit |
 | --- | --- | --- |
@@ -173,28 +175,33 @@ section 3.4 carries both departures with their reasoning.
 | DELETE | 0 | See section 3.2 |
 | **Total** | **39** | Section 2 carries one row for each |
 
-Both directions are complete, and the claim is checkable rather than asserted. Every one of `SEC-01`
-through `SEC-12` has at least one file in section 1; every file in section 2 traces to a finding, to
-the dependency prerequisite, to an enabling repair, or to Rule 1; and the two directions agree in both
-senses — no section-1 claimant is missing the finding from its section-2 row, and no section-2 row
-carries a finding its section-1 claimant list omits. The two tables were read against each other to
-confirm that, rather than checked by eye.
+**Coverage is stated as measured, not asserted.** An edge-set comparison extracted from the two
+sections reports **82 edges in Direction A and 82 non-exempt edges in Direction B, with an empty
+difference in both directions**. It also reports **5 exempt edges across the 6 declared-asymmetric
+rows** below, and **47 unique paths at 20 CREATE, 24 UPDATE and 3 REFERENCE**. `DL-395` carries the
+decision to state the claim this way.
 
-Six rows are deliberately asymmetric, so a cross-check has to allow for them. Three REFERENCE rows read
-`Authority for`, and the harness row reads `Verification for`: those files supply the authority a
-control was transcribed from, or the scaffolding the assertions run on, and none of them carries a
-control. The two security documents carry a Rule 1 obligation rather than a finding, as section 2.7
-states. All six therefore appear in section 2 against findings whose section-1 claimant lists do not
-name them. Every other row is symmetric, the eight regression-test files, `filters.py` and
-`subscriptions.py` included — each is named in section 1 by the finding it carries or asserts.
+What that measurement covers: every one of `SEC-01` through `SEC-12` has at least one file in section
+1, and every file in section 2 traces to a finding, to the dependency prerequisite, to an enabling
+repair, or to Rule 1. No section-1 claimant is missing the finding from its section-2 row, and no
+section-2 row carries a finding its section-1 claimant list omits.
 
-Version control settles the delivered mode of all thirty-nine rows. Measured against the last pre-work
-commit, each CREATE is absent there, each UPDATE differs from it, and three of the five paths planned as
+Six rows are deliberately asymmetric, and a cross-check has to allow for them. Three REFERENCE rows
+read `Authority for` and the harness row reads `Verification for`; those four files supply an authority
+or the scaffolding the assertions run on, and none carries a control. The two security documents carry
+a Rule 1 obligation rather than a finding, as section 2.7 states. All six appear in section 2 against
+findings whose section-1 claimant lists do not name them. Every other row is symmetric, the eight
+regression-test files, `filters.py` and `subscriptions.py` included; `DL-390` carries the reconciliation
+that made the last three of them so.
+
+Version control settles the delivered mode of every row. Measured against the last pre-work commit,
+each CREATE is absent there, each UPDATE differs from it, and three of the five paths planned as
 REFERENCE are byte-identical to it. Two carry controls instead: `backend/app/api/endpoints/filters.py`
-carries a SEC-05 control, and `backend/app/api/endpoints/subscriptions.py` binds the requested plan on
-the charge call, so both are recorded in section 2 as delivered updates. Six further paths the map never
-listed carry a control: the three build-context ignore files, both image definitions, and the provider
-lock. Section 3.4 states every departure and records what else the branch touches.
+carries a SEC-05 control and `backend/app/api/endpoints/subscriptions.py` binds the requested plan on
+the charge call, so section 2 records both as delivered updates. Eight further paths the map never
+listed carry a control: the three build-context ignore files, both image definitions, the provider
+lock, and both frontend schema declarations. Section 3.4 states every departure and records what else
+the branch touches.
 
 ### 3.2 Zero deletions, stated deliberately
 
@@ -210,21 +217,25 @@ is a dependency decision, not a file deletion.
 ### 3.3 Files whose absence is the point
 
 Three of the five paths planned as references are read as authorities and deliberately left unchanged:
-`backend/app/db/models.py`, `frontend/src/utils/validators.ts` and `backend/tests/test_api.py`. Listing
-them is what shows a reviewer that the model file was consulted and then left alone, rather than
-missed. That file matters most: no column and no default was added, because with no migration tooling
-neither would ever reach an existing table — which is also why the filter repair in section 3.4 needed
-none.
+`backend/app/db/models.py`, `frontend/src/utils/validators.ts` and `backend/tests/test_api.py`. All
+three are byte-identical to the last pre-work commit, so each was consulted and then left alone rather
+than missed.
+
+No column and no default was added to the model file, and the filter repair in section 3.4 adds none
+either. `DL-247` carries that decision and the three capabilities it defers.
 
 ### 3.4 Plan versus delivery
 
-**Delivery departs from the planned classification on eight paths, and the table below carries every
+**Delivery departs from the planned classification on ten paths, and the table below carries every
 one.** Across the 39 planned paths: 16 created, **20 updated, 3 references left byte-identical**, no
 deletions — the two differences being `backend/app/api/endpoints/filters.py` and
 `backend/app/api/endpoints/subscriptions.py`, both planned REFERENCE and both delivered UPDATE.
-**Six further paths are delivered outside the map**: the three build-context ignore files, both image
-definitions, and the Terraform provider lock. Delivered totals are therefore **20 created, 22 updated,
-3 byte-identical references, 45 paths**.
+
+**Eight further paths are delivered outside the map**: the three build-context ignore files, the
+Terraform provider lock, both image definitions, and both frontend schema declarations. Four of the
+eight are new files and four are modifications, measured against the last pre-work commit. Delivered
+totals are therefore **20 created, 24 updated, 3 byte-identical references, 47 paths**, which is what
+the edge-set comparison in section 3.1 recomputes from this file. `DL-391` carries the decision.
 
 Three of those departures were withdrawn by an earlier pass and all three are restored here. A
 withdrawal and a restoration are each a decision in their own right rather than a quiet tidy-up.
@@ -237,23 +248,23 @@ withdrawal and a restoration are each a decision in their own right rather than 
 | `infrastructure/terraform/.terraform.lock.hcl` | not planned | **CREATE, delivered** | The encryption argument and the write-only password pair are provider features, and an untracked lock left the selection of that provider to whatever a clean checkout happened to resolve. The lock is generated for four platforms and tracked. Log section 41, `DL-349` and `DL-350` |
 | `infrastructure/docker/Dockerfile.frontend` | not planned | **UPDATE, delivered** | The client bundle embeds `REACT_APP_API_BASE_URL` and `REACT_APP_PAYPAL_CLIENT_ID` at compile time, so the only place they can be supplied is this file's build stage. The template calls itself authoritative for every variable, which it could not be while these two had nowhere to arrive. The same file also carries the pinned Node line, raised for a platform runtime floor. Log section 40, `DL-309` and `DL-310` |
 | `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore` | not planned | **CREATE, delivered** | Three paths outside the planned map carry a SEC-12 control the map did not anticipate. `Dockerfile.backend:14` and `Dockerfile.frontend:14` both run `COPY . .`, so without them every path in a build context enters the image, an untracked `.env` included — the one secret `.gitignore` cannot reach. An earlier pass removed them to keep the path count exact and reopened that route. Log section 40, `DL-300` and `DL-301`, which supersede `DL-287` and reinstate `DL-127` through `DL-129` |
+| `frontend/src/schema/listing.ts`, `frontend/src/schema/filter.ts` | not planned | **UPDATE, delivered** | Two paths outside the planned map carry a SEC-05 control. Each declares the body its read or write path actually carries — integer identifiers, snake_case names, ISO-8601 date-time strings — and `filter.ts` adds a `FilterCreate` naming the writable fields plus the form's own value type. The client sends that allow-list rather than a cast object. Log section 40.3, `DL-306` and `DL-308`; the section scope line there names both files literally |
 
 Sections 2 and 3.1 state the planned scope. Where delivery exceeds it, the excess is a control this
 table names rather than a difference a reader has to find in a diff, and section 2 carries a row for
 every delivered path.
 
-Four further withdrawals in an earlier log section changed content without changing any classification,
-so they carry no row above: the provider logger stayed capped while the transport replacement beside it
-went, the pagination bounds and the listing-side value ranges went while the wire-type guards stayed,
-the advisory register settled at fifteen entries, and the login throttle was recorded as it ships. Log
-section 38 carries all seven of that pass's withdrawals together, `DL-286` through `DL-292`, which is
-the shortest path to that set.
+Four further withdrawals in an earlier log section changed content without changing any
+classification, so they carry no row above. The provider logger stayed capped while the transport
+replacement beside it went. The pagination bounds and the listing-side value ranges went while the
+wire-type guards stayed. The advisory register settled at fifteen entries, and the login throttle was
+recorded as it ships. Log section 38 carries all seven of that pass's withdrawals, `DL-286` through
+`DL-292`.
 
-Two of them were reversed by the security assessment that followed, and both reversals are rows above.
-The payment service's charge verifier is back, because the withdrawal left an authorization outage in
-its place, and the listing-side finiteness check is back — not as a value range, which stays withdrawn,
-but as the type-domain check that keeps a non-finite literal out of a float column. Log section 41,
-`DL-332` and `DL-335`.
+Two of them were reversed by the security assessment that followed, and both reversals are rows
+above. The payment service's charge verifier is back. The listing-side finiteness check is back as a
+type-domain check that keeps a non-finite literal out of a float column, not as the value range, which
+stays withdrawn. Log section 41, `DL-332` and `DL-335`.
 
 ### 3.5 What this matrix deliberately omits
 
@@ -302,15 +313,18 @@ the exact expression; [`SECURITY.md`](../../SECURITY.md) section 2.6 covers all 
 [`decision-log.md`](decision-log.md) sections 36 and 41.6 carry the reasoning.
 
 Exemption is not the same as admission, and the gate now has both. The pattern matches an assignment
-with or without spaces and quotes, which is what closes the formatter-compliant spelling, and a second
-reviewed stage admits four named classes: a value read from configuration, a name denoting a policy
-bound or metadata, an upper-case placeholder token, and a line carrying the reviewed marker with a
-reason. Measured on the current tree: **21 lines match the pattern, all 21 are admitted, and the gate
-reports 0.** The marker sits on four test-fixture lines, all under `backend/tests/`, and on no line of
-application source; the guard tests pin that count and require every marked line to carry a reason.
+with or without spaces and quotes, which reaches the formatter-compliant spelling. A second reviewed
+stage admits four named classes: a value read from configuration, a name denoting a policy bound or
+metadata, an upper-case placeholder token, and a line carrying the reviewed marker with a reason.
+`DL-208` carries the pattern's breadth and the four spellings left uncovered.
+
+Measured on the current tree: **21 lines match the pattern, all 21 are admitted, and the gate reports
+0.** The marker sits on four test-fixture lines, all under `backend/tests/`, and on no line of
+application source. The guard tests pin that count and require every marked line to carry a reason.
 
 Gate three's three hits were the write, the remove and the read of the stored token, all in the
-frontend authentication service at `auth.ts:11`, `:21` and `:25`, with the key declared at `:5`. Gate
+pre-fix frontend authentication service at `auth.ts:11`, `:21` and `:25`, with the key declared at
+`:5`. Gate
 two never had a hit, so its pipeline step prevents a regression rather than closing one.
 
 ### 4.2 Test and style baselines
@@ -320,8 +334,8 @@ that "no new failures" means something.
 
 | Measure | Before | Now |
 | --- | --- | --- |
-| Tests collected under `backend/` | 0, with 3 collection errors | 688 collected, with the same 3 collection errors |
-| `tests/security` result | did not exist | 688 passed, 1 warning |
+| Tests collected under `backend/` | 0, with 3 collection errors | 689 collected, with the same 3 collection errors |
+| `tests/security` result | did not exist | 689 passed, 1 warning |
 | Style findings under `backend/` | 129 | 109 |
 | Undefined names | 4 | 1 |
 
@@ -334,8 +348,9 @@ the SQLAlchemy 2.0 moved-name deprecation, raised by a reference file no change 
 
 The three pre-existing test modules still fail to import, for reasons that predate this work and are
 outside its scope. The four undefined names were `listings.py:18`, `subscriptions.py:54` and two
-annotation sites in `paypal_service.py`; three are gone, and the one that remains is the out-of-scope
-missing datetime import in the subscription endpoint. Creating the manifest is what allowed the
+annotation sites in `paypal_service.py`, all four located in the pre-fix tree; three are gone, and the
+one that remains is the out-of-scope missing datetime import, whose shipped use is the comparison at
+`subscriptions.py:60`. Creating the manifest is what allowed the
 pipeline to reach these steps at all, so they are running for the first time rather than newly
 failing.
 
@@ -343,7 +358,7 @@ failing.
 
 Plan review does not run today, and it has **two** independent pre-existing blockers rather than one.
 `outputs.tf` references nine resource addresses of which only two are declared in `main.tf`; the seven
-absent ones are three storage buckets, two messaging topics and two functions. Separately, `main.tf:34`
+absent ones are three storage buckets, two messaging topics and two functions. Separately, `main.tf:45`
 reads `var.gke_num_nodes`, which `variables.tf` declares nowhere.
 
 Both blockers predate this work and neither follows from it. Neither breaks an automated gate either,
@@ -391,12 +406,14 @@ Two claims are worth stating precisely, because the obvious citation for each do
   is first-hand instead, and stronger for it. Five layers of import-time failure stood between the
   repository and a running process. The guard also compared a subject typed `str` against the integer
   primary key declared at `models.py:10` — pre-fix, at lines 48 and 35 of `core/security.py`, whose
-  shipped equivalents are the coercion at `security.py:62` and the filter at `:88`.
+  shipped equivalents are the coercion at `security.py:84` and the filter at `:85`.
 
 ### 5.2 Named there, not delivered here
 
 Each gap below is either on the exclusion list supplied with the brief or is one of the four labelled
-partial remediations. [`decision-log.md`](decision-log.md) section 35 records each one;
+partial remediations. [`decision-log.md`](decision-log.md) carries both sets: section 32 holds the four
+partial remediations with the gap named in each, and section 35 holds the design intent named in the
+sibling specifications that this work does not deliver.
 [`SECURITY.md`](../../SECURITY.md) section 4 lists the follow-ons in priority order.
 
 | Design intent | Status here |

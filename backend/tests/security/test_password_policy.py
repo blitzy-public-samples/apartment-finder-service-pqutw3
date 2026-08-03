@@ -6,16 +6,16 @@ hashes anything. ``frontend/src/utils/validators.ts`` carries the
 matching client-side character set.
 
 Login cases pin the other edge of the policy. ``UserLogin`` carries no
-policy rule: an account whose credential predates the policy still
-authenticates, and a shape the hasher itself refuses receives the
-counted uniform 401 that a wrong secret receives.
+policy rule. An account whose credential predates the policy still
+authenticates, and a shape the hasher refuses receives the counted uniform
+401 a wrong secret receives.
 
 The cases run at two layers. The HTTP layer pins the status code, the
 field name and the absence of any database row. The schema layer pins
 the character set and reports a direct failure when a rule moves.
 
-The stored value is checked too. Every ceiling below is a bcrypt input
-limit, so the scheme that produced the hash is covered by these cases.
+The stored value is checked too: every ceiling below is a bcrypt input
+limit, so the scheme that produced the hash is asserted as well. DL-384
 """
 import logging
 import re
@@ -67,8 +67,7 @@ CLIENT_DIGIT_RULE = "hasNumber"
 CLIENT_SPECIAL_RULE = "hasSpecialChar"
 CLIENT_LENGTH_RULE = "minLength"
 
-# validators.ts:22 names the digit class by its shorthand rather than by
-# an explicit range
+# validators.ts:22 names the digit class by its shorthand
 CLIENT_DIGIT_SHORTHAND = "\\d"
 
 EXCLUDED_PUNCTUATION = ("~", "`", " ")
@@ -164,8 +163,7 @@ def _user_row_count(session, email):
 
 
 def _stored_password_hash(session, email):
-    # SEC-04: reads the column the route wrote; the assertion covers
-    # what an attacker reaching the table would find
+    # SEC-04: reads the column the route wrote, as stored
     return session.execute(
         text("SELECT hashed_password FROM users WHERE email = :email"),
         {"email": email},
@@ -183,10 +181,10 @@ def _client_rule_line(identifier):
     """Return the line of validators.ts that declares one rule."""
     assert CLIENT_VALIDATOR.is_file(), CLIENT_VALIDATOR
     source = CLIENT_VALIDATOR.read_text(encoding="utf-8")
-    # the declaration, not the reference the return statement makes to it
+    # matches the declaration line alone
     declaration = "const {0}".format(identifier)
     matches = [line for line in source.splitlines() if declaration in line]
-    # a rule declared twice would make the parse below ambiguous
+    # exactly one declaration keeps the parse below unambiguous
     assert len(matches) == 1, (identifier, matches)
     return matches[0]
 
@@ -235,18 +233,15 @@ def _client_class_members(source):
 def test_special_set_mirrors_the_client_rule():
     """The server set holds the same characters validators.ts:23 does.
 
-    The client file is read and its character class parsed, so a
-    character added to or dropped from either side fails here.
-
-    Tilde, backtick and space stay outside the set on both sides, so the
-    rule names an explicit set and not any punctuation.
+    The client file is read and its character class parsed, then compared
+    against the server set. Tilde, backtick and space are asserted absent
+    from both sides. DL-384
     """
     parsed = _client_class_members(
         _client_regex_source(CLIENT_SPECIAL_RULE)
     )
 
-    # the class names each character once, so a duplicate on either side
-    # is a drift rather than a harmless repeat
+    # the class names each character once; a duplicate is a drift
     assert len(parsed) == SPECIAL_COUNT, "".join(parsed)
     assert len(set(parsed)) == SPECIAL_COUNT, "".join(parsed)
 
@@ -267,8 +262,7 @@ def test_length_and_class_rules_mirror_the_client_rule():
 
     validators.ts:19-22 carries the minimum length and the uppercase,
     lowercase and digit classes. Each is read from that file and compared
-    against the constant the server validator applies, so a rule relaxed
-    on one side fails here rather than passing on both.
+    against the constant the server validator applies. DL-384
     """
     length_rule = _client_rule_line(CLIENT_LENGTH_RULE)
     declared = re.search(
@@ -318,7 +312,7 @@ def test_compliant_password_registers(client, db_session, unique_email):
 def test_password_one_character_short_is_rejected(client, unique_email):
     """Eleven characters fail the length rule.
 
-    All four character classes are present, so length alone decides the
+    All four character classes are present; length alone decides the
     outcome.
     """
     assert len(ELEVEN_CHARACTERS) == MIN_LENGTH - 1
@@ -333,8 +327,8 @@ def test_password_one_character_short_is_rejected(client, unique_email):
 def test_missing_character_class_is_rejected(client, unique_email, password):
     """A password holding three of the four character classes fails.
 
-    Each value clears the minimum length, so the missing class is the
-    only cause.
+    Each value clears the minimum length; the missing class is the only
+    cause.
     """
     assert len(password) >= MIN_LENGTH
 
@@ -383,8 +377,7 @@ def test_multibyte_password_over_the_byte_ceiling_is_rejected(
 ):
     """A multibyte password past 72 UTF-8 bytes fails.
 
-    Both values hold fewer than 72 characters, so the ceiling counts
-    bytes.
+    Both values hold fewer than 72 characters; the ceiling counts bytes.
     """
     assert len(password) <= MAX_BYTES
     assert len(password.encode("utf-8")) == expected_bytes
@@ -457,9 +450,8 @@ def test_the_stored_secret_is_a_bcrypt_hash(
     """Registration stores a bcrypt hash at the pinned work factor.
 
     The 72-byte ceiling every case above asserts is the bcrypt input
-    limit, so a different scheme would leave the whole policy arbitrary.
-    A reversible or fast digest would also hand an attacker who reads
-    one table every password in it (CWE-916).
+    limit. The case reads the stored column and pins the scheme
+    identifier and the work factor (CWE-916). DL-384
     """
     response = _register(client, unique_email, COMPLIANT)
     assert response.status_code == 200
@@ -491,8 +483,8 @@ def test_one_password_stored_twice_yields_two_hashes(
 ):
     """Two accounts sharing a password store different hashes.
 
-    Equal hashes would let one cracked password unlock every account
-    that reused it, and would make the column a lookup table (CWE-759).
+    The two stored values are compared for inequality, which is the
+    per-account salt (CWE-759). DL-384
     """
     second_email = SECOND_SCHEMA_EMAIL
 
@@ -597,7 +589,8 @@ def test_login_schema_admits_a_credential_the_policy_rejects():
 def test_a_credential_predating_the_policy_authenticates(
     client, db_session, unique_email, password
 ):
-    """An account the policy would now refuse still logs in."""
+    """An account whose credential the policy now refuses still logs
+    in."""
     _plant_account(db_session, unique_email, password=password)
 
     response = _login(client, unique_email, password)

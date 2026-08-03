@@ -1,28 +1,18 @@
 """Configuration guards for the payment environment, the signing key and
 database transport, and the subscription charge seam.
 
-The validation cases build ``Settings`` directly for each guarded
-setting - the payment environment, the signing key length, the signing
-algorithm, the token lifetime, the login-throttle threshold and window,
-and the database transport mode - and inspect the field named in the
-validation error it raises.
+The validation cases build ``Settings`` directly for each guarded setting
+and inspect the field named in the error it raises. The transport cases execute
+``backend/app/db/database.py`` against each database URL form and read the
+connect arguments off the engine it builds. The payment and charge cases
+execute the payment service and the subscription route with the provider
+library replaced. The remaining cases read the shipped
+pipeline, provisioning, Terraform and build definitions as text and assert
+the controls they carry.
 
-The database transport mode carries an explicit value in place of the
-driver's negotiated default, and it is restricted to the six modes libpq
-defines: a seventh value stops startup. The transport cases execute
-``backend/app/db/database.py`` against each database URL form and inspect
-the engine it builds; no case establishes a live encrypted database
-connection. The payment cases execute
-``backend/app/services/paypal_service.py`` with the provider library
-replaced, so the configured environment reaches the code that calls the
-provider.
-
-The charge cases drive ``process_payment`` through the signature
-``backend/app/api/endpoints/subscriptions.py`` calls, and drive the route
-itself. A charge authorizes only against a reference the provider confirms
-for that exact amount, unit and payer, and for a reusable agreement only
-for the plan the request names; a verified reference is spent once. Every
-provider lookup is replaced, so no case reaches the network.
+No case opens a network connection or an encrypted database connection.
+Rationale: ``documentation/security/decision-log.md`` sections 14, 18, 21,
+24, 25 and 28, and DL-380 through DL-383.
 """
 import asyncio
 import importlib.util
@@ -295,6 +285,9 @@ DECISION_LOG = (
 )
 REVIEW_TRIGGER = "a Python runtime upgrade"
 
+# Rule 1: the date every suppression entry carries. DL-387
+ACCEPTANCE_DATE = "2026-07-31"
+
 # Rule 1: the operational document that carries the residual register
 SECURITY_DOCUMENT = REPOSITORY_ROOT / "SECURITY.md"
 
@@ -322,8 +315,8 @@ APP_ROLE_DEFAULT_PRIVILEGES = (
 # SEC-11: the application role is created with a login and nothing else
 APP_ROLE_CREATION = "CREATE ROLE app_user WITH LOGIN"
 
-# SEC-11: schema public grants CREATE to PUBLIC by default, which would
-# hand the application role the DDL the grants above withhold
+# SEC-11: schema public grants CREATE to PUBLIC by default, reaching the
+# application role past the grants above. DL-370
 REVOKED_FROM_PUBLIC = "REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
 
 # SEC-11: a database grants CONNECT and TEMPORARY to PUBLIC by default, so
@@ -350,8 +343,8 @@ EFFECTIVE_PRIVILEGE_PROBES = (
     "has_schema_privilege('app_user', 'public', 'USAGE')",
 )
 
-# SEC-11: the condition each probe raises on, so a verification that finds
-# a privilege stops the run instead of reporting it
+# SEC-11: the condition each probe raises on; a verification finding a
+# privilege stops the run
 EFFECTIVE_PRIVILEGE_FAILURES = (
     "RAISE EXCEPTION 'PUBLIC still holds % on database %'",
     "RAISE EXCEPTION 'PUBLIC still holds % on schema public'",
@@ -378,8 +371,8 @@ FORBIDDEN_PROVISIONING_SQL = (
 # repository credential scan does not match this expression
 SQL_PASSWORD_LITERAL = re.compile("PASS" + "WORD +'")
 
-# SEC-11: the two forms that would place a role password in an argument
-# list, readable by any local process (CWE-214)
+# SEC-11: the two forms that place a role password in an argument list,
+# readable by any local process (CWE-214). DL-370
 ARGUMENT_LIST_PASSWORD_FORMS = ("-v owner_pw=", "-v app_pw=")
 
 # SEC-01: the guards that keep the generated secret file unreadable by
@@ -406,8 +399,8 @@ PUBLISH_VERIFICATION = (
     '[ ! -s "$destination" ]',
 )
 
-# SEC-01: what a planted destination holds, and the content the run would
-# have to leak into it for the publish to have written through
+# SEC-01: what a planted destination holds, and the content a publish
+# that wrote through it delivers. DL-370
 PLANTED_DESTINATION_CONTENT = "zzz-planted-destination-4471\n"
 PUBLISHED_MARKER = "PROBE_KEY=probe-published-value"
 
@@ -424,12 +417,12 @@ PROVISIONING_ORDER = (
 )
 
 # SEC-11: the grant batch reaches psql on standard input, and a failed
-# batch stops the run rather than leaving half-provisioned roles behind
+# batch stops the run. DL-370
 PSQL_INVOCATION = "} | psql -v ON_ERROR_STOP=1 -d dbname"
 GRANT_BATCH_STATUS = '[ "${PIPESTATUS[1]}" -ne 0 ]'
 
-# SEC-01/SEC-11: every command whose failure would leave the run
-# provisioning against state that does not exist (CWE-252)
+# SEC-01/SEC-11: every command whose failure leaves the run provisioning
+# against absent state (CWE-252). DL-370
 GUARDED_COMMANDS = (
     "python3 -m venv venv",
     "source venv/bin/activate",
@@ -441,7 +434,7 @@ GUARDED_COMMANDS = (
     "create_schema_as_owner",
 )
 
-# SEC-01/SEC-11: the two ways a step ends the run rather than continuing
+# SEC-01/SEC-11: the two ways a step ends the run
 FAILURE_CONTROLS = ("return 1", "exit 1")
 
 # SEC-11: the manifest is resolved from the script's own location, so the
@@ -479,7 +472,7 @@ DECLARED_DATABASE_VERSION = "POSTGRES_13"
 QUOTED_DATABASE_VERSION = '"{0}"'.format(DECLARED_DATABASE_VERSION)
 
 # SEC-11: the input variables the application role draws its identity
-# from, so that no credential appears in a tracked file
+# from; no credential appears in a tracked file. DL-368
 APP_ROLE_NAME_VARIABLE = "db_app_user"
 APP_ROLE_PASSWORD_VARIABLE = "db_app_password"
 APP_ROLE_NAME_REFERENCE = "var.{0}".format(APP_ROLE_NAME_VARIABLE)
@@ -524,8 +517,8 @@ CLOUD_PRIVILEGE_STATEMENTS = (
     " SEQUENCES TO app_user;",
 )
 
-# SEC-11: the cloud block reads the effective ACLs rather than trusting the
-# statements it issues, and states what each query must return
+# SEC-11: the cloud block reads the effective access lists and states what
+# each query must return. DL-368
 CLOUD_PRIVILEGE_VERIFICATION = (
     "aclexplode(coalesce(d.datacl, acldefault('d', d.datdba)))",
     "a.grantee = 0",
@@ -536,8 +529,7 @@ CLOUD_PRIVILEGE_VERIFICATION = (
 )
 
 # SEC-10/SEC-11/SEC-12: the provider delivery contract. Every argument
-# below is a provider feature, so an ambient install resolving to a build
-# that withdrew one would silently stop enforcing it (CWE-1104)
+# below is a provider feature (CWE-1104). DL-368
 TERRAFORM_LOCK = TERRAFORM_DIRECTORY / ".terraform.lock.hcl"
 TERRAFORM_SETTINGS_HEADER = "\nterraform {"
 PROVIDER_LOCAL_NAME = "google"
@@ -550,8 +542,8 @@ PROVIDER_GATED_ARGUMENTS = (
     APP_ROLE_PASSWORD_VERSION_ARGUMENT,
 )
 
-# SEC-12: the write-only argument arrived in this command-line release, so
-# the floor is a requirement rather than a preference
+# SEC-12: the command-line release the write-only argument arrived in,
+# which is the declared floor. DL-368
 TERRAFORM_VERSION_FLOOR = (1, 11, 0)
 
 # the platforms an operator or the pipeline installs from; the lock carries
@@ -623,9 +615,8 @@ def assert_rejects(field, **overrides):
 def assert_rejected_across_fields(*quoted, **overrides):
     """Assert the override is rejected and the message quotes each term.
 
-    A rule spanning two fields is reported against the model rather than
-    against one field name, so the field is identified by the message it
-    raises instead of by the error location.
+    A rule spanning two fields is reported against the model, so the field
+    is identified from the message text. DL-384
     """
     with pytest.raises(ValidationError) as caught:
         build_settings(**overrides)
@@ -640,7 +631,11 @@ class ConnectIntercepted(Exception):
 
 
 def recorded_connect_args(engine):
-    """Return the connect arguments SQLAlchemy hands the driver."""
+    """Return the connect arguments SQLAlchemy hands the driver.
+
+    A ``do_connect`` listener records the keywords and raises, so no
+    connection is opened. DL-380
+    """
     recorded = {}
     fired = []
 
@@ -665,8 +660,8 @@ def recorded_connect_args(engine):
 def recorded_paypal_configuration(monkeypatch, mode):
     """Return the configuration the payment service hands the provider.
 
-    The provider library is replaced outright, so the service runs its
-    own configuration call and reaches no network.
+    The provider library is replaced outright: the service runs its own
+    configuration call and opens no connection. DL-383
     """
     recorded = []
 
@@ -698,7 +693,11 @@ _PROBE_ENGINES = []
 
 
 def load_database_module(url, sslmode):
-    """Execute the application database module against one settings pair."""
+    """Execute the application database module against one settings pair.
+
+    ``spec_from_file_location`` loads the shipped file as a fresh module
+    under a probe name, leaving the application engine untouched. DL-381
+    """
     specification = importlib.util.spec_from_file_location(
         "backend_app_db_database_config_guard_probe", database.__file__
     )
@@ -717,7 +716,7 @@ def load_database_module(url, sslmode):
 def dispose_probe_engines():
     """Dispose every engine a probe built in this test.
 
-    The application engine is never registered, so it is untouched.
+    The application engine is never registered. DL-381
     """
     _PROBE_ENGINES.clear()
     try:
@@ -772,9 +771,8 @@ def test_baseline_kwargs_supply_every_required_field():
 def test_the_frozen_setting_names_are_declared_unchanged():
     """``Settings`` still declares each of the eight frozen names.
 
-    AAP 0.1.4 freezes these names, so renaming or dropping one breaks the
-    deployment contract even when the field behind it survives under
-    another name. The names are transcribed above this case.
+    AAP 0.1.4 freezes these names. They are transcribed above this case and
+    compared against the declared fields. DL-384
     """
     declared = set(Settings.__fields__)
 
@@ -802,10 +800,7 @@ def test_every_declared_setting_is_documented_by_name():
     """The environment template names every setting the code reads.
 
     SEC-12 requires each variable to be documented by name with no value.
-    A setting the template omits reaches an operator only as a startup
-    failure, and a name the template carries that the code no longer
-    reads sends an operator to configure nothing, so the parity is
-    asserted in both directions.
+    The parity is asserted in both directions. DL-372
     """
     documented = _documented_setting_names()
 
@@ -825,11 +820,8 @@ def test_each_frozen_name_is_the_variable_the_application_reads(
 ):
     """Each frozen name is decisive in the process environment.
 
-    A field name in ``Settings`` is half the contract; what an operator
-    sets is an environment variable. Removing one frozen name from the
-    environment and rebuilding the settings shows which variable the
-    field reads: a field bound to some other variable through an alias
-    fails this case.
+    Each frozen name is removed from the environment in turn and the
+    settings rebuilt, which names the variable the field reads. DL-384
     """
     monkeypatch.delenv(name, raising=False)
 
@@ -882,10 +874,8 @@ def test_payment_creation_configures_the_environment_it_is_given(
 ):
     """Creating a payment configures the provider with the setting.
 
-    The validated setting only matters if the code that talks to the
-    provider reads it; a literal restored in the service would route a
-    live transaction to the wrong environment with the domain check
-    still in place.
+    The configuration the service hands the provider is recorded and
+    compared against the setting. DL-383
     """
     recorded = recorded_paypal_configuration(monkeypatch, mode)
     monkeypatch.setattr(paypalrestsdk, "Payment", StubPayment)
@@ -906,8 +896,7 @@ def test_payment_creation_configures_the_environment_it_is_given(
 def test_the_payment_service_spells_no_environment_literal():
     """No source line in the payment service names an environment.
 
-    A literal is what SEC-09 removed, and the two configuration calls are
-    the sites that would carry it back.
+    Both configuration call sites are read from the shipped source.
     """
     with open(paypal_service.__file__, encoding="utf-8") as handle:
         source = handle.read()
@@ -976,10 +965,9 @@ FLOORS_ABOVE_THE_FIELD = sorted(
 def test_the_stronger_algorithms_carry_a_higher_key_floor():
     """The floor table exceeds the field constraint for HS384 and HS512.
 
-    A character constraint on the field is one number, so it can only
-    express the weakest algorithm's floor. Were the table flattened to
-    that number, a 32-byte key would sign HS512 tokens at half the
-    length RFC 7518 sec. 3.2 requires.
+    The field's character constraint carries one number, the weakest
+    algorithm's floor. The per-algorithm table is asserted to exceed it
+    for HS384 and HS512, as RFC 7518 sec. 3.2 requires. DL-384
     """
     assert HMAC_KEY_MIN_BYTES == {"HS256": 32, "HS384": 48, "HS512": 64}
     assert HMAC_KEY_MIN_BYTES["HS256"] == SIGNING_KEY_MIN_LENGTH
@@ -995,9 +983,9 @@ def test_signing_key_one_byte_below_the_algorithm_floor_is_rejected(
 ):
     """A key one byte under its algorithm's floor is rejected.
 
-    Every key here clears the field's character constraint, so only the
-    algorithm-coupled rule can refuse it, and the message it raises has
-    to name the algorithm an operator must change.
+    Every key here clears the field's character constraint, leaving the
+    algorithm-coupled rule to refuse it. The message is asserted to name
+    the algorithm. DL-384
     """
     short = KEY_CHARACTER * (minimum - 1)
     assert len(short) >= SIGNING_KEY_MIN_LENGTH
@@ -1030,11 +1018,10 @@ def test_signing_key_at_the_algorithm_floor_is_accepted(
 def test_a_multibyte_key_is_measured_in_bytes():
     """The signing-key floor is measured in bytes, not in characters.
 
-    Both directions are checked. A key of half as many two-byte
-    characters carries exactly the strongest floor in bytes and is
-    accepted, even though its character count sits below that floor. A
-    key one byte under the floor is rejected, even though its character
-    count clears the 32-character minimum the field itself declares.
+    Both directions are checked. A key of two-byte characters carrying the
+    strongest floor in bytes is accepted below that floor in characters. A
+    key one byte under the floor is rejected above the 32-character
+    minimum. DL-384
     """
     strongest = max(HMAC_KEY_MIN_BYTES, key=HMAC_KEY_MIN_BYTES.get)
     floor = HMAC_KEY_MIN_BYTES[strongest]
@@ -1085,9 +1072,8 @@ def test_positive_token_lifetime_is_accepted(minutes):
 def test_non_positive_throttle_setting_is_rejected(field, value):
     """A throttle threshold or window below one is rejected.
 
-    A threshold of zero admits every attempt, and a window of zero
-    prunes every counter on the next attempt, so either value turns the
-    login throttle off while leaving it configured.
+    A threshold of zero admits every attempt and a window of zero prunes
+    every counter on the next attempt. Both are refused. DL-384
     """
     assert_rejects(field, **{field: value})
 
@@ -1177,10 +1163,8 @@ def test_transport_mode_carries_every_driver_defined_mode(mode):
 def test_transport_mode_outside_the_driver_domain_is_rejected(mode):
     """A transport mode the driver does not define is rejected.
 
-    Without the domain check a misspelling reaches the driver, which
-    rejects it only when a connection is first opened - so the failure
-    surfaces on the first query rather than at startup - and a value
-    carrying an appended connection parameter would reach it intact.
+    The domain check refuses a misspelling, and a value carrying an
+    appended connection parameter, at settings construction. DL-384
     """
     assert mode not in LIBPQ_SSLMODES
     assert_rejects("DB_SSLMODE", DB_SSLMODE=mode)
@@ -1219,8 +1203,7 @@ ENVELOPE_KEYS = {"detail", "error_id", "fields"}
 def _workflow_step(name):
     """Return the lines belonging to one workflow step.
 
-    The step is its own header plus every line indented under it, so a
-    comment written between two steps belongs to neither.
+    The step is its own header plus every line indented under it.
     """
     assert WORKFLOW.is_file(), WORKFLOW
     lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
@@ -1240,9 +1223,8 @@ def _workflow_step(name):
 def test_the_dependency_audit_gate_keeps_its_shape():
     """The audit step fails on any advisory outside its register.
 
-    The count is transcribed here, so a suppression added without a
-    decision-log entry fails this case. Every identifier is shape-checked
-    as well, since an unrecognised one suppresses nothing.
+    The count is transcribed here and every identifier is shape-checked.
+    DL-373
     """
     step = _workflow_step(AUDIT_STEP_NAME)
 
@@ -1265,10 +1247,9 @@ def test_the_dependency_audit_gate_keeps_its_shape():
 def test_the_staleness_check_compares_both_namespaces():
     """The check reads the report's own identifiers and its aliases.
 
-    One accepted advisory is published only under the GitHub namespace, so
-    a check reading a single namespace out of the report can never see it
-    and its suppression stays declared forever after the advisory stops
-    being reported.
+    One accepted advisory is published only under the GitHub namespace, and
+    the check is asserted to read both namespaces out of the report.
+    DL-373
     """
     step = _workflow_step(AUDIT_STEP_NAME)
 
@@ -1280,7 +1261,7 @@ def test_the_staleness_check_compares_both_namespaces():
         "PYSEC" if identifier.startswith("PYSEC") else "GHSA"
         for identifier in declared
     }
-    # both namespaces are in use, which is what makes the comparison matter
+    # both namespaces are in use across the register. DL-373
     assert namespaces == {"PYSEC", "GHSA"}, sorted(declared)
 
 
@@ -1288,9 +1269,9 @@ def _staleness_check(tmp_path, report, declared_line):
     """Run the workflow's own staleness check over one synthetic report.
 
     The check is copied out of the workflow with two substitutions, each
-    asserted to apply once: the report it reads and the workflow it reads
-    its declarations from. The comparison logic under test is therefore
-    the shipped one.
+    asserted to apply once: the report it reads, and the workflow it reads
+    its declarations from. The logic under test is the shipped one.
+    DL-382
     """
     step = _workflow_step(AUDIT_STEP_NAME)
     opened = step.index("python - <<'PY'")
@@ -1346,8 +1327,8 @@ def test_the_staleness_check_admits_a_reported_suppression(tmp_path):
 def test_the_staleness_check_admits_an_alias_only_suppression(tmp_path):
     """A declaration matching only the report's alias passes the check.
 
-    This is the msgpack shape: the advisory has no identifier in the
-    Python namespace, so the accepted suppression names its GitHub alias.
+    This is the msgpack shape: no identifier in the Python namespace, and a
+    suppression naming the GitHub alias. DL-373
     """
     completed = _staleness_check(
         tmp_path,
@@ -1384,12 +1365,9 @@ def test_the_staleness_check_refuses_an_unreported_suppression(
 def test_every_suppressed_advisory_is_justified_in_the_decision_log():
     """No advisory is suppressed without a register entry, and none spare.
 
-    Suppressing an advisory is accepting a risk, and an acceptance with
-    no recorded reachability assessment and no review trigger is how a
-    temporary exception becomes permanent. The register and the gate are
-    compared in both directions, so neither can move without the other:
-    an identifier added to the workflow alone fails here, and an entry
-    left in the register after its suppression is dropped fails here too.
+    The register and the gate are compared in both directions: every
+    suppressed identifier carries a register entry, and every entry carries
+    a suppression. DL-387
     """
     assert DECISION_LOG.is_file(), DECISION_LOG
     log = DECISION_LOG.read_text(encoding="utf-8")
@@ -1400,8 +1378,8 @@ def test_every_suppressed_advisory_is_justified_in_the_decision_log():
     registered = {
         row[1]
         for row in re.findall(
-            r"^\|\s*(\d+)\s*\|[^|]*\|\s*`(" + ADVISORY_IDENTIFIER.pattern
-            + r")`\s*\|",
+            r"^- \*\*Row (\d+), `(" + ADVISORY_IDENTIFIER.pattern
+            + r")` in ",
             log,
             re.MULTILINE,
         )
@@ -1413,6 +1391,17 @@ def test_every_suppressed_advisory_is_justified_in_the_decision_log():
 
     # the register states the shared review trigger it accepts them under
     assert REVIEW_TRIGGER in log
+
+    # SEC-12: each entry is dated where it is accepted. DL-387
+    dated = set(
+        re.findall(
+            r"^- \*\*Row \d+, `(" + ADVISORY_IDENTIFIER.pattern
+            + r")` in [^\n]*\*\* Accepted " + ACCEPTANCE_DATE,
+            log,
+            re.MULTILINE,
+        )
+    )
+    assert dated == registered, sorted(registered.difference(dated))
 
 
 def _credential_scan_command():
@@ -1435,9 +1424,8 @@ def _credential_allow_list_command():
 def _expression_argument(command):
     """Return the expression one grep invocation in the workflow carries.
 
-    The command is split the way the shell splits it, so a pattern quoted
-    either way and carrying either quote character is read exactly as
-    ``grep`` receives it.
+    The command is split the way the shell splits it, so the expression is
+    read as ``grep`` receives it. DL-382
     """
     arguments = shlex.split(command)
     expressions = [
@@ -1520,7 +1508,7 @@ def test_the_credential_scan_matches_no_part_of_its_own_source():
     """The scan does not match the line that declares it.
 
     Every branch of the pattern is split by a one-character bracket
-    expression, so it matches the same text without matching itself.
+    expression. DL-373
     """
     command = _credential_scan_command()
     pattern = _credential_scan_pattern()
@@ -1548,9 +1536,9 @@ def test_the_credential_scan_reports_nothing_across_tracked_content():
 def test_the_reviewed_allow_list_marker_is_bounded_and_placed():
     """Every marked line is a harness fixture, and the count is pinned.
 
-    The marker is how a reviewed non-credential is admitted, so a marker
-    added to application source, or added in quantity, is the way this
-    gate would be defeated quietly. Each marked line carries its reason.
+    The marker admits a reviewed non-credential. Its count is pinned, every
+    marked line is under ``backend/tests/`` and carries a reason, and no
+    line of application source carries it. DL-373
     """
     marked = []
     for path in _tracked_files():
@@ -1652,8 +1640,7 @@ def test_the_database_instance_refuses_unencrypted_connections():
 
     assert _hcl_argument(ip_configuration, "ssl_mode") == QUOTED_SSL_MODE
 
-    # AAP 0.5.10: the superseded argument is deprecated and unused, so a
-    # configuration relying on it would not enforce anything
+    # AAP 0.5.10: the superseded argument is deprecated and unused
     assert DEPRECATED_SSL_ARGUMENT not in instance
 
     # the gated instance is the PostgreSQL one the application connects to
@@ -1667,11 +1654,9 @@ def test_the_application_database_role_carries_no_literal_credential():
     """The application role is declared with its password from a variable.
 
     SEC-11 separates the application account from the instance admin
-    account. Every identifying argument arrives from an input variable, so
-    no credential and no role name sits in a tracked file. SEC-12 carries
-    the password through the write-only argument, so the value reaches
-    neither state nor a plan file, and the variable is sensitive and
-    ephemeral with no default.
+    account. Every identifying argument arrives from an input variable, the
+    password through the write-only argument, and the variable is
+    sensitive and ephemeral with no default. DL-368, DL-369
     """
     role = _terraform_resource(*CLOUD_SQL_USER)
 
@@ -1683,13 +1668,13 @@ def test_the_application_database_role_carries_no_literal_credential():
     # the password into the state file
     assert STATE_PERSISTING_PASSWORD_ARGUMENT not in role
 
-    # SEC-12: without the counter a rotated password is never reapplied,
-    # which would leave the account on the value it was created with
+    # SEC-12: the counter the provider reapplies a rotated password on.
+    # DL-368
     assert _hcl_argument(
         role, APP_ROLE_PASSWORD_VERSION_ARGUMENT
     ) == "var.{0}".format(APP_ROLE_PASSWORD_VERSION_VARIABLE)
 
-    # a quoted value in either argument would be a credential in the file
+    # neither argument carries a quoted value. DL-368
     assert '"' not in password
     assert '"' not in _hcl_argument(role, "name")
 
@@ -1703,8 +1688,7 @@ def test_the_application_database_role_carries_no_literal_credential():
     assert _hcl_argument(password_variable, "type") == "string"
     # SEC-12: an ephemeral value is held for the run only
     assert _hcl_argument(password_variable, "ephemeral") == "true"
-    # a default would put a password in the file the variable exists to
-    # keep it out of
+    # the variable declares no default. DL-369
     assert "default" not in password_variable
 
     name_variable = _terraform_variable(APP_ROLE_NAME_VARIABLE)
@@ -1716,14 +1700,9 @@ def test_the_application_database_role_carries_no_literal_credential():
 def test_the_cloud_application_account_is_creatable_and_its_residual_stated():
     """The declaration assigns no role, and SECURITY.md carries the grants.
 
-    A role assignment names a role. Nothing in this repository creates one
-    or grants it anything, so an assignment leaves a default apply unable to
-    create the account at all. Cloud SQL also grants an elevated role to
-    every built-in user it creates, and this provider carries no grant or
-    revoke resource, so the restriction has to arrive out of band. This case
-    fails if the assignment returns, if the withdrawn variable returns, if a
-    referenced variable stops being read, or if the document stops carrying
-    any statement the account needs.
+    The declaration is asserted to carry no role assignment and no
+    withdrawn variable, every referenced variable to be read, and
+    SECURITY.md to carry every statement the account needs. DL-368
     """
     main_source = TERRAFORM_MAIN.read_text(encoding="utf-8")
     variables_source = TERRAFORM_VARIABLES.read_text(encoding="utf-8")
@@ -1796,11 +1775,8 @@ def test_the_configuration_bounds_the_provider_its_controls_rely_on():
     """The root block bounds both the command line and the provider.
 
     Encrypted-only transport, the write-only password and its rotation
-    counter are all provider features. Without a declared range an install
-    resolves to whatever build is ambient, including one past a major
-    boundary where an argument may have been withdrawn or given a different
-    meaning, and the configuration would then apply without enforcing what
-    it reads as enforcing.
+    counter are all provider features. Both declared ranges are read off
+    the root block. DL-368
     """
     settings_block = _terraform_settings()
     main_source = TERRAFORM_MAIN.read_text(encoding="utf-8")
@@ -1849,19 +1825,16 @@ def test_the_configuration_bounds_the_provider_its_controls_rely_on():
 def test_the_provider_lock_is_tracked_and_covers_every_platform_named():
     """The lock is committable, committed, and hashed for each platform.
 
-    A range still admits many builds, and a checkout that resolves one the
-    lock does not record installs an unverified provider. The lock carries
-    one directory hash per platform an operator or the pipeline installs
-    from, plus the registry checksum set, and it records the same
-    constraint the configuration declares, so a widened constraint with a
-    stale lock fails here rather than at apply time.
+    The lock is asserted to carry one directory hash per platform an
+    operator or the pipeline installs from, the registry checksum set, and
+    the same constraint the configuration declares. DL-368
     """
     assert TERRAFORM_LOCK.is_file(), TERRAFORM_LOCK
     lock_path = TERRAFORM_LOCK.relative_to(REPOSITORY_ROOT).as_posix()
 
     # committable: no ignore rule excludes it
     assert not _git_succeeds("check-ignore", "-q", lock_path), lock_path
-    # committed: it is in the index rather than merely present on disk
+    # committed: present in the index, not only on disk
     assert _git_succeeds("ls-files", "--error-unmatch", lock_path), lock_path
 
     source = TERRAFORM_LOCK.read_text(encoding="utf-8")
@@ -1896,13 +1869,9 @@ def test_the_provider_lock_is_tracked_and_covers_every_platform_named():
 def test_the_documented_commands_match_the_pipeline():
     """Both documented test invocations match the steps that run them.
 
-    The document calls its full-suite command the pipeline invocation, and
-    without the collection-error flag that command exits during collection
-    and runs nothing at all: three pre-existing modules fail to import, so
-    pytest abandons the run before it reaches the security suite. A command
-    documented for an operator that silently runs zero tests is worse than
-    one that fails, so the flag is asserted in both places rather than in
-    the workflow alone.
+    Three pre-existing modules fail to import, so the full-suite command
+    needs the collection-error flag to run anything at all. The flag is
+    asserted in the document and in the workflow. DL-384
     """
     assert SECURITY_DOCUMENT.is_file(), SECURITY_DOCUMENT
     document = SECURITY_DOCUMENT.read_text(encoding="utf-8")
@@ -1911,7 +1880,7 @@ def test_the_documented_commands_match_the_pipeline():
     assert COLLECTION_ERROR_FLAG in suite_step, suite_step
     assert COLLECTION_ERROR_FLAG in document
 
-    # the security suite runs without it, because it collects cleanly
+    # the security suite collects cleanly and runs without it
     security_step = _workflow_step(DOCUMENTED_SECURITY_STEP)
     assert "python -m pytest tests/security -q" in security_step
     assert COLLECTION_ERROR_FLAG not in security_step, security_step
@@ -1922,15 +1891,13 @@ def test_the_documented_commands_match_the_pipeline():
         assert finding in document, finding
 
 
-# SEC-12: the secret's input channel, not the secret's storage
+# SEC-12: the secret's input channel. DL-369
 def test_no_variable_description_recommends_a_command_line_secret():
     """A sensitive variable names safe channels and warns against argv.
 
-    A value passed with -var appears in the process arguments, which any
-    local user can read for the life of the command, and in shell history
-    afterwards. The description is the only place an operator looks before
-    choosing a channel, so it names the environment variable and the
-    ignored variable file, and mentions the flag only to prohibit it.
+    The description is asserted to name the environment variable and the
+    ignored variable file, and to mention the command-line flag only to
+    prohibit it. DL-369
     """
     source = TERRAFORM_VARIABLES.read_text(encoding="utf-8")
     names = re.findall(r'^variable "([^"]+)"', source, re.MULTILINE)
@@ -1988,9 +1955,8 @@ def _shell_function(name):
 def _provisioning_batch():
     """Return the whole SQL batch the provisioning script sends to psql.
 
-    The batch is a quoted here-document, so the shell performs no
-    expansion on it and the tracked bytes are the statements the server
-    receives.
+    The batch is a quoted here-document: the shell performs no expansion,
+    and the tracked bytes are the statements the server receives.
     """
     body = _shell_function("init_database")
     opened = "cat <<'SQL'\n"
@@ -2002,9 +1968,8 @@ def _provisioning_batch():
 def _provisioning_statements():
     """Return the role and privilege statements, one per line.
 
-    The verification block that closes the batch is returned separately,
-    so a privilege set compared whole here is not diluted by the probes
-    that read it back.
+    The verification block that closes the batch is returned separately
+    from the privilege statements. DL-382
     """
     batch = _provisioning_batch()
     assert EFFECTIVE_PRIVILEGE_BLOCK in batch, EFFECTIVE_PRIVILEGE_BLOCK
@@ -2026,10 +1991,8 @@ def test_the_application_role_is_granted_data_access_only():
     """Every privilege the application role receives is a data operation.
 
     SEC-11 replaces one account holding every privilege on the database
-    with two roles. The granted set is compared whole, so a privilege
-    added to the application role later fails this case. Nothing here
-    runs the script; it creates cluster roles, so the shipped statements
-    are read.
+    with two roles. The granted set is compared whole, read from the
+    shipped statements. DL-383
     """
     statements = _provisioning_statements()
     granted = [line for line in statements if "app_user" in line]
@@ -2038,8 +2001,8 @@ def test_the_application_role_is_granted_data_access_only():
     expected.update(APP_ROLE_DEFAULT_PRIVILEGES)
     expected.add(APP_ROLE_CREATION)
 
-    # the creation statement carries a psql variable rather than a value,
-    # so it is compared by its privilege-bearing prefix
+    # the creation statement carries a psql variable, compared by its
+    # privilege-bearing prefix
     normalised = {
         APP_ROLE_CREATION if line.startswith(APP_ROLE_CREATION) else line
         for line in granted
@@ -2049,16 +2012,13 @@ def test_the_application_role_is_granted_data_access_only():
     ))
 
 
-# SEC-11: the default grant on schema public would return the withheld DDL
+# SEC-11: the default grant on schema public, which carries DDL. DL-370
 def test_the_default_public_schema_privilege_is_revoked():
     """PUBLIC loses CREATE on schema public, and the owner keeps it.
 
     A PostgreSQL 13 database grants CREATE on schema public to PUBLIC,
-    which every role holds. Granting the application role no DDL is
-    therefore not enough on its own: without this revoke the role creates
-    tables through the default grant. Revoking without granting the owner
-    explicitly would leave nobody able to create, so both statements are
-    required and the owner grant is the only CREATE on the schema.
+    which every role holds. Both statements are asserted present, and the
+    owner grant is asserted to be the only CREATE on the schema. DL-370
     """
     statements = _provisioning_statements()
 
@@ -2078,12 +2038,9 @@ def test_the_default_public_schema_privilege_is_revoked():
 def test_the_default_public_database_privileges_are_revoked():
     """PUBLIC loses CONNECT and TEMPORARY on the database.
 
-    Granting the application role CONNECT says nothing about who else
-    holds it: PostgreSQL grants CONNECT and TEMPORARY on every database to
-    PUBLIC, so any cluster role reaches the database and the application
-    role keeps temporary-object capability the granted set never mentions.
-    The revoke precedes the explicit grant, so the role that needs CONNECT
-    holds it by grant rather than by default.
+    PostgreSQL grants CONNECT and TEMPORARY on every database to PUBLIC.
+    Both revokes are asserted present, and the revoke is asserted to
+    precede the explicit grant. DL-370
     """
     statements = _provisioning_statements()
 
@@ -2105,17 +2062,13 @@ def test_the_default_public_database_privileges_are_revoked():
                 " TO " in line]
 
 
-# SEC-11: the batch reads back what it granted rather than assuming it
+# SEC-11: the batch reads back what it granted. DL-370
 def test_the_provisioning_batch_verifies_the_effective_privileges():
     """The batch ends by reading the catalog, and aborts on a surprise.
 
-    Explicit GRANT text records intent. A statement that applied to a
-    different role, a default the revoke missed, or a privilege another
-    session granted afterwards all read the same in the script and
-    different in the catalog. The closing block probes the effective
-    privileges instead, and every probe that finds the wrong answer raises,
-    which stops the batch because psql runs it with the stop-on-error
-    setting.
+    The closing block probes the effective privileges in the catalog, and
+    every probe that finds the wrong answer raises under the stop-on-error
+    setting. DL-370
     """
     verification = _provisioning_verification()
 
@@ -2132,7 +2085,7 @@ def test_the_provisioning_batch_verifies_the_effective_privileges():
         EFFECTIVE_PRIVILEGE_BLOCK
     ) > _provisioning_batch().index(DATABASE_REVOKED_FROM_PUBLIC)
 
-    # a raise only stops the run because the invocation stops on error
+    # the invocation stops on error, the behaviour a raise relies on
     body = _shell_function("init_database")
     assert PSQL_INVOCATION in body
     assert GRANT_BATCH_STATUS in body
@@ -2143,11 +2096,9 @@ def test_the_provisioning_batch_verifies_the_effective_privileges():
 def test_the_provisioning_statements_confer_no_broad_privilege(privilege):
     """No statement grants the privileges SEC-11 exists to remove.
 
-    The account this script used to create held every privilege on the
-    database. Each name below either restores that account or gives the
-    application role cluster-level authority, so each is checked against
-    the whole shipped batch case-insensitively, verification block
-    included.
+    Each name below either restores the original all-privileges account or
+    confers cluster-level authority. Each is checked against the whole
+    shipped batch case-insensitively, verification block included.
     """
     batch = _provisioning_batch().upper()
 
@@ -2158,11 +2109,8 @@ def test_the_provisioning_statements_confer_no_broad_privilege(privilege):
 def test_the_provisioning_statements_carry_no_password_literal():
     """Both role passwords reach the server as psql variables.
 
-    A generated value is only unexposed while it stays out of the file
-    that creates it. Each creation statement names a psql variable, which
-    the script assigns on standard input, so the tracked bytes carry no
-    password and the repository credential scan has nothing to report
-    here.
+    Each creation statement names a psql variable that the script assigns
+    on standard input, so the tracked bytes carry no password. DL-370
     """
     statements = _provisioning_statements()
     batch = "\n".join(statements)
@@ -2180,13 +2128,10 @@ def test_the_provisioning_statements_carry_no_password_literal():
 def test_the_role_passwords_never_enter_a_process_argument_list():
     """The grant batch and its variable assignments arrive on stdin.
 
-    Passing either value with psql's own variable flag would place it in
-    an argument list, which any local process can read. The script writes
-    both assignments through the printf builtin, which runs inside the
-    shell and starts no process, and pipes them into psql ahead of the
-    quoted batch. The pipeline status of psql itself is checked, because
-    a pipeline reports only its last command by default and the batch is
-    the command that can fail.
+    The script writes both assignments through the printf builtin, which
+    runs inside the shell and starts no process, and pipes them into psql
+    ahead of the quoted batch. The pipeline status of psql itself is
+    checked. DL-370
     """
     body = _shell_function("init_database")
 
@@ -2220,12 +2165,9 @@ def test_the_generated_secret_file_is_installed_under_a_restrictive_mask(
 ):
     """Each guard on the generated secret file is present as shipped.
 
-    Writing the values straight to the destination leaves a window in
-    which the file exists under the invoking user's default mask, and it
-    writes through any symlink already at that path. The script creates
-    an owner-only temporary file in the same directory, restricts it, then
-    links it to the destination and drops the temporary name, which closes
-    both without ever overwriting what is already there.
+    The script creates an owner-only temporary file in the same directory,
+    restricts it, links it to the destination and drops the temporary name.
+    Each step is asserted present. DL-370
     """
     assert guard in _shell_function("configure_env_vars"), guard
 
@@ -2233,8 +2175,8 @@ def test_the_generated_secret_file_is_installed_under_a_restrictive_mask(
 def test_the_secrets_are_never_written_straight_to_the_destination():
     """The here-document writes to the temporary file, not to .env.
 
-    This is the shape the guards above replace, so its absence is what
-    proves they are in the path rather than beside it.
+    The direct-write shape is asserted absent from the shipped script.
+    DL-370
     """
     body = _shell_function("configure_env_vars")
 
@@ -2246,12 +2188,9 @@ def test_the_secrets_are_never_written_straight_to_the_destination():
 def test_the_schema_is_created_by_the_owner_role():
     """The owner role creates the tables, over an environment credential.
 
-    The application role holds no DDL, so something else has to create
-    the schema. The owner bootstrap does, and its credential travels in
-    the environment of the interpreter it starts rather than in an
-    argument list. Its imports are checked before the first database
-    object exists, so a missing driver reports itself rather than leaving
-    a database with roles and no tables.
+    The owner bootstrap creates the schema, and its credential travels in
+    the environment of the interpreter it starts. Its imports are checked
+    ahead of the first database object. DL-370
     """
     body = _shell_function(OWNER_BOOTSTRAP)
 
@@ -2275,15 +2214,13 @@ def test_the_schema_is_created_by_the_owner_role():
         assert 'importlib.import_module("{0}")'.format(module) in prerequisites
 
 
-# SEC-01/SEC-11: a failed step stops the run instead of continuing (CWE-252)
+# SEC-01/SEC-11: a failed step stops the run (CWE-252)
 def test_every_provisioning_step_stops_the_run_on_failure():
     """Each step runs in order and aborts the run when it fails.
 
-    Order is load-bearing twice over. The interpreter is prepared and
-    populated before the credential step, which needs it to generate the
-    values, and the credentials exist before the roles that carry them.
-    Without the failure controls a broken step would leave the run
-    provisioning roles against credentials it never wrote.
+    The interpreter is prepared and populated before the credential step,
+    and the credentials exist before the roles that carry them. Each step
+    is asserted to abort the run on failure. DL-370
     """
     body = _shell_function("main")
     positions = []
@@ -2300,11 +2237,8 @@ def test_every_provisioning_step_stops_the_run_on_failure():
 def test_each_provisioning_command_aborts_its_step_on_failure(command):
     """Each command that can fail is tested, and a failure returns.
 
-    Ordering alone does not make the sequence safe: an unguarded command
-    lets the run continue past a step that did nothing, which is how a
-    database ends up with roles and no tables, or a role created against
-    a credential no file records. Every command below is wrapped in the
-    same shape, and the guard returns rather than reporting success.
+    Every command below is asserted to be wrapped in the same guard shape,
+    and every guard to return on failure. DL-370
     """
     source = _provisioning_source()
     guard = "if ! {0}; then".format(command)
@@ -2319,11 +2253,9 @@ def test_each_provisioning_command_aborts_its_step_on_failure(command):
 def test_no_provisioning_guard_continues_past_a_failure():
     """Every conditional guard in the script ends the run.
 
-    The case above names the commands that exist today. This one holds
-    for a guard added later: whatever the script tests, the branch it
-    takes on failure returns or exits rather than printing a message and
-    continuing. A guard that only prints is how the script reported
-    success after provisioning nothing.
+    The case above names the commands that exist today. This one reads
+    every conditional guard in the script and asserts each failure branch
+    returns or exits. DL-370
     """
     lines = _provisioning_source().splitlines()
     continuing = []
@@ -2347,11 +2279,8 @@ def test_no_provisioning_guard_continues_past_a_failure():
 def test_the_backend_manifest_is_resolved_from_the_script_location():
     """The install targets the tracked manifest by absolute path.
 
-    A path relative to the working directory installs nothing when the
-    operator runs the script from anywhere but the repository root, and a
-    silent no-install leaves the owner bootstrap without a driver. The
-    script resolves its own location first, so the manifest it installs
-    is the tracked one wherever it is invoked from.
+    The script resolves its own location first, so the manifest it installs
+    is the tracked one from any working directory. DL-370
     """
     body = _shell_function("install_dependencies")
 
@@ -2368,9 +2297,8 @@ def test_the_backend_manifest_is_resolved_from_the_script_location():
 def test_the_provisioning_script_parses():
     """The script is syntactically valid for the shell that runs it.
 
-    Every case above reads the script as text, which cannot tell a valid
-    guard from one inside an unclosed quotation. The shell's own parser
-    can, and it reads the file without running any statement in it.
+    The shell's own parser reads the file without running any statement in
+    it. DL-370
     """
     parsed = subprocess.run(
         ["bash", "-n", str(PROVISIONING_SCRIPT)],
@@ -2435,7 +2363,7 @@ def authorize(resource, amount=CHARGE_TOTAL, reference="PAY-1", **binding):
 
 def refusal(resource, amount=CHARGE_TOTAL, currency="USD", plan_id=None,
             payer_id=None):
-    """Return the reason the authorization gate refuses one charge."""
+    """Return the refusal the authorization gate returns for one charge."""
     return paypal_service._resource_authorizes_charge(
         resource, amount, currency, plan_id, payer_id)
 
@@ -2638,7 +2566,7 @@ def test_charge_refuses_a_reference_the_provider_does_not_return(
     assert len(paypal_service._claimed_references) == 0
 
 
-# SEC-09: a lookup that raises refuses rather than propagating
+# SEC-09: a lookup that raises returns a refusal
 def test_charge_refuses_when_the_provider_lookup_raises(spent_references):
     """A provider lookup that raises is answered with a refusal."""
     loop = asyncio.new_event_loop()
@@ -2721,8 +2649,7 @@ def test_a_refused_reference_stays_available(spent_references):
 
 
 def test_the_consumption_ledger_stays_bounded(spent_references):
-    """The ledger evicts its oldest entry rather than growing without
-    end."""
+    """The ledger evicts its oldest entry once it reaches its cap."""
     limit = paypal_service._CONSUMPTION_LIMIT
     first = paypal_service._reference_key("PAY-0")
     for index in range(limit + 1):
@@ -2753,7 +2680,7 @@ def test_every_provider_call_carries_a_timeout():
 
 
 def test_a_provider_timeout_refuses_the_charge(spent_references):
-    """A provider call that times out refuses rather than raising."""
+    """A provider call that times out returns a refusal."""
     class Stalled:
         def request(self, *args, **kwargs):
             raise requests.exceptions.Timeout("bounded")
@@ -2827,8 +2754,7 @@ def test_the_subscription_route_binds_the_requested_plan(
         client, registered_user):
     """The route hands the verifier the plan the request names.
 
-    The recorded call is inspected directly, so a route that drops the
-    keyword fails here even while the verifier's own cases pass.
+    The recorded call is inspected directly, keyword included. DL-383
     """
     recorded = {}
 
@@ -2916,7 +2842,7 @@ def test_an_unauthenticated_subscription_reaches_no_provider_call(
     assert not spent(body["payment_method"])
 
 
-# SEC-09: the route awaits the module seam rather than a local stand-in
+# SEC-09: the route awaits the module seam
 def test_the_subscription_route_calls_the_service_seam(client,
                                                        registered_user):
     """The route's provider call reaches the service module's own seam."""
@@ -2937,9 +2863,8 @@ def test_the_subscription_route_calls_the_service_seam(client,
 def test_probe_engines_are_registered_for_disposal():
     """Loading the database module registers its engine for disposal.
 
-    An engine left undisposed keeps its pool, and the parametrized cases
-    above build one per case. The registry is what the autouse fixture
-    drains, so an unregistered engine would leak silently.
+    The parametrized cases above build one engine each, and the autouse
+    fixture drains the registry they are added to. DL-381
     """
     before = len(_PROBE_ENGINES)
     module = load_database_module(POSTGRES_URL, "require")
@@ -2954,8 +2879,7 @@ def test_probe_engines_are_registered_for_disposal():
 def test_disposing_a_probe_engine_releases_its_pool():
     """A disposed probe engine reports an empty pool.
 
-    The pool is read after disposal, so the fixture's cleanup is shown to
-    have an effect.
+    The pool is read after disposal. DL-381
     """
     module = load_database_module(SQLITE_URL, "require")
     engine = module.engine
@@ -2979,10 +2903,9 @@ PROVIDER_LOGGER_NAME = "paypalrestsdk"
 def test_the_provider_logger_withholds_records_below_warning():
     """The provider library is held above the level its records use.
 
-    The client records the request URL at INFO, and that URL carries the
-    caller-supplied reference; it records the authorization header, the
-    request body and the response body at DEBUG. Capping the library
-    logger is what keeps those out of the diagnostic channel (CWE-532).
+    The client records the request URL at INFO, and the authorization
+    header with both bodies at DEBUG. The level cap on the library logger
+    is read and asserted (CWE-532). DL-364
     """
     assert paypal_service.PROVIDER_LOG_LEVEL == logging.WARNING
     provider_logger = logging.getLogger(PROVIDER_LOGGER_NAME)
@@ -3081,8 +3004,8 @@ def _generated_values(work_dir):
 def _meta_command_values(captured_stdin):
     """Return the values set by the psql meta-commands on standard input.
 
-    Each value is shipped as a quoted SQL literal, so the quoting is
-    asserted here and stripped before the value is compared.
+    Each value is shipped as a quoted SQL literal. The quoting is asserted
+    here and stripped before the value is compared. DL-370
     """
     values = {}
     for line in captured_stdin.splitlines():
@@ -3146,10 +3069,8 @@ def test_the_generated_secret_file_refuses_a_planted_symlink(tmp_path):
 def test_the_generated_secret_file_refuses_a_planted_hard_link(tmp_path):
     """A second name for .env keeps its content and gains no secret.
 
-    Redirecting into an existing name truncates that inode in place, so
-    any other name for it - a link made earlier, while the mode was still
-    permissive - would receive the secret. The pre-existence guard stops
-    the run before a credential is generated, so neither name changes.
+    The pre-existence guard stops the run ahead of any credential
+    generation, and both names are asserted unchanged. DL-370
     """
     standing = tmp_path / ".env"
     standing.write_text(PLANTED_TARGET_CONTENT)
@@ -3175,11 +3096,10 @@ def test_the_generated_secret_file_refuses_a_planted_hard_link(tmp_path):
 def _run_publish(work_dir, plant, expect_status):
     """Publish a prepared file with the script's own primitive.
 
-    ``plant`` places whatever stands at the destination, and it runs after
-    the source file exists, so nothing the function does precedes it. The
-    real ``publish_env_file`` is sourced from the shipped script and called
-    directly: no earlier existence check is in the path, which is what
-    makes this a test of the publish rather than of the check.
+    ``plant`` places whatever stands at the destination, after the source
+    file exists. The real ``publish_env_file`` is sourced from the shipped
+    script and called directly, with no earlier existence check in the
+    path. DL-383
     """
     source = work_dir / ".env.tmp.probe"
     source.write_text(PUBLISHED_MARKER + "\n")
@@ -3244,11 +3164,9 @@ def test_the_publish_refuses_a_destination_that_appears_late(
 ):
     """A destination standing at publish time is never written through.
 
-    A check followed by a move leaves a window: a directory created inside
-    it absorbs the source as a child entry, the move reports success, and
-    setup announces a file that does not exist. The publish is a single
-    link call instead, which fails when the destination exists in any
-    form, so the outcome does not depend on when the destination appeared.
+    The publish is a single link call, which fails when the destination
+    exists in any form. Three destination forms are planted after the
+    source exists. DL-370
     """
     output, before = _run_publish(tmp_path, plant, expect_status=1)
     assert "Refusing to publish" in output, output
@@ -3280,11 +3198,9 @@ def test_the_publish_installs_an_owner_only_file_and_drops_the_source(
 ):
     """A free destination receives the file, owner-only, once.
 
-    The source and the destination are the same inode until the source
-    name is dropped, so the mode the file was created under is the mode it
-    is published with; no interval exists in which it is permissive. The
-    run is performed under a permissive mask, so the mode measured here is
-    the script's own guarantee rather than the environment's.
+    The source and the destination are the same inode until the source name
+    is dropped, so the published mode is the mode the file was created
+    under. The run is performed under a permissive mask. DL-370
     """
     _run_publish(tmp_path, _plant_nothing, expect_status=0)
 
@@ -3485,11 +3401,10 @@ def _dockerignore_patterns(path):
 def _pattern_regex(pattern):
     """Compile one ignore pattern under Docker's documented matching.
 
-    Only the constructs these files use are handled: a leading ``**/``
-    or an embedded ``**`` spanning whole path segments, ``*`` and ``?``
-    inside one segment, a character class, and a trailing separator
-    marking a directory. A directory pattern also matches the paths
-    beneath it, which the caller supplies by testing every ancestor.
+    Handles the constructs these files use. A leading ``**/`` or an
+    embedded ``**`` spanning whole path segments, ``*`` and ``?`` inside
+    one segment, a character class, and a trailing separator marking a
+    directory. The caller supplies every ancestor path. DL-382
     """
     directory = pattern.endswith("/")
     segments = pattern.rstrip("/").split("/")
@@ -3548,9 +3463,9 @@ def test_every_build_context_declares_an_ignore_file(context):
 def test_the_build_context_excludes_every_secret_bearing_path(context):
     """No secret, key, credential, dependency or cache path is copied.
 
-    SEC-12 keeps secrets out of version control; an image layer is the
-    other place a local secret can escape to, because both Dockerfiles
-    copy the whole context.
+    SEC-12 keeps secrets out of version control, and an image layer is the
+    other place a local secret can reach. Both Dockerfiles copy the whole
+    context. DL-374, DL-375
     """
     patterns = _dockerignore_patterns(DOCKER_CONTEXTS[context])
 
@@ -3583,9 +3498,8 @@ def test_the_matcher_rejects_a_pattern_that_covers_nothing():
 def test_each_image_copies_its_context_wholesale(dockerfile):
     """The premise the exclusions rest on is asserted, not assumed.
 
-    An image that copied an explicit allow-list would not need the
-    exclusions. Both copy the whole context, so the exclusions are the
-    control, and this case fails if that stops being true.
+    Both image definitions are read and asserted to copy the whole
+    context, which is the premise the exclusions rest on. DL-374
     """
     assert dockerfile.is_file(), dockerfile
     body = dockerfile.read_text(encoding="utf-8")
@@ -3624,7 +3538,7 @@ def test_the_template_documents_every_frontend_build_variable():
 
 
 def test_no_backend_setting_is_documented_as_a_build_variable():
-    """The two contracts stay separate, so neither absorbs the other."""
+    """No backend setting appears in the frontend build section."""
     backend_half, frontend_half = _template_sections()
 
     assert not _assigned_names(frontend_half) & set(Settings.__fields__)
@@ -3649,8 +3563,7 @@ def test_the_frontend_build_declares_each_variable_it_embeds(name):
 def test_the_compose_definition_forwards_each_build_variable(name):
     """Compose passes each name to the build, failing when it is unset.
 
-    The ``:?`` form is what turns a missing value into a failed build
-    rather than an empty argument baked into the bundle.
+    Each build argument is asserted to carry the ``:?`` form. DL-367
     """
     assert COMPOSE_DEFINITION.is_file(), COMPOSE_DEFINITION
     body = COMPOSE_DEFINITION.read_text(encoding="utf-8")
@@ -3712,10 +3625,8 @@ def _build_reference(block):
 def test_each_declared_build_names_a_dockerfile_that_exists(service):
     """The image definition each service names is present in the tree.
 
-    Compose resolves the dockerfile path against the build context, so a
-    name that reads plausibly and resolves nowhere fails only at build
-    time - after a clean checkout, in a pipeline, with no local cache to
-    hide it.
+    Compose resolves the dockerfile path against the build context, and
+    each resolved path is asserted to exist in the tree. DL-367
     """
     reference = _build_reference(_compose_service_blocks()[service])
     if reference is None:
@@ -3733,9 +3644,8 @@ def test_each_declared_build_names_a_dockerfile_that_exists(service):
 def test_no_declared_value_interpolates_to_empty(service):
     """Every variable the definition reads fails closed when unset.
 
-    Compose substitutes an unset variable with the empty string, so a
-    reference carrying neither a default nor the ``:?`` guard starts a
-    container with an empty setting where the operator expected a value.
+    Compose substitutes an unset variable with the empty string. Every
+    reference is asserted to carry a default or the ``:?`` guard. DL-367
     """
     for name, modifier in _compose_interpolations(
         _compose_service_blocks()[service]
@@ -3748,9 +3658,8 @@ def test_no_declared_value_interpolates_to_empty(service):
 def test_the_backend_service_supplies_every_required_setting():
     """The container receives every setting the application demands.
 
-    ``Settings`` is constructed while the application imports, so a
-    required value the definition never passes stops the container after
-    it starts rather than when it is configured.
+    Every setting ``Settings`` declares without a default is asserted
+    present in the service environment. DL-367
     """
     block = _compose_service_blocks()["backend"]
     supplied = set(re.findall(r"^      - ([A-Z_]+)=", "\n".join(block), re.M))
@@ -3762,7 +3671,7 @@ def test_the_backend_service_supplies_every_required_setting():
     assert not required - supplied, sorted(required - supplied)
 
     # SEC-10: the proxy topology's documented local exception, supplied as
-    # a literal because the hop it describes is not encrypted
+    # a literal. DL-367
     assert "      - DB_SSLMODE=disable" in block
 
 
@@ -3798,8 +3707,8 @@ def test_the_backend_image_serves_the_port_the_definition_publishes():
 def test_the_backend_image_starts_the_module_the_application_declares():
     """The entry point names the module path the package resolves.
 
-    Every application module imports itself as ``backend.app.*``, so a
-    command naming a shorter path cannot import the application at all.
+    Every application module imports itself as ``backend.app.*``, and the
+    entry point is asserted to name that path. DL-374
     """
     body = _dockerfile_for("backend")
 
@@ -3818,8 +3727,8 @@ def test_the_backend_image_starts_the_module_the_application_declares():
 def test_each_healthcheck_names_a_program_its_image_carries(service):
     """No healthcheck invokes a program its base image does not ship.
 
-    Neither base image carries curl, so a curl healthcheck fails on every
-    interval whatever the application is doing.
+    Neither base image carries curl. Each healthcheck program is asserted
+    against its own base image. DL-367
     """
     block = "\n".join(_compose_service_blocks()[service])
     probe = re.search(r"^      test: \[(.+)\]$", block, re.MULTILINE)
@@ -3836,9 +3745,8 @@ def test_each_healthcheck_names_a_program_its_image_carries(service):
 def test_the_frontend_image_needs_no_file_the_repository_omits():
     """The install step resolves from the tracked manifest alone.
 
-    No lock file is tracked, so an install demanding one cannot run from a
-    clean checkout; documentation/security/decision-log.md records that
-    decision and the determinism it leaves open.
+    No lock file is tracked, and the install step is asserted to resolve
+    from the manifest alone. DL-375
     """
     body = _dockerfile_for("frontend")
 

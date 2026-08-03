@@ -8,10 +8,7 @@ secrets/
 *.key
 *credentials*.json
 
-# SEC-01, SEC-11: operator variable files carry the application role's
-# password, and state records other resource attributes. The password
-# itself reaches neither state nor a plan: main.tf takes it through the
-# write-only password_wo argument from an ephemeral variable.
+# SEC-01, SEC-11: Terraform state, plan and variable files. DL-371
 .terraform/
 .terraform.tfstate.lock.info
 *.tfstate

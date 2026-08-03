@@ -7,9 +7,8 @@ services:
       # the image definition lives beside this file, not in the context
       dockerfile: ../infrastructure/docker/Dockerfile.frontend
       args:
-        # SEC-12: build-time only. The :? form fails the build when the
-        # value is unset or empty, so no wrong origin is baked into the
-        # bundle and no empty argument passes for a supplied one
+        # SEC-12: build-time only. The :? form fails the build on an
+        # unset or empty value. DL-367
         - REACT_APP_API_BASE_URL=${REACT_APP_API_BASE_URL:?set the API origin the bundle calls}
         - REACT_APP_PAYPAL_CLIENT_ID=${REACT_APP_PAYPAL_CLIENT_ID:?set the public PayPal client identifier}
     ports:
@@ -17,7 +16,7 @@ services:
     depends_on:
       - backend
     healthcheck:
-      # the nginx image ships busybox wget, not curl
+      # probe program: busybox wget, present in this base image. DL-367
       test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:80/"]
       interval: 30s
       timeout: 10s
@@ -35,8 +34,8 @@ services:
       - db
     environment:
       # SEC-01/SEC-12: every setting Settings declares without a default,
-      # each in the :? form so a missing value fails the container start
-      # here rather than part-way through application import
+      # each in the :? form, which fails the container start on an unset
+      # value. DL-367
       - DATABASE_URL=${DATABASE_URL:?set the application database URL}
       # SEC-01: backend reads SECRET_KEY
       - SECRET_KEY=${SECRET_KEY:?set the token signing key, 32 characters or more}
@@ -52,8 +51,8 @@ services:
       # SEC-10: db service is the Cloud SQL Auth Proxy on plain local TCP
       - DB_SSLMODE=disable
     healthcheck:
-      # the slim Python image ships no curl; the schema document is served
-      # without reaching the database
+      # probe program: python urllib against the schema document, which
+      # is served without reaching the database. DL-367
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')"]
       interval: 30s
       timeout: 10s

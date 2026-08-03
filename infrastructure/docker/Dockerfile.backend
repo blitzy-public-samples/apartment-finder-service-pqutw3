@@ -2,8 +2,7 @@
 FROM python:3.9-slim
 
 # Set the working directory in the container
-# The application imports itself as backend.app.*, so the context lands in
-# /app/backend and the process starts one directory above it
+# The build context lands in /app/backend. DL-374
 WORKDIR /app/backend
 
 # Copy the requirements file into the container
@@ -15,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application code
 COPY . .
 
-# The import root backend.app.main resolves against
+# The directory the import root backend.app.main resolves against. DL-374
 WORKDIR /app
 
 # Make port 8000 available to the world outside this container

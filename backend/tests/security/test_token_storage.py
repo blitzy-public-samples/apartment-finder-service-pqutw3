@@ -143,10 +143,8 @@ def _filter_names(response):
 def _send_with_one_cookie(client, cookie_value, headers):
     """Send one request carrying exactly the named cookie value.
 
-    Replacing a value in the jar leaves the value the server set behind
-    under a different domain, so both would travel and the request would
-    not be the one the test describes. The jar is emptied first and the
-    outgoing header is checked before the request goes out.
+    The jar is emptied first and the outgoing header is checked before the
+    request goes out, so exactly one cookie value travels. DL-384
     """
     client.cookies.clear()
     client.cookies.set(SESSION_COOKIE_NAME, cookie_value)
@@ -295,7 +293,7 @@ def test_cookie_identity_answers_a_conflicting_bearer_header(
     )
 
     assert response.status_code == 200, response.text
-    # SEC-06: the cookie identity answers, not the header identity
+    # SEC-06: the cookie identity answers
     owners = [row["user_id"] for row in response.json()]
     assert owners == [cookie_owner["id"]]
 
@@ -326,9 +324,7 @@ def test_the_session_cookie_outranks_the_bearer_header(
     """The account the cookie names is the one the guard resolves.
 
     Both credentials are valid and name different accounts, so the rows
-    that come back say which one was read. The order is a deliberate
-    choice: reading the header first would let any caller holding a
-    token displace the session the browser is carrying.
+    that come back say which one was read. DL-384
     """
     cookie_owner = register_user()
     header_owner = register_user()
@@ -351,8 +347,8 @@ def test_the_session_cookie_outranks_the_bearer_header(
     # SEC-06: the cookie decides; the header cannot displace it
     assert _filter_names(response) == [COOKIE_OWNER_FILTER_NAME]
 
-    # SEC-06: swapping the two credentials swaps the answer, so the
-    # order rather than the account is what decided
+    # SEC-06: swapping the two credentials swaps the answer, which pins
+    # the read order
     client.cookies.set(SESSION_COOKIE_NAME, header_owner[FIXTURE_TOKEN_KEY])
     mirrored = client.get(
         PROTECTED_ROUTE,
@@ -370,10 +366,9 @@ def test_an_unusable_cookie_does_not_fall_back_to_the_header(
 ):
     """A cookie the guard cannot use refuses the request outright.
 
-    The cookie is authoritative, so a value planted on the domain is
-    answered with a refusal rather than quietly discarded in favour of
-    whatever header the same caller also sent. Falling back would make a
-    hostile cookie a no-op and hide it from every caller.
+    The cookie is authoritative: a value planted on the domain is
+    answered with a refusal, with a valid header on the same request.
+    DL-384
     """
     account = register_user()
     login = _login(client, account)
@@ -406,8 +401,8 @@ def test_a_cleared_cookie_leaves_the_bearer_header_in_charge(
 ):
     """The cookie logout leaves behind counts as no cookie at all.
 
-    Logout clears the cookie by sending an empty value, so a
-    non-browser client holding a token must keep working afterwards.
+    Logout clears the cookie by sending an empty value. A non-browser
+    client holding a token keeps working afterwards.
     """
     account = register_user()
     login = _login(client, account)

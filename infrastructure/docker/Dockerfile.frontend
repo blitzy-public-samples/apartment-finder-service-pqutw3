@@ -1,16 +1,14 @@
 # Use an official Node.js runtime as the base image
-# Platform runtime policy: Node 20.x below 20.20.2 and 22.x below 22.12.0 are
-# interdicted, so node:14 is not installable. 22 is the lowest permitted line
-# and it builds react-scripts 5.0.1 without a legacy-OpenSSL workaround.
+# Pinned Node line: 22, the lowest line the platform runtime policy
+# permits. DL-375
 FROM node:22 as build
 
 # Set the working directory in the container
 WORKDIR /app
 
 # Copy the dependency manifest
-# No lock file is tracked, so the install resolves from the manifest alone;
-# documentation/security/decision-log.md records that decision and the
-# residual it carries
+# The install resolves from the manifest alone; no lock file is tracked.
+# DL-375
 COPY package.json ./
 
 # Install dependencies
@@ -19,9 +17,9 @@ RUN npm install --no-audit --no-fund
 # Copy the rest of the application code
 COPY . .
 
-# SEC-12: create-react-app embeds these while the bundle builds, so a runtime
-# value never reaches the browser. Both arrive as build arguments, never as
-# literals, and neither may carry a secret
+# SEC-12: create-react-app embeds these into the bundle at build time.
+# Both arrive as build arguments, never as literals, and neither may carry
+# a secret. DL-375
 ARG REACT_APP_API_BASE_URL
 ARG REACT_APP_PAYPAL_CLIENT_ID
 ENV REACT_APP_API_BASE_URL=$REACT_APP_API_BASE_URL

@@ -75,11 +75,10 @@ variable "db_app_user" {
   default     = "app_user"
 }
 
-# SEC-12: the value arrives through the environment or a gitignored variable
-# file, never on the command line, so it stays out of the process arguments
-# any local user can read and out of shell history (CWE-214, CWE-532)
+# SEC-12: the value arrives through the environment or a gitignored
+# variable file, never on the command line (CWE-214, CWE-532). DL-369
 variable "db_app_password" {
-  description = "The password for the application database role. Supply it through the TF_VAR_db_app_password environment variable, or through a gitignored *.tfvars file passed with -var-file, or from a secret manager via an ephemeral input. Never pass it on the command line: -var puts the value in the process arguments, which any local user can read, and in shell history. An ephemeral value is never written to state or to a plan file."
+  description = "The password for the application database role. Supply it through the TF_VAR_db_app_password environment variable, or through a gitignored *.tfvars file passed with -var-file, or from a secret manager via an ephemeral input. Never pass it on the command line with -var. An ephemeral value is never written to state or to a plan file."
   type        = string
   sensitive   = true
   ephemeral   = true

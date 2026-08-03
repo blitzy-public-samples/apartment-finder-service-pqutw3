@@ -33,9 +33,8 @@ _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 _JOINED_LINE_MARKER = "\\n"
 
 
-# SEC-08: control characters a record may not carry into any sink. A bare
-# carriage return rewrites a line on a terminal, and the C0 range carries
-# terminal escapes, so each is replaced rather than only the newline
+# SEC-08: control characters a record may not carry into any sink. Every
+# C0 code point and DEL is replaced, the newline included. DL-364
 _CONTROL_CHARACTER_TRANSLATION = {
     code: _JOINED_LINE_MARKER
     for code in range(0x20)
@@ -62,8 +61,8 @@ def _fold_record(record: logging.LogRecord) -> logging.LogRecord:
         rendered = "%s\n%s" % (rendered, record.stack_info)
     record.msg = _single_line(rendered)
     record.args = ()
-    # SEC-08: the diagnostics are folded into the message already, so no
-    # formatter can append them again on a later line
+    # SEC-08: the folded text is the message; the record carries no
+    # separate diagnostics for a formatter to append. DL-364
     record.exc_info = None
     record.exc_text = None
     record.stack_info = None
@@ -78,12 +77,9 @@ def _owns_record(name: str) -> bool:
 
 
 def _install_single_line_records() -> None:
-    # SEC-08: folds every record this package creates at the moment it is
-    # created, which is before Logger.handle reaches any handler and
-    # therefore before propagation offers the record to an ancestor sink.
-    # Normalizing in the owned handler's formatter alone leaves a
-    # deployment or root handler emitting the raw multi-line record
-    # (CWE-117, CWE-778)
+    # SEC-08: folds every record this package creates at creation, ahead
+    # of Logger.handle, every handler and propagation to an ancestor sink
+    # (CWE-117, CWE-778). DL-364
     previous = logging.getLogRecordFactory()
     if getattr(previous, "_folds_application_records", False):
         return
@@ -102,9 +98,9 @@ def _install_single_line_records() -> None:
 
 
 class _SingleLineFormatter(logging.Formatter):
-    # SEC-08: the sink this module owns re-applies the same normalization,
-    # so a record reaching it from another factory is still one line, and so
-    # is any text the format string itself contributes (CWE-778)
+    # SEC-08: the sink this module owns re-applies the same normalization
+    # to the record and to the text the format string contributes
+    # (CWE-778). DL-364
     def format(self, record: logging.LogRecord) -> str:
         return _single_line(super().format(record))
 
@@ -115,8 +111,8 @@ class _ApplicationLogHandler(logging.StreamHandler):
 
 
 def _configure_application_logging() -> None:
-    # SEC-08: gives this package a level, a timestamp and a logger name,
-    # none of which logging.lastResort emits (CWE-778)
+    # SEC-08: gives this package a level, a timestamp and a logger name
+    # on its own handler (CWE-778). DL-364
     application_logger = logging.getLogger(_APPLICATION_LOGGER_NAME)
     application_logger.setLevel(_LOG_LEVEL)
     _install_single_line_records()
@@ -138,8 +134,7 @@ app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
 def create_tables():
-    # SEC-11: DDL for absent tables only; a runtime role holding no CREATE
-    # on a provisioned schema is not asked to issue any (CWE-250)
+    # SEC-11: DDL for absent tables only (CWE-250). DL-364
     Base.metadata.create_all(bind=engine, checkfirst=True)
 
 
@@ -199,14 +194,14 @@ create_tables()
 _REQUEST_LOCATIONS = ("body", "query", "path", "header", "cookie")
 _GENERIC_SERVER_DETAIL = "Internal server error"
 
-# SEC-08: substitutes for the client-supplied request path and method, so
-# neither reaches a record (CWE-532)
+# SEC-08: substitutes a record carries in place of the client-supplied
+# request path and method (CWE-532). DL-364
 _UNMATCHED_ROUTE = "<unmatched>"
 _UNSERVED_METHOD = "<method>"
 _SERVED_METHODS = frozenset({"GET", "HEAD", "POST", "OPTIONS"})
 
-# SEC-08: an undeclared key's name is submitted text, so a record names
-# its position and withholds the key (CWE-532)
+# SEC-08: a record names an undeclared key by position and withholds the
+# submitted name (CWE-532). DL-364
 _UNDECLARED_ERROR_TYPES = ("value_error.extra", "extra_forbidden")
 _UNDECLARED_FIELD = "<undeclared>"
 _MAX_LOGGED_FIELDS = 8
@@ -353,7 +348,7 @@ def _dsn_password(url: str) -> str:
 
 def _secret_literals() -> tuple:
     # SEC-08: the values this process holds that no record may quote,
-    # longest first so no remainder of a longer one survives (CWE-532)
+    # ordered longest first (CWE-532). DL-364
     values = [
         getattr(settings, name, None) for name in _SECRET_SETTING_NAMES
     ]
@@ -425,8 +420,8 @@ def _driver_literals(exc: BaseException) -> tuple:
 
 
 def _suppress_bound_parameters(exc: BaseException) -> None:
-    # SEC-08: bound parameters are caller-submitted row values; every chain
-    # member is suppressed, not only the raised one (CWE-532)
+    # SEC-08: suppresses the caller-submitted row values on every chain
+    # member, the raised exception included (CWE-532). DL-364
     for member in _exception_members(exc):
         if hasattr(member, "hide_parameters"):
             member.hide_parameters = True

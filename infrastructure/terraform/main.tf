@@ -1,11 +1,11 @@
 # Main Terraform configuration file for provisioning Google Cloud resources
 
-# SEC-12: floor for the write-only argument and ephemeral variable that
-# keep the database password out of state (CWE-522)
-# SEC-10/SEC-11/SEC-12: bounded provider and CLI ranges plus the tracked
-# .terraform.lock.hcl beside this file; an ambient install can no longer
-# resolve to a build that withdraws ssl_mode, password_wo or google_sql_user
-# (CWE-1104)
+# SEC-12: command-line floor for the write-only argument and the
+# ephemeral variable that keep the database password out of state
+# (CWE-522). DL-368
+# SEC-10/SEC-11/SEC-12: bounded provider and command-line ranges, with the
+# selected build fixed by the .terraform.lock.hcl beside this file
+# (CWE-1104). DL-368
 terraform {
   required_version = ">= 1.11.0, < 2.0.0"
 
@@ -85,10 +85,11 @@ resource "google_sql_database" "database" {
   instance = google_sql_database_instance.main.name
 }
 
-# SEC-11: application account separate from the instance admin account,
-# restricted out of band by the statements in SECURITY.md section 3.2
-# (CWE-250, CWE-269)
-# SEC-12: password_wo is write-only, so the value never lands in state
+# SEC-11: application account separate from the instance admin account.
+# SECURITY.md section 3.2 carries the out-of-band narrowing statements
+# (CWE-250, CWE-269). DL-368
+# SEC-12: password_wo is write-only; the value reaches neither state nor a
+# plan file. DL-368
 resource "google_sql_user" "app" {
   name                = var.db_app_user
   instance            = google_sql_database_instance.main.name

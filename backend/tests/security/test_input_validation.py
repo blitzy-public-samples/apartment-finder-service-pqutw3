@@ -1,28 +1,16 @@
 """Request-validation regression tests for the write endpoints.
 
 The endpoints and the request models are driven against unknown, missing,
-malformed, wrongly typed and empty declared fields. A body carrying an
-undeclared key is refused, so a client cannot set a server-owned column
-by adding a key to the request.
+malformed, wrongly typed and empty declared fields, nested criteria, and
+every non-finite spelling of a declared number. The same file pins the
+contracts a validation change could move quietly. The declared paths and
+verbs, the pagination of the public read path, and the filter response
+model. Then the answer a duplicate address receives, the two browser wire
+declarations, and the split between the key a reply names and the position
+a record names.
 
-The same file pins the contracts a validation change could quietly move:
-the set of paths and verbs the application declares, the pagination the
-public read path applies, the response model the filter route declares,
-and the answer a duplicate address receives.
-
-A nested body carries the same duty. A criterion inside a filter
-declares strict scalars, so a number, a boolean or any other JSON type
-is refused where a string is declared, and a NUL byte the driver cannot
-store is refused with it.
-
-The subscription amount also carries a domain. A value outside it - NaN,
-either infinity, a magnitude no float holds, or a figure at or beneath
-the floor - stops at the request boundary, ahead of the payment call.
-
-A rejection is also written down, and an undeclared key's name is text
-the caller chose. The last cases here read the record as well as the
-reply: the caller is told which key was refused, and the record names
-the position instead, bounded in count and in length.
+Rationale: ``documentation/security/decision-log.md`` sections 5, 13, 14
+and 40.3, and DL-384.
 """
 import json
 import logging
@@ -326,9 +314,9 @@ def _route_for(path, method):
 def _seed_listings(session, count):
     """Write listing rows directly and return their identifiers.
 
-    The create route cannot write a row - the model declares no owner
-    column and two non-null timestamps the body never carries - so the
-    read path is seeded through the session instead.
+    The create route writes no row: the model declares no owner column,
+    and two non-null timestamps the body never carries. The read path is
+    seeded through the session instead.
     """
     stamped = datetime.utcnow()
     rows = [
@@ -351,9 +339,8 @@ def _seed_listings(session, count):
 def seed_filter(session, user_id, name=DECLARED_FILTER_BODY["name"]):
     """Write one filter row with its criteria child and return its id.
 
-    Seeding through the session gives the read path a row that belongs to
-    an account no request has authenticated as, which is what the
-    cross-account cases need.
+    Seeding through the session gives the read path a row belonging to an
+    account no request has authenticated as. DL-384
     """
     row = FilterModel(
         name=name,
@@ -384,8 +371,7 @@ def test_the_frozen_envelope_contract_matches_the_application():
     """The hardcoded envelope contract is the one the application builds.
 
     ENVELOPE_KEYS and _CORRELATION_KEY are transcribed at the top of this
-    module, so a change to the function that builds the envelope fails
-    this case.
+    module and compared against the function that builds the envelope.
     """
     built = _error_envelope("a detail", "a correlation id")
 
@@ -641,8 +627,7 @@ def test_filter_refuses_wrongly_typed_name(client, register_user):
 # SEC-05: the nested scalars a criterion declares
 CRITERION_FIELDS = ("field", "operator", "value")
 
-# SEC-05: every JSON type a nested scalar is not; a permissive string type
-# would coerce and store the first three (CWE-20)
+# SEC-05: every JSON type a nested scalar is not (CWE-20)
 WRONG_NESTED_TYPES = (
     pytest.param(3000, id="number"),
     pytest.param(True, id="boolean"),
@@ -861,8 +846,8 @@ LISTING_FLOAT_FIELDS = ("rent", "broker_fee", "square_footage")
 def _listing_raw_body(field, literal):
     """Return a listing document carrying one raw numeric literal.
 
-    The literal is written into the document text, because a JSON encoder
-    would refuse the spellings under test or rewrite them.
+    The literal is written into the document text, ahead of any JSON
+    encoder. DL-384
     """
     remaining = {
         name: value
@@ -886,8 +871,8 @@ def test_listing_refuses_every_non_finite_number(
     number.
 
     Python's JSON decoder accepts ``NaN``, ``Infinity`` and ``-Infinity``
-    as float literals, and ``1e309`` overflows to an infinity, so none of
-    them is caught by declaring the field a float.
+    as float literals, and ``1e309`` overflows to an infinity. The
+    finiteness check is the control under assertion. DL-384
     """
     account = register_user()
     response = _post_raw(
@@ -905,10 +890,10 @@ def test_listing_refuses_every_non_finite_number(
 
 @pytest.mark.parametrize("field", LISTING_FLOAT_FIELDS)
 def test_listing_model_refuses_an_unrepresentable_magnitude(field):
-    """A magnitude no float holds is refused rather than raising.
+    """A magnitude no float holds is refused with a 422.
 
     ``math.isfinite`` raises ``OverflowError`` on an integer this large,
-    so the pre-validator has to answer for that case itself.
+    and the pre-validator answers 422 for it. DL-384
     """
     with pytest.raises(ValidationError) as raised:
         ListingCreate(
@@ -1015,12 +1000,8 @@ def test_declared_listing_body_writes_no_row(
 ):
     """A body of declared fields alone still writes no listing row.
 
-    The status is asserted exactly. A test that only ruled out a 2xx
-    would also pass on a 401, a 422, a 429 or a 502, and each of those
-    means something different: the guard refused the caller, the request
-    boundary refused the body, the throttle answered, or a dependency
-    did. Ruling out success alone therefore keeps passing after the
-    contract moves, which is what makes the exact status the assertion.
+    The status is asserted exactly, and the table is asserted to hold no
+    row. DL-384
     """
     account = register_user()
     response = client.post(
@@ -1112,10 +1093,9 @@ def test_registering_one_address_twice_answers_bad_request(
 ):
     """A second registration of one address answers 400, never 500.
 
-    Two defences answer this: a pre-check before the insert and an
-    IntegrityError branch for the request that loses the race. Both
-    return the same 400, so the caller cannot tell which one answered
-    and cannot learn anything from the difference.
+    Two defences answer this: a pre-check before the insert, and an
+    IntegrityError branch for the request that loses the race. Both return
+    the same 400. DL-378
     """
     body = {"email": unique_email, "password": POLICY_PASSWORD}
 
@@ -1145,11 +1125,8 @@ def test_a_duplicate_address_is_refused_before_the_insert(
 ):
     """The duplicate is refused without attempting the write.
 
-    The race branch answers the same 400, so only the write itself
-    distinguishes the two defences. Without the pre-check every repeated
-    attempt costs an insert and a rollback that an unauthenticated
-    caller chooses freely, and on PostgreSQL the failed insert leaves
-    the transaction unusable.
+    The race branch answers the same 400, so the case asserts the absence
+    of the write itself. DL-378
     """
     body = {"email": unique_email, "password": POLICY_PASSWORD}
 
@@ -1172,8 +1149,7 @@ def test_a_duplicate_address_is_refused_before_the_insert(
 def test_the_route_table_matches_the_frozen_declaration():
     """The application declares exactly the frozen paths and verbs.
 
-    An added route is reachable the moment it is declared, so the table
-    is compared whole rather than probed path by path.
+    The route table is compared whole, an added route included.
     """
     assert _application_route_table() == DECLARED_ROUTES
 
@@ -1181,9 +1157,8 @@ def test_the_route_table_matches_the_frozen_declaration():
 def test_no_route_declares_an_undeclared_verb():
     """No route serves a verb outside the declared set.
 
-    The CORS policy advertises GET, POST and OPTIONS alone, so a route
-    answering a destructive verb would be reachable without ever
-    appearing in the advertised method list.
+    The CORS policy advertises GET, POST and OPTIONS alone, and the
+    declared verbs are asserted against that set. DL-384
     """
     served = {method for _path, method in _application_route_table()}
 
@@ -1196,14 +1171,10 @@ def test_no_route_declares_an_undeclared_verb():
 def test_public_listing_page_slices_by_skip_and_limit(client, db_session):
     """The public read path returns the slice its bounds ask for.
 
-    No credentials are sent. Bounds that are accepted but ignored would
-    return the whole table to every caller, which is a denial-of-service
-    surface on a public path as the row count grows.
-
-    The row counts hold in every dialect: LIMIT and OFFSET bound them.
-    The disjointness and coverage below are scoped to the SQLite
-    harness - the statement carries no ORDER BY, and separate statements
-    against PostgreSQL are not ordered against each other.
+    No credentials are sent, and each bound is asserted to change the
+    slice returned. The row counts hold in every dialect, bounded by LIMIT
+    and OFFSET; the disjointness and coverage assertions are scoped to the
+    SQLite harness. DL-384
     """
     seeded = _seed_listings(db_session, SEEDED_LISTING_COUNT)
 
@@ -1229,7 +1200,7 @@ def test_public_listing_page_slices_by_skip_and_limit(client, db_session):
     assert not set(pages[1]) & set(pages[2])
     assert set(pages[0]) | set(pages[1]) | set(pages[2]) == set(seeded)
 
-    # a zero limit is a valid empty page, not the whole table
+    # a zero limit is a valid empty page
     empty = _read_listings(client, limit=0)
     assert empty.status_code == 200
     assert _listing_ids(empty) == []
@@ -1261,8 +1232,7 @@ def test_public_listing_page_refuses_a_non_numeric_bound(
 ):
     """A bound that is not an integer is refused at the boundary.
 
-    The refusal names the bound, so a caller learns which one it sent
-    wrongly without any statement text reaching the response.
+    The refusal names the bound and carries no statement text.
     """
     response = _read_listings(client, **bounds)
 
@@ -1276,9 +1246,8 @@ def test_public_listing_page_admits_the_frozen_numeric_domain(
 ):
     """Every integer bound inside the frozen domain answers a page.
 
-    AAP 0.8.3 freezes the skip and limit contract, so this case fails if
-    a narrower domain is reintroduced and starts refusing a bound the
-    public read path accepted.
+    AAP 0.8.3 freezes the skip and limit contract, and every bound inside
+    it is asserted to answer 200. DL-384
     """
     _seed_listings(db_session, SEEDED_LISTING_COUNT)
 
@@ -1301,8 +1270,8 @@ def test_an_unbindable_bound_answers_a_sanitized_fault(
     """A bound past the driver's range answers the uniform envelope.
 
     The frozen contract declares no ceiling, so the value reaches the
-    statement. SEC-08 is what keeps the failure from carrying the
-    statement, the driver name or a traceback back to the caller.
+    statement. The reply is asserted to carry the uniform envelope and no
+    statement, driver name or traceback. DL-384
     """
     _seed_listings(db_session, SEEDED_LISTING_COUNT)
 
@@ -1326,9 +1295,8 @@ def test_the_filter_routes_publish_the_declared_response_model(
 ):
     """Both filter routes declare the model, and both publish it.
 
-    AAP 0.8.3 freezes the response model these routes declare. The
-    declaration is what filters the response, and dropping it would
-    widen the body without moving any status code.
+    AAP 0.8.3 freezes the response model these routes declare. Both the
+    declaration and the served body are read. DL-384
     """
     account = register_user()
     credentials = _bearer(account["access_token"])
@@ -1364,11 +1332,9 @@ def test_filter_creation_persists_only_the_validated_fields(
 ):
     """A valid create writes one row carrying exactly what was sent.
 
-    SEC-05 admits the declared allow-list and nothing else, so the row
-    the request produces has to carry the sent values verbatim and take
-    every other column from the server. Asserting the stored row as well
-    as the reply is what distinguishes a persisted write from a body the
-    handler assembled and dropped.
+    SEC-05 admits the declared allow-list and nothing else. The stored row
+    is asserted alongside the reply: the sent values verbatim, every other
+    column server-owned. DL-384
     """
     account = register_user()
 
@@ -1415,9 +1381,8 @@ def test_a_created_filter_belongs_to_its_author_alone(
 ):
     """One account's filter never reaches another account's read.
 
-    The create path takes the owner from the authenticated identity, and
-    the read path filters on it. A row that leaked across accounts would
-    be a broken access control, so both accounts are read back.
+    The create path takes the owner from the authenticated identity and
+    the read path filters on it. Both accounts are read back. DL-384
     """
     author = register_user()
     stranger = register_user()
@@ -1471,10 +1436,8 @@ def test_a_stored_script_payload_round_trips_inside_json(
 ):
     """A script payload held as a filter name comes back verbatim.
 
-    The response is JSON, so the value sits in no markup context on the
-    server and nothing here executes server-side. Pinning it records
-    where the escaping duty lies and fails if the same value were ever
-    served as a document.
+    The response is JSON, and the stored value is asserted to come back
+    verbatim. Nothing here executes server-side. DL-384
     """
     account = register_user()
     credentials = _bearer(account["access_token"])
@@ -1525,10 +1488,8 @@ def test_an_undeclared_key_name_reaches_no_record(
 ):
     """The caller is told which key was refused; the record is not.
 
-    Both channels are read in one case, because the two answers differ on
-    purpose. The reply names the key so a client can correct the request.
-    The record names its position, because the key itself is text the
-    caller chose and a record is read by tooling that trusts it.
+    Both channels are read in one case: the reply names the key, and the
+    record names its position. DL-384
     """
     caplog.set_level(logging.WARNING)
     response = client.post(
@@ -1587,7 +1548,7 @@ def test_a_nested_undeclared_key_is_located_but_not_named(
 
 def test_a_declared_field_name_reaches_the_record(client, unique_email,
                                                   caplog):
-    """A refused declared field is named, so the record still diagnoses."""
+    """A refused declared field is named in the record."""
     caplog.set_level(logging.WARNING)
     response = client.post(
         REGISTER_PATH, json={"email": unique_email}
@@ -1596,8 +1557,8 @@ def test_a_declared_field_name_reaches_the_record(client, unique_email,
     _assert_rejected(response, 422, "password")
 
     message = _validation_record(caplog, response)
-    # SEC-05: the name is declared by the schema, so it is the server's
-    # own vocabulary and withholding it would remove the diagnosis
+    # SEC-05: a schema-declared name is the server's own vocabulary and
+    # is carried into the record
     assert "fields=password" in message
     assert _UNDECLARED_FIELD not in message
 
@@ -1658,9 +1619,8 @@ def test_a_long_field_path_is_truncated_in_the_record(error_type, expected):
 def test_filter_criteria_beyond_the_cap_are_refused(client, register_user):
     """A criteria list longer than the cap stops at the boundary.
 
-    An unbounded list lets one authenticated request write arbitrarily
-    many child rows, so the cap is the control and the boundary is where
-    it has to be enforced (CWE-770).
+    The cap is enforced at the request boundary, ahead of any child row
+    (CWE-770). DL-384
     """
     account = register_user()
     oversized = dict(
@@ -1678,8 +1638,7 @@ def test_filter_criteria_beyond_the_cap_are_refused(client, register_user):
 def test_filter_criteria_at_the_cap_are_admitted(client, register_user):
     """A criteria list exactly at the cap clears the request boundary.
 
-    The cap refuses one entry more, so the boundary case proves the cap is
-    a bound rather than an off-by-one refusal.
+    The cap refuses one entry more, which the case above asserts.
     """
     account = register_user()
     at_cap = dict(
@@ -1759,8 +1718,8 @@ def test_identifiers_are_served_as_integers(
 ):
     """Every served identifier is a JSON number, not a string.
 
-    The columns are INTEGER, so a string identifier would force a
-    caller to coerce before comparing and would misreport the contract.
+    The columns are INTEGER, and every served identifier is asserted to be
+    a JSON number. DL-384
     """
     account = register_user()
     credentials = _bearer(account["access_token"])
@@ -1869,9 +1828,7 @@ def test_the_browser_declaration_names_the_served_fields(
     """A browser type claims exactly the keys the server sends or takes.
 
     The client casts nothing, so its declaration is the only statement of
-    the wire shape on that side. A field renamed on the server and left
-    alone here would leave the browser reading a key that is no longer
-    published, which no server-side test can catch.
+    the wire shape on that side. The two key sets are compared. DL-384
     """
     assert set(_declared_interface(filename, name)) == set(
         model.__fields__
@@ -1885,8 +1842,8 @@ def test_the_browser_declaration_types_identifiers_as_numbers(
     """Integer keys are declared as numbers, not as strings.
 
     The mapped columns are integers and the response models publish them
-    as JSON numbers, so a browser declaration claiming a string
-    misdescribes every identifier the UI reads or sends.
+    as JSON numbers. The browser declaration is read and compared.
+    DL-384
     """
     declared = _declared_interface(filename, name)
 
@@ -1895,10 +1852,10 @@ def test_the_browser_declaration_types_identifiers_as_numbers(
 
 
 def test_the_api_client_asserts_no_response_shape():
-    """The client declares its wire types instead of casting to them.
+    """The client declares a wire type on every call it makes.
 
-    An unchecked cast makes a claim the compiler cannot check, which is
-    how the identifier drift this contract pins went unnoticed.
+    The client source is read and asserted to carry no response cast.
+    DL-384
     """
     assert FRONTEND_API_CLIENT.is_file(), FRONTEND_API_CLIENT
     source = FRONTEND_API_CLIENT.read_text(encoding="utf-8")
@@ -1984,9 +1941,8 @@ def _driven_client_call(driver_body, tmp_path):
 
     The client module is copied verbatim except for two substitutions,
     each asserted to apply exactly once: its HTTP library becomes a
-    recorder, and its two type-only imports become ``import type`` so the
-    runtime needs no module resolution. The mapping under test is
-    therefore the shipped source, not a transcription of it.
+    recorder, and its two type-only imports become ``import type``. The
+    mapping under test is the shipped source. DL-384
     """
     assert _node_major() >= MINIMUM_NODE_MAJOR, MINIMUM_NODE_MAJOR
     source = FRONTEND_API_CLIENT.read_text(encoding="utf-8")
@@ -2044,9 +2000,8 @@ def test_the_form_value_the_client_receives_is_the_shape_it_maps(tmp_path):
     """The client maps the value the form actually holds.
 
     The form keys its criteria by input name and keeps a zip-code list of
-    its own, so the client cannot treat that value as the wire body. This
-    case reads the form's own initial state and input names, then runs the
-    shipped client over them.
+    its own. The case reads the form's own initial state and input names,
+    then runs the shipped client over them. DL-366
     """
     initial = _form_initial_state()
     # the form's own value is a keyed object plus a zip-code list, neither
@@ -2089,8 +2044,8 @@ def test_the_driven_form_body_persists_through_the_route(
 ):
     """The route accepts the client's body and stores its criteria.
 
-    A mapper that produced a valid-looking body the route refuses would
-    pass a model-level case and still leave the flow broken.
+    The body the client produces is posted to the route and the stored
+    criteria are read back. DL-366
     """
     body = _driven_filter_submission(tmp_path)["posted"][0]["body"]
     account = register_user()

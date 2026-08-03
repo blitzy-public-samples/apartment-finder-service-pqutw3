@@ -39,11 +39,9 @@ jobs:
         # documentation/security/decision-log.md section 2.2
         pip freeze > /tmp/frozen.txt
         # CWE-1104: suppression register staleness check;
-        # documentation/security/decision-log.md section 20. The declared
-        # set and the reported set are both read in whichever namespace they
-        # are published in: the report's own identifier and its aliases, so
-        # a GHSA-only advisory is compared too. The regex is assembled from
-        # two fragments so this check does not read itself as a declaration.
+        # documentation/security/decision-log.md section 20. Both sets are
+        # read in either namespace: the report's own identifier and its
+        # aliases. The expression is assembled from two fragments. DL-373
         pip-audit --no-deps -r /tmp/frozen.txt --format json \
           --output /tmp/audit-report.json || true
         python - <<'PY'
@@ -84,10 +82,10 @@ jobs:
           --ignore-vuln GHSA-6v7p-g79w-8964
 
     # SEC-01, SEC-12: credential scan over tracked content, this workflow
-    # included. An assignment is matched with or without spaces around the
-    # separator and with or without a quote, so a formatter-compliant
-    # spelling does not pass. Bracket expressions keep the pattern off its
-    # own line: [:] matches a colon, [W] a W, [w] a w
+    # included. An assignment matches with or without spaces around the
+    # separator and with or without a quote. Bracket expressions keep the
+    # pattern off its own line: [:] matches a colon, [W] a W, [w] a w.
+    # DL-373
     - name: Scan for hardcoded credentials
       run: |
         status=0
@@ -156,9 +154,8 @@ jobs:
         cd backend
         python -m pytest tests/security -q
 
-    # No lock file is tracked, so the install resolves from the manifest
-    # alone. documentation/security/decision-log.md records the decision and
-    # the residual determinism it leaves.
+    # The install resolves from the manifest alone; no lock file is
+    # tracked. DL-373
     - name: Install Node.js dependencies
       run: |
         cd frontend

@@ -1,31 +1,16 @@
 """Regression tests for SEC-07, the login throttle.
 
-Two controls answer a failed login. The limiter registered on the login
-route refuses the attempt past the configured threshold for one client
-address; an in-process counter refuses it for one account reached from
-many addresses. The cases below exercise each control on its own and
-both together, and check that every refusal carries the sanitized error
-envelope and reaches the server log under the correlation identifier the
-caller receives.
-
-The account counter keys on the stored account identity - the same value
-the credential query filters on - so two accounts differing only in case
-are two counters, and a successful login empties its own counter alone.
-
-One further case here belongs to the response rather than the counter:
-an unknown address and a wrong secret both reach the hasher, so the
-reply time discloses no more than the reply text does.
-
-Two further layers are exercised here. The counter map is bounded, so a
-flood of distinct addresses cannot exhaust memory and cannot drop a
-lockout to make room; those cases address the reservation function
-directly. And the limiter the application registers is proven to be the
-one the harness empties, with its rejection driven through the app.
+Two controls answer a failed login: the limiter registered on the login
+route, keyed on the client address, and an in-process counter keyed on the
+stored account identity. The cases exercise each control alone and both
+together. They assert the sanitized envelope, the correlation identifier in
+the server log, one counter per stored spelling, the bounded counter map,
+and the equal hasher work both credential branches perform.
 
 Both controls hold their state in the worker process that served the
-request, so the bound measured here is the bound one worker applies.
-Durable shared lockout is recorded as deferred in
-``documentation/security/decision-log.md``.
+request. Rationale, and the deferral of durable shared lockout, are
+recorded in ``documentation/security/decision-log.md`` sections 7 and 11,
+and in DL-365 and DL-384.
 """
 import itertools
 import logging
@@ -131,8 +116,8 @@ RESERVED_ADDRESS_KEY = "addr:reserved-probe"
 def _registered_login_limit():
     """Return the limit object the login route actually carries.
 
-    The value is read from the registered limiter, so the rejection
-    driven below carries the shipped threshold and window.
+    The value is read from the registered limiter, which carries the
+    shipped threshold and window.
     """
     registered = app.state.limiter._route_limits[_LOGIN_ROUTE_KEY]
     assert len(registered) == 1, registered
@@ -342,8 +327,8 @@ def test_the_account_counter_bounds_a_changing_client_address(
 ):
     """Attempts against one account are bounded across client addresses.
 
-    Every attempt below arrives from an address no earlier attempt used,
-    so no address budget approaches its threshold.
+    Every attempt arrives from an address no earlier attempt used, which
+    keeps every address budget below its threshold.
     """
     account = register_user()
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
@@ -369,8 +354,8 @@ def test_the_account_counter_bounds_a_changing_client_address(
 def test_the_address_budget_bounds_a_changing_account(register_user):
     """Attempts from one address are bounded across accounts.
 
-    Every attempt below names an account no earlier attempt named, so no
-    account counter approaches its threshold.
+    Every attempt names an account no earlier attempt named, which keeps
+    every account counter below its threshold.
     """
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
     accounts = [register_user() for _ in range(attempts + 1)]
@@ -457,8 +442,8 @@ def test_the_account_throttle_reaches_the_log(register_user, caplog):
     """One record carries the correlation identifier the caller sees.
 
     No submitted secret, minted token, cookie value, email address or
-    client address appears in any record. The account counter answers
-    here, because the limiter storage is emptied between attempts.
+    client address appears in any record. The limiter storage is emptied
+    between attempts, leaving the account counter to answer.
     """
     caplog.set_level(logging.WARNING, logger=application_logger.name)
     account = register_user()
@@ -509,9 +494,9 @@ def test_the_account_throttle_reaches_the_log(register_user, caplog):
 def test_the_address_throttle_reaches_the_log(
     client, register_user, caplog
 ):
-    """The address budget records its refusal, rather than dropping it.
+    """The address budget records every refusal it returns.
 
-    The record carries the correlation identifier the caller sees and no
+    The record carries the correlation identifier the caller sees, and no
     submitted value.
     """
     caplog.set_level(logging.WARNING, logger=application_logger.name)
@@ -543,9 +528,8 @@ def test_account_counter_keys_on_the_stored_identity(register_user):
     """Spellings the request model folds together share one counter.
 
     ``EmailStr`` strips surrounding space and lowercases the domain, so
-    those spellings reach the credential query - and therefore the
-    counter - as one identity. The counter key is that value, so it names
-    exactly the row a successful attempt would authenticate.
+    those spellings reach the credential query, and the counter, as one
+    identity. The counter key is that value. DL-365
     """
     account = register_user()
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
@@ -581,9 +565,8 @@ def test_case_variant_accounts_do_not_share_a_counter(register_user):
     """Exhausting one account's counter leaves the other's untouched.
 
     The credential query filters on the stored address exactly, so
-    ``Victim@example.com`` and ``victim@example.com`` are two rows. A
-    counter folding them together would let an attacker lock an account
-    by guessing at a spelling they own.
+    ``Victim@example.com`` and ``victim@example.com`` are two rows with
+    two counters. DL-365
     """
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
     victim = register_user(email="throttle-victim@example.com")
@@ -620,8 +603,8 @@ def test_a_success_on_one_variant_leaves_the_other_counter_standing(
 ):
     """Authenticating one variant does not reset the other's counter.
 
-    A shared key would let an attacker holding one spelling clear the
-    counter guarding the account they are guessing at.
+    Each stored spelling holds its own counter, cleared by its own
+    success. DL-365
     """
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
     assert attempts >= 2
@@ -664,11 +647,7 @@ def test_an_unknown_address_and_a_wrong_secret_do_equal_hasher_work(
 ):
     """An absent account is verified against a stand-in hash.
 
-    Returning before the hasher on the unknown-address branch leaves a
-    timing difference the uniform response text does not close, so the
-    account-existence oracle survives in the clock. The assertion counts
-    hasher invocations rather than measuring wall-clock time, which is
-    what a loaded runner makes unreliable.
+    The assertion counts hasher invocations, not elapsed time. DL-365
     """
     account = register_user()
     verified = []
@@ -715,8 +694,8 @@ def test_the_stand_in_hash_authenticates_nobody(client):
 
 
 def test_successful_login_empties_the_account_counter(register_user):
-    """A success resets the account counter, so later failures start
-    from zero.
+    """A success resets the account counter; later failures start from
+    zero.
     """
     attempts = settings.LOGIN_RATE_LIMIT_ATTEMPTS
     # SEC-07: the second run below needs one attempt of headroom
@@ -819,9 +798,8 @@ def test_an_elapsed_counter_is_pruned_before_the_next_attempt(
 ):
     """An elapsed lockout no longer refuses the next attempt.
 
-    The window bounds guessing for its own duration only. A counter that
-    outlived its window would lock an account out indefinitely, and one
-    that is never removed would also keep the map growing.
+    The window bounds guessing for its own duration, and the elapsed
+    counter is removed from the map. DL-365
     """
     account = register_user()
     canonical_key = auth_endpoint._account_key(account["email"])
@@ -845,9 +823,8 @@ def test_an_elapsed_counter_is_pruned_before_the_next_attempt(
 def test_the_counter_map_never_exceeds_the_cap(client, monkeypatch):
     """A flood of distinct accounts cannot grow the counter map.
 
-    Each attempt writes one account key, so an unbounded map is a
-    memory-exhaustion vector reachable by an unauthenticated caller
-    (CWE-400).
+    Each attempt writes one account key, and the map is asserted against
+    its cap (CWE-400). DL-365
     """
     monkeypatch.setattr(
         auth_endpoint, "_LOGIN_FAILURE_TRACKING_CAP", PROBE_CAP
@@ -881,10 +858,9 @@ def test_the_counter_map_never_exceeds_the_cap(client, monkeypatch):
 def test_a_key_at_the_limit_is_never_evicted(monkeypatch):
     """Eviction frees an unexhausted key, never a lockout.
 
-    The bound is reached below the HTTP layer, so the reservation
-    function is addressed directly. The exhausted key here expires
-    first, so an eviction ordered by expiry alone would take it and
-    hand a locked-out account a fresh allowance.
+    The bound sits below the HTTP layer, so the case addresses the
+    reservation function directly. The exhausted key expires first and is
+    asserted to survive eviction. DL-365
     """
     monkeypatch.setattr(
         auth_endpoint, "_LOGIN_FAILURE_TRACKING_CAP", PROBE_CAP
@@ -915,9 +891,8 @@ def test_a_key_at_the_limit_is_never_evicted(monkeypatch):
 def test_a_full_map_of_lockouts_denies_the_attempt(monkeypatch):
     """With nothing evictable the attempt is denied, not admitted.
 
-    Denying is the only choice that neither drops a lockout nor grows
-    the map past its cap, and it is unreachable through the HTTP layer
-    because a key already at the limit refuses the attempt first.
+    The case addresses the reservation function directly: through the HTTP
+    layer a key already at the limit refuses the attempt first. DL-365
     """
     monkeypatch.setattr(
         auth_endpoint, "_LOGIN_FAILURE_TRACKING_CAP", len(LOCKED_KEYS)
@@ -944,8 +919,8 @@ def test_a_full_map_of_lockouts_denies_the_attempt(monkeypatch):
 def test_the_registered_limiter_holds_its_state_in_process():
     """The application registers one limiter, backed by memory.
 
-    An external store is the dependency the minimal fix avoids, so the
-    throttle must need no service beyond the process.
+    The storage backend is read off the registered limiter and asserted to
+    need no service beyond the process. DL-365
     """
     limiter = app.state.limiter
 
@@ -963,9 +938,8 @@ def test_the_registered_limiter_holds_its_state_in_process():
 def test_the_harness_reset_empties_the_limiter_storage():
     """Both throttle mechanisms are emptied between tests.
 
-    The limiter storage outlives a test on its own, so a reset covering
-    only the counter map would let one test's throttle state decide
-    another's outcome.
+    The reset covers the limiter storage as well as the counter map, both
+    of which outlive a test. DL-384
     """
     storage = app.state.limiter._storage
     window_seconds = settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES * 60
@@ -1025,9 +999,7 @@ def test_a_limiter_rejection_reaches_the_log(
 ):
     """The refusal is recorded under the caller's correlation identifier.
 
-    A throttled attempt that reaches no record leaves an attack
-    invisible, and a refusal answered by the generic handler would carry
-    no throttle attribution at all.
+    The record names the throttle that refused the attempt. DL-365
     """
     caplog.set_level(logging.WARNING, logger=application_logger.name)
     rejection = limiter_refuses_every_request

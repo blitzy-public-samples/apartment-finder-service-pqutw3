@@ -71,9 +71,8 @@ def create_filter(client, token):
 
     ``POST /filters/`` persists: it copies the validated allow-list onto
     mapped criteria children and supplies the server-owned timestamp. The
-    row therefore arrives through the guard, which is what makes the
-    ownership assertion below cover the write path as well as the read
-    path.
+    row arrives through the guard, so the ownership assertion below covers
+    the write path and the read path. DL-384
     """
     response = client.post(
         PROTECTED_ROUTE, headers=bearer(token), json=SEEDED_FILTER_BODY
@@ -116,9 +115,9 @@ def assert_refused(response):
 def seed_account(db_session, user_id):
     """Persist one account carrying the exact integer primary key.
 
-    Registration assigns the key, so a test that needs a chosen key
-    inserts the row itself. The hash column holds a placeholder: no
-    assertion here reads it and no login path runs against it.
+    Registration assigns the key, so a case needing a specific key
+    inserts the row itself. The hash column holds a placeholder that no
+    assertion reads and no login path runs against. DL-384
     """
     row = User(
         id=user_id,
@@ -179,10 +178,9 @@ def test_session_cookie_reaches_the_protected_route(client, register_user):
 def test_guard_resolves_the_owning_account(client, register_user):
     """Each account reads its own filters and none belonging to another.
 
-    The row is created through the route, so the guard resolves the
-    subject twice: once to own the row on the way in, and once to select
-    it on the way out. A row written straight to the session would assert
-    the read path only.
+    The row is created through the route, so the guard resolves the subject
+    twice: to own the row on the way in, and to select it on the way out.
+    DL-384
     """
     owner = register_user()
     other = register_user()
@@ -319,8 +317,8 @@ OUT_OF_RANGE_SUBJECTS = [
 def test_uncoercible_subject_is_refused(client, payload):
     """A subject the guard cannot read as a user id is refused.
 
-    Coercing any of these payloads raises, so a guard that stops
-    screening the claim answers 500 and the case fails.
+    Every payload here fails coercion. The expected answer is the
+    uniform 401 challenge. DL-384
     """
     response = client.get(
         PROTECTED_ROUTE, headers=bearer(create_access_token(payload))
@@ -333,12 +331,10 @@ def test_uncoercible_subject_is_refused(client, payload):
 def test_out_of_range_subject_reaches_no_account(client, payload):
     """A subject wider than the id column is refused, not merely rejected.
 
-    The guard screens the claim before any comparison is attempted, so
-    the answer is the same uniform 401 challenge every other unusable
-    subject receives. A guard that stopped screening would let the value
-    reach the driver, which answers 500 through the sanitized boundary -
-    a status this case has to distinguish from a refusal, because a
-    server fault means the value was not screened at all.
+    The guard screens the claim ahead of any comparison, so the answer is
+    the uniform 401 challenge every other unusable subject receives. The
+    case distinguishes that refusal from the 500 the sanitized boundary
+    returns. DL-384
     """
     response = client.get(
         PROTECTED_ROUTE, headers=bearer(create_access_token(payload))
@@ -404,9 +400,9 @@ def test_coercible_subject_is_refused_before_the_lookup(
 ):
     """A coercible subject is refused while its account exists.
 
-    The row the coercion would reach is seeded first, so the refusal
-    cannot come from the unresolved-account branch. A guard that stops
-    screening the claim resolves the seeded row and answers 200.
+    The row the coercion resolves to is seeded first, so the refusal
+    comes from the screen and not from the unresolved-account branch.
+    DL-384
     """
     seed_account(db_session, resolvable_id)
     seeded = db_session.query(User).filter(User.id == resolvable_id).first()
@@ -456,10 +452,9 @@ def test_a_subject_past_the_mapped_key_ceiling_is_refused(
 ):
     """One key past the mapped ceiling is refused while its row exists.
 
-    The harness column holds the value, so the refusal cannot come from
-    the unresolved-account branch. A guard carrying a wider ceiling
-    resolves the seeded row and answers 200. The refusal a client reads
-    is the one the unresolved-account branch returns.
+    The harness column holds the value, so the refusal comes from the
+    ceiling and not from the unresolved-account branch. The status a
+    client reads is the unresolved-account 401. DL-384
     """
     seed_account(db_session, ABOVE_MAPPED_KEY_CEILING)
     seeded = (
@@ -488,9 +483,8 @@ def test_the_subject_ceiling_matches_the_key_column_width(db_session):
     """The guard's ceiling is the width the id column actually declares.
 
     The column is INTEGER, which PostgreSQL emits as a signed 32-bit
-    SERIAL. A ceiling wider than the column lets a value no key can hold
-    past the guard and into the comparison, where the driver refuses it
-    as a server fault rather than the guard refusing it as a 401.
+    SERIAL. The case compares the guard's ceiling against that width.
+    DL-384
     """
     # SEC-02: the signed 32-bit maximum the INTEGER key binds
     assert _MAX_SUBJECT_ID == 2 ** 31 - 1
@@ -510,7 +504,7 @@ def test_integer_subject_is_refused_for_a_registered_account(
     """One registered key is refused as an integer, accepted as a string.
 
     Both tokens name the same live account, so the refusal turns on the
-    type of the claim and on nothing else.
+    type of the claim alone.
     """
     account = register_user()
     refused = client.get(
