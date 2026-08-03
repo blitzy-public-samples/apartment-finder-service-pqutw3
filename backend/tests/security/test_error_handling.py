@@ -1062,8 +1062,8 @@ def test_the_owned_handler_records_one_line_without_a_root_handler(
     assert "ERROR" in line
     assert application_logger.name in line
 
-    # SEC-08: the traceback is joined rather than split, so a collector
-    # keeps the diagnosis attached to the identifier
+    # SEC-08: the traceback is joined, so a collector keeps the diagnosis
+    # attached to the identifier (CWE-778)
     assert _JOINED_LINE_MARKER in line
     assert "Traceback (most recent call last)" in line
     assert EXCEPTION_TEXT_SENTINEL in line

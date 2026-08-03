@@ -29,8 +29,8 @@ install_dependencies() {
 
     echo "Installing project dependencies..."
 
-    # SEC-11: installs the tracked backend manifest with the active
-    # interpreter; a failed install aborts the run (CWE-252)
+    # SEC-11: installs the tracked manifest with the active interpreter;
+    # a failed install aborts the run (CWE-252)
     if ! python3 -m pip install -r "$repo_root/backend/requirements.txt"; then
         echo "Failed to install $repo_root/backend/requirements.txt. Resolve the installation error, then rerun." >&2
         return 1
@@ -72,8 +72,8 @@ configure_env_vars() {
         return 1
     fi
     
-    # SEC-01: credential values are generated at run time and never stored in this file
-    # SEC-12: key length satisfies the 32-character floor on Settings.SECRET_KEY
+    # SEC-01: credential values are generated at run time, never stored here
+    # SEC-12: key length clears the floor on Settings.SECRET_KEY
     SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
     DB_APP_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
     DB_OWNER_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
@@ -83,16 +83,16 @@ configure_env_vars() {
         return 1
     fi
 
-    # SEC-11: both role passwords reach psql as quoted SQL literals; this
-    # guard holds them to the generator's own character set
+    # SEC-11: holds both role passwords to the generator's character set,
+    # since each reaches psql as a quoted SQL literal (CWE-89)
     if ! [[ "$DB_APP_PASSWORD" =~ ^[A-Za-z0-9_-]+$ ]] || ! [[ "$DB_OWNER_PASSWORD" =~ ^[A-Za-z0-9_-]+$ ]]; then
         echo "A generated role password carries an unexpected character. Please re-run." >&2
         return 1
     fi
 
-    # SEC-01/SEC-12: an owner-only temporary file is renamed over .env; no
-    # byte is world-readable at any point (CWE-367, CWE-732) and a symlink
-    # at .env is replaced (CWE-59)
+    # SEC-01/SEC-12: an owner-only temporary file is renamed over .env, so
+    # no byte is world-readable and a symlink there is replaced
+    # (CWE-59, CWE-367, CWE-732)
     env_tmp=$(umask 077 && mktemp ./.env.tmp.XXXXXXXX)
     if [ -z "$env_tmp" ] || [ ! -f "$env_tmp" ]; then
         echo "Unable to create the environment file. Setup aborted." >&2
@@ -113,15 +113,15 @@ EOF
         return 1
     fi
 
-    # SEC-01: restricts the generated secret file to the owning user; an
-    # unrestricted secret file aborts the run (CWE-252)
+    # SEC-01: restricts the secret file to its owner; failing to do so
+    # aborts the run (CWE-732, CWE-252)
     if ! chmod 600 "$env_tmp"; then
         echo "Failed to restrict .env to the owning user. Secure or remove .env before continuing." >&2
         return 1
     fi
 
-    # SEC-01: a .env path that is not a regular file absorbs the temporary
-    # file and the run still reports success (CWE-252)
+    # SEC-01: refuses a .env path that is not a regular file, which would
+    # absorb the temporary file and still report success (CWE-252)
     if [ -e .env ] && [ ! -f .env ]; then
         echo "Refusing to install .env: the path exists and is not a regular file. Remove or rename it, then rerun." >&2
         return 1
@@ -157,8 +157,8 @@ create_schema_as_owner() {
     local repo_root
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
 
-    # SEC-11: schema objects are owned by app_owner; app_user holds no CREATE
-    # on schema public and issues no DDL
+    # SEC-11: schema objects are owned by app_owner, and app_user issues
+    # no DDL (CWE-250)
     # SEC-11: the owner credential travels in the environment, never in the
     # process argument list (CWE-214)
     OWNER_DATABASE_URL="postgresql://app_owner:${DB_OWNER_PASSWORD}@localhost:5432/dbname" \
@@ -181,9 +181,8 @@ PY
 init_database() {
     echo "Initializing local database..."
 
-    # SEC-11: verifies the owner bootstrap's imports before the first
-    # database object exists, so a missing dependency does not leave a
-    # database and two roles behind (CWE-252)
+    # SEC-11: checks the owner bootstrap's imports before the first database
+    # object exists, so a failure leaves nothing behind (CWE-252)
     if ! check_schema_prerequisites; then
         echo "Cannot import SQLAlchemy, psycopg2 and backend.app.db.models with this interpreter. Install backend/requirements.txt, then rerun." >&2
         return 1
@@ -194,12 +193,12 @@ init_database() {
         return 1
     fi
 
-    # SEC-11: owner role performs schema work; application role is limited to table data operations
-    # SEC-11: PostgreSQL 13 grants CREATE on schema public to PUBLIC; the
-    # revoke below removes DDL capability from app_user
-    # SEC-11: the two role passwords reach psql on standard input through the
-    # printf builtin; neither value appears in any process argument list
-    # (CWE-214); a failed grant batch aborts the run (CWE-252)
+    # SEC-11: owner role performs schema work; application role is limited
+    # to table data operations, and the revoke below removes the CREATE on
+    # schema public that PostgreSQL 13 grants to PUBLIC (CWE-250, CWE-269)
+    # SEC-11: both role passwords reach psql on standard input, so neither
+    # appears in a process argument list (CWE-214); a failed grant batch
+    # aborts the run (CWE-252)
     {
         printf "\\\\set owner_pw '%s'\\n" "$DB_OWNER_PASSWORD"
         printf "\\\\set app_pw '%s'\\n" "$DB_APP_PASSWORD"
@@ -245,8 +244,8 @@ run_migrations() {
 # Main execution
 main() {
     check_software
-    # SEC-11: the interpreter that runs the owner bootstrap is prepared and
-    # populated before the credential and database steps
+    # SEC-11: prepares the interpreter the owner bootstrap needs before the
+    # credential and database steps
     setup_virtual_env || exit 1
     install_dependencies || exit 1
     # SEC-01/SEC-11: a failed credential or role provisioning step stops the run

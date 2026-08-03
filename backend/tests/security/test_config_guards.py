@@ -68,9 +68,7 @@ LIBPQ_SSLMODES = (
     "verify-full",
 )
 
-# SEC-10: values outside the driver's domain - a misspelling, a wrong
-# case, a padded spelling, an unknown word, the wildcard and the empty
-# string
+# SEC-10: values outside the driver's domain
 REJECTED_SSLMODES = (
     "",
     "requier",
@@ -99,9 +97,7 @@ LONG_KEY = KEY_CHARACTER * 64
 
 SIGNING_KEY_FIELD = "SECRET_KEY"
 
-# AAP 0.1.4: the eight environment variable names the user froze,
-# transcribed from that section. New settings are additive, so this tuple
-# does not grow with them.
+# AAP 0.1.4: the eight frozen environment variable names, transcribed
 FROZEN_SETTING_NAMES = (
     "DATABASE_URL",
     "SECRET_KEY",
@@ -127,17 +123,28 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 # no secret value
 ENVIRONMENT_TEMPLATE = REPOSITORY_ROOT / ".env.example"
 
+# SEC-12: the template carries two contracts; the backend parity check
+# below applies to the first, and this heading divides them
+FRONTEND_SECTION_HEADING = "# Frontend build variables"
+
+# SEC-12: the two names create-react-app embeds into the client bundle at
+# build time, so a value supplied at run time never reaches the browser
+FRONTEND_BUILD_VARIABLE = re.compile(r"process\.env\.(REACT_APP_[A-Z0-9_]+)")
+FRONTEND_SOURCE_DIR = REPOSITORY_ROOT / "frontend" / "src"
+FRONTEND_IMAGE = (
+    REPOSITORY_ROOT / "infrastructure" / "docker" / "Dockerfile.frontend"
+)
+COMPOSE_DEFINITION = (
+    REPOSITORY_ROOT / "infrastructure" / "docker" / "docker-compose.yml"
+)
+
 # SEC-01/SEC-12: the workflow carrying the credential scan, and the two
-# paths that scan formerly excluded. An exclusion made the gate blind to
-# any credential committed into either file, so the scan is read from the
-# workflow here and exercised in both directions.
+# paths that scan formerly excluded
 WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 FORMERLY_EXCLUDED_PATHS = (".github/workflows/ci.yml", "SECURITY.md")
 EXCLUSION_PATHSPEC = ":(exclude)"
 
-# CWE-1104: the dependency advisory gate. Every suppressed advisory is
-# unpatchable on the pinned Python version, so the register is complete
-# rather than growing; a new advisory fails the build.
+# CWE-1104: the dependency advisory gate, its flags and its register size
 AUDIT_STEP_NAME = "Audit Python dependencies"
 AUDIT_STEP_FLAGS = ("--strict", "--no-deps")
 FROZEN_CLOSURE_COMMAND = "pip freeze > /tmp/frozen.txt"
@@ -147,15 +154,13 @@ EXPECTED_SUPPRESSION_COUNT = 15
 # a step's own lines are indented deeper than its header
 STEP_BODY_INDENT = " " * 6
 
-# the two identifier namespaces the register uses: PYSEC, and the GHSA
-# alias one advisory carries in place of a PYSEC identifier.
+# the two identifier namespaces the register uses
 ADVISORY_IDENTIFIER = re.compile(
     r"PYSEC-[0-9]{4}-[0-9]+|GHSA(?:-[2-9a-hjkmnp-z]{4}){3}"
 )
 
 # One line per credential shape the scan detects. Every value is invented
-# here and appears in no configuration. Each is assembled from fragments,
-# so the scan reading this file matches none of them.
+# and assembled from fragments, so the scan matches none of them here.
 CREDENTIAL_POSITIVE_CONTROLS = (
     pytest.param(
         "DATABASE_URL=postgresql://postgres" + ":" + "postgres@db:5432/app",
@@ -175,8 +180,7 @@ CREDENTIAL_POSITIVE_CONTROLS = (
     ),
 )
 
-# Documented placeholders the scan must pass over. A template that named
-# every variable but tripped the gate would force the exclusions back.
+# Documented placeholders the scan must pass over
 CREDENTIAL_NEGATIVE_CONTROLS = (
     pytest.param(
         "SECRET_KEY=<random-secret-min-32-chars>", id="template-key"
@@ -192,8 +196,8 @@ CREDENTIAL_NEGATIVE_CONTROLS = (
     pytest.param("SENTRY_DSN=", id="template-empty-value"),
 )
 
-# Rule 1: the register that justifies every suppressed advisory, and the
-# one condition under which all of them are re-measured
+# Rule 1: the register justifying every suppressed advisory, and the
+# condition under which all are re-measured
 DECISION_LOG = (
     REPOSITORY_ROOT / "documentation" / "security" / "decision-log.md"
 )
@@ -202,12 +206,10 @@ REVIEW_TRIGGER = "a Python runtime upgrade"
 # Rule 1: the operational document that carries the residual register
 SECURITY_DOCUMENT = REPOSITORY_ROOT / "SECURITY.md"
 
-# SEC-01/SEC-11: the developer provisioning script. No case runs it - it
-# creates databases and cluster roles - so its guards are read as text.
+# SEC-01/SEC-11: the developer provisioning script, read as text
 PROVISIONING_SCRIPT = REPOSITORY_ROOT / "scripts" / "setup_dev_environment.sh"
 
-# SEC-11: every privilege the application role is granted. Data operations
-# on the owner's tables, and nothing that changes the schema.
+# SEC-11: every privilege the application role is granted
 APP_ROLE_GRANTS = (
     "GRANT CONNECT ON DATABASE dbname TO app_user;",
     "GRANT USAGE ON SCHEMA public TO app_user;",
@@ -245,14 +247,12 @@ FORBIDDEN_PROVISIONING_SQL = (
     "GRANT CREATE ON SCHEMA public TO app_user",
 )
 
-# SEC-11: a role password quoted directly after the keyword would be a
-# credential in a tracked file. The script passes values as psql variables
-# instead, so the keyword is followed by a colon. The fragments keep this
-# expression out of the repository credential scan's way.
+# SEC-11: an inline role-password literal, assembled from fragments so the
+# repository credential scan does not match this expression
 SQL_PASSWORD_LITERAL = re.compile("PASS" + "WORD +'")
 
 # SEC-11: the two forms that would place a role password in an argument
-# list, where any local process can read it
+# list, readable by any local process (CWE-214)
 ARGUMENT_LIST_PASSWORD_FORMS = ("-v owner_pw=", "-v app_pw=")
 
 # SEC-01: the guards that keep the generated secret file unreadable by
@@ -267,13 +267,11 @@ SECRET_FILE_GUARDS = (
     pytest.param("^[A-Za-z0-9_-]+$", id="generated-password-charset"),
 )
 
-# SEC-01: writing the secrets straight to the destination is the shape the
-# guards above replace
+# SEC-01: the direct-write shape the guards above replace
 DIRECT_SECRET_WRITE = "EOF > .env"
 
-# SEC-01/SEC-11: main runs these in this order, each stopping the run on
-# failure. The interpreter is prepared before anything uses it, and the
-# credentials exist before the roles that carry them.
+# SEC-01/SEC-11: the order main runs these in, each stopping the run on
+# failure
 PROVISIONING_ORDER = (
     "setup_virtual_env || exit 1",
     "install_dependencies || exit 1",
@@ -316,9 +314,7 @@ OWNER_BOOTSTRAP_PREREQUISITES = "check_schema_prerequisites"
 OWNER_CREDENTIAL_VARIABLE = "OWNER_DATABASE_URL"
 OWNER_SCHEMA_CREATION = "Base.metadata.create_all(bind=engine)"
 
-# SEC-10/SEC-11: the infrastructure declarations that carry the server
-# half of transport encryption and the separated application role. No
-# runtime case can reach them, so they are read as text.
+# SEC-10/SEC-11: the infrastructure declarations, read as text
 TERRAFORM_DIRECTORY = REPOSITORY_ROOT / "infrastructure" / "terraform"
 TERRAFORM_MAIN = TERRAFORM_DIRECTORY / "main.tf"
 TERRAFORM_VARIABLES = TERRAFORM_DIRECTORY / "variables.tf"
@@ -327,8 +323,8 @@ TERRAFORM_VARIABLES = TERRAFORM_DIRECTORY / "variables.tf"
 CLOUD_SQL_INSTANCE = ("google_sql_database_instance", "main")
 CLOUD_SQL_USER = ("google_sql_user", "app")
 
-# SEC-10: the only instance transport setting that refuses an unencrypted
-# connection. The alternatives permit one, so the value is exact.
+# SEC-10: the one instance transport setting that refuses an unencrypted
+# connection; every other value in the domain permits one
 REQUIRED_SSL_MODE = "ENCRYPTED_ONLY"
 QUOTED_SSL_MODE = '"{0}"'.format(REQUIRED_SSL_MODE)
 
@@ -345,17 +341,14 @@ APP_ROLE_PASSWORD_VARIABLE = "db_app_password"
 APP_ROLE_NAME_REFERENCE = "var.{0}".format(APP_ROLE_NAME_VARIABLE)
 APP_ROLE_PASSWORD_REFERENCE = "var.{0}".format(APP_ROLE_PASSWORD_VARIABLE)
 
-# SEC-12: the write-only argument carrying the password, the counter that
-# makes a rotation reapply it, and the state-persisting argument that must
-# stay absent
+# SEC-12: the write-only password argument, its rotation counter, and the
+# state-persisting argument that must stay absent
 APP_ROLE_PASSWORD_ARGUMENT = "password_wo"
 APP_ROLE_PASSWORD_VERSION_ARGUMENT = "password_wo_version"
 APP_ROLE_PASSWORD_VERSION_VARIABLE = "db_app_password_version"
 STATE_PERSISTING_PASSWORD_ARGUMENT = "password ="
 
-# SEC-11: the arguments and variables the declaration must not carry. No
-# repository mechanism creates a custom database role or grants it anything,
-# so a role assignment leaves a default apply unable to create the account.
+# SEC-11: the argument and the variable the declaration must not carry
 ROLE_ASSIGNMENT_ARGUMENT = "database_roles"
 WITHDRAWN_ROLE_VARIABLE = "db_app_role"
 
@@ -494,10 +487,7 @@ class StubPayment:
         return dict(self.created)
 
 
-# Every engine a probe builds is registered here so the autouse fixture
-# below can dispose it. Executing the database module creates a connection
-# pool, and an undisposed pool holds its connections for the rest of the
-# session - one leak per parametrized case.
+# Every engine a probe builds, registered for disposal by the fixture below
 _PROBE_ENGINES = []
 
 
@@ -536,15 +526,29 @@ def test_pinned_validation_library_is_the_one_x_line():
     assert PYDANTIC_VERSION.startswith("1."), PYDANTIC_VERSION
 
 
-def _documented_setting_names():
-    """Return every variable name the environment template documents."""
-    assert ENVIRONMENT_TEMPLATE.is_file(), ENVIRONMENT_TEMPLATE
-    source = ENVIRONMENT_TEMPLATE.read_text(encoding="utf-8")
+def _assigned_names(source):
+    """Return the variable names one template extract assigns."""
     return {
         line.split("=", 1)[0].strip()
         for line in source.splitlines()
         if "=" in line and not line.lstrip().startswith("#")
     }
+
+
+def _template_sections():
+    """Return the backend and frontend halves of the template."""
+    assert ENVIRONMENT_TEMPLATE.is_file(), ENVIRONMENT_TEMPLATE
+    source = ENVIRONMENT_TEMPLATE.read_text(encoding="utf-8")
+    backend_half, marker, frontend_half = source.partition(
+        FRONTEND_SECTION_HEADING
+    )
+    assert marker, FRONTEND_SECTION_HEADING
+    return backend_half, frontend_half
+
+
+def _documented_setting_names():
+    """Return every backend variable name the template documents."""
+    return _assigned_names(_template_sections()[0])
 
 
 def test_baseline_kwargs_supply_every_required_field():
@@ -564,8 +568,7 @@ def test_the_frozen_setting_names_are_declared_unchanged():
 
     AAP 0.1.4 freezes these names, so renaming or dropping one breaks the
     deployment contract even when the field behind it survives under
-    another name. The names are written out above this test; reading them
-    from the model instead would make the assertion agree with a rename.
+    another name. The names are transcribed above this case.
     """
     declared = set(Settings.__fields__)
 
@@ -1034,13 +1037,9 @@ def _workflow_step(name):
 def test_the_dependency_audit_gate_keeps_its_shape():
     """The audit step fails on any advisory outside its register.
 
-    The gate is only useful if it can pass and can fail. Its passing
-    direction depends on the register being complete, and its failing
-    direction on the register being exact, so the count is written out
-    here: a suppression added without a decision-log entry fails this
-    case. Each identifier is also shape-checked, because the audit tool
-    accepts an identifier it does not recognise and silently suppresses
-    nothing, which turns a typo into a hole rather than an error.
+    The count is transcribed here, so a suppression added without a
+    decision-log entry fails this case. Every identifier is shape-checked
+    as well, since an unrecognised one suppresses nothing.
     """
     step = _workflow_step(AUDIT_STEP_NAME)
 
@@ -1148,8 +1147,8 @@ def test_the_credential_scan_passes_over_documented_placeholders(line):
 def test_the_credential_scan_matches_no_part_of_its_own_source():
     """The scan does not match the line that declares it.
 
-    Each alternative is split by a one-character bracket expression, so
-    the pattern matches the same text without matching itself.
+    Every branch of the pattern is split by a one-character bracket
+    expression, so it matches the same text without matching itself.
     """
     command = _credential_scan_command()
     pattern = _credential_scan_pattern()
@@ -1232,13 +1231,9 @@ def _terraform_variable(name):
 def test_the_database_instance_refuses_unencrypted_connections():
     """The Cloud SQL instance declares encrypted-only transport.
 
-    Every other transport case here inspects the client half, the engine
-    argument the application sends. AAP 0.5.10 requires both ends, and
-    the server end exists only as a declaration that no runtime case can
-    reach. ``terraform validate`` cannot stand in for this: the directory
-    carries pre-existing references to resources it never declares, so
-    the whole-directory command fails for reasons unrelated to transport.
-    Reading the declaration is what leaves the server end covered.
+    AAP 0.5.10 requires both ends. Every other transport case inspects the
+    client half; this one reads the server half, which exists only as a
+    declaration no runtime case can reach.
     """
     instance = _terraform_resource(*CLOUD_SQL_INSTANCE)
     ip_configuration = _hcl_block(
@@ -1897,33 +1892,25 @@ def test_the_provider_logger_withholds_records_below_warning():
 
 # SEC-09: the route awaits the service seam, not a local stand-in
 def test_the_subscription_route_awaits_the_service_seam():
-    """The subscription route is bound to the module-level charge seam.
-
-    A route holding its own callable would refuse nothing while the
-    service cases above still passed, so the binding is asserted rather
-    than assumed.
-    """
+    """The subscription route is bound to the module-level charge seam."""
     assert subscription_route.process_payment is paypal_service.process_payment
 
 
 # ---------------------------------------------------------------------
-# SEC-01/SEC-12: how the provisioning script writes the only credentials
-# a developer machine holds is part of the control
+# SEC-01/SEC-12: how the provisioning script writes its credentials
 # ---------------------------------------------------------------------
 # SEC-01: the alphabet the generated values are constrained to
 CREDENTIAL_ALPHABET = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
-# SEC-01: a permissive creation mask, so each case measures the script's own
-# guarantee rather than the mask it happened to inherit
+# SEC-01: a permissive creation mask, so each case measures the script's
+# own guarantee (CWE-732)
 PERMISSIVE_UMASK = "022"
 
 # SEC-01: what a planted name standing at .env holds before the run
 PLANTED_TARGET_CONTENT = "zzz-planted-standing-name-8901\n"
 
-# SEC-11: the two bootstrap helpers reach a live cluster and an importable
-# repository root, neither of which a unit run provides. They are replaced
-# with successful no-ops so the psql batch between them executes as shipped;
-# their shipped bodies are covered by the statement cases above.
+# SEC-11: no-op stands-in for the two bootstrap helpers that reach a live
+# cluster, so the psql batch between them executes as shipped
 PROVISIONING_BOOTSTRAP_STUBS = (
     "check_schema_prerequisites() { return 0; }",
     "create_schema_as_owner() { return 0; }",
@@ -1933,11 +1920,9 @@ PROVISIONING_BOOTSTRAP_STUBS = (
 def _run_provisioning(work_dir, functions, expect_status=0):
     """Run named functions from the real provisioning script.
 
-    The script is sourced with its single bare ``main`` invocation removed,
-    so the named function bodies execute exactly as shipped without the
-    dependency installs and migrations the orchestration performs. Only
-    ``psql`` and ``createdb`` are replaced, and the replacement records the
-    argument vector and the standard input it received.
+    The script is sourced with its bare ``main`` invocation removed, and
+    only ``psql`` and ``createdb`` are replaced; each replacement records
+    the argument vector and the standard input it received.
     """
     stub_dir = work_dir / "stub-bin"
     capture_dir = work_dir / "capture"
@@ -2141,3 +2126,287 @@ def test_the_generated_credentials_use_a_constrained_alphabet(tmp_path):
     # SEC-12: and the key clears the floor of every algorithm Settings
     # accepts, not only the configured one
     assert len(values["SECRET_KEY"]) >= max(HMAC_KEY_MIN_BYTES.values())
+
+
+# ---------------------------------------------------------------------
+# SEC-12: docker build-context exclusions
+# ---------------------------------------------------------------------
+# SEC-12: both images copy their whole context, so the context-local
+# ignore file is what keeps a local secret out of an image layer
+# (CWE-200, CWE-522)
+DOCKER_CONTEXTS = {
+    ".": REPOSITORY_ROOT / ".dockerignore",
+    "backend": REPOSITORY_ROOT / "backend" / ".dockerignore",
+    "frontend": REPOSITORY_ROOT / "frontend" / ".dockerignore",
+}
+
+DOCKERFILES = (
+    REPOSITORY_ROOT / "infrastructure" / "docker" / "Dockerfile.backend",
+    REPOSITORY_ROOT / "infrastructure" / "docker" / "Dockerfile.frontend",
+)
+
+# SEC-12: one path per class of material that must never enter a layer
+EXCLUDED_CONTEXT_PATHS = {
+    ".": (
+        ".env",
+        "backend/.env",
+        "frontend/.env",
+        ".env.tmp.7f3a91",
+        "infrastructure/docker/secrets/google-credentials.json",
+        "tls/server.pem",
+        "tls/server.key",
+        "gcp-credentials.json",
+        ".venv/bin/python",
+        "backend/venv/bin/python",
+        "frontend/node_modules/axios/index.js",
+        "backend/app/__pycache__/main.cpython-39.pyc",
+        "backend/app/main.pyc",
+        "backend/.pytest_cache/CACHEDATA",
+        "backend/.coverage",
+        "backend/coverage.xml",
+        "htmlcov/index.html",
+        "frontend/build/index.html",
+        "frontend/coverage/lcov.info",
+        ".git/config",
+    ),
+    "backend": (
+        ".env",
+        ".env.tmp.7f3a91",
+        "secrets/google-credentials.json",
+        "tls/server.pem",
+        "tls/server.key",
+        "gcp-credentials.json",
+        ".venv/bin/python",
+        "venv/bin/python",
+        "app/__pycache__/main.cpython-39.pyc",
+        "app/main.pyc",
+        ".pytest_cache/CACHEDATA",
+        ".coverage",
+        "coverage.xml",
+        "htmlcov/index.html",
+        ".git/config",
+    ),
+    "frontend": (
+        ".env",
+        ".env.tmp.7f3a91",
+        "secrets/google-credentials.json",
+        "tls/server.pem",
+        "tls/server.key",
+        "gcp-credentials.json",
+        "node_modules/axios/index.js",
+        "build/index.html",
+        "coverage/lcov.info",
+        ".git/config",
+    ),
+}
+
+# SEC-12: material each build needs, so an exclusion cannot be widened
+# into a broken image
+REQUIRED_CONTEXT_PATHS = {
+    ".": ("backend/requirements.txt", "frontend/package.json", ".env.example"),
+    "backend": ("requirements.txt", "app/main.py", "tests/conftest.py"),
+    "frontend": (
+        "package.json",
+        "package-lock.json",
+        "src/index.tsx",
+        "src/services/api.ts",
+    ),
+}
+
+
+def _dockerignore_patterns(path):
+    """Return the ignore patterns one context file declares."""
+    assert path.is_file(), path
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _pattern_regex(pattern):
+    """Compile one ignore pattern under Docker's documented matching.
+
+    Only the constructs these files use are handled: a leading ``**/``
+    or an embedded ``**`` spanning whole path segments, ``*`` and ``?``
+    inside one segment, a character class, and a trailing separator
+    marking a directory. A directory pattern also matches the paths
+    beneath it, which the caller supplies by testing every ancestor.
+    """
+    directory = pattern.endswith("/")
+    segments = pattern.rstrip("/").split("/")
+    compiled = ""
+    pending_separator = False
+    for index, segment in enumerate(segments):
+        if pending_separator:
+            compiled += "/"
+            pending_separator = False
+        if segment == "**":
+            # a spanning wildcard supplies its own separator, and matches
+            # zero segments, so none is added after it
+            last = index == len(segments) - 1
+            compiled += ".*" if last else "(?:[^/]+/)*"
+            continue
+        position = 0
+        while position < len(segment):
+            character = segment[position]
+            if character == "*":
+                compiled += "[^/]*"
+            elif character == "?":
+                compiled += "[^/]"
+            elif character == "[":
+                closing = segment.find("]", position)
+                assert closing != -1, pattern
+                compiled += segment[position:closing + 1]
+                position = closing
+            else:
+                compiled += re.escape(character)
+            position += 1
+        pending_separator = True
+    return re.compile("(?:{0})$".format(compiled)), directory
+
+
+def _is_excluded(patterns, candidate):
+    """Report whether the ignore patterns exclude one context path."""
+    parts = candidate.split("/")
+    prefixes = ["/".join(parts[:count + 1]) for count in range(len(parts))]
+    excluded = False
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        expression, _directory = _pattern_regex(pattern.lstrip("!"))
+        if any(expression.match(prefix) for prefix in prefixes):
+            excluded = not negated
+    return excluded
+
+
+@pytest.mark.parametrize("context", sorted(DOCKER_CONTEXTS))
+def test_every_build_context_declares_an_ignore_file(context):
+    """Each build context carries its own ignore file."""
+    assert DOCKER_CONTEXTS[context].is_file(), DOCKER_CONTEXTS[context]
+    assert _dockerignore_patterns(DOCKER_CONTEXTS[context])
+
+
+@pytest.mark.parametrize("context", sorted(EXCLUDED_CONTEXT_PATHS))
+def test_the_build_context_excludes_every_secret_bearing_path(context):
+    """No secret, key, credential, dependency or cache path is copied.
+
+    SEC-12 keeps secrets out of version control; an image layer is the
+    other place a local secret can escape to, because both Dockerfiles
+    copy the whole context.
+    """
+    patterns = _dockerignore_patterns(DOCKER_CONTEXTS[context])
+
+    for candidate in EXCLUDED_CONTEXT_PATHS[context]:
+        assert _is_excluded(patterns, candidate), (context, candidate)
+
+
+@pytest.mark.parametrize("context", sorted(REQUIRED_CONTEXT_PATHS))
+def test_the_build_context_still_carries_what_the_image_needs(context):
+    """The exclusions withhold nothing the build depends on."""
+    patterns = _dockerignore_patterns(DOCKER_CONTEXTS[context])
+
+    for candidate in REQUIRED_CONTEXT_PATHS[context]:
+        assert not _is_excluded(patterns, candidate), (context, candidate)
+
+
+def test_the_matcher_rejects_a_pattern_that_covers_nothing():
+    """The matcher fails a context whose ignore file lost a pattern."""
+    weakened = [
+        pattern
+        for pattern in _dockerignore_patterns(DOCKER_CONTEXTS["backend"])
+        if pattern != "**/.env"
+    ]
+
+    assert not _is_excluded(weakened, ".env")
+    assert _is_excluded(weakened, "secrets/google-credentials.json")
+
+
+@pytest.mark.parametrize("dockerfile", DOCKERFILES, ids=lambda p: p.name)
+def test_each_image_copies_its_context_wholesale(dockerfile):
+    """The premise the exclusions rest on is asserted, not assumed.
+
+    An image that copied an explicit allow-list would not need the
+    exclusions. Both copy the whole context, so the exclusions are the
+    control, and this case fails if that stops being true.
+    """
+    assert dockerfile.is_file(), dockerfile
+    body = dockerfile.read_text(encoding="utf-8")
+
+    assert re.search(r"^COPY \. \.$", body, re.MULTILINE), dockerfile
+
+
+# ---------------------------------------------------------------------
+# SEC-12: the frontend build-variable contract
+# ---------------------------------------------------------------------
+def _frontend_build_variables():
+    """Return every build variable the browser sources read."""
+    assert FRONTEND_SOURCE_DIR.is_dir(), FRONTEND_SOURCE_DIR
+    found = set()
+    for path in sorted(FRONTEND_SOURCE_DIR.rglob("*")):
+        if path.suffix in {".ts", ".tsx"} and path.is_file():
+            found.update(
+                FRONTEND_BUILD_VARIABLE.findall(
+                    path.read_text(encoding="utf-8")
+                )
+            )
+    assert found, FRONTEND_SOURCE_DIR
+    return found
+
+
+def test_the_template_documents_every_frontend_build_variable():
+    """The template names each build variable the browser code reads.
+
+    SEC-12 requires each variable to be documented by name, and the
+    template is the authority an operator is sent to. A build variable it
+    omits reaches that operator as a bundle pointing at nothing.
+    """
+    documented = _assigned_names(_template_sections()[1])
+
+    assert documented == _frontend_build_variables(), documented
+
+
+def test_no_backend_setting_is_documented_as_a_build_variable():
+    """The two contracts stay separate, so neither absorbs the other."""
+    backend_half, frontend_half = _template_sections()
+
+    assert not _assigned_names(frontend_half) & set(Settings.__fields__)
+    assert not _assigned_names(backend_half) & _frontend_build_variables()
+
+
+@pytest.mark.parametrize("name", sorted(_frontend_build_variables()))
+def test_the_frontend_build_declares_each_variable_it_embeds(name):
+    """The image takes each build variable as an argument, not a literal."""
+    assert FRONTEND_IMAGE.is_file(), FRONTEND_IMAGE
+    body = FRONTEND_IMAGE.read_text(encoding="utf-8")
+
+    argument = body.index("ARG {0}".format(name))
+    assigned = body.index("ENV {0}=${0}".format(name))
+
+    # SEC-12: both precede the build, or the substitution misses them
+    assert argument < body.index("RUN npm run build")
+    assert assigned < body.index("RUN npm run build")
+
+
+@pytest.mark.parametrize("name", sorted(_frontend_build_variables()))
+def test_the_compose_definition_forwards_each_build_variable(name):
+    """Compose passes each name to the build with no inline default."""
+    assert COMPOSE_DEFINITION.is_file(), COMPOSE_DEFINITION
+    body = COMPOSE_DEFINITION.read_text(encoding="utf-8")
+
+    assert "- {0}=${{{0}}}".format(name) in body, name
+
+
+def test_no_build_variable_is_supplied_only_at_run_time():
+    """No build variable is offered to the running container instead.
+
+    A value the bundle needs at build time does nothing in a runtime
+    environment block, and offering it there reads as though it works.
+    """
+    body = COMPOSE_DEFINITION.read_text(encoding="utf-8")
+    runtime_lines = [
+        line
+        for line in body.splitlines()
+        if "REACT_APP" in line and "${" not in line and "#" not in line
+    ]
+
+    assert runtime_lines == [], runtime_lines

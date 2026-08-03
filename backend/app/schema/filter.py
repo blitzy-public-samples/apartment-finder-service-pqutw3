@@ -2,9 +2,7 @@ from pydantic import BaseModel, StrictStr, conlist, constr, validator
 from datetime import datetime
 from typing import List, Optional
 
-# SEC-05: caps what one authenticated POST /filters/ can store. An unbounded
-# criteria list and unbounded criterion text let a single request write
-# arbitrarily many arbitrarily large rows (CWE-770)
+# SEC-05: bounds on what one POST /filters/ can store (CWE-770)
 MAX_CRITERIA = 25
 MAX_CRITERION_FIELD = 64
 MAX_CRITERION_OPERATOR = 16
@@ -13,8 +11,7 @@ MAX_FILTER_NAME = 120
 
 
 def _reject_nul_character(value: str) -> str:
-    # SEC-05: a NUL byte is refused by the PostgreSQL text type and aborts the
-    # transaction at commit (CWE-20)
+    # SEC-05: the text type refuses a NUL byte at commit (CWE-20)
     if "\x00" in value:
         raise ValueError("must not contain a NUL character")
     return value
@@ -32,8 +29,7 @@ class Criteria(BaseModel):
     operator: StrictStr
     value: StrictStr
 
-    # SEC-05: refuses the byte the driver cannot store; an authenticated
-    # caller can no longer force a 500 out of db.commit() (CWE-20)
+    # SEC-05: refuses the byte the driver cannot store (CWE-20)
     _reject_nul = validator(
         "field", "operator", "value", allow_reuse=True
     )(_reject_nul_character)
@@ -43,8 +39,7 @@ class Criteria(BaseModel):
         orm_mode = True    # SEC-05: reads the mapped criteria rows on response
 
 
-# SEC-05: bounded twin of Criteria for the write path; the read model above
-# stays unbounded
+# SEC-05: bounded twin of Criteria for the write path
 class CriteriaCreate(Criteria):
     field: constr(strict=True, max_length=MAX_CRITERION_FIELD)
     operator: constr(strict=True, max_length=MAX_CRITERION_OPERATOR)
@@ -55,8 +50,7 @@ class FilterCreate(BaseModel):
     name: constr(strict=True, max_length=MAX_FILTER_NAME)
     criteria: conlist(CriteriaCreate, max_items=MAX_CRITERIA)
 
-    # SEC-05: refuses the byte the driver cannot store; an authenticated
-    # caller can no longer force a 500 out of db.commit() (CWE-20)
+    # SEC-05: refuses the byte the driver cannot store (CWE-20)
     _reject_nul_name = validator(
         "name", allow_reuse=True
     )(_reject_nul_character)
@@ -66,7 +60,7 @@ class FilterCreate(BaseModel):
         extra = "forbid"
 
 class Filter(BaseModel):
-    # SEC-05: matches the INTEGER key and foreign key at models.py:37-38
+    # SEC-05: matches the INTEGER key and foreign key
     id: int
     user_id: int
     name: str

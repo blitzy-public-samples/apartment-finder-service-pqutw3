@@ -28,8 +28,7 @@ PASSWORD_SPECIAL_CHARACTERS = "!@#$%^&*()_+-=[]{};':\"\\|,.<>/?"
 
 
 def _reject_nul_character(value: str) -> str:
-    # SEC-05: bcrypt refuses a NUL byte in a secret and raises on the hash
-    # call and the verify call alike
+    # SEC-05: the hasher refuses a NUL byte in a secret (CWE-20)
     if "\x00" in value:
         raise ValueError("must not contain a NUL character")
     return value
@@ -82,9 +81,6 @@ class UserLogin(BaseModel):
     # SEC-05: email must arrive as a JSON string; no type coercion
     _require_string_email = validator(
         "email", pre=True, allow_reuse=True)(_require_json_string)
-
-    # SEC-04: no policy validator here; every credential reaches
-    # authentication and any refusal is the counted uniform 401 (CWE-209)
 
     class Config:
         # SEC-05: rejects unknown keys; closes the CWE-915 vector

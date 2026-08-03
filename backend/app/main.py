@@ -34,9 +34,8 @@ _JOINED_LINE_MARKER = "\\n"
 
 
 class _SingleLineFormatter(logging.Formatter):
-    # SEC-08: one record occupies one line. A traceback split across
-    # lines loses the correlation identifier a line-oriented collector
-    # files it under (CWE-778).
+    # SEC-08: one record occupies one line, so a multi-line traceback
+    # stays attached to its correlation identifier (CWE-778)
     def format(self, record: logging.LogRecord) -> str:
         return super().format(record).replace("\n", _JOINED_LINE_MARKER)
 
@@ -47,9 +46,8 @@ class _ApplicationLogHandler(logging.StreamHandler):
 
 
 def _configure_application_logging() -> None:
-    # SEC-08: the server configures its own loggers and leaves this
-    # package on logging.lastResort, which emits the message alone -
-    # no level, no timestamp, no logger name (CWE-778)
+    # SEC-08: gives this package a level, a timestamp and a logger name,
+    # none of which logging.lastResort emits (CWE-778)
     application_logger = logging.getLogger(_APPLICATION_LOGGER_NAME)
     application_logger.setLevel(_LOG_LEVEL)
     for handler in application_logger.handlers:
@@ -70,11 +68,8 @@ app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
 def create_tables():
-    # SEC-11: issues DDL for absent tables only. Against a database
-    # provisioned by scripts/setup_dev_environment.sh every table already
-    # exists and is owned by the owner role, so the runtime role reaches this
-    # call holding no CREATE on the schema. An unprovisioned PostgreSQL
-    # database fails closed here with InsufficientPrivilege.
+    # SEC-11: DDL for absent tables only; a runtime role holding no CREATE
+    # on a provisioned schema is not asked to issue any (CWE-250)
     Base.metadata.create_all(bind=engine, checkfirst=True)
 
 
@@ -99,8 +94,7 @@ class SanitizedServerErrorMiddleware:
         try:
             await self.app(scope, receive, send_started)
         except Exception as exc:
-            # SEC-08: a partially sent response cannot be replaced; the
-            # framework boundary outside this layer completes it
+            # SEC-08: a partially sent response cannot be replaced
             if started:
                 raise
             response = handle_unhandled_exception(
@@ -135,23 +129,20 @@ create_tables()
 _REQUEST_LOCATIONS = ("body", "query", "path", "header", "cookie")
 _GENERIC_SERVER_DETAIL = "Internal server error"
 
-# SEC-08: a request path and a request method are client-supplied text. A
-# record names the matched route template and a served verb, so a token
-# or an address carried in the request line reaches no record (CWE-532).
+# SEC-08: substitutes for the client-supplied request path and method, so
+# neither reaches a record (CWE-532)
 _UNMATCHED_ROUTE = "<unmatched>"
 _UNSERVED_METHOD = "<method>"
 _SERVED_METHODS = frozenset({"GET", "HEAD", "POST", "OPTIONS"})
 
-# SEC-08: pydantic reports an undeclared key by name, and that name is
-# submitted text. A record names the position and withholds the key.
+# SEC-08: an undeclared key's name is submitted text, so a record names
+# its position and withholds the key (CWE-532)
 _UNDECLARED_ERROR_TYPES = ("value_error.extra", "extra_forbidden")
 _UNDECLARED_FIELD = "<undeclared>"
 _MAX_LOGGED_FIELDS = 8
 _MAX_LOGGED_NAME_LENGTH = 40
 
-# SEC-08: the client reference and the server diagnostics are two
-# channels joined by one correlation identifier. The type chain and the
-# frame summary below are the indexable part of a record.
+# SEC-08: bounds on the type chain and the frame summary a record carries
 _MAX_LOGGED_CAUSES = 4
 _MAX_LOGGED_FRAMES = 6
 _APPLICATION_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -161,9 +152,8 @@ _APPLICATION_ROOT = os.path.dirname(os.path.abspath(__file__))
 _MAX_RENDERED_MEMBERS = 16
 _MIN_DRIVER_TEXT_LENGTH = 4
 
-# SEC-08: a diagnostic record carries the formatted traceback, which
-# quotes exception messages. Held secrets and secret-shaped text are
-# removed from it before it reaches a log handler (CWE-209, CWE-532).
+# SEC-08: held secrets and secret-shaped text are removed from a record
+# before it reaches a handler (CWE-209, CWE-532)
 _REDACTED = "[redacted]"
 _MIN_SECRET_LENGTH = 8
 _SECRET_SETTING_NAMES = (
@@ -190,10 +180,8 @@ _SECRET_SHAPES = (
         re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
         r"\g<1>" + _REDACTED,
     ),
-    # a credential named in assignment, keyword or mapping syntax. The name
-    # match ends an identifier: signing_key, client_secret and api-token are
-    # covered alongside key, secret and token. The lookahead skips a value
-    # a previous pattern already replaced; one marker per value.
+    # a credential named in assignment, keyword or mapping syntax, with a
+    # lookahead that leaves one marker per value
     (
         re.compile(
             r"(?i)([A-Za-z0-9_.\-]*(?:pass(?:word|wd|phrase)?|secret"
@@ -219,9 +207,8 @@ def _status_phrase(status_code: int) -> str:
 
 
 def _route_label(request: Request) -> str:
-    # SEC-08: the template of the matched route, never the request path.
-    # A path carries whatever the caller put in the request line, which a
-    # link sent to a victim can make a token or an address (CWE-532).
+    # SEC-08: the template of the matched route, never the request path
+    # the caller supplied (CWE-532)
     route = request.scope.get("route")
     template = getattr(route, "path", None)
     if isinstance(template, str) and template:
@@ -268,9 +255,8 @@ def _exception_chain(exc: BaseException) -> str:
 
 
 def _exception_origin(exc: BaseException) -> str:
-    # SEC-08: a compact single-line frame summary for indexing, with source
-    # lookup disabled. The innermost application frame is kept alongside the
-    # innermost frames overall.
+    # SEC-08: a single-line frame summary with source lookup disabled,
+    # keeping the innermost application frame
     frames = traceback.StackSummary.extract(
         traceback.walk_tb(exc.__traceback__), lookup_lines=False
     )
@@ -296,7 +282,8 @@ def _dsn_password(url: str) -> str:
 
 
 def _secret_literals() -> tuple:
-    # SEC-08: the values this process holds that no record may quote
+    # SEC-08: the values this process holds that no record may quote,
+    # longest first so no remainder of a longer one survives (CWE-532)
     values = [
         getattr(settings, name, None) for name in _SECRET_SETTING_NAMES
     ]
@@ -306,8 +293,6 @@ def _secret_literals() -> tuple:
         for value in values
         if value and len(str(value)) >= _MIN_SECRET_LENGTH
     }
-    # SEC-08: longest first; a shorter secret nested in a longer one leaves
-    # no remainder of the longer one in the record
     return tuple(sorted(literals, key=len, reverse=True))
 
 
@@ -321,8 +306,7 @@ def _redact(text: str) -> str:
 
 
 def _exception_members(exc: BaseException) -> list:
-    # SEC-08: every exception a formatted report renders - the raised one
-    # plus its driver origin, its cause and its context
+    # SEC-08: every exception a formatted report renders
     members = []
     seen = set()
     pending = [exc]
@@ -343,9 +327,8 @@ def _exception_members(exc: BaseException) -> list:
 
 
 def _driver_literals(exc: BaseException) -> tuple:
-    # SEC-08: the provider-supplied text a database exception renders -
-    # the driver message, whose diagnostic lines quote the column value
-    # that failed, and the statement that carried it (CWE-532)
+    # SEC-08: provider text a database exception renders, which quotes the
+    # failing column value and the statement that carried it (CWE-532)
     literals = set()
     for member in _exception_members(exc):
         if not isinstance(member, SQLAlchemyError):
@@ -372,19 +355,16 @@ def _driver_literals(exc: BaseException) -> tuple:
 
 
 def _suppress_bound_parameters(exc: BaseException) -> None:
-    # SEC-08: a rendered database exception quotes the parameters it bound,
-    # which are the row values the caller submitted. Every member of the
-    # chain is suppressed, because a driver failure caught and re-raised as
-    # an ordinary error is still rendered through its context (CWE-532).
+    # SEC-08: bound parameters are caller-submitted row values; every chain
+    # member is suppressed, not only the raised one (CWE-532)
     for member in _exception_members(exc):
         if hasattr(member, "hide_parameters"):
             member.hide_parameters = True
 
 
 def _diagnostics(exc: BaseException) -> str:
-    # SEC-08: the full formatted traceback, including the stack, the
-    # exception messages and the cause chain, with held secrets, bound
-    # parameters and provider message text removed
+    # SEC-08: the full formatted traceback with held secrets, bound
+    # parameters and provider text removed (CWE-209, CWE-532)
     _suppress_bound_parameters(exc)
     report = "".join(
         traceback.format_exception(type(exc), exc, exc.__traceback__)
@@ -395,9 +375,8 @@ def _diagnostics(exc: BaseException) -> str:
 
 
 def _audit_context(exc: BaseException) -> str:
-    # SEC-08: appends only the redacted markers an exception publishes on
-    # its audit_context mapping; raised detail and exception text are never
-    # promoted into the record
+    # SEC-08: appends the markers an exception publishes on audit_context;
+    # raised detail and exception text are never promoted (CWE-209)
     context = getattr(exc, "audit_context", None)
     if not isinstance(context, dict):
         return ""
@@ -416,14 +395,13 @@ def _error_location(error) -> tuple:
 
 
 def _measures_the_body(location) -> bool:
-    # SEC-08: a body that is not JSON is located by a byte offset rather
-    # than a field; the offset measures the submitted content (CWE-209)
+    # SEC-08: a byte offset measures the submitted content (CWE-209)
     return len(location) == 1 and isinstance(location[0], int)
 
 
 def _validation_field_names(errors) -> list:
-    # SEC-08: emits field paths only; withholds the submitted values
-    # carried by msg, ctx and input
+    # SEC-08: field paths only; withholds the values msg, ctx and input
+    # carry (CWE-209)
     names = []
     for error in errors:
         location = _error_location(error)
@@ -436,10 +414,8 @@ def _validation_field_names(errors) -> list:
 
 
 def _loggable_field_names(errors) -> str:
-    # SEC-08: the record carries schema-declared names only. An
-    # undeclared key is text the caller chose, so its position is named
-    # and the key itself withheld; the list is bounded in count and in
-    # the length of each name (CWE-532).
+    # SEC-08: schema-declared names only, bounded in count and in length;
+    # an undeclared key is named by position (CWE-532)
     names = []
     for error in errors:
         location = _error_location(error)
@@ -462,8 +438,8 @@ def _loggable_field_names(errors) -> str:
 def handle_validation_error(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    # SEC-08: a field path is submitted content; the rendered name list
-    # passes through the same redaction the diagnostic channel applies
+    # SEC-08: the rendered name list passes through the same redaction the
+    # diagnostic channel applies (CWE-532)
     error_id = uuid.uuid4().hex
     errors = exc.errors()
     fields = _validation_field_names(errors)
@@ -483,10 +459,8 @@ def handle_validation_error(
 def handle_http_exception(
     request: Request, exc: StarletteHTTPException
 ) -> JSONResponse:
-    # SEC-08: preserves the raised status and replaces the raised detail.
-    # One record carries the response error_id and the raiser's redacted
-    # audit context; a throttled or rejected attempt is traceable from the
-    # client reference alone. The diagnostic channel opens at 500 (CWE-209).
+    # SEC-08: preserves the raised status, replaces the raised detail, and
+    # opens the diagnostic channel at 500 only (CWE-209)
     error_id = uuid.uuid4().hex
     server_fault = exc.status_code >= 500
     diagnostics = (
@@ -509,9 +483,7 @@ def handle_http_exception(
 def handle_rate_limit_exceeded(
     request: Request, exc: RateLimitExceeded
 ) -> JSONResponse:
-    # SEC-07: throttled attempts are logged, not silently dropped. The
-    # record carries the response status, matching the record the
-    # account-keyed layer produces through handle_http_exception.
+    # SEC-07: throttled attempts are logged, not silently dropped
     error_id = uuid.uuid4().hex
     logger.warning(
         "error_id=%s rate limit exceeded status=429 limit=%s on %s %s",
@@ -534,11 +506,9 @@ def _driver_error_code(exc: SQLAlchemyError) -> str:
 def handle_database_error(
     request: Request, exc: SQLAlchemyError
 ) -> JSONResponse:
-    # SEC-08: records the exception type chain, the driver exception type
-    # inside it, SQLSTATE, frame locations, the matched route and the
-    # correlation id. No provider message text and no bound parameter
-    # reaches the record: a driver diagnostic quotes the column value
-    # that failed, and the statement quotes the row it wrote (CWE-532).
+    # SEC-08: records the type chain, SQLSTATE, frame locations, the
+    # matched route and the correlation id, and no provider text or bound
+    # parameter (CWE-532)
     error_id = uuid.uuid4().hex
     _suppress_bound_parameters(exc)
     logger.error(
@@ -558,8 +528,7 @@ def handle_unhandled_exception(
     request: Request, exc: Exception
 ) -> JSONResponse:
     # SEC-08: the caller receives a reference; this record carries the
-    # diagnostics that reference resolves to - the type chain, the frame
-    # locations and the redacted traceback with its exception messages
+    # diagnostics it resolves to (CWE-209)
     error_id = uuid.uuid4().hex
     logger.error(
         "error_id=%s unhandled exception on %s %s exception=%s origin=%s"

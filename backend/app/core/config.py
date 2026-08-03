@@ -30,9 +30,7 @@ _LABEL_CHARACTERS = set("abcdefghijklmnopqrstuvwxyz0123456789-")
 
 
 def _is_dns_name(host: str) -> bool:
-    # SEC-03: per-label DNS syntax; a label must be non-empty, at most 63
-    # characters of lowercase letters, digits or hyphen, and may not start or
-    # end with a hyphen; the whole name is at most 253 characters
+    # SEC-03: per-label DNS syntax (CWE-346)
     if not host or len(host) > _MAX_HOSTNAME_LENGTH:
         return False
     for label in host.split("."):
@@ -46,8 +44,8 @@ def _is_dns_name(host: str) -> bool:
 
 
 def _is_valid_host(host: str) -> bool:
-    # SEC-03: accepts a bracketed IPv6 literal, an IPv4 literal or a
-    # syntactically valid DNS name; rejects every other host form
+    # SEC-03: accepts an IPv6 literal, an IPv4 literal or a DNS name;
+    # rejects every other host form (CWE-346)
     if host.startswith("[") and host.endswith("]"):
         try:
             return ip_address(host[1:-1]).version == 6
@@ -60,9 +58,8 @@ def _is_valid_host(host: str) -> bool:
 
 
 def _split_authority(netloc: str):
-    # SEC-03: separates host from port and rejects a malformed authority,
-    # including an empty port, a stray colon and an unterminated IPv6 literal.
-    # Returns (host, port_text) with port_text None when no port is present.
+    # SEC-03: splits host from port and rejects a malformed authority.
+    # Returns (host, port_text), with port_text None when no port is present
     if netloc.startswith("["):
         closing = netloc.find("]")
         if closing == -1:
@@ -84,10 +81,9 @@ def _split_authority(netloc: str):
 
 
 def _is_valid_origin(origin: str) -> bool:
-    # SEC-03: accepts only the exact serialization a browser sends in an
-    # Origin header - scheme://host[:port] over http or https, in printable
-    # lowercase ASCII with no userinfo, wildcard, path, query or fragment.
-    # Every other spelling is rejected, never repaired (CWE-346)
+    # SEC-03: accepts only the exact serialization a browser sends -
+    # scheme://host[:port] over http or https, in printable lowercase ASCII
+    # with no userinfo, wildcard, path, query or fragment (CWE-346)
     if not origin.isascii():
         return False
     if any(c.isspace() or not c.isprintable() for c in origin):
@@ -142,8 +138,8 @@ def _is_valid_origin(origin: str) -> bool:
 
 class Settings(BaseSettings):
     DATABASE_URL: str
-    # SEC-12: 32-character floor on the HMAC signing key; the byte floor for
-    # the configured ALGORITHM is applied by validate_secret_key_bytes
+    # SEC-12: character floor on the HMAC signing key; the byte floor per
+    # ALGORITHM is applied by validate_secret_key_bytes (CWE-522)
     SECRET_KEY: str = Field(..., min_length=32)
     ALGORITHM: str
     # SEC-12: a non-positive lifetime mints an already-expired token
@@ -165,9 +161,7 @@ class Settings(BaseSettings):
     # SEC-06: cookie Secure attribute is environment-driven
     COOKIE_SECURE: bool = True
 
-    # SEC-07: login throttle thresholds; a non-positive window prunes every
-    # counter on the next attempt and leaves credential guessing unbounded
-    # (CWE-307)
+    # SEC-07: login throttle thresholds, both bounded below (CWE-307)
     LOGIN_RATE_LIMIT_ATTEMPTS: int = Field(5, ge=1)
     LOGIN_RATE_LIMIT_WINDOW_MINUTES: int = Field(15, ge=1)
 
@@ -178,7 +172,7 @@ class Settings(BaseSettings):
 
     @validator("ALGORITHM")
     def validate_algorithm(cls, value):
-        # SEC-02/SEC-12: accepts only HMAC token-signing algorithms.
+        # SEC-02/SEC-12: accepts only HMAC token-signing algorithms
         if value not in ("HS256", "HS384", "HS512"):
             raise ValueError(
                 "ALGORITHM must be one of HS256, HS384, HS512, "
@@ -188,8 +182,7 @@ class Settings(BaseSettings):
 
     @validator("PAYPAL_MODE")
     def validate_paypal_mode(cls, value):
-        # SEC-09: payment environment domain; blocks an unintended
-        # transaction environment (CWE-1188).
+        # SEC-09: payment environment domain (CWE-1188)
         if value not in ("sandbox", "live"):
             raise ValueError(
                 "PAYPAL_MODE must be either 'sandbox' or 'live', "
@@ -199,9 +192,7 @@ class Settings(BaseSettings):
 
     @validator("DB_SSLMODE")
     def validate_db_sslmode(cls, value):
-        # SEC-10: libpq transport-mode domain; refuses a value the driver
-        # rejects at connect time and refuses an appended connection
-        # parameter (CWE-319, CWE-1188).
+        # SEC-10: libpq transport-mode domain (CWE-319, CWE-1188)
         if value not in DB_SSLMODES:
             raise ValueError(
                 "DB_SSLMODE must be one of "
@@ -214,8 +205,7 @@ class Settings(BaseSettings):
     def validate_allowed_origins(cls, value):
         # SEC-03: rejects an empty allow-list, the wildcard, the null
         # origin and any entry that is not a browser-serialized http or
-        # https origin; closes CWE-942, CWE-346 and CWE-20 and keeps
-        # matching exact-equality only.
+        # https origin (CWE-942, CWE-346, CWE-20)
         if not value:
             raise ValueError(
                 "ALLOWED_ORIGINS must contain at least one origin"
@@ -239,8 +229,7 @@ class Settings(BaseSettings):
     @root_validator(skip_on_failure=True)
     def validate_secret_key_bytes(cls, values):
         # SEC-12: couples the SECRET_KEY byte floor to the configured
-        # algorithm; HS384 and HS512 require 48 and 64 UTF-8 bytes
-        # (RFC 7518 sec. 3.2).
+        # algorithm (RFC 7518 sec. 3.2, CWE-522)
         algorithm = values.get("ALGORITHM")
         secret_key = values.get("SECRET_KEY")
         minimum = HMAC_KEY_MIN_BYTES.get(algorithm)
@@ -260,9 +249,8 @@ class Settings(BaseSettings):
 
         @classmethod
         def parse_env_var(cls, field_name: str, raw_value: str):
-            # SEC-03: names the required JSON form when a list-valued
-            # setting cannot be parsed; the startup failure stays
-            # fail-closed (CWE-1188)
+            # SEC-03: names the required JSON form for a list-valued
+            # setting, and stays fail-closed (CWE-1188)
             try:
                 return cls.json_loads(raw_value)
             except ValueError:

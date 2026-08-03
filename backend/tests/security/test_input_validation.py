@@ -28,6 +28,7 @@ import logging
 import re
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import List
 
 import pytest
@@ -57,7 +58,7 @@ from backend.app.schema.filter import (
     Filter,
     FilterCreate,
 )
-from backend.app.schema.listing import ListingCreate
+from backend.app.schema.listing import Listing, ListingCreate
 from backend.app.schema.subscription import SubscriptionCreate
 from backend.app.schema.user import UserCreate, UserLogin
 
@@ -118,18 +119,13 @@ _CORRELATION_KEY = "error_id"
 SANITIZED_FAULT_DETAIL = "Internal server error"
 CORRELATION_ID = re.compile(r"[0-9a-f]{32}")
 
-# AAP 0.8.3: the status the listing write path answers with. The route
-# clears the request boundary and then fails on a model defect the AAP
-# places out of scope: ListingModel declares no owner_id column while
-# listings.py:23 passes one, and the model's non-null created_at and
-# updated_at columns are never supplied. Adding columns needs migration
-# tooling the repository does not carry (AAP 0.9.2), so what this module
-# pins is the answer the defect produces rather than a working write.
+# AAP 0.8.3: the status the listing write path answers with. It clears the
+# request boundary and then fails on the model gap AAP 0.9.2 leaves out of
+# scope, so what this module pins is that answer.
 KNOWN_LISTING_DEFECT_STATUS = 500
 
-# SEC-08: text the sanitized reply must not carry. The defect above
-# raises TypeError from a named module against a named column, and none
-# of that may reach the caller.
+# SEC-08: text the sanitized reply must not carry - the exception type,
+# the module path, the column name and the statement (CWE-209)
 WITHHELD_FAULT_TEXT = (
     "traceback",
     "typeerror",
@@ -205,10 +201,8 @@ UNBINDABLE_BOUND = 2 ** 63
 # SEC-05: a payload that executes in a document and is inert in JSON
 SCRIPT_PAYLOAD = "<script>alert('filter-name')</script>"
 
-# SEC-05: an undeclared key whose name is the payload. A rejection that
-# copies the name into the record writes caller-chosen text to the log
-# (CWE-117), and the name here is shaped like an address and a bearer
-# value so a record quoting it is unmistakable.
+# SEC-05: undeclared keys shaped like an address and a bearer value, so a
+# record quoting one is unmistakable (CWE-117)
 UNDECLARED_KEY_NAME = "zzz-undeclared-7301-victim@example.com"
 UNDECLARED_NESTED_NAME = "zzz-undeclared-7302-Bearer-token"
 
@@ -230,19 +224,14 @@ class _RecordedPaymentCall:
 @pytest.fixture(autouse=True)
 def payment_call(monkeypatch):
     """Replace the payment call the subscription route awaits."""
-    # SEC-05/SEC-09: subscriptions.py binds process_payment into the
-    # endpoint module namespace at import, so the name the route awaits is
-    # the one replaced here. The real callable reaches PayPal from a worker
-    # thread, so a body that slipped past the request boundary would make
-    # this suite perform provider I/O and depend on a network answer.
+    # SEC-05/SEC-09: replaces the name the route awaits, so no case here
+    # can reach the provider
     recorder = _RecordedPaymentCall()
     monkeypatch.setattr(
         subscription_endpoint, "process_payment", recorder
     )
     yield recorder
-    # SEC-05: no case in this module may reach the payment call. Every
-    # subscription body here is refused by the request schema or by the
-    # route's own guard, and both answer before the call.
+    # SEC-05: no case in this module may reach the payment call
     assert recorder.awaits == [], (
         "the payment call was awaited {0} time(s): {1!r}".format(
             len(recorder.awaits), recorder.awaits
@@ -360,10 +349,9 @@ def _seed_listings(session, count):
 def seed_filter(session, user_id, name=DECLARED_FILTER_BODY["name"]):
     """Write one filter row with its criteria child and return its id.
 
-    ``POST /filters/`` cannot write a row: the endpoint hands a mapped
-    relationship a request model and supplies no value for the non-null
-    ``created_at`` column. The read path is seeded through the session,
-    as the listing read path above is.
+    Seeding through the session gives the read path a row that belongs to
+    an account no request has authenticated as, which is what the
+    cross-account cases need.
     """
     row = FilterModel(
         name=name,
@@ -651,9 +639,8 @@ def test_filter_refuses_wrongly_typed_name(client, register_user):
 # SEC-05: the nested scalars a criterion declares
 CRITERION_FIELDS = ("field", "operator", "value")
 
-# SEC-05: every JSON type a nested scalar is not. A permissive string
-# type coerces the first three of these into text and stores whatever
-# the caller sent under a name the operator never wrote.
+# SEC-05: every JSON type a nested scalar is not; a permissive string type
+# would coerce and store the first three (CWE-20)
 WRONG_NESTED_TYPES = (
     pytest.param(3000, id="number"),
     pytest.param(True, id="boolean"),
@@ -1253,27 +1240,28 @@ def test_an_unbindable_bound_answers_a_sanitized_fault(
 # The filter route's declared response model
 # ---------------------------------------------------------------------
 def test_the_filter_routes_publish_the_declared_response_model(
-    client, register_user, db_session
+    client, register_user
 ):
-    """Both filter routes declare the model, and a read publishes it.
+    """Both filter routes declare the model, and both publish it.
 
     AAP 0.8.3 freezes the response model these routes declare. The
     declaration is what filters the response, and dropping it would
-    widen the body without moving any status code. The create route
-    cannot write a row, so the published key set is read back from a
-    seeded one.
+    widen the body without moving any status code.
     """
     account = register_user()
+    credentials = _bearer(account["access_token"])
 
     # AAP 0.8.3: both routes still declare the model they always had
     assert _route_for(FILTER_PATH, "POST").response_model is Filter
     assert _route_for(FILTER_PATH, "GET").response_model == List[Filter]
 
-    seed_filter(db_session, account["id"])
-
-    response = client.get(
-        FILTER_PATH, headers=_bearer(account["access_token"])
+    created = client.post(
+        FILTER_PATH, json=DECLARED_FILTER_BODY, headers=credentials
     )
+    assert created.status_code == 200, created.text
+    assert set(created.json()) == DECLARED_FILTER_RESPONSE_KEYS
+
+    response = client.get(FILTER_PATH, headers=credentials)
 
     assert response.status_code == 200, response.text
     published = response.json()
@@ -1289,16 +1277,16 @@ def test_the_filter_routes_publish_the_declared_response_model(
     assert frozenset(Filter.__fields__) == DECLARED_FILTER_RESPONSE_KEYS
 
 
-def test_filter_creation_defect_answers_a_sanitized_fault(
-    client, register_user
+def test_filter_creation_persists_only_the_validated_fields(
+    client, register_user, db_session
 ):
-    """The create path's pre-existing defect discloses nothing.
+    """A valid create writes one row carrying exactly what was sent.
 
-    AAP 0.8.3 records that this route cannot write a row, for reasons
-    outside the security scope: the endpoint hands a mapped relationship
-    a request model and supplies no value for the non-null ``created_at``
-    column. The strict schema still closes the mass-assignment vector,
-    and the fault must surface as the uniform sanitized envelope.
+    SEC-05 admits the declared allow-list and nothing else, so the row
+    the request produces has to carry the sent values verbatim and take
+    every other column from the server. Asserting the stored row as well
+    as the reply is what distinguishes a persisted write from a body the
+    handler assembled and dropped.
     """
     account = register_user()
 
@@ -1308,28 +1296,96 @@ def test_filter_creation_defect_answers_a_sanitized_fault(
         headers=_bearer(account["access_token"]),
     )
 
-    # SEC-08: one uniform envelope, no internal detail
-    assert response.status_code == 500, response.text
+    assert response.status_code == 200, response.text
     body = response.json()
-    assert set(body) == ENVELOPE_KEYS
-    assert body["detail"] == "Internal server error"
-    assert body["fields"] == []
-    assert body[_CORRELATION_KEY]
+    assert set(body) == DECLARED_FILTER_RESPONSE_KEYS
 
-    served = response.text
-    for leaked in (
-        "Traceback",
-        "_sa_instance_state",
-        "sqlalchemy",
-        "INSERT INTO",
-        "filters.py",
-        "site-packages",
-    ):
-        assert leaked not in served, served
+    # SEC-05: the sent fields arrive unchanged
+    assert body["name"] == DECLARED_FILTER_BODY["name"]
+    assert body["criteria"] == [DECLARED_CRITERION]
+
+    # SEC-05: the server owns every column the request may not set
+    assert body["user_id"] == account["id"]
+    assert body["created_at"]
+    assert body["last_used"] is None
+    assert body["zip_codes"] == []
+
+    stored = db_session.query(FilterModel).all()
+    assert len(stored) == 1
+    row = stored[0]
+    assert row.id == body["id"]
+    assert row.user_id == account["id"]
+    assert row.created_at is not None
+
+    children = (
+        db_session.query(CriteriaModel)
+        .filter(CriteriaModel.filter_id == row.id)
+        .all()
+    )
+    assert len(children) == 1
+    assert children[0].field == DECLARED_CRITERION["field"]
+    assert children[0].operator == DECLARED_CRITERION["operator"]
+    assert children[0].value == DECLARED_CRITERION["value"]
+
+
+def test_a_created_filter_belongs_to_its_author_alone(
+    client, register_user
+):
+    """One account's filter never reaches another account's read.
+
+    The create path takes the owner from the authenticated identity, and
+    the read path filters on it. A row that leaked across accounts would
+    be a broken access control, so both accounts are read back.
+    """
+    author = register_user()
+    stranger = register_user()
+
+    created = client.post(
+        FILTER_PATH,
+        json=DECLARED_FILTER_BODY,
+        headers=_bearer(author["access_token"]),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["user_id"] == author["id"]
+
+    # SEC-05: the owner comes from the token, never from the body
+    assert created.json()["user_id"] != stranger["id"]
+
+    mine = client.get(FILTER_PATH, headers=_bearer(author["access_token"]))
+    assert mine.status_code == 200, mine.text
+    assert [entry["id"] for entry in mine.json()] == [created.json()["id"]]
+
+    theirs = client.get(
+        FILTER_PATH, headers=_bearer(stranger["access_token"])
+    )
+    assert theirs.status_code == 200, theirs.text
+    assert theirs.json() == []
+
+
+def test_filter_creation_refuses_a_client_supplied_owner(
+    client, register_user
+):
+    """A body naming an owner is refused, not honoured.
+
+    ``user_id`` is a server-owned column, and ``FilterCreate`` declares
+    it nowhere. Adding it to the body is the mass-assignment attempt the
+    strict allow-list has to reject outright.
+    """
+    author = register_user()
+    stranger = register_user()
+
+    response = client.post(
+        FILTER_PATH,
+        json=dict(DECLARED_FILTER_BODY, user_id=stranger["id"]),
+        headers=_bearer(author["access_token"]),
+    )
+
+    # SEC-05: an undeclared key is refused; closes the CWE-915 vector
+    assert response.status_code == 422, response.text
 
 
 def test_a_stored_script_payload_round_trips_inside_json(
-    client, register_user, db_session
+    client, register_user
 ):
     """A script payload held as a filter name comes back verbatim.
 
@@ -1339,26 +1395,32 @@ def test_a_stored_script_payload_round_trips_inside_json(
     served as a document.
     """
     account = register_user()
+    credentials = _bearer(account["access_token"])
 
     # SEC-05: the request boundary admits the payload as declared text,
     # with no server-side rewrite
     admitted = FilterCreate(**dict(DECLARED_FILTER_BODY, name=SCRIPT_PAYLOAD))
     assert admitted.name == SCRIPT_PAYLOAD
 
-    seed_filter(db_session, account["id"], name=SCRIPT_PAYLOAD)
-
-    read_back = client.get(
-        FILTER_PATH, headers=_bearer(account["access_token"])
+    created = client.post(
+        FILTER_PATH,
+        json=dict(DECLARED_FILTER_BODY, name=SCRIPT_PAYLOAD),
+        headers=credentials,
     )
+    assert created.status_code == 200, created.text
+
+    read_back = client.get(FILTER_PATH, headers=credentials)
     assert read_back.status_code == 200, read_back.text
 
     # SEC-05: the payload is carried as data, never as markup
-    content_type = read_back.headers["content-type"]
-    assert content_type.startswith("application/json"), content_type
-    assert "html" not in content_type
+    for response in (created, read_back):
+        content_type = response.headers["content-type"]
+        assert content_type.startswith("application/json"), content_type
+        assert "html" not in content_type
 
     # SEC-05: stored and returned unchanged; no server-side rewrite
     # hides it from a caller that has to escape it
+    assert created.json()["name"] == SCRIPT_PAYLOAD
     assert [entry["name"] for entry in read_back.json()] == [SCRIPT_PAYLOAD]
 
 
@@ -1535,10 +1597,7 @@ def test_filter_criteria_at_the_cap_are_admitted(client, register_user):
     """A criteria list exactly at the cap clears the request boundary.
 
     The cap refuses one entry more, so the boundary case proves the cap is
-    a bound rather than an off-by-one refusal. AAP 0.8.3 records that this
-    route cannot write a row, so admission is asserted as the absence of a
-    422 plus acceptance by the request model itself; the pre-existing write
-    defect still answers the uniform sanitized 500.
+    a bound rather than an off-by-one refusal.
     """
     account = register_user()
     at_cap = dict(
@@ -1555,10 +1614,8 @@ def test_filter_criteria_at_the_cap_are_admitted(client, register_user):
 
     # SEC-05: no field is rejected, so the cap did not refuse this list
     assert response.status_code != 422, response.text
-    assert response.status_code == 500, response.text
-    body = response.json()
-    assert set(body) == ENVELOPE_KEYS
-    assert body["fields"] == []
+    assert response.status_code == 200, response.text
+    assert len(response.json()["criteria"]) == MAX_CRITERIA
 
 
 def test_filter_criterion_text_beyond_its_cap_is_refused(
@@ -1674,3 +1731,125 @@ def test_declared_foreign_keys_are_enforced_under_test(db_session):
     with pytest.raises(IntegrityError):
         db_session.commit()
     db_session.rollback()
+
+
+# ---------------------------------------------------------------------
+# The client/server wire contract
+# ---------------------------------------------------------------------
+# the declaration files the browser code compiles against
+FRONTEND_SCHEMA_DIR = (
+    Path(__file__).resolve().parents[3] / "frontend" / "src" / "schema"
+)
+FRONTEND_API_CLIENT = (
+    Path(__file__).resolve().parents[3]
+    / "frontend" / "src" / "services" / "api.ts"
+)
+
+# the response models whose served body a browser declaration claims, and
+# the identifier fields whose JSON type the two must agree on
+WIRE_CONTRACTS = (
+    pytest.param(Listing, "listing.ts", "Listing", id="listing-read"),
+    pytest.param(Filter, "filter.ts", "Filter", id="filter-read"),
+    pytest.param(FilterCreate, "filter.ts", "FilterCreate", id="filter-write"),
+)
+
+INTEGER_WIRE_FIELDS = (
+    pytest.param("listing.ts", "Listing", ("id",), id="listing-id"),
+    pytest.param("filter.ts", "Filter", ("id", "user_id"), id="filter-ids"),
+)
+
+
+def _declared_interface(filename, name):
+    """Return the field name to declared type text of one interface."""
+    path = FRONTEND_SCHEMA_DIR / filename
+    assert path.is_file(), path
+    body = re.search(
+        r"^export interface {0} \{{\n(.*?)^\}}".format(re.escape(name)),
+        path.read_text(encoding="utf-8"),
+        re.DOTALL | re.MULTILINE,
+    )
+    assert body, (filename, name)
+    fields = {}
+    for line in body.group(1).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        field, _, declared = stripped.partition(":")
+        fields[field.strip().rstrip("?")] = declared.strip().rstrip(";")
+    assert fields, (filename, name)
+    return fields
+
+
+@pytest.mark.parametrize("model, filename, name", WIRE_CONTRACTS)
+def test_the_browser_declaration_names_the_served_fields(
+    model, filename, name
+):
+    """A browser type claims exactly the keys the server sends or takes.
+
+    The client casts nothing, so its declaration is the only statement of
+    the wire shape on that side. A field renamed on the server and left
+    alone here would leave the browser reading a key that is no longer
+    published, which no server-side test can catch.
+    """
+    assert set(_declared_interface(filename, name)) == set(
+        model.__fields__
+    ), (filename, name)
+
+
+@pytest.mark.parametrize("filename, name, identifiers", INTEGER_WIRE_FIELDS)
+def test_the_browser_declaration_types_identifiers_as_numbers(
+    filename, name, identifiers
+):
+    """Integer keys are declared as numbers, not as strings.
+
+    The mapped columns are integers and the response models publish them
+    as JSON numbers, so a browser declaration claiming a string
+    misdescribes every identifier the UI reads or sends.
+    """
+    declared = _declared_interface(filename, name)
+
+    for field in identifiers:
+        assert declared[field] == "number", (filename, field)
+
+
+def test_the_api_client_asserts_no_response_shape():
+    """The client declares its wire types instead of casting to them.
+
+    An unchecked cast makes a claim the compiler cannot check, which is
+    how the identifier drift this contract pins went unnoticed.
+    """
+    assert FRONTEND_API_CLIENT.is_file(), FRONTEND_API_CLIENT
+    source = FRONTEND_API_CLIENT.read_text(encoding="utf-8")
+
+    for asserted in ("as Listing", "as Filter", "as User"):
+        assert asserted not in source, asserted
+
+
+def test_the_public_read_path_publishes_numeric_identifiers(
+    client, db_session
+):
+    """The served listing body carries the identifier as a JSON number."""
+    _seed_listings(db_session, 1)
+
+    published = _read_listings(client).json()
+
+    assert published
+    assert isinstance(published[0]["id"], int)
+    assert not isinstance(published[0]["id"], bool)
+
+
+def test_the_filter_body_publishes_numeric_identifiers(
+    client, register_user
+):
+    """The served filter body carries both identifiers as JSON numbers."""
+    account = register_user()
+
+    body = client.post(
+        FILTER_PATH,
+        json=DECLARED_FILTER_BODY,
+        headers=_bearer(account["access_token"]),
+    ).json()
+
+    for field in ("id", "user_id"):
+        assert isinstance(body[field], int), field
+        assert not isinstance(body[field], bool), field

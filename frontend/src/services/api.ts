@@ -1,29 +1,39 @@
 import axios from 'axios';
-import { Listing } from 'frontend/src/schema/listing';
-import { Filter } from 'frontend/src/schema/filter';
-import { User } from 'frontend/src/schema/user';
+import { Listing, ListingQuery } from '../schema/listing';
+import { Filter, FilterCreate } from '../schema/filter';
+import { User } from '../schema/user';
 
 export const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
-// SEC-06: sends the HttpOnly session cookie. No xsrf option is set,
-// which keeps CVE-2023-45857 closed under credentialed requests (CWE-359)
+// SEC-06: sends the HttpOnly session cookie; no xsrf option is set
 axios.defaults.withCredentials = true;
 
-export const fetchListings = async (filter: Filter): Promise<Listing[]> => {
+export const fetchListings = async (
+  query: ListingQuery = {}
+): Promise<Listing[]> => {
   try {
-    const endpoint = `${API_BASE_URL}/listings`;
-    const response = await axios.get(endpoint, { params: filter });
-    return response.data as Listing[];
+    const endpoint = `${API_BASE_URL}/listings/`;
+    const response = await axios.get<Listing[]>(endpoint, { params: query });
+    return response.data;
   } catch (error) {
     console.error('Error fetching listings:', error);
     throw error;
   }
 };
 
-export const createFilter = async (filter: Filter): Promise<Filter> => {
+export const createFilter = async (filter: FilterCreate): Promise<Filter> => {
   try {
-    const endpoint = `${API_BASE_URL}/filters`;
-    const response = await axios.post(endpoint, filter);
-    return response.data as Filter;
+    const endpoint = `${API_BASE_URL}/filters/`;
+    // SEC-05: sends the allow-list only; a server-owned key is refused
+    const body: FilterCreate = {
+      name: filter.name,
+      criteria: filter.criteria.map(({ field, operator, value }) => ({
+        field,
+        operator,
+        value,
+      })),
+    };
+    const response = await axios.post<Filter>(endpoint, body);
+    return response.data;
   } catch (error) {
     console.error('Error creating filter:', error);
     throw error;
@@ -33,8 +43,8 @@ export const createFilter = async (filter: Filter): Promise<Filter> => {
 export const getUserProfile = async (): Promise<User> => {
   try {
     const endpoint = `${API_BASE_URL}/user/profile`;
-    const response = await axios.get(endpoint);
-    return response.data as User;
+    const response = await axios.get<User>(endpoint);
+    return response.data;
   } catch (error) {
     console.error('Error fetching user profile:', error);
     throw error;

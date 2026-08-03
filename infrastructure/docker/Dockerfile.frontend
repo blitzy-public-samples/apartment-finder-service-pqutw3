@@ -16,6 +16,14 @@ RUN npm ci
 # Copy the rest of the application code
 COPY . .
 
+# SEC-12: create-react-app embeds these while the bundle builds, so a runtime
+# value never reaches the browser. Both arrive as build arguments, never as
+# literals, and neither may carry a secret
+ARG REACT_APP_API_BASE_URL
+ARG REACT_APP_PAYPAL_CLIENT_ID
+ENV REACT_APP_API_BASE_URL=$REACT_APP_API_BASE_URL
+ENV REACT_APP_PAYPAL_CLIENT_ID=$REACT_APP_PAYPAL_CLIENT_ID
+
 # Build the React app
 RUN npm run build
 

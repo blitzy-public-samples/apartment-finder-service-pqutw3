@@ -8,7 +8,10 @@ secrets/
 *.key
 *credentials*.json
 
-# SEC-01, SEC-11: Terraform state, plans and variable files carry db_app_password
+# SEC-01, SEC-11: operator variable files carry the application role's
+# password, and state records other resource attributes. The password
+# itself reaches neither state nor a plan: main.tf takes it through the
+# write-only password_wo argument from an ephemeral variable.
 .terraform/
 .terraform.tfstate.lock.info
 *.tfstate

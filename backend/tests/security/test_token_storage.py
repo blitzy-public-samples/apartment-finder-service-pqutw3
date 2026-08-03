@@ -25,17 +25,14 @@ REGISTER_ROUTE = "/auth/register"
 LOGIN_ROUTE = "/auth/login"
 LOGOUT_ROUTE = "/auth/logout"
 
-# SEC-06: an authenticated route reached through the session cookie.
-# Declared at backend/app/api/endpoints/filters.py:45 and guarded by
-# get_current_user.
+# SEC-06: an authenticated route reached through the session cookie
 PROTECTED_ROUTE = "/filters/"
 
 # SEC-06: the cookie attributes the auth routes set and clear
 EXPECTED_SAMESITE = "strict"
 EXPECTED_COOKIE_PATH = "/"
 
-# Frozen response contracts, read from
-# backend/app/api/endpoints/auth.py:177-184 and :220-223
+# Frozen response contracts, transcribed from the auth routes
 # SEC-06: the body key naming the token, derived from the cookie name
 TOKEN_BODY_KEY = SESSION_COOKIE_NAME
 REGISTER_BODY_KEYS = frozenset({"user", TOKEN_BODY_KEY, "token_type"})

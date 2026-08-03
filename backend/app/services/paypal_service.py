@@ -4,10 +4,8 @@ import paypalrestsdk
 from typing import Dict
 from backend.app.core.config import settings
 
-# SEC-09/SEC-12: the provider client records the request URL at INFO, and
-# that URL carries the client-supplied reference; it records the
-# authorization header, the request body and the response body at DEBUG.
-# No provider record below this level is emitted (CWE-532).
+# SEC-09/SEC-12: caps the provider client's records, which carry the
+# request URL, the authorization header and both bodies (CWE-532)
 PROVIDER_LOG_LEVEL = logging.WARNING
 _PROVIDER_LOGGER_NAME = "paypalrestsdk"
 logging.getLogger(_PROVIDER_LOGGER_NAME).setLevel(PROVIDER_LOG_LEVEL)
@@ -59,8 +57,7 @@ def execute_payment(payment_id: str, payer_id: str) -> Dict:
         return {"error": payment.error}
 
 
-# SEC-09: charge seam for subscriptions.py:24. No trusted plan, price or
-# authenticated identity reaches this call. It authorizes nothing and
-# refuses every charge (CWE-863)
+# SEC-09: charge seam carrying no trusted plan, price or authenticated
+# identity; it authorizes nothing and refuses every charge (CWE-863)
 async def process_payment(payment_method: str, amount: float) -> bool:
     return False

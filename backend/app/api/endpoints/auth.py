@@ -26,28 +26,25 @@ router = APIRouter()
 # its middleware and its rejection handler
 limiter = Limiter(key_func=get_remote_address)
 
-# SEC-07: the limit the limiter enforces on the login route, keyed by
-# client address. Threshold and window come from settings.
+# SEC-07: the address-keyed limit enforced on the login route (CWE-307)
 LOGIN_RATE_LIMIT = "{0}/{1} minutes".format(
     settings.LOGIN_RATE_LIMIT_ATTEMPTS,
     settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES,
 )
 
 # SEC-07: login-failure counters, one key per account, bounding guessing
-# spread across client addresses. Entries expire with the throttle window;
-# at the cap only a key below the limit is evicted, so no live lockout is
-# dropped to make room (CWE-307).
+# spread across client addresses (CWE-307)
 _LOGIN_FAILURE_TRACKING_CAP = 4096
 _ACCOUNT_KEY_PREFIX = "acct:"
 _login_failures = {}
 _login_failures_lock = threading.Lock()
 
-# SEC-07: a per-process key for the audit marker; an unkeyed digest of an
-# email address is recoverable from a candidate dictionary (CWE-916)
+# SEC-07: per-process key for the audit marker, so the marker is not a
+# recoverable digest of an email address (CWE-916)
 _AUDIT_MARKER_KEY = secrets.token_bytes(32)
 
-# SEC-06: HttpOnly/Secure/SameSite session cookie; removes the token from
-# script-readable storage. The set and the clear share these attributes.
+# SEC-06: HttpOnly/Secure/SameSite session cookie, shared by the set and
+# the clear; keeps the token out of script-readable storage (CWE-1004)
 _SESSION_COOKIE_PATH = "/"
 _SESSION_COOKIE_SAMESITE = "strict"
 
@@ -71,8 +68,7 @@ _UNIFORM_CREDENTIAL_DETAIL = "Incorrect email or password"
 
 class CredentialRejected(HTTPException):
     # SEC-07: the single 401 the credential path returns, whatever refused
-    # the attempt. SEC-08: audit_context holds redacted markers only; the
-    # error boundary records them under the response error_id.
+    # the attempt. SEC-08: audit_context holds redacted markers only
     def __init__(self, hasher_refusal: str = ""):
         super().__init__(
             status_code=401, detail=_UNIFORM_CREDENTIAL_DETAIL
@@ -82,11 +78,9 @@ class CredentialRejected(HTTPException):
 
 
 def _verified_credentials(db_user, submitted_password: str):
-    # SEC-04/SEC-08: the hasher refuses a NUL byte, a secret past passlib's
-    # own size ceiling, and a stored hash it cannot parse. Each refusal is
-    # answered by the counted uniform 401 of the credential path - never a
-    # 500, never a distinguishable 422 (CWE-209, CWE-307). Returns
-    # (matched, refusing exception type name).
+    # SEC-04/SEC-08: every hasher refusal is answered by the counted
+    # uniform 401, never a 500 and never a distinguishable 422 (CWE-209,
+    # CWE-307). Returns (matched, refusing exception type name)
     if db_user is None:
         return False, ""
     try:
@@ -99,9 +93,8 @@ def _verified_credentials(db_user, submitted_password: str):
 
 
 class AccountThrottled(HTTPException):
-    # SEC-07: 429 carrying the account marker to the error boundary, which
-    # logs one record under the same error_id the client receives.
-    # SEC-08: audit_context holds redacted markers only.
+    # SEC-07: 429 carrying the account marker to the error boundary.
+    # SEC-08: audit_context holds redacted markers only
     def __init__(self, account_marker: str):
         super().__init__(status_code=429)
         self.audit_context = {"account": account_marker}
@@ -114,11 +107,9 @@ def _prune_expired_login_failures(now: float) -> None:
 
 
 def _evict_unexhausted_login_keys(limit: int, needed: int) -> bool:
-    # SEC-07: frees slots from the keys closest to expiry that are still below
-    # the limit; entries are (count, expires_at) and eviction orders by
-    # expires_at alone. A key at the limit is never evicted. Returns False
-    # when too few evictable keys exist; a full map denies the attempt and
-    # drops no lockout (CWE-307)
+    # SEC-07: frees slots from the keys closest to expiry that sit below the
+    # limit; a key at the limit is never evicted, and False means the map is
+    # full so the attempt is denied (CWE-307)
     candidates = sorted(
         (entry[1], key) for key, entry in _login_failures.items()
         if entry[0] < limit
@@ -131,11 +122,9 @@ def _evict_unexhausted_login_keys(limit: int, needed: int) -> bool:
 
 
 def _reserve_login_attempt(*throttle_keys: str) -> bool:
-    # SEC-07: counts the attempt on every account key and decides admission
-    # inside one critical section; a concurrent burst shares no allowance
-    # (CWE-367). Returns False when any key is at the limit, and when the map
-    # is at capacity with no evictable key. A successful authentication
-    # releases the reservation through _clear_login_failures.
+    # SEC-07: counts the attempt and decides admission inside one critical
+    # section, so a concurrent burst shares no allowance (CWE-367). False
+    # means a key is at the limit or the map is full
     now = time.monotonic()
     window = settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES * 60
     limit = settings.LOGIN_RATE_LIMIT_ATTEMPTS
@@ -236,23 +225,20 @@ def login_user(
     user: UserLogin,
     db: Session = Depends(get_db),
 ):
-    # SEC-07: the decorator above refuses the attempt past the threshold
-    # for one client address; the counter below refuses it for one account
-    # reached from many addresses, and counts before the credentials are
-    # read, so both bound credential guessing (CWE-307)
+    # SEC-07: the decorator bounds attempts per client address and the
+    # counter below bounds them per account, before the credentials are
+    # read (CWE-307)
     account_key = _account_key(user.email)
     if not _reserve_login_attempt(account_key):
-        # SEC-07: the error boundary logs this attempt under the response
-        # error_id; SEC-08: neither the client address nor the submitted
-        # email reaches the record
+        # SEC-07: the error boundary logs this attempt.
+        # SEC-08: neither the address nor the email reaches the record
         raise AccountThrottled(_account_marker(account_key))
 
     # Verify user credentials
     db_user = db.query(User).filter(User.email == user.email).first()
     matched, hasher_refusal = _verified_credentials(db_user, user.password)
     if not matched:
-        # SEC-07: the reserved attempt stands; a credential failure is
-        # counted exactly once on the account key
+        # SEC-07: the reserved attempt stands, counted once per account
         raise CredentialRejected(hasher_refusal)
     
     # SEC-07: authentication succeeded, so the counter retains no state

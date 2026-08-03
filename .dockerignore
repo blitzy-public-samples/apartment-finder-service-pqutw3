@@ -1,0 +1,31 @@
+# Version control metadata
+.git/
+.gitignore
+
+# Environment files
+**/.env
+**/.env.tmp.*
+
+# Credentials, certificates, and keys
+**/secrets/
+**/*.pem
+**/*.key
+**/*credentials*.json
+
+# Python caches and build artifacts
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+**/.coverage
+**/coverage.xml
+**/htmlcov/
+
+# Local virtual environments
+**/.venv/
+**/venv/
+
+# Node and frontend build artifacts
+**/node_modules/
+frontend/build/
+frontend/coverage/

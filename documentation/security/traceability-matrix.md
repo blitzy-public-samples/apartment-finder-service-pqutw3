@@ -51,14 +51,14 @@ before any of them could be tested. Four rows are labelled **Partial**, with the
 | **SEC-02** | Broken authentication through identity mismatch. CWE-287, CWE-863. A01:2021. High | The subject claim is minted as `str(user.id)` and coerced back with `int()` inside a guard that answers 401, so the claim and the queried column share a type. The bare 404 at `security.py:49-50` becomes a 401 carrying `WWW-Authenticate: Bearer`, an `iat` claim joins the existing `exp`, and the outbound user model retypes `id` from `str` to `int` and drops its password-hash field | `backend/app/core/security.py`, `backend/app/api/endpoints/auth.py`, `backend/app/schema/user.py`, `backend/tests/security/test_auth_identity.py` |
 | **SEC-03** | Permissive cross-origin policy with credentials. CWE-942, CWE-346. A05:2021. High | `ALLOWED_ORIGINS` becomes a required list whose validator rejects an empty list, `"*"`, the literal `"null"` and any entry that is not a full origin. Matching is exact string equality, with no reflection and no regular expression, and the two middleware wildcards give way to explicit method and header lists. A misconfigured allow-list stops startup | `backend/app/core/config.py`, `backend/app/main.py`, `.env.example`, `backend/tests/security/test_cors_policy.py` |
 | **SEC-04** | Weak password requirements. CWE-521. A07:2021. Medium | A validator on the new `UserCreate` model mirrors the client character set at `validators.ts:18-32`, twelve characters with an upper, a lower, a digit and a special character, and adds a hard maximum at the 72-byte bcrypt ceiling. The maximum is mandatory rather than defensive: at the pinned `bcrypt==4.3.0` a 100-character password is accepted silently, so the library supplies no protection | `backend/app/schema/user.py`, `backend/app/api/endpoints/auth.py`, `backend/tests/security/test_password_policy.py` |
-| **SEC-05** | Improper input validation and mass assignment. CWE-20, CWE-915. A03:2021, secondary A04:2021. High | `UserCreate`, `UserLogin`, `FilterCreate` and `ListingCreate` arrive alongside a new `subscription.py` module, and every create model sets `extra = "forbid"` so an unknown key is rejected rather than absorbed. That single setting is the mass-assignment control for `listings.py:26`, which expands the request body straight into a mapped constructor. A model closes nothing until a route binds it, so the two updated write endpoints are claimants in their own right: `auth.py:192` and `:236` bind `UserCreate` and `UserLogin`, and `listings.py:18` binds `ListingCreate` ahead of that expansion. `filters.py:12` already bound `FilterCreate` before this work and is the reference pattern rather than a delivered control | `backend/app/schema/user.py`, `backend/app/schema/filter.py`, `backend/app/schema/listing.py`, `backend/app/schema/subscription.py`, `backend/app/api/endpoints/auth.py`, `backend/app/api/endpoints/listings.py`, `backend/tests/security/test_input_validation.py` |
+| **SEC-05** | Improper input validation and mass assignment. CWE-20, CWE-915. A03:2021, secondary A04:2021. High | `UserCreate`, `UserLogin`, `FilterCreate` and `ListingCreate` arrive alongside a new `subscription.py` module, and every create model sets `extra = "forbid"` so an unknown key is rejected rather than absorbed. That single setting is the mass-assignment control for `listings.py:26`, which expands the request body straight into a mapped constructor. A model closes nothing until a route binds it, so the two updated write endpoints are claimants in their own right: `auth.py:192` and `:236` bind `UserCreate` and `UserLogin`, and `listings.py:18` binds `ListingCreate` ahead of that expansion. `filters.py:17` bound `FilterCreate` before this work and supplies the reference pattern; `filters.py:25-37` is a delivered control in its own right, copying the validated allow-list onto mapped `Criteria` children and keeping `created_at` server-owned | `backend/app/schema/user.py`, `backend/app/schema/filter.py`, `backend/app/schema/listing.py`, `backend/app/schema/subscription.py`, `backend/app/api/endpoints/auth.py`, `backend/app/api/endpoints/listings.py`, `backend/app/api/endpoints/filters.py`, `backend/tests/security/test_input_validation.py` |
 | **SEC-06** | Session token in browser-accessible storage. CWE-522, CWE-1004. A07:2021. Medium | Both auth routes set an `HttpOnly`, `Secure`, `SameSite=Strict` cookie while leaving the JSON body untouched, and the guard reads that cookie before the bearer header, so non-browser clients still work. `POST /auth/logout` clears it, because script cannot delete a cookie it cannot read. The frontend drops browser storage, corrects its request path to `/auth/login`, exports `API_BASE_URL` and sends credentials; axios is pinned exactly and the cross-site-token option is deliberately left unset. A pipeline gate scans `frontend/` for browser storage on every run, so the removal cannot be undone silently | `backend/app/core/security.py`, `backend/app/api/endpoints/auth.py`, `backend/app/core/config.py`, `frontend/src/services/auth.ts`, `frontend/src/services/api.ts`, `frontend/package.json`, `.github/workflows/ci.yml`, `backend/tests/security/test_token_storage.py` |
 | **SEC-07** | Unrestricted authentication attempts. CWE-307. A07:2021. Medium. **Partial** | A limiter with in-memory storage applies five attempts per fifteen minutes to `POST /auth/login`, layered with an in-process counter keyed by normalized lowercase email so a distributed attempt on one account is also bounded. Throttled attempts are logged rather than silently dropped. **Gap**: the state is per-worker and lost on restart, so lockout is neither durable nor multi-replica-safe | `backend/app/main.py`, `backend/app/api/endpoints/auth.py`, `backend/app/core/config.py`, `backend/tests/security/test_login_throttle.py` |
 | **SEC-08** | Information exposure through an error message. CWE-209, CWE-497. A05:2021. Medium | Four global handlers replace the placeholder comment at `main.py:35`, sharing one response envelope and a correlation identifier while full diagnostics go to the server log. Uniformity is the requirement rather than the style, which is why the SEC-02 normalisation of the 404 into a 401 belongs here too: a differential response is an account-state oracle | `backend/app/main.py`, `backend/app/core/security.py`, `backend/tests/security/test_error_handling.py` |
 | **SEC-09** | Insecure default initialization of a resource. CWE-1188, CWE-798. A05:2021. High | `PAYPAL_MODE` is restricted to `sandbox` or `live`, and the service reads it from the settings class in place of the hardcoded literal and its manual-edit comment, which stood at `paypal_service.py:11`. A pipeline step asserts that no client-secret pattern appears under `frontend/`; the property already held, so the step converts an accident into an invariant. `backend/app/api/endpoints/subscriptions.py` is the authority here rather than a claimant: it is byte-identical, and its import and call site fixed the wrapper signature the service had to expose | `backend/app/core/config.py`, `backend/app/services/paypal_service.py`, `.github/workflows/ci.yml`, `backend/tests/security/test_config_guards.py` |
 | **SEC-10** | Cleartext transmission to the database. CWE-319. A02:2021. High. **Partial** | The Cloud SQL instance gains `ip_configuration { ssl_mode = "ENCRYPTED_ONLY" }`, and the engine passes an environment-driven `sslmode` through `connect_args` for PostgreSQL URLs only, because SQLite raises `TypeError` on that argument. Both ends are needed: the Auth Proxy encrypts its own tunnel while the instance keeps accepting unencrypted direct connections until the mode is set. The deprecated `require_ssl` argument is not used. **Gap**: `require` encrypts but performs no server-identity check | `infrastructure/terraform/main.tf`, `backend/app/core/config.py`, `backend/app/db/database.py`, `infrastructure/docker/docker-compose.yml`, `.env.example`, `backend/tests/security/test_config_guards.py` |
 | **SEC-11** | Execution with unnecessary privileges. CWE-250, CWE-269. A01:2021. Medium. **Partial** | The two halves reach different depths. Locally the single all-privileges account splits into an owner role used for schema work and an application role holding only connect, schema usage and table data rights, with `CREATE` revoked from `PUBLIC`. On Cloud SQL, Terraform declares a `google_sql_user` whose password comes from a variable rather than a literal, which separates the account from the instance admin and restricts nothing: the service grants `cloudsqlsuperuser` to every built-in user it creates and this provider carries no grant or revoke resource. **Gaps**: the cloud account stays elevated until an operator runs the statements `SECURITY.md` section 3.2 carries, and nothing here delivers row-level security | `scripts/setup_dev_environment.sh`, `infrastructure/terraform/main.tf`, `infrastructure/terraform/variables.tf`, `.gitignore`, `SECURITY.md`, `backend/tests/security/test_config_guards.py` |
-| **SEC-12** | Insufficiently protected credentials in custody. CWE-522. A05:2021. Medium. **Partial** | Exclusion rules and a value-free template keep secrets out of version control. `SECRET_KEY` gains a `min_length=32` floor grounded in RFC 7518 section 3.2, the three settings that raised `AttributeError` are declared, and a pipeline secret scan enforces the discipline on every run. Provisioning carries the same custody: the setup script generates values instead of emitting literals and creates the file under `umask 077`, and Terraform takes the database password from an `ephemeral`, `sensitive` variable with no default through the write-only `password_wo` argument, so the value reaches neither state nor a plan file. **Gaps**: no managed secret store, deployment still authenticates with a long-lived credential, and nothing filters build context — the three `.dockerignore` files that would have kept a stray secret out of a container image were withdrawn as unplanned and are **not delivered**, as section 3.4 records | `.gitignore`, `.env.example`, `SECURITY.md`, `backend/app/core/config.py`, `.github/workflows/ci.yml`, `scripts/setup_dev_environment.sh`, `infrastructure/terraform/main.tf`, `infrastructure/terraform/variables.tf`, `backend/tests/security/test_config_guards.py` |
+| **SEC-12** | Insufficiently protected credentials in custody. CWE-522. A05:2021. Medium. **Partial** | Exclusion rules and a value-free template keep secrets out of version control. `SECRET_KEY` gains a `min_length=32` floor grounded in RFC 7518 section 3.2, the three settings that raised `AttributeError` are declared, and a pipeline secret scan enforces the discipline on every run. Provisioning carries the same custody: the setup script generates values instead of emitting literals and creates the file under `umask 077`, and Terraform takes the database password from an `ephemeral`, `sensitive` variable with no default through the write-only `password_wo` argument, so the value reaches neither state nor a plan file. Build context carries the same custody: three context-local ignore files keep the environment file, the `secrets/` directory, certificates, keys, credential JSON, virtual environments, dependency trees, caches and coverage out of every image layer, which `.gitignore` cannot do for an untracked file. **Gaps**: no managed secret store, deployment still authenticates with a long-lived credential, and both container definitions still copy their whole context rather than an allow-list | `.gitignore`, `.env.example`, `SECURITY.md`, `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore`, `backend/app/core/config.py`, `.github/workflows/ci.yml`, `scripts/setup_dev_environment.sh`, `infrastructure/terraform/main.tf`, `infrastructure/terraform/variables.tf`, `backend/tests/security/test_config_guards.py` |
 | **Prerequisite** | No dependency manifest, so the dependency surface had never been enumerated. CWE-1104. A06:2021 | `backend/requirements.txt` pins nineteen packages exactly, fourteen runtime and five for test and audit tooling. Two pins are load-bearing beyond version hygiene: `bcrypt==4.3.0` prevents a passlib capability probe that would break every password hash, and omitting a multipart parser keeps six advisories that cannot be patched on this runtime out of the closure | `backend/requirements.txt`, `.github/workflows/ci.yml` |
 
 ---
@@ -74,7 +74,8 @@ unchanged. Controls are named, not re-explained; section 1 holds the mechanism.
 | File | Mode | Control it carries | Closes |
 | --- | --- | --- | --- |
 | `.gitignore` | CREATE | Excludes the environment file, the secrets directory, certificates, keys and credential JSON, plus Terraform state and variable files. `password_wo` from an `ephemeral` variable keeps the database password out of both state and plan, so these two exclusions stand on the variable file being the conventional home for an operator-supplied value and on state recording other resource attributes | SEC-01, SEC-11, SEC-12 |
-| `.env.example` | CREATE | Documents every required variable by name, shape and purpose, with placeholder values only, including the JSON-array form the origin list expects | SEC-01, SEC-03, SEC-10, SEC-12 |
+| `.env.example` | CREATE | Documents every required variable by name, shape and purpose, with placeholder values only, including the JSON-array form the origin list expects. Carries both contracts: the backend settings, and a final section naming the two frontend build variables the client bundle embeds | SEC-01, SEC-03, SEC-10, SEC-12 |
+| `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore` | CREATE | One ignore file per build context. Each excludes the environment file and its temporary form, the `secrets/` directory, certificates, keys, credential JSON, virtual environments, dependency trees, caches and coverage output, so a broad `COPY . .` cannot carry an untracked secret into an image layer | SEC-12 |
 | `SECURITY.md` | CREATE | Operator-facing custody procedure, verification commands, residual-risk register and the deferred follow-ons. Section 3.2 also carries the out-of-band `REVOKE` and `GRANT` statements that reduce the Cloud application account, which no provider resource can express | SEC-11, SEC-12 |
 
 ### 2.2 Backend application
@@ -94,7 +95,7 @@ unchanged. Controls are named, not re-explained; section 1 holds the mechanism.
 | `backend/app/db/database.py` | UPDATE | Passes the transport mode through `connect_args`, conditionally and only for PostgreSQL URLs | SEC-10 |
 | `backend/app/services/paypal_service.py` | UPDATE | Reads the payment environment from the validated setting. Also adds the missing typing import for both annotation sites and the async wrapper the subscription endpoint calls, clearing boot-blocker layers two and three | SEC-09 |
 | `backend/app/db/models.py` | REFERENCE | The authority for column types and nullability, and the reason no schema change is proposed: with no migration tooling, a new column or default never reaches an existing table. Verified byte-identical | Authority for SEC-02, SEC-05 |
-| `backend/app/api/endpoints/filters.py` | REFERENCE | The reference pattern for a declared `response_model`, the one write endpoint that already had one. Verified byte-identical; an earlier edit here was withdrawn, see section 3.4 | Authority for SEC-05 |
+| `backend/app/api/endpoints/filters.py` | UPDATE | Copies the validated allow-list onto mapped `Criteria` children and supplies the server-owned `created_at`, so a request cannot set either through the relationship. Also the reference pattern for a declared `response_model`, the one write endpoint that already had one. Delivered beyond the planned mode, see section 3.4 | SEC-05 |
 | `backend/app/api/endpoints/subscriptions.py` | REFERENCE | The authority whose import at `:7` and its call site dictated the wrapper signature added to the payment service. Its import at `:4` is equally an authority for SEC-05: it names `SubscriptionCreate` and `Subscription`, which is what the created `schema/subscription.py` module had to export. Verified byte-identical; an earlier edit here was withdrawn, see section 3.4 | Authority for SEC-05, SEC-09 |
 
 ### 2.3 Backend tests
@@ -119,8 +120,9 @@ longer exploitable.
 
 | File | Mode | Control it carries | Closes |
 | --- | --- | --- | --- |
-| `frontend/src/services/auth.ts` | UPDATE | Removes all browser token storage, corrects the request path to `/auth/login`, and delegates logout to the server route that can clear an `HttpOnly` cookie | SEC-06 |
-| `frontend/src/services/api.ts` | UPDATE | Two lines: exports the base URL that the auth module already imported, and sends credentials so the browser transmits the session cookie. The cross-site-token option is deliberately left unset | SEC-06 |
+| `frontend/src/services/auth.ts` | UPDATE | Removes all browser token storage, corrects the request path to `/auth/login`, and delegates logout to the server route that can clear an `HttpOnly` cookie. Declares the authentication response contract the frozen login body actually carries, as the exported `AuthSession` type, in place of a user object the body has never held | SEC-06 |
+| `frontend/src/services/api.ts` | UPDATE | Exports the base URL that the auth module already imported, and sends credentials so the browser transmits the session cookie; the cross-site-token option is deliberately left unset. Declares the wire type of each response instead of casting to one, and sends `POST /filters/` the writable-field allow-list only | SEC-06, SEC-05 |
+| `frontend/src/schema/listing.ts`, `frontend/src/schema/filter.ts` | UPDATE | Exported declarations of the bodies the read and write paths actually carry: integer identifiers, snake_case names, ISO-8601 date-time strings, and a separate `FilterCreate` naming the writable fields | SEC-05 |
 | `frontend/package.json` | UPDATE | One line: the axios caret range becomes an exact pin, removing a declared floor that sat inside the CVE-2023-45857 range now that credentialed mode is enabled | SEC-06 prerequisite |
 | `frontend/src/utils/validators.ts` | REFERENCE | The authority for the password character set at `:18-32`, mirrored by the server validator so the two cannot drift. Verified byte-identical | Authority for SEC-04 |
 
@@ -128,6 +130,7 @@ longer exploitable.
 
 | File | Mode | Control it carries | Closes |
 | --- | --- | --- | --- |
+| `infrastructure/docker/Dockerfile.frontend` | UPDATE | Declares a build argument for each frontend build variable ahead of `npm run build`, so both reach the bundle from the build environment and neither is a literal in the image definition | SEC-12 |
 | `infrastructure/docker/docker-compose.yml` | UPDATE | Environment indirection with no inline default, the corrected secret variable name, and the documented local transport exception for the Auth Proxy topology | SEC-01, SEC-10 |
 | `infrastructure/terraform/main.tf` | UPDATE | The encryption-only IP configuration on the Cloud SQL instance, and a separate application database account whose password reaches neither state nor a plan file. It carries no privilege restriction, which is a provider limit rather than an omission | SEC-10, SEC-11, SEC-12 |
 | `infrastructure/terraform/variables.tf` | UPDATE | The application account's name, its write-only password and the counter that reapplies a rotation. Each one is read by `main.tf`; the configuration declares no variable it never reads | SEC-11, SEC-12 |
@@ -146,7 +149,7 @@ of the twelve, and their presence is a rule obligation rather than a coverage ga
 
 | File | Mode | Control it carries | Closes |
 | --- | --- | --- | --- |
-| `documentation/security/decision-log.md` | CREATE | The four-column decision table: what was decided, what alternatives existed, why the choice won, and what risk it leaves. The single source of truth for rationale | Rule 1, not a finding |
+| `documentation/security/decision-log.md` | CREATE | The four-column decision table: what was decided, what alternatives existed, why the choice won, and what risk it leaves. The single source of truth for rationale. Section 40.8 carries the Rule 2 prose scorecard for the file, with its verdict and the measurements behind it | Rule 1 and Rule 2, not a finding |
 | `documentation/security/traceability-matrix.md` | CREATE | This file. The bidirectional finding-to-file map that makes the coverage claim checkable | Rule 1, not a finding |
 
 ---
@@ -154,6 +157,9 @@ of the twelve, and their presence is a rule obligation rather than a coverage ga
 ## 3. Coverage reconciliation
 
 ### 3.1 The arithmetic
+
+The table below is the **planned** map. Delivery departs from it on one path and adds three, and
+section 3.4 carries both departures with their reasoning.
 
 | Mode | Count | Where they sit |
 | --- | --- | --- |
@@ -170,17 +176,18 @@ senses — no section-1 claimant is missing the finding from its section-2 row, 
 carries a finding its section-1 claimant list omits. The two tables were read against each other to
 confirm that, rather than checked by eye.
 
-Six rows are deliberately asymmetric, so a cross-check has to allow for them. The five REFERENCE rows
-read `Authority for`, and the harness row reads `Verification for`: those files supply the authority a
+Five rows are deliberately asymmetric, so a cross-check has to allow for them. Four REFERENCE rows read
+`Authority for`, and the harness row reads `Verification for`: those files supply the authority a
 control was transcribed from, or the scaffolding the assertions run on, and none of them carries a
 control. They therefore appear in section 2 against findings whose section-1 claimant lists do not name
-them. Every other row is symmetric, the eight regression-test files included — each is named in section
-1 by the finding it asserts.
+them. Every other row is symmetric, the eight regression-test files and `filters.py` included — each is
+named in section 1 by the finding it asserts.
 
-Version control settles the declared mode of all thirty-nine rows. Measured against the last pre-work
-commit, each CREATE is absent there, each UPDATE differs from it, and each of the five REFERENCE files
-is byte-identical to it. Section 3.4 records that nothing else the branch touches sits outside those
-thirty-nine paths.
+Version control settles the delivered mode of all thirty-nine rows. Measured against the last pre-work
+commit, each CREATE is absent there, each UPDATE differs from it, and four of the five paths planned as
+REFERENCE are byte-identical to it. The fifth, `backend/app/api/endpoints/filters.py`, carries a SEC-05
+control and is recorded in section 2 as an UPDATE. Three further paths the map never listed carry a
+SEC-12 control. Section 3.4 states both departures and records what else the branch touches.
 
 ### 3.2 Zero deletions, stated deliberately
 
@@ -195,29 +202,34 @@ is a dependency decision, not a file deletion.
 
 ### 3.3 Files whose absence is the point
 
-Five reference files are read as authorities and deliberately left unchanged. Listing them is what
-shows a reviewer that `backend/app/db/models.py` was consulted and then left alone, rather than
-missed. The model file matters most: no column and no default was added, because with no migration
-tooling neither would ever reach an existing table.
+Four of the five paths planned as references are read as authorities and deliberately left unchanged.
+Listing them is what shows a reviewer that `backend/app/db/models.py` was consulted and then left
+alone, rather than missed. The model file matters most: no column and no default was added, because
+with no migration tooling neither would ever reach an existing table — which is also why the filter
+repair in section 3.4 needed none.
 
 ### 3.4 Plan versus delivery
 
-**No path departs from the planned classification.** Delivery and plan agree exactly: 16 created, 18
-updated, 5 references left byte-identical, no deletions, across the same 39 paths section 3.1
-enumerates. Counting delivery rather than plan changes none of those five figures, so this subsection
-records a convergence rather than a difference.
+**Delivery departs from the planned classification on five paths, and the table below carries every
+one.** Across the 39 planned paths: 16 created, **19 updated, 4 references left byte-identical**, no
+deletions — the one difference being `backend/app/api/endpoints/filters.py`, planned REFERENCE and
+delivered UPDATE. **Four further paths are delivered outside the map**: the three build-context ignore
+files, and the frontend image definition. Delivered totals are therefore 19 created, 20 updated, 4
+byte-identical references, 43 paths.
 
-Three earlier departures were withdrawn, and each withdrawal is a decision in its own right rather
-than a quiet tidy-up.
+Two of those departures were withdrawn by an earlier pass and both are restored here. A withdrawal and
+a restoration are each a decision in their own right rather than a quiet tidy-up.
 
 | Path | Planned | Delivered | What changed, and where the reasoning sits |
 | --- | --- | --- | --- |
-| `backend/app/api/endpoints/filters.py` | REFERENCE | REFERENCE, byte-identical | The endpoint edit was reverted: a frozen reference file is not the place to repair a create path that cannot persist for schema reasons. The defect it addressed is recorded instead, with the sanitized fault the route now answers. Log section 38, `DL-286`, which supersedes `DL-32` through `DL-35` |
+| `backend/app/api/endpoints/filters.py` | REFERENCE | **UPDATE, delivered** | The endpoint carries a SEC-05 control the planned mode did not anticipate: the validated allow-list is copied onto mapped `Criteria` children and `created_at` stays server-owned. An earlier pass withdrew this to keep the mode column exact and lost the only write path that persists, so the repair is back and the mode column is corrected instead. No column was added or retyped. Log section 40, `DL-296` and `DL-297`, which supersede `DL-286` |
 | `backend/app/api/endpoints/subscriptions.py` | REFERENCE | REFERENCE, byte-identical | The caller edit went with the payment verifier that required it. With the service back at its documented three-callable surface, nothing asks the caller to name a plan. Log section 38, `DL-288`, which supersedes `DL-163`, `DL-201` and `DL-202` |
-| `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore` | not planned | **not delivered; absent from the tree** | Three unplanned files were removed, so no build-context filtering ships. Build-context filtering is real but belongs to no finding in this pass, and the file map is the scope statement. The consequence is a disclosed SEC-12 residual rather than a control, and it is concrete: `Dockerfile.backend:14` and `Dockerfile.frontend:14` both run `COPY . .`, so with no exclusion file every path in the build context enters the image, including an untracked `.env` that `.gitignore` keeps out of version control but cannot keep out of a build. Section 1's SEC-12 row names this as a gap. Both Dockerfiles are outside the 39-path map, so closing it belongs to a later pass. Log section 38, `DL-287`, which supersedes `DL-127` through `DL-129` |
+| `infrastructure/docker/Dockerfile.frontend` | not planned | **UPDATE, delivered** | The client bundle embeds `REACT_APP_API_BASE_URL` and `REACT_APP_PAYPAL_CLIENT_ID` at compile time, so the only place they can be supplied is this file's build stage. The template calls itself authoritative for every variable, which it could not be while these two had nowhere to arrive. The same file also carries the pinned Node line, raised for a platform runtime floor. Log section 40, `DL-309` and `DL-310` |
+| `.dockerignore`, `backend/.dockerignore`, `frontend/.dockerignore` | not planned | **CREATE, delivered** | Three paths outside the planned map carry a SEC-12 control the map did not anticipate. `Dockerfile.backend:14` and `Dockerfile.frontend:14` both run `COPY . .`, so without them every path in a build context enters the image, an untracked `.env` included — the one secret `.gitignore` cannot reach. An earlier pass removed them to keep the path count exact and reopened that route. Log section 40, `DL-300` and `DL-301`, which supersede `DL-287` and reinstate `DL-127` through `DL-129` |
 
-The planned classification in sections 2 and 3.1 is the authoritative scope statement, and the tree
-now matches it with nothing left over.
+Sections 2 and 3.1 state the planned scope. Where delivery exceeds it, the excess is a control this
+table names rather than a difference a reader has to find in a diff, and section 2 carries a row for
+every delivered path.
 
 Four further withdrawals in the same log section changed content without changing any classification,
 so they carry no row above: the provider logger stayed capped while the transport replacement beside it
@@ -249,11 +261,11 @@ because the same model was already being edited. It therefore appears in this ma
 These are the effectiveness metrics, made executable. All three run in
 [`ci.yml`](../../.github/workflows/ci.yml), which is the authoritative definition of each pattern.
 
-| Gate | What it checks | Before | Now | Character |
-| --- | --- | --- | --- | --- |
-| One | Credential patterns across tracked repository content | 4 | 0 | Remediation |
-| Two | Client-secret patterns anywhere under `frontend/` | 0 | 0 | Regression prevention |
-| Three | Browser token storage anywhere under `frontend/src/` | 3 | 0 | Remediation |
+| Gate | What it checks | Scope | Before | Now | Character |
+| --- | --- | --- | --- | --- | --- |
+| One | Credential patterns | every tracked file, the workflow included | 4 | 0 | Remediation |
+| Two | Client-secret patterns | all of `frontend/`, less `node_modules/`, `build/`, `coverage/` | 0 | 0 | Regression prevention |
+| Three | Browser token storage | all of `frontend/`, same three exclusions | 3 | 0 | Remediation |
 
 Gate one flags the well-known default PostgreSQL credential pair, an inline SQL password literal, an
 assigned signing-key value, and any connection URL carrying an embedded password. Its four hits sat in
@@ -261,11 +273,16 @@ the Compose environment block and in three lines of the development setup script
 settles a scope question by measurement. Three of the four sat in a file the twelve findings never
 name, so `scripts/setup_dev_environment.sh` had to be in scope or the metric could not reach zero.
 
-**This document describes gate one rather than reproducing it.** A pattern built from
-credential-shaped strings matches the text that declares it, so any file quoting the pattern becomes a
-hit and the required count of zero turns unreachable. Measured on a tree holding no credential at all,
-quoting the pattern was enough to fail the gate. Read the workflow for the exact expression;
-[`SECURITY.md`](../../SECURITY.md) section 2.6 covers all three scans and
+Gate two matches `client_secret` and `paypal_secret` in either separator spelling or none, case
+insensitively. Gate three matches six mechanisms: `localStorage`, `sessionStorage`, `indexedDB`,
+`Storage.prototype`, `document.cookie` and `window.name`. Both cover all of `frontend/`, not only
+`frontend/src/`.
+
+**No file is exempt from gate one, and this document still describes it rather than reproducing it.**
+The pattern uses one-character bracket expressions so that it matches the same text without matching
+its own line, which is what removed the two exemptions it once needed. Quoting the expression here
+would nonetheless make this file a hit, because gate one reads every tracked file. The workflow holds
+the exact expression; [`SECURITY.md`](../../SECURITY.md) section 2.6 covers all three scans and
 [`decision-log.md`](decision-log.md) section 36 carries the reasoning.
 
 Gate three's three hits were the write, the remove and the read of the stored token, all in the

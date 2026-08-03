@@ -5,12 +5,15 @@ services:
     build:
       context: ../../frontend
       dockerfile: Dockerfile
+      args:
+        # SEC-12: build-time only; no inline default, so an unset value
+        # fails the build instead of baking a wrong origin into the bundle
+        - REACT_APP_API_BASE_URL=${REACT_APP_API_BASE_URL}
+        - REACT_APP_PAYPAL_CLIENT_ID=${REACT_APP_PAYPAL_CLIENT_ID}
     ports:
       - "80:80"
     depends_on:
       - backend
-    environment:
-      - REACT_APP_API_URL=http://backend:5000
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80"]
       interval: 30s

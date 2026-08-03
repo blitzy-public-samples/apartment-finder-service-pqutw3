@@ -1,7 +1,7 @@
 # Main Terraform configuration file for provisioning Google Cloud resources
 
-# SEC-12: write-only arguments and ephemeral variables keep the database
-# password out of state; both require Terraform 1.11 or newer
+# SEC-12: floor for the write-only argument and ephemeral variable that
+# keep the database password out of state (CWE-522)
 terraform {
   required_version = ">= 1.11.0"
 }
@@ -74,11 +74,9 @@ resource "google_sql_database" "database" {
   instance = google_sql_database_instance.main.name
 }
 
-# SEC-11: application account separate from the instance admin account.
-# Cloud SQL grants cloudsqlsuperuser to every built-in user it creates, and
-# this provider carries no grant or revoke resource, so the account is
-# separated here and restricted out of band. SECURITY.md section 3.2 carries
-# the statements.
+# SEC-11: application account separate from the instance admin account,
+# restricted out of band by the statements in SECURITY.md section 3.2
+# (CWE-250, CWE-269)
 # SEC-12: password_wo is write-only, so the value never lands in state
 resource "google_sql_user" "app" {
   name                = var.db_app_user

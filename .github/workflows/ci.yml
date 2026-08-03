@@ -21,10 +21,7 @@ jobs:
     - name: Set up Node.js
       uses: actions/setup-node@v2
       with:
-        # Platform runtime policy: Node 20.x below 20.20.2 and 22.x below
-        # 22.12.0 are interdicted, so the previously pinned '14' is not
-        # installable. 22 is the lowest permitted line that still builds
-        # react-scripts 5.0.1 and resolves axios at the exact pin.
+        # Lowest Node line the platform runtime floor permits
         node-version: '22'
 
     - name: Install Python dependencies
@@ -37,14 +34,9 @@ jobs:
       continue-on-error: true
       run: |
         set -euo pipefail
-        # CWE-1104: dependency advisory gate. Every suppressed advisory is
-        # unpatchable on the Python version this project pins: each fix
-        # release requires 3.10 or newer. Per-advisory justification, the
-        # reachability assessment and the shared review trigger - a runtime
-        # upgrade - are recorded in
+        # CWE-1104: dependency advisory gate; the register and the
+        # reachability assessment sit in
         # documentation/security/decision-log.md section 2.2
-        # Plain freeze: the audited set is the manifest closure, so the
-        # verdict cannot drift with the runner image's own tooling
         pip freeze > /tmp/frozen.txt
         # CWE-1104: suppression register staleness check;
         # documentation/security/decision-log.md section 20
@@ -66,15 +58,9 @@ jobs:
           --ignore-vuln PYSEC-2026-1845 --ignore-vuln PYSEC-2026-2270 \
           --ignore-vuln GHSA-6v7p-g79w-8964
 
-    # SEC-01, SEC-12: repository-wide credential scan over tracked content.
-    # Pattern source of record; see documentation/security/decision-log.md
-    # Every tracked file is scanned, this workflow included. Several
-    # alternatives would otherwise match the pattern written here, so each
-    # is split by a one-character bracket expression: [:] matches a colon,
-    # [W] a W, [w] a w. Detection is unchanged - the expressions match the
-    # same text - while the line no longer matches itself, which is what
-    # previously forced two files to be excluded from the scan.
-    # test_config_guards.py reads this command and gates both directions.
+    # SEC-01, SEC-12: credential scan over tracked content, this workflow
+    # included. Bracket expressions keep the pattern off its own line: [:]
+    # matches a colon, [W] a W, [w] a w
     - name: Scan for hardcoded credentials
       run: |
         status=0
@@ -91,8 +77,7 @@ jobs:
         fi
         echo "SEC-01: credential scan clean"
 
-    # SEC-09: frontend client-secret guard. The pattern matches the name of a
-    # secret, so a matching line carries its value; only the location is
+    # SEC-09: frontend client-secret guard; only the location of a match is
     # printed (CWE-532)
     - name: Scan frontend for client secrets
       run: |
@@ -159,10 +144,8 @@ jobs:
         cd frontend
         npm test -- --coverage
 
-    # Known non-zero baseline: test_api.py, test_services.py and
-    # test_tasks.py each fail to import, so this step reports three
-    # collection errors. --continue-on-collection-errors keeps them visible
-    # and still runs the tests that do collect.
+    # Known non-zero baseline: three legacy test modules fail to import, so
+    # this step reports three collection errors and still runs the rest.
     # documentation/security/decision-log.md records the disposition.
     - name: Run backend unit tests
       if: always()

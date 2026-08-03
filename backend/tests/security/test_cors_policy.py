@@ -9,7 +9,7 @@ built; the cases here assert that error, not a process exit.
 The allow-list arrives from the environment in production, and that path
 differs from passing a keyword: an unparsable value is refused before
 any validator sees it, and the guidance an operator needs travels on the
-cause rather than in the message. Both spellings are covered here, so a
+cause and not in the message. Both spellings are covered here, so a
 rejection proved through a keyword is never mistaken for a rejection
 proved through the environment.
 """

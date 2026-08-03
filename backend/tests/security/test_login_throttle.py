@@ -14,15 +14,12 @@ successful login empties that counter.
 Two further layers are exercised here. The counter map is bounded, so a
 flood of distinct addresses cannot exhaust memory and cannot drop a
 lockout to make room; those cases address the reservation function
-directly, because the bound is reached below the HTTP layer. And the
-limiter the application registers is proven to be the one the harness
-empties, with its rejection driven through the app so the handler that
-answers it is under test.
+directly. And the limiter the application registers is proven to be the
+one the harness empties, with its rejection driven through the app.
 
 Both controls hold their state in the worker process that served the
-request. Neither survives a restart, and neither is shared between
-workers or replicas, so the bound measured here is the bound one worker
-applies. Durable shared lockout is recorded as deferred in
+request, so the bound measured here is the bound one worker applies.
+Durable shared lockout is recorded as deferred in
 ``documentation/security/decision-log.md``.
 """
 import itertools
@@ -591,10 +588,9 @@ def test_successful_login_empties_the_account_counter(register_user):
     assert _account_keys() == []
     assert auth_endpoint._login_failures == {}
 
-    # SEC-07: an emptied counter answers 401 again for a full run; a
-    # retained count would answer 429 on the second attempt here. The
-    # limiter storage counted the accepted attempt too and is emptied
-    # first; the second run then reaches the account counter.
+    # SEC-07: an emptied counter answers 401 again for a full run. The
+    # address layer is emptied first, so the second run reaches the
+    # account counter.
     _reset_address_layer()
     second_run = [
         _login_from_a_new_address(account["email"], WRONG_SECRET).status_code

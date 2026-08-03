@@ -64,12 +64,9 @@ _BACKEND_DIR = _TESTS_DIR.parent
 _REPO_ROOT = _BACKEND_DIR.parent
 _APP_DIR = _BACKEND_DIR / "app"
 
-# The repository root resolves ``backend.app.*``, the canonical package
-# path every application module and every security test imports. The
-# backend directory resolves the short ``app.*`` path the CI working
-# directory and the three legacy test modules use. Both roots stay on the
-# path; _install_canonical_aliases below makes the short path an alias of
-# the canonical one rather than a second copy of it.
+# Both import roots: the repository root resolves ``backend.app.*`` and the
+# backend directory resolves the short ``app.*`` path. The short path is an
+# alias of the canonical one, installed below.
 _CANONICAL_PACKAGE = "backend.app"
 _SHORT_PACKAGE = "app"
 for _import_root in (str(_BACKEND_DIR), str(_REPO_ROOT)):
@@ -85,18 +82,12 @@ ALLOWED_ORIGIN = TEST_BASE_URL
 # SEC-03: an origin absent from ALLOWED_ORIGINS
 FOREIGN_ORIGIN = "https://foreign.example.com"
 
-# SEC-04: clears every rule in backend/app/schema/user.py - twelve
-# characters, one uppercase, one lowercase, one digit, one special
+# SEC-04: clears every rule in backend/app/schema/user.py
 VALID_PASSWORD = "Harness1!Passphrase"
 
-# Every setting the application declares is assigned here, before the
-# first application import below, which builds Settings() at module
-# scope. Assignment is unconditional: os.environ.setdefault would let an
-# ambient value from the runner's environment or a CI secret decide what
-# the suite tests, so a run on a developer machine and a run in the
-# pipeline would assert against different configuration. Every value
-# below is a test-only sentinel that reaches no provider and signs no
-# token outside this process.
+# Every setting the application declares, assigned unconditionally before
+# the first application import below. Every value is a test-only sentinel
+# that reaches no provider and signs no token outside this process.
 _HARNESS_ENVIRONMENT = {
     # SEC-10: a SQLite URL, for which database.py builds no sslmode
     # connect argument; the SQLite driver rejects that keyword
@@ -107,9 +98,8 @@ _HARNESS_ENVIRONMENT = {
     "ALLOWED_ORIGINS": json.dumps([ALLOWED_ORIGIN]),
     # SEC-06: the session cookie carries the Secure attribute under test
     "COOKIE_SECURE": "true",
-    # SEC-12: 64 bytes clears the RFC 7518 sec. 3.2 floor for HS256,
-    # HS384 and HS512 alike. Not a deployable key: a fixed literal in a
-    # tracked file, carried by this harness only.
+    # SEC-12: 64 bytes, clearing the RFC 7518 sec. 3.2 floor of every
+    # accepted algorithm. A harness literal, never a deployable key.
     "SECRET_KEY": "harness-only-signing-key-" + "x" * 39,
     "ALGORITHM": "HS256",
     "ACCESS_TOKEN_EXPIRE_MINUTES": "30",
@@ -128,8 +118,7 @@ _HARNESS_ENVIRONMENT = {
     "FROM_EMAIL": "harness@example.com",
 }
 
-# Declared optional and read by no test. Removed from the environment, so
-# Settings carries no ambient value for it.
+# Declared optional and read by no test; removed from the environment
 _SCRUBBED_ENVIRONMENT = ("SENTRY_DSN",)
 
 os.environ.update(_HARNESS_ENVIRONMENT)
@@ -146,16 +135,10 @@ from sqlalchemy.pool import StaticPool  # noqa: E402
 def _install_canonical_aliases():
     """Bind every short ``app.*`` name to its canonical module object.
 
-    Both import roots are on sys.path, so ``app.core.config`` and
-    ``backend.app.core.config`` name the same source file. Left alone,
-    importing both executes that file twice and yields two module
-    objects, two Settings instances, two login-failure counters and two
-    get_db functions - a test would then assert against state no request
-    reaches. Importing the application entry point first, then binding
-    each loaded module in sys.modules under its short name, makes the
-    second import a lookup. _assert_one_module_object_per_source_file
-    below is the enforcement: it fails the run if any application source
-    file is ever loaded twice, whichever name imported it.
+    The application entry point is imported first, then every loaded
+    module is bound in sys.modules under its short name, so the second
+    import is a lookup rather than a second execution.
+    _assert_one_module_object_per_source_file enforces that.
     """
     importlib.import_module("{0}.main".format(_CANONICAL_PACKAGE))
     for name, module in list(sys.modules.items()):
@@ -174,10 +157,8 @@ from backend.app.db.database import get_db  # noqa: E402
 from backend.app.db.models import Base  # noqa: E402
 from backend.app.main import app  # noqa: E402
 
-# The state a second module object would silently duplicate: the settings
-# every guard reads, the limiter the throttle asserts through, the
-# account-keyed failure counter the harness empties between tests, and
-# the session dependency every route resolves.
+# The state a second module object would duplicate: settings, limiter,
+# account-keyed failure counter and session dependency.
 _SHARED_OBJECTS = (
     ("core.config", "settings"),
     ("api.endpoints.auth", "limiter"),
@@ -185,9 +166,7 @@ _SHARED_OBJECTS = (
     ("db.database", "get_db"),
 )
 
-# Resolving every loaded module's __file__ once per test would cost tens
-# of thousands of stat calls across a session; sys.modules entries keep
-# the same __file__ string, so the resolved path is cached by that string.
+# Resolved source paths, cached by the __file__ string sys.modules keeps
 _RESOLVED_SOURCES = {}
 
 
@@ -283,11 +262,8 @@ test_engine = create_engine(
 def _enforce_sqlite_foreign_keys(dbapi_connection, connection_record):
     """Turn on foreign-key enforcement for every SQLite connection.
 
-    SQLite ignores foreign keys unless the pragma is set per connection,
-    so without this the four foreign keys the models declare are inert
-    under test and a row referencing no parent inserts cleanly. The
-    production engine is PostgreSQL, which enforces them always, so the
-    harness would otherwise be weaker than what it stands in for.
+    SQLite applies the four foreign keys the models declare only when the
+    pragma is set per connection.
     """
     cursor = dbapi_connection.cursor()
     try:

@@ -54,9 +54,18 @@ URL, the SendGrid API key, and the sender address. Without those three, the mail
 ingestion modules fail on first use. Two login-throttle thresholds are also new, but both carry
 working defaults and need no action.
 
+**Supply the two frontend build variables to the build, not to the runtime.** `REACT_APP_API_BASE_URL`
+and `REACT_APP_PAYPAL_CLIENT_ID` are read by the browser sources, and create-react-app substitutes
+them into the bundle while it compiles. A value handed to a running container arrives too late.
+`infrastructure/docker/Dockerfile.frontend` declares one build argument per name ahead of
+`npm run build`, and `infrastructure/docker/docker-compose.yml` forwards both with no inline default.
+Whatever they hold is served to every visitor, so neither may carry a secret; the PayPal client
+**secret** stays a backend setting and never becomes a build argument.
+
 [`.env.example`](.env.example) is authoritative for every variable name, shape, and purpose. It
-documents the JSON-array form the origin allow-list requires, the per-algorithm key floor, and the
-one local-development exception for the database SSL mode.
+carries two contracts: the backend settings the process reads, and a final section for the two
+frontend build variables. It documents the JSON-array form the origin allow-list requires, the
+per-algorithm key floor, and the one local-development exception for the database SSL mode.
 
 **Restrict the secret file's permissions** to the owning service account, and confirm the ignore
 rules exclude it before the first commit that could pick it up.
@@ -80,6 +89,15 @@ The `secrets/` entry matters more than it looks. The Compose stack mounts `./sec
 database proxy container and reads a Google service-account credential file from it. Nothing
 previously stopped that file from being committed.
 
+**Version control is not the only way a local secret escapes.** Both container definitions copy their
+whole build context with `COPY . .`, so an untracked `.env` that `.gitignore` keeps out of history
+still lands in an image layer. Three context-local ignore files close that path: one at the
+repository root and one at each declared build context, `backend/` and `frontend/`. Each excludes the
+environment file and its temporary form, the `secrets/` directory, certificates, keys, credential
+JSON, virtual environments, dependency trees, caches and coverage output.
+`test_config_guards.py` asserts the exclusion of every one of those classes per context, and asserts
+that the exclusions still admit the files each build needs.
+
 The settings class rejects weak or missing security values while it loads, so a misconfiguration
 surfaces as a failed boot rather than a silent weakening. Eleven variables are required with no
 default.
@@ -94,6 +112,9 @@ understands. The token algorithm accepts only the HMAC family.
 SEC-12 is a partial remediation. It delivers custody discipline, not a secret store.
 
 - No managed secret store is provisioned, and no key-management service is configured.
+- The broad `COPY . .` in both container definitions is unchanged, so the build depends on the
+  context exclusions rather than on an allow-list. Narrowing each copy to the application sources is
+  the stronger form and is recommended in section 4.
 - The deployment pipeline still authenticates with a long-lived service-account key rather than
   federated identity. `.github/workflows/cd.yml` passes that key to the Cloud SDK setup step and
   exports it as the default credential. Migrating to federated identity needs provider-side
@@ -214,41 +235,38 @@ The three scans below are the effectiveness metrics, made executable. All three 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml), which is the authoritative definition of
 each pattern.
 
-| Gate | What it checks | Before | Required after |
-| --- | --- | --- | --- |
-| One | Credential patterns across tracked repository content | 4 | 0 |
-| Two | Client-secret patterns anywhere under `frontend/` | 0 | must remain 0 |
-| Three | Browser storage anywhere under `frontend/src/` | 3 | 0 |
+| Gate | What it checks | Scope | Before | Required after |
+| --- | --- | --- | --- | --- |
+| One | Credential patterns | every tracked file, this workflow included | 4 | 0 |
+| Two | Client-secret patterns | all of `frontend/`, excluding `node_modules/`, `build/` and `coverage/` | 0 | must remain 0 |
+| Three | Browser token storage | all of `frontend/`, same three exclusions | 3 | 0 |
 
 Gate one flags the well-known default PostgreSQL credential pair, an inline SQL password literal,
 an assigned signing-key value, and any connection URL carrying an embedded password. It also flags
 an assigned value for any variable whose name ends in a credential word, and any inline private
 key. Its four original hits were the Compose environment block and three lines of the development
-setup script. Read the workflow for the exact pattern; this document describes it rather than
-reproducing it, for the reason given at the end of this section.
+setup script.
 
-Gate two is a regression gate rather than a remediation gate. The property already held, since the
-frontend only ever used the public client identifier, and the pipeline step converts it from an
-accident into an invariant.
+Gate two matches `client_secret` and `paypal_secret` in either hyphen or underscore spelling, with
+or without the separator, case-insensitively. It is a regression gate rather than a remediation
+gate: the property already held, since the frontend only ever used the public client identifier, and
+the pipeline step converts it from an accident into an invariant.
 
-Gate three had three hits, all in the frontend authentication service, one each for writing,
-removing, and reading the stored token.
+Gate three matches six storage mechanisms, not two: `localStorage`, `sessionStorage`, `indexedDB`,
+`Storage.prototype`, `document.cookie` and `window.name`. Its three original hits were in the
+frontend authentication service, one each for writing, removing and reading the stored token.
 
-Gates two and three are scoped to the frontend, so they can be run directly:
+**No file is excluded from gate one.** The pattern is written with one-character bracket expressions
+— `[:]` for a colon, `[W]` for a W, `[w]` for a w — so it matches the same text without matching the
+line that declares it. Nothing has to be exempted, which is what makes the gate cover the workflow
+and this document as well. Gate one is restricted to tracked content, so a local `.env` or an
+installed dependency tree produces no false hit.
 
-```bash
-grep -rIn -E "CLIENT_SECRET|client_secret" frontend/
-grep -rIn -E "localStorage|sessionStorage" frontend/src/
-```
-
-The pipeline runs broader variants of both, and it restricts gate one to tracked content so that a
-local `.env` or an installed dependency tree cannot produce a false hit.
-
-**The credential-scan step must exclude the files that define or document its own pattern.** A
-scan whose pattern is itself a credential-shaped string matches the line that declares it, so the
-gate can never reach zero otherwise. The workflow filters out its own pattern-defining line, and
-this document describes gate one in prose instead of reproducing it. The decision log carries the
-reasoning.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) holds the exact expression for all three, and
+this document describes rather than reproduces gate one: a pattern built from credential-shaped
+strings would match the line quoting it, and gate one reads this file. The decision log carries the
+reasoning. To run gates two and three by hand, use the two commands from the workflow verbatim;
+narrowing either scope or shortening either pattern gives a weaker answer than the pipeline's.
 
 ### 2.7 Infrastructure validation
 
@@ -439,27 +457,30 @@ Two controls close it. The dependency is pinned exactly to 1.19.0, which separat
 concerns. The explicit cross-site-token option is deliberately left unset, which keeps the old
 behaviour switched off.
 
-**Three endpoints cannot persist records, before or after this work.** `POST /listings/`,
-`POST /subscriptions/` and `POST /filters/` all fail for reasons that have nothing to do with
-security.
+**Two endpoints cannot persist records, before or after this work.** `POST /listings/` and
+`POST /subscriptions/` both fail for reasons that have nothing to do with security.
 
 - `POST /listings/` — the listing model has no owner column, and two non-null timestamp columns are
   never supplied.
 - `POST /subscriptions/` — the subscription model has no plan column, and a non-null status column is
   never supplied.
-- `POST /filters/` — `filters.py:20` assigns `FilterCreate` models to the mapped `criteria`
-  relationship, which expects `Criteria` rows, and supplies no value for the non-null `created_at`
-  column. The request is validated and rejected-on-unknown-keys correctly, then the flush fails. The
-  route answers the uniform sanitized 500 of section 2 and **leaves no row**, which
-  `test_filter_creation_defect_answers_a_sanitized_fault` asserts together with a zero-row check.
 
-Repairing any of the three means adding or retyping columns, which needs migration tooling this
-repository does not have, and that is feature work rather than security work.
+Repairing either means adding or retyping columns, which needs migration tooling this repository
+does not have, and that is feature work rather than security work.
 
-The honest criterion is narrower: all three routes stay importable with their paths, verbs and
-request contracts unchanged; the new strict schemas close the mass-assignment vector on them; and
-the failure discloses nothing, because it surfaces through the same sanitized envelope every other
+The honest criterion is narrower: both routes stay importable with their paths, verbs and request
+contracts unchanged; the new strict schemas close the mass-assignment vector on them; and the
+failure discloses nothing, because it surfaces through the same sanitized envelope every other
 error uses.
+
+`POST /filters/` is **not** in that group. It persists. The endpoint copies the validated
+allow-list onto mapped `Criteria` children and supplies the server-owned `created_at`, so a valid
+request writes one filter row with its criteria rows and returns the declared response model. No
+column was added or retyped to make that work, so nothing here depends on migration tooling.
+`test_filter_creation_persists_only_the_validated_fields`,
+`test_a_created_filter_belongs_to_its_author_alone` and
+`test_filter_creation_refuses_a_client_supplied_owner` assert the stored row, its ownership, the
+cross-account isolation of the read path, and the refusal of a body naming an owner.
 
 **The pre-existing pipeline baseline, measured so that "no new failures" is an honest claim.**
 Style checking reported 129 findings before this work. The test suite collected zero tests with
@@ -520,8 +541,9 @@ in production is a one-line change whenever the team decides it should be gated.
 7. Add durable, multi-replica-safe account lockout, which needs either migration tooling or an
    external store.
 8. Repair `infrastructure/terraform/outputs.tf` so that plan validation succeeds.
-9. Harden the containers: refresh both base images, run as a non-root user, pin pipeline actions to
-   immutable digests, and refresh the database proxy image.
+9. Harden the containers: narrow both `COPY . .` instructions to an explicit allow-list, refresh both
+   base images, run as a non-root user, pin pipeline actions to immutable digests, and refresh the
+   database proxy image.
 
 ---
 
