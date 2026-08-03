@@ -22,8 +22,9 @@ export interface Filter {
 }
 
 // SEC-05: the writable-field allow-list POST /filters/ accepts. Any other
-// key is refused with 422, and the server owns id, user_id, created_at,
-// last_used and zip_codes.
+// key is refused with 422. The server owns id, user_id, created_at and
+// last_used. zip_codes is not writable through this endpoint either, and no
+// code path populates it, so Filter.zip_codes always arrives empty.
 export interface FilterCreate {
   name: string;
   criteria: Criteria[];
@@ -32,7 +33,9 @@ export interface FilterCreate {
 // The value the filter form holds while a user edits it. It is a UI model,
 // not a wire body: criteria arrive keyed by input name in camelCase, and the
 // zip-code field is a plain list of strings. frontend/src/services/api.ts
-// maps it to FilterCreate; nothing sends this shape to the server.
+// maps it to FilterCreate; nothing sends this shape to the server. The
+// mapping drops zipCodes, which the form collects but no request body
+// carries and no server field stores.
 export interface FilterFormValue {
   name?: string;
   zipCodes?: string[];

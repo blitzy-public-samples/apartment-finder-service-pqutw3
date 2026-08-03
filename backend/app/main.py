@@ -171,8 +171,6 @@ class SanitizedServerErrorMiddleware:
 # SEC-08: registered before CORSMiddleware, which places this layer inside it
 app.add_middleware(SanitizedServerErrorMiddleware)
 
-# HUMAN ASSISTANCE NEEDED
-# The following setup section has a confidence level below 0.8 and may need review
 # Application setup and configuration
 # SEC-03: explicit method/header allow-list; closes the
 # wildcard-with-credentials CORS policy (CWE-942, CWE-346)

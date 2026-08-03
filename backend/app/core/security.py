@@ -39,8 +39,6 @@ def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
     encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
     return encoded_jwt
 
-# HUMAN ASSISTANCE NEEDED
-# This function might need additional error handling and token validation
 def get_current_user(
     request: Request,
     token: Optional[str] = Depends(oauth2_scheme),

@@ -240,11 +240,11 @@ The pipeline runs this, and creating the dependency manifest made it execute for
 cd backend && flake8 .
 ```
 
-Baseline: 129 findings, of which 4 are undefined names. Measured again on 2026-08-03: **109 findings,
+Baseline: 129 findings, of which 4 are undefined names. Measured again on 2026-08-03: **108 findings,
 of which 4 are substantive and exactly 1 is an undefined name** — `datetime` at
 `app/api/endpoints/subscriptions.py:60`, the out-of-scope case section 3.3 records. The other three
 are unused imports in `app/api/endpoints/listings.py`, `app/tasks/listing_updater.py` and
-`tests/test_api.py`. The remaining 105 are blank-line, trailing-whitespace, line-length and
+`tests/test_api.py`. The remaining 104 are blank-line, trailing-whitespace, line-length and
 missing-final-newline findings in files this work did not reformat.
 
 No new category appears: the category set is the same seven as the baseline. Both figures were
@@ -416,7 +416,8 @@ remaining five, listed separately below, arrive through the audit and test tooli
 Eight of those ten are unreachable, one is low and partial, and one is partial with a named
 compensating control.
 
-The five that arrive through tooling rather than through the application:
+The five that sit outside the served application. Four arrive through the audit and test tooling; the
+last arrives through the direct `python-dotenv` pin, which `pydantic` reads to load `env_file`:
 
 | Package | Pinned | Advisory | Fix release | Installable here | Reachability |
 | --- | --- | --- | --- | --- | --- |
@@ -457,6 +458,20 @@ state is per-worker and lost on restart. Lockout is therefore neither durable no
 multi-replica-safe. Durable lockout needs either new database columns, which require migration
 tooling this repository does not have, or an external store, which was ruled out as new
 infrastructure.
+
+Account throttling also brings a denial-of-service surface that did not exist before this work, and
+it is the price of counting per account rather than per address. The counter reserves one of the
+account's five attempts before the credential lookup runs, which is what stops an attacker learning
+whether an address is registered. An unauthenticated attacker who knows a victim's address can
+therefore spend that budget and leave the owner answered with 429 for the rest of the window, and
+repeat it indefinitely. `DL-292` carries the two-layer decision and `DL-337` the keying.
+
+A second variant targets the tracking map rather than one account. The map holds 4,096 accounts and
+never evicts an entry that has reached the limit. An attacker who drives 4,096 distinct accounts to
+the limit therefore denies a tracking slot to any further account, whose first attempt is refused
+until an entry expires. Reaching that state needs roughly 4,096 distinct source addresses, because
+the address-keyed limiter allows only five attempts per address per window. `DL-49` carries that
+bound, and both variants close with the durable store in item 8 of section 4.
 
 **SEC-10 gained encryption, not certificate verification.** Both ends now require encryption: the
 Cloud SQL instance is set to accept encrypted connections only, and the application requests
@@ -571,6 +586,18 @@ travels automatically. `SameSite=Strict` is the control. A full anti-forgery tok
 touch every mutating endpoint and every client call site, which is the opposite of minimal, so the
 gap is recorded here rather than closed.
 
+**`COOKIE_SECURE` defaults to true, and the Compose stack serves plain HTTP.** A browser discards a
+`Secure` cookie delivered over plain HTTP, so on the default the stack answers a login with 200 and
+the frozen body while storing no session cookie, and every protected route then answers 401. The
+Compose definition therefore carries `COOKIE_SECURE=${COOKIE_SECURE:-false}` beside the transport
+exception, which is the only channel an operator has: the definition declares no `env_file`, and all
+three build contexts exclude `.env`.
+
+The default is deliberate and stays true, so a deployment that sets nothing gets the secure
+attribute. The residual is the mirror of the transport exception beside it: a local value of `false`
+could be copied into a deployed environment by mistake. Both live in the Compose file rather than in
+code, so the copy is visible in a diff.
+
 **Logout clears the cookie; it does not revoke the token.** `POST /auth/logout` expires the session
 cookie, so the browser stops sending it, and that is the whole of what a server can do about a cookie
 it cannot read from script. The token itself stays valid until its `exp` claim passes.
@@ -598,6 +625,23 @@ Two controls close it. The dependency is pinned exactly to 1.19.0, which separat
 concerns. The explicit cross-site-token option is deliberately left unset, which keeps the old
 behaviour switched off.
 
+**The public listing page has no size ceiling, so one unauthenticated request can read the whole
+table.** `GET /listings/` is public by design and its `skip` and `limit` parameters are plain
+integers with no declared range, which the brief freezes. Any value the driver binds is therefore a
+legal `LIMIT`, and `?limit=1000000000` returns every row (CWE-770).
+
+The bound this work does deliver is narrower than it looks, so read it precisely. A value past the
+driver's signed 64-bit range never reaches the database: it answers the uniform sanitized 500 with
+no statement, driver name or traceback, which is what `DL-187` measured. That bound holds only
+**above** the accepted domain and is not a page-size limit. Measured on PostgreSQL 13.23: `LIMIT` at
+9223372036854775807 is accepted and returns the whole table, while a negative `LIMIT` raises
+`InvalidRowCountInLimitClause` and reaches the client as the same sanitized 500. On the SQLite test
+harness a negative limit instead returns every row, which `DL-67` records; production is PostgreSQL.
+
+No code change is offered here, and that is deliberate. Narrowing the parameters would change a
+contract the brief freezes, so `DL-187` refuses it and recommends the amendment instead. Authorising
+a bounded page size is item 6 in section 4.
+
 **Two endpoints cannot persist records, before or after this work.** `POST /listings/` and
 `POST /subscriptions/` both fail for reasons that have nothing to do with security.
 
@@ -623,12 +667,33 @@ column was added or retyped to make that work, so nothing here depends on migrat
 `test_filter_creation_refuses_a_client_supplied_owner` assert the stored row, its ownership, the
 cross-account isolation of the read path, and the refusal of a body naming an owner.
 
+**Payment replay protection is per-worker and bounded, so a reference can authorize a second
+charge.** A verified provider reference is recorded in a ledger inside the worker that verified it,
+and a replay is refused only while that digest is retained (CWE-294). The ledger holds 4,096
+digests, evicts the oldest past that, and starts empty after a restart.
+
+Three states therefore admit a second charge on the same reference: after a worker restart, past the
+4,096th distinct reference in one worker, and on any other worker in a multi-replica deployment.
+This is the same residual class as the login throttle in section 3.2, from the same cause, and
+`DL-163` carries the decision to keep the in-process ledger rather than provision a store. Durable,
+shared replay protection is item 9 in section 4.
+
+**Keep `PAYPAL_MODE` at `sandbox` until the subscription schema is repaired.** The setting accepts
+`live`, and on `live` the provider captures a real charge. The charge is verified and consumed
+before the row is built, and `POST /subscriptions/` then fails at insertion for the schema reasons
+above, so the money moves and no record of it survives.
+
+Nothing in the code stops that sequence, because each half is correct on its own: the domain check
+exists so an operator can select `live` deliberately, and the persistence gap is feature work the
+brief excludes. The two facts only combine into a hazard when the mode is switched, which is why the
+warning sits here and beside the variable in `.env.example`.
+
 **The pre-existing pipeline baseline, measured so that "no new failures" is an honest claim.**
 Style checking reported 129 findings before this work, 4 of them undefined names. The test suite
 collected zero tests with three collection errors, because all three existing test modules failed to
 import. The pipeline had never reached either step, because it failed at dependency installation.
 
-Measured now: style checking reports 109 findings with 1 undefined name, and the suite reports 689
+Measured now: style checking reports 108 findings with 1 undefined name, and the suite reports 689
 passed with the same three collection errors. Those three errors survive this work untouched. **A
 green pipeline is not on offer.**
 
@@ -719,13 +784,20 @@ closed with a residual is distinguishable from one closed outright.
 4. Provision a managed secret store with key management, and migrate the deployment pipeline to
    federated identity in place of the long-lived service-account key.
 5. Add per-service database roles and row-level security.
-6. Add a full anti-forgery token scheme, replacing reliance on `SameSite=Strict` alone.
-7. Add durable, multi-replica-safe account lockout, which needs either migration tooling or an
-   external store.
-8. Repair `infrastructure/terraform/outputs.tf` so that plan validation succeeds.
-9. Harden the containers: narrow both `COPY . .` instructions to an explicit allow-list, refresh both
-   base images, run as a non-root user, pin pipeline actions to immutable digests, and refresh the
-   database proxy image.
+6. Authorise a bounded page size on `GET /listings/`, then apply it. The parameters are a frozen
+   contract, so the amendment comes first and `DL-187` refuses to narrow them without it. Until then
+   one unauthenticated request can read the whole table; section 3.3 carries the residual.
+7. Add a full anti-forgery token scheme, replacing reliance on `SameSite=Strict` alone.
+8. Add durable, multi-replica-safe account lockout, which needs either migration tooling or an
+   external store. The same store closes the two lockout-abuse variants in section 3.2.
+9. Add durable, shared replay protection for payment references, so a verified reference is spent
+   once across restarts and across replicas rather than inside one worker's bounded ledger. Review
+   trigger: the first deployment running more than one worker, or any change to the payment flow.
+   Section 3.3 carries the residual.
+10. Repair `infrastructure/terraform/outputs.tf` so that plan validation succeeds.
+11. Harden the containers: narrow both `COPY . .` instructions to an explicit allow-list, refresh
+    both base images, run as a non-root user, pin pipeline actions to immutable digests, and refresh
+    the database proxy image.
 
 ---
 
