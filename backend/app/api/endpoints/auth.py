@@ -1,4 +1,5 @@
 import hmac
+import math
 import secrets
 import threading
 import time
@@ -100,11 +101,53 @@ def _verified_credentials(db_user, submitted_password: str):
     return bool(matched and db_user is not None), ""
 
 
+# SEC-07: the recovery hint on a throttled attempt. Retry-After alone;
+# the RateLimit-* family would publish the attempt threshold (CWE-209).
+RETRY_AFTER_HEADER = "Retry-After"
+
+
+def _configured_window_seconds() -> int:
+    # SEC-07: the throttle window, in seconds
+    return settings.LOGIN_RATE_LIMIT_WINDOW_MINUTES * 60
+
+
+def retry_after_seconds(remaining: float) -> int:
+    # SEC-07: a whole number of seconds inside the window, so a client
+    # that waits it out is admitted and never told to wait longer than
+    # the window itself. A rounded-down hint would invite a retry the
+    # limiter still refuses, so the value rounds up.
+    window = _configured_window_seconds()
+    if remaining <= 0:
+        return window
+    return max(1, min(window, math.ceil(remaining)))
+
+
+def _seconds_until_admission(*throttle_keys: str) -> int:
+    # SEC-07: seconds until the earliest exhausted key admits another
+    # attempt. A refusal raised by the capacity guard holds no expiry,
+    # so the configured window is the answer.
+    now = time.monotonic()
+    with _login_failures_lock:
+        expiries = [
+            _login_failures[key][1]
+            for key in throttle_keys
+            if key in _login_failures
+        ]
+    if not expiries:
+        return _configured_window_seconds()
+    return retry_after_seconds(min(expiries) - now)
+
+
 class AccountThrottled(HTTPException):
-    # SEC-07: 429 carrying the account marker to the error boundary.
-    # SEC-08: audit_context holds redacted markers only
-    def __init__(self, account_marker: str):
-        super().__init__(status_code=429)
+    # SEC-07: 429 carrying the account marker to the error boundary, which
+    # logs one record under the same error_id the client receives, and the
+    # Retry-After a throttled caller needs to recover.
+    # SEC-08: audit_context holds redacted markers only.
+    def __init__(self, account_marker: str, retry_after: int):
+        super().__init__(
+            status_code=429,
+            headers={RETRY_AFTER_HEADER: str(retry_after)},
+        )
         self.audit_context = {"account": account_marker}
 
 
@@ -189,13 +232,18 @@ def register_user(
     user: UserCreate,
     db: Session = Depends(get_db),
 ):
+    # Hash the submitted secret first
+    # SEC-08: both answers pay the hashing cost, so the elapsed time of a
+    # refusal does not disclose whether the address is already registered
+    # (CWE-208, CWE-203)
+    hashed_password = get_password_hash(user.password)
+
     # Check if user already exists
     existing_user = db.query(User).filter(User.email == user.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
-    # Create new user with hashed password
-    hashed_password = get_password_hash(user.password)
+    # Create new user with the hash computed above
     new_user = User(email=user.email, hashed_password=hashed_password,
                     created_at=datetime.utcnow())
     db.add(new_user)
@@ -238,9 +286,13 @@ def login_user(
     # read (CWE-307)
     account_key = _account_key(user.email)
     if not _reserve_login_attempt(account_key):
-        # SEC-07: the error boundary logs this attempt.
-        # SEC-08: neither the address nor the email reaches the record
-        raise AccountThrottled(_account_marker(account_key))
+        # SEC-07: the error boundary logs this attempt under the response
+        # error_id; SEC-08: neither the client address nor the submitted
+        # email reaches the record
+        raise AccountThrottled(
+            _account_marker(account_key),
+            _seconds_until_admission(account_key),
+        )
 
     # Verify user credentials
     db_user = db.query(User).filter(User.email == user.email).first()

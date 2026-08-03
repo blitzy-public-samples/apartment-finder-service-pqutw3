@@ -27,6 +27,8 @@ Module surface
     The SQLite engine and session factory every request is routed to.
 ``reset_login_throttle()``
     Empties the login-attempt counters and the rate-limiter storage.
+    ``backend.app.main.reset_error_diagnostics()`` empties the diagnostic
+    budget alongside it, and its presence is checked at import.
 ``_assert_harness_integrity()``
     Checks one module object per application source file, shared
     settings, limiter, counter and ``get_db`` across both import paths,
@@ -36,9 +38,9 @@ Module surface
 Fixtures
 --------
 ``isolated_state``
-    Autouse. Recreates the schema, empties the login counters, installs
-    the ``get_db`` override and re-checks the harness invariants for the
-    span of one test.
+    Autouse. Recreates the schema, empties the login counters and the
+    diagnostic budget, installs the ``get_db`` override and re-checks the
+    harness invariants for the span of one test.
 ``db_session``
     A session on ``test_engine`` for direct row inspection or seeding.
 ``client``
@@ -151,6 +153,7 @@ def _install_canonical_aliases():
 
 _install_canonical_aliases()
 
+from backend.app import main as application_main  # noqa: E402
 from backend.app.core.config import settings  # noqa: E402
 from backend.app.db.database import get_db  # noqa: E402
 from backend.app.db.models import Base  # noqa: E402
@@ -357,6 +360,17 @@ def reset_login_throttle():
         limiter_reset()
 
 
+# SEC-08: the error boundary renders a bounded number of full diagnostic
+# reports per route and exception type per window. Emptying that budget
+# between cases keeps one case's failures from deciding what the next
+# case's record carries.
+if not callable(getattr(application_main, "reset_error_diagnostics", None)):
+    raise RuntimeError(
+        "backend.app.main exposes no reset_error_diagnostics(), so "
+        "per-test isolation of the diagnostic budget is not in force"
+    )
+
+
 # SEC-07: a distinct client address and email per test keeps an
 # exhausted counter scoped to the test that exhausted it
 _CLIENT_HOSTS = itertools.count(1)
@@ -374,10 +388,11 @@ def _next_email():
 
 @pytest.fixture(autouse=True)
 def isolated_state():
-    """Give one test an empty database and empty login counters."""
+    """Give one test an empty database and empty counters."""
     Base.metadata.drop_all(bind=test_engine)
     Base.metadata.create_all(bind=test_engine)
     reset_login_throttle()
+    application_main.reset_error_diagnostics()
     # SEC-02/SEC-05: overrides backend.app.db.database.get_db, the
     # dependency every route and get_current_user resolve
     app.dependency_overrides[get_db] = _override_get_db
@@ -388,6 +403,7 @@ def isolated_state():
     finally:
         app.dependency_overrides.pop(get_db, None)
         reset_login_throttle()
+        application_main.reset_error_diagnostics()
 
 
 @pytest.fixture

@@ -15,6 +15,7 @@ Rationale: ``documentation/security/decision-log.md`` sections 14, 18, 21,
 24, 25 and 28, and DL-380 through DL-383.
 """
 import asyncio
+import importlib.metadata
 import importlib.util
 import inspect
 import json
@@ -35,7 +36,8 @@ import pytest
 import requests
 from pydantic import VERSION as PYDANTIC_VERSION
 from pydantic import ValidationError
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import Session
 
 from backend.app.api.endpoints import subscriptions as subscription_route
 from backend.app.core.config import (
@@ -140,9 +142,65 @@ WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 FORMERLY_EXCLUDED_PATHS = (".github/workflows/ci.yml", "SECURITY.md")
 EXCLUSION_PATHSPEC = ":(exclude)"
 
-# CWE-1104: the dependency advisory gate, its flags and its register size
+# SEC-01/SEC-12: the exclusion rules, which keep the generated secret
+# file and every other credential shape out of the index in the first
+# place. The credential scan above catches a secret that reaches tracked
+# content; these rules are what stop it arriving.
+EXCLUSION_RULES = REPOSITORY_ROOT / ".gitignore"
+REQUIRED_EXCLUSIONS = (
+    ".env",
+    "secrets/",
+    "*.pem",
+    "*.key",
+    "*credentials*.json",
+)
+
+# One untracked path per required rule, so each rule is put to git
+# rather than only read out of the file
+EXCLUDED_PROBE_PATHS = (
+    ".env",
+    "secrets/service-account.json",
+    "infrastructure/tls/server.pem",
+    "infrastructure/tls/signing.key",
+    "gcp-credentials.json",
+)
+
+# A tracked source path. Without it a tree that excluded everything
+# would satisfy every assertion above.
+INCLUDED_PROBE_PATH = "backend/app/main.py"
+
+# AAP 0.4.2: bcrypt 5.0.0 raises inside passlib's own capability probe,
+# which breaks every hash and every verification, so this pin is
+# availability-critical rather than a version preference.
+PASSWORD_BACKEND = "bcrypt"  # blitzy-scan-allow: backend name
+PASSWORD_BACKEND_BREAKING_MAJOR = 5  # blitzy-scan-allow: policy bound
+DEPENDENCY_MANIFEST = REPOSITORY_ROOT / "backend" / "requirements.txt"
+
+# AAP 0.10.1: the coverage command an operator is handed. Three legacy
+# modules fail collection and a collection error aborts the whole
+# session, so the last flag decides between the accepted baseline and a
+# run that executes nothing and writes no artifact.
+COVERAGE_STEP_NAME = "Run backend unit tests"
+COVERAGE_ARTIFACT_FLAG = "--cov-report=xml"
+COLLECTION_ERROR_FLAG = "--continue-on-collection-errors"
+
+# CWE-1104: the dependency advisory gate. Every suppressed advisory is
+# unpatchable on the pinned Python version, so the register is complete
+# rather than growing; a new advisory fails the build.
 AUDIT_STEP_NAME = "Audit Python dependencies"
 AUDIT_STEP_FLAGS = ("--strict", "--no-deps")
+
+# Rule 1: the workflow's own test invocation, and the flags SECURITY.md
+# section 2.3 publishes as that invocation. Without the last flag a
+# collection error aborts the session, so the published command would run
+# no test while the document says the suite passes.
+BACKEND_TEST_STEP_NAME = "Run backend unit tests"
+BACKEND_TEST_FLAGS = (
+    "--cov=./",
+    "--cov-report=xml",
+    "--continue-on-collection-errors",
+)
+COVERAGE_COMMAND_FRAGMENT = "python -m pytest --cov"
 FROZEN_CLOSURE_COMMAND = "pip freeze > /tmp/frozen.txt"
 RUNNER_DEPENDENT_FREEZE_FLAG = "pip freeze --all"
 EXPECTED_SUPPRESSION_COUNT = 15
@@ -247,7 +305,7 @@ CREDENTIAL_NEGATIVE_CONTROLS = (
 
 # The marker admitting one reviewed line, and how many lines carry it
 ALLOW_LIST_MARKER = "blitzy-scan" + "-allow"
-EXPECTED_ALLOW_LIST_COUNT = 4
+EXPECTED_ALLOW_LIST_COUNT = 7
 
 # One line per class the reviewed allow-list admits. Each is matched by the
 # scan and then dropped, so both halves of the gate are exercised.
@@ -291,7 +349,20 @@ ACCEPTANCE_DATE = "2026-07-31"
 # Rule 1: the operational document that carries the residual register
 SECURITY_DOCUMENT = REPOSITORY_ROOT / "SECURITY.md"
 
-# SEC-01/SEC-11: the developer provisioning script, read as text
+# Rule 1: the bidirectional map, and the accountability set it declares.
+# The map's central claim is that no path the branch changed sits outside
+# it, which is checkable against version control rather than by eye.
+TRACEABILITY_MATRIX = (
+    REPOSITORY_ROOT / "documentation" / "security" / "traceability-matrix.md"
+)
+DIRECTION_B_HEADING = "## 2. Direction B"
+COVERAGE_HEADING = "## 3. Coverage reconciliation"
+DECLARED_MODE_COUNTS = {"CREATE": 20, "UPDATE": 25, "REFERENCE": 3}
+CHANGE_STATUS_MODES = {"A": "CREATE", "M": "UPDATE", "D": "DELETE"}
+REMEDIATION_AUTHOR = "Blitzy Agent"
+
+# SEC-01/SEC-11: the developer provisioning script. No case runs it - it
+# creates databases and cluster roles - so its guards are read as text.
 PROVISIONING_SCRIPT = REPOSITORY_ROOT / "scripts" / "setup_dev_environment.sh"
 
 # SEC-11: every privilege the application role is granted
@@ -731,6 +802,38 @@ def test_pinned_validation_library_is_the_one_x_line():
     assert PYDANTIC_VERSION.startswith("1."), PYDANTIC_VERSION
 
 
+def _manifest_pin(distribution):
+    """Return the version the dependency manifest pins for one package."""
+    assert DEPENDENCY_MANIFEST.is_file(), DEPENDENCY_MANIFEST
+    pinned = re.findall(
+        r"^{0}(?:\[[^\]]+\])?==(\S+)$".format(re.escape(distribution)),
+        DEPENDENCY_MANIFEST.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert len(pinned) == 1, (distribution, pinned)
+    return pinned[0]
+
+
+def test_pinned_password_backend_stays_below_the_breaking_major():
+    """The installed hashing backend is the pinned pre-5.0.0 line.
+
+    The 72-byte ceiling the password policy enforces is a property of
+    this backend, and at 5.0.0 the hashing library raises while probing
+    the backend's capabilities, so every registration and every login
+    fails. Two cases in the password suite would catch that outage
+    indirectly, by finding no stored hash; this one names the cause, and
+    it reads the running process rather than the manifest alone, because
+    an environment installed before the pin moved would otherwise pass.
+    """
+    installed = importlib.metadata.version(PASSWORD_BACKEND)
+    major = int(installed.split(".")[0])
+
+    assert major < PASSWORD_BACKEND_BREAKING_MAJOR, installed
+
+    # the manifest pins the version this process is running
+    assert _manifest_pin(PASSWORD_BACKEND) == installed, installed
+
+
 def _assigned_names(source):
     """Return the variable names one template extract assigns."""
     return {
@@ -1109,6 +1212,47 @@ def test_application_sqlite_engine_opens_a_connection():
         assert connection.exec_driver_sql("select 1").scalar() == 1
 
 
+def test_the_request_scoped_session_binds_to_the_application_engine():
+    """``get_db`` yields a session on the engine this module built.
+
+    Every route reaches its session through this dependency, and the
+    harness overrides it so that assertions land in an inspectable
+    database - which leaves the real generator unexecuted by every other
+    case here. It is therefore driven directly: the session is bound to
+    the engine carrying the transport argument the cases above pin, it
+    serves a statement, and exhausting the generator releases the
+    connection instead of leaking it for the process lifetime.
+    """
+    generator = database.get_db()
+    session = next(generator)
+    released = []
+
+    try:
+        assert isinstance(session, Session)
+        assert session.get_bind() is database.engine
+        assert session.execute(text("select 1")).scalar() == 1
+        assert session.in_transaction()
+
+        # the close the generator's finally clause performs, observed
+        # rather than assumed
+        closing = session.close
+
+        def record_close():
+            released.append(True)
+            closing()
+
+        session.close = record_close
+        with pytest.raises(StopIteration):
+            next(generator)
+        session.close = closing
+
+        assert released == [True]
+        # the connection went back to the pool rather than staying out
+        assert not session.in_transaction()
+    finally:
+        session.close()
+
+
 @pytest.mark.parametrize("url", [POSTGRES_URL, POSTGRES_DRIVER_URL])
 def test_postgres_url_applies_the_configured_sslmode(url):
     """A PostgreSQL URL carries the configured transport mode."""
@@ -1404,6 +1548,189 @@ def test_every_suppressed_advisory_is_justified_in_the_decision_log():
     assert dated == registered, sorted(registered.difference(dated))
 
 
+def _fenced_blocks(document):
+    """Return the body of every fenced code block in one document."""
+    return re.findall(r"```[a-z]*\n(.*?)```", document, re.DOTALL)
+
+
+def _documented_command(marker):
+    """Return the one documented command carrying ``marker``."""
+    assert SECURITY_DOCUMENT.is_file(), SECURITY_DOCUMENT
+    blocks = [
+        block
+        for block in _fenced_blocks(
+            SECURITY_DOCUMENT.read_text(encoding="utf-8")
+        )
+        if marker in block
+    ]
+    assert len(blocks) == 1, blocks
+    return blocks[0]
+
+
+def _invocation_flags(command):
+    """Return every long flag one command carries."""
+    return set(re.findall(r"--[a-z][a-z-]*(?:=\S+)?", command))
+
+
+# AAP 0.10.1: the documented command and the pipeline's own are one command
+def test_the_documented_coverage_command_matches_the_pipeline():
+    """The operator-facing coverage command is the one the pipeline runs.
+
+    Three legacy modules fail collection, and a collection error aborts
+    the session rather than skipping the module, so a command missing
+    ``--continue-on-collection-errors`` exits 2 having executed nothing
+    and written no artifact. An operator reading that as a regression
+    would be reading a healthy tree, which makes the difference between
+    the two commands worth an assertion rather than a footnote. They are
+    compared flag for flag, so neither can gain an option the other
+    lacks.
+    """
+    step = _workflow_step(COVERAGE_STEP_NAME)
+    documented = _documented_command(COVERAGE_ARTIFACT_FLAG)
+
+    for flag in (COVERAGE_ARTIFACT_FLAG, COLLECTION_ERROR_FLAG):
+        assert flag in step, flag
+        assert flag in documented, flag
+
+    assert _invocation_flags(documented) == _invocation_flags(step)
+
+
+def _published_command(fragment):
+    """Return the one SECURITY.md command block holding ``fragment``."""
+    assert SECURITY_DOCUMENT.is_file(), SECURITY_DOCUMENT
+    document = SECURITY_DOCUMENT.read_text(encoding="utf-8")
+    blocks = re.findall(r"```bash\n(.*?)```", document, re.DOTALL)
+    matching = [block for block in blocks if fragment in block]
+    assert len(matching) == 1, matching
+    return matching[0]
+
+
+# Rule 1: the published command is the one the pipeline runs
+def test_the_published_coverage_command_matches_the_workflow():
+    """SECURITY.md section 2.3 carries every flag the workflow carries.
+
+    A published command that drifts from the workflow is worse than no
+    command, and this one drifted in the direction that hides its own
+    failure: without ``--continue-on-collection-errors`` the session
+    aborts at the three pre-existing collection errors and executes no
+    test, so a reader checking that the security suite passes watches
+    zero cases run while the document reports that they passed. Reading
+    both from their source files is what keeps the two in step.
+    """
+    step = _workflow_step(BACKEND_TEST_STEP_NAME)
+    published = _published_command(COVERAGE_COMMAND_FRAGMENT)
+
+    for flag in BACKEND_TEST_FLAGS:
+        assert flag in step, flag
+        assert flag in published, flag
+
+
+def _pre_work_commit():
+    """Return the last commit this remediation did not author."""
+    history = subprocess.run(
+        ["git", "log", "--format=%H%x09%an"],
+        cwd=str(REPOSITORY_ROOT),
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout.decode("utf-8")
+
+    for line in history.splitlines():
+        commit, _, author = line.partition("\t")
+        if author != REMEDIATION_AUTHOR:
+            return commit
+    raise AssertionError("no pre-remediation commit in this history")
+
+
+def _declared_mode(cell):
+    """Return the transformation mode one Direction B cell declares.
+
+    A row that departs from the planned map marks the departure in
+    emphasis, so the mode is read out of its presentation rather than
+    compared to it.
+    """
+    return cell.strip("*").split(",")[0].strip()
+
+
+def _declared_accountability_set():
+    """Return the matrix's file-to-mode map, read from Direction B."""
+    assert TRACEABILITY_MATRIX.is_file(), TRACEABILITY_MATRIX
+    document = TRACEABILITY_MATRIX.read_text(encoding="utf-8")
+    opened = document.index(DIRECTION_B_HEADING)
+    closed = document.index(COVERAGE_HEADING)
+
+    declared = {}
+    for line in document[opened:closed].splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        paths = re.findall(r"`([^`]+)`", cells[0])
+        assert len(paths) == 1, line
+        assert paths[0] not in declared, paths[0]
+        declared[paths[0]] = _declared_mode(cells[1])
+    return declared
+
+
+def _changed_paths():
+    """Return every tracked path this remediation changed, with status."""
+    difference = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--name-status",
+            "--no-renames",
+            "-z",
+            _pre_work_commit(),
+        ],
+        cwd=str(REPOSITORY_ROOT),
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout.decode("utf-8")
+
+    fields = [field for field in difference.split("\0") if field]
+    return dict(zip(fields[1::2], fields[0::2]))
+
+
+# Rule 1: the map is the accountability set, and version control says so
+def test_every_changed_path_is_declared_in_the_traceability_matrix():
+    """No path this work changed sits outside the map, and none is spare.
+
+    The matrix exists to make a completeness claim checkable, so the
+    claim is checked here rather than asserted there: every path the
+    branch changed carries a row, in the mode its change status implies,
+    and the declared totals match the rows. Prose has no mechanism that
+    fails when it drifts, which is how a modified container definition
+    once sat outside a map that said nothing sat outside it. The diff is
+    taken against the working tree, so an edit fails this case before it
+    is committed rather than after.
+    """
+    declared = _declared_accountability_set()
+    changed = _changed_paths()
+
+    assert changed, "no change against the pre-remediation commit"
+
+    undeclared = sorted(path for path in changed if path not in declared)
+    assert not undeclared, undeclared
+
+    mismatched = sorted(
+        (path, status, declared[path])
+        for path, status in changed.items()
+        if declared[path] != CHANGE_STATUS_MODES[status]
+    )
+    assert not mismatched, mismatched
+
+    counted = {mode: 0 for mode in DECLARED_MODE_COUNTS}
+    for mode in declared.values():
+        assert mode in counted, mode
+        counted[mode] += 1
+    assert counted == DECLARED_MODE_COUNTS, counted
+
+    # a REFERENCE row claims the file was read and left alone
+    for path, mode in declared.items():
+        if mode != "REFERENCE":
+            continue
+        assert path not in changed, path
+
+
 def _credential_scan_command():
     """Return the one workflow line that runs the credential scan."""
     assert WORKFLOW.is_file(), WORKFLOW
@@ -1582,6 +1909,53 @@ def test_the_allow_list_admits_no_credential_shape(line):
     """No credential shape the scan detects is admitted by the
     allow-list."""
     assert not _credential_allow_list_pattern().search(line), line
+
+
+def _git_excludes(path):
+    """Return whether git keeps one path out of the index."""
+    checked = subprocess.run(
+        ["git", "check-ignore", "--no-index", "-q", "--", path],
+        cwd=str(REPOSITORY_ROOT),
+    )
+    # 0 excluded, 1 not excluded; any other code is a git failure
+    assert checked.returncode in (0, 1), (path, checked.returncode)
+    return checked.returncode == 0
+
+
+# SEC-01/SEC-12: the exclusion rules are the control, the scan above is
+# the consequence
+def test_the_exclusion_rules_keep_every_secret_shape_out_of_the_index():
+    """Each required rule is declared, and git applies it.
+
+    The credential scan fails once a secret reaches tracked content,
+    which is one step too late to be the only guard: the rule is what
+    stops the generated environment file, a service-account key, a
+    certificate or a private key from being added at all. Reading the
+    file alone would pass on a rule git never applies, so each rule is
+    also put to ``git check-ignore``, and a tracked source path is
+    asserted included so a tree excluding everything cannot pass.
+    """
+    assert EXCLUSION_RULES.is_file(), EXCLUSION_RULES
+    declared = {
+        line.strip()
+        for line in EXCLUSION_RULES.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    for rule in REQUIRED_EXCLUSIONS:
+        assert rule in declared, rule
+
+    for path in EXCLUDED_PROBE_PATHS:
+        assert _git_excludes(path), path
+
+    assert not _git_excludes(INCLUDED_PROBE_PATH)
+
+    # SEC-12: and no path a rule covers is tracked in spite of it
+    tracked = {
+        str(path.relative_to(REPOSITORY_ROOT)) for path in _tracked_files()
+    }
+    for path in EXCLUDED_PROBE_PATHS:
+        assert path not in tracked, path
 
 
 def _hcl_block(source, header):

@@ -2,6 +2,8 @@ import logging
 import os
 import re
 import sys
+import threading
+import time
 import traceback
 import uuid
 from http import HTTPStatus
@@ -14,7 +16,11 @@ from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.exc import SQLAlchemyError
-from backend.app.api.endpoints.auth import limiter
+from backend.app.api.endpoints.auth import (
+    RETRY_AFTER_HEADER,
+    limiter,
+    retry_after_seconds,
+)
 from backend.app.api.router import api_router
 from backend.app.core.config import settings
 from backend.app.db.database import engine
@@ -180,6 +186,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Accept", "Authorization", "Content-Type"],
+    # SEC-07: a cross-origin caller cannot read a response header that is
+    # not exposed, so the throttle recovery hint would be unreadable
+    expose_headers=[RETRY_AFTER_HEADER],
     max_age=600,
 )
 
@@ -215,8 +224,30 @@ _APPLICATION_ROOT = os.path.dirname(os.path.abspath(__file__))
 _MAX_RENDERED_MEMBERS = 16
 _MIN_DRIVER_TEXT_LENGTH = 4
 
-# SEC-08: held secrets and secret-shaped text are removed from a record
-# before it reaches a handler (CWE-209, CWE-532)
+# SEC-08: bounds on one diagnostic record. The rendered report keeps the
+# innermost frames, which carry the fault, and stops at a byte ceiling. An
+# unbounded record lets a client-reachable failure fill the log volume the
+# process shares with everything else on the host (CWE-770, CWE-779).
+_MAX_RENDERED_FRAMES = 8
+_MAX_DIAGNOSTIC_BYTES = 4096
+_TRUNCATION_MARKER = "...[truncated]"
+
+# SEC-08: the diagnostic budget. One route and one exception type may
+# render the full report a bounded number of times per window; every
+# further occurrence is still recorded under its own correlation
+# identifier, in the compact form, with the number it stands for. Without
+# the budget a client that can reach any failing route writes an unbounded
+# volume of diagnostics on the request path (CWE-770).
+_DIAGNOSTIC_BURST = 5
+_DIAGNOSTIC_WINDOW_SECONDS = 60.0
+_DIAGNOSTIC_TRACKING_CAP = 512
+_SUPPRESSED_DIAGNOSTICS = "suppressed"
+_diagnostic_budget = {}
+_diagnostic_budget_lock = threading.Lock()
+
+# SEC-08: a diagnostic record carries the formatted traceback, which
+# quotes exception messages. Held secrets and secret-shaped text are
+# removed from it before it reaches a log handler (CWE-209, CWE-532).
 _REDACTED = "[redacted]"
 _MIN_SECRET_LENGTH = 8
 _SECRET_SETTING_NAMES = (
@@ -243,11 +274,14 @@ _SECRET_SHAPES = (
         re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
         r"\g<1>" + _REDACTED,
     ),
-    # a credential named in assignment, keyword or mapping syntax, with a
-    # lookahead that leaves one marker per value
+    # a credential named in assignment, keyword or mapping syntax. The
+    # name match starts at the keyword and any identifier prefix before it
+    # is left in place, so signing_key, client_secret and api-token are
+    # covered alongside key, secret and token. The lookahead skips a value
+    # a previous pattern already replaced; one marker per value.
     (
         re.compile(
-            r"(?i)([A-Za-z0-9_.\-]*(?:pass(?:word|wd|phrase)?|secret"
+            r"(?i)((?:pass(?:word|wd|phrase)?|secret"
             r"|token|key|credential|auth(?:orization)?|cookie)"
             r"[\"']?\s*[:=]\s*)"
             r"(?!\[redacted\])"
@@ -425,16 +459,63 @@ def _suppress_bound_parameters(exc: BaseException) -> None:
             member.hide_parameters = True
 
 
-def _diagnostics(exc: BaseException) -> str:
-    # SEC-08: the full formatted traceback with held secrets, bound
-    # parameters and provider text removed (CWE-209, CWE-532)
-    _suppress_bound_parameters(exc)
+def _bounded_report(exc: BaseException) -> str:
+    # SEC-08: the formatted traceback, bounded before it is scrubbed. The
+    # negative frame limit keeps the innermost frames of every exception in
+    # the chain, which is where the fault is raised; the outer frames are
+    # the same server stack on every request. The byte ceiling bounds an
+    # exception whose own message is long (CWE-770).
     report = "".join(
-        traceback.format_exception(type(exc), exc, exc.__traceback__)
+        traceback.format_exception(
+            type(exc), exc, exc.__traceback__, limit=-_MAX_RENDERED_FRAMES
+        )
     )
+    if len(report) > _MAX_DIAGNOSTIC_BYTES:
+        report = report[:_MAX_DIAGNOSTIC_BYTES] + _TRUNCATION_MARKER
+    return report
+
+
+def _diagnostics(exc: BaseException) -> str:
+    # SEC-08: the bounded formatted traceback, including the innermost
+    # stack, the exception messages and the cause chain, with held
+    # secrets, bound parameters and provider message text removed
+    _suppress_bound_parameters(exc)
+    report = _bounded_report(exc)
     for literal in _driver_literals(exc):
         report = report.replace(literal, _REDACTED)
     return _redact(report)
+
+
+def _diagnostic_allowance(route: str, chain: str) -> tuple:
+    # SEC-08: counts one failure and decides whether it renders the full
+    # report. Returns (render_full, occurrence_in_window); an occurrence of
+    # zero reports a tracking map at capacity, which renders nothing new
+    # rather than evicting a live window and repeating its budget.
+    # Counting and deciding happen in one critical section, so a
+    # concurrent burst shares one budget (CWE-367).
+    key = (route, chain)
+    now = time.monotonic()
+    with _diagnostic_budget_lock:
+        for spent in [
+            held for held, entry in _diagnostic_budget.items()
+            if entry[1] <= now
+        ]:
+            del _diagnostic_budget[spent]
+        seen, expires_at = _diagnostic_budget.get(
+            key, (0, now + _DIAGNOSTIC_WINDOW_SECONDS)
+        )
+        if seen == 0 and len(_diagnostic_budget) >= _DIAGNOSTIC_TRACKING_CAP:
+            return False, 0
+        seen += 1
+        _diagnostic_budget[key] = (seen, expires_at)
+        return seen <= _DIAGNOSTIC_BURST, seen
+
+
+def reset_error_diagnostics() -> None:
+    # SEC-08: empties the diagnostic budget. The test harness calls this
+    # between cases so one case's failures decide nothing for the next.
+    with _diagnostic_budget_lock:
+        _diagnostic_budget.clear()
 
 
 def _audit_context(exc: BaseException) -> str:
@@ -519,6 +600,24 @@ def handle_validation_error(
     )
 
 
+def _budgeted_diagnostics(request: Request, exc: BaseException) -> str:
+    # SEC-08: the diagnostic suffix one record carries. Inside the window's
+    # budget the record renders the bounded report; past it the record
+    # names the occurrence it stands for and renders nothing, so a
+    # client-reachable failure costs a bounded record and a bounded amount
+    # of work on the request path (CWE-770).
+    render, occurrence = _diagnostic_allowance(
+        _route_label(request), _exception_chain(exc)
+    )
+    if render:
+        return " occurrence=%s origin=%s\ndiagnostics:\n%s" % (
+            occurrence, _exception_origin(exc), _diagnostics(exc)
+        )
+    return " occurrence=%s diagnostics=%s" % (
+        occurrence, _SUPPRESSED_DIAGNOSTICS
+    )
+
+
 def handle_http_exception(
     request: Request, exc: StarletteHTTPException
 ) -> JSONResponse:
@@ -527,7 +626,7 @@ def handle_http_exception(
     error_id = uuid.uuid4().hex
     server_fault = exc.status_code >= 500
     diagnostics = (
-        "\ndiagnostics:\n%s" % _diagnostics(exc) if server_fault else ""
+        _budgeted_diagnostics(request, exc) if server_fault else ""
     )
     emit = logger.error if server_fault else logger.warning
     emit(
@@ -543,6 +642,24 @@ def handle_http_exception(
     )
 
 
+def _address_layer_retry_after(request: Request) -> int:
+    # SEC-07: seconds until the address-keyed window admits another
+    # attempt, read from the limiter's own storage. The limiter records
+    # the refused limit on the request before it raises; when that record
+    # or the storage is unavailable the configured window is the answer,
+    # so the hint is always present and never understated.
+    current_limit = getattr(request.state, "view_rate_limit", None)
+    if current_limit:
+        try:
+            reset_at, _remaining = limiter.limiter.get_window_stats(
+                current_limit[0], *current_limit[1]
+            )
+            return retry_after_seconds(reset_at - time.time())
+        except Exception:
+            logger.warning("rate limit window stats unavailable")
+    return retry_after_seconds(0)
+
+
 def handle_rate_limit_exceeded(
     request: Request, exc: RateLimitExceeded
 ) -> JSONResponse:
@@ -556,6 +673,7 @@ def handle_rate_limit_exceeded(
     return JSONResponse(
         status_code=429,
         content=_error_envelope(_status_phrase(429), error_id),
+        headers={RETRY_AFTER_HEADER: str(_address_layer_retry_after(request))},
     )
 
 
@@ -574,12 +692,17 @@ def handle_database_error(
     # parameter (CWE-532)
     error_id = uuid.uuid4().hex
     _suppress_bound_parameters(exc)
+    chain = _exception_chain(exc)
+    render, occurrence = _diagnostic_allowance(_route_label(request), chain)
+    # SEC-08: the frame summary is the expensive part of this record, and a
+    # repeat of one route's one failure adds no location the first record
+    # does not already carry (CWE-770)
+    origin = _exception_origin(exc) if render else _SUPPRESSED_DIAGNOSTICS
     logger.error(
         "error_id=%s database error on %s %s exception=%s sqlstate=%s"
-        " origin=%s",
+        " occurrence=%s origin=%s",
         error_id, _method_label(request), _route_label(request),
-        _exception_chain(exc), _driver_error_code(exc),
-        _exception_origin(exc),
+        chain, _driver_error_code(exc), occurrence, origin,
     )
     return JSONResponse(
         status_code=500,
@@ -591,13 +714,15 @@ def handle_unhandled_exception(
     request: Request, exc: Exception
 ) -> JSONResponse:
     # SEC-08: the caller receives a reference; this record carries the
-    # diagnostics it resolves to (CWE-209)
+    # diagnostics that reference resolves to - the type chain, the frame
+    # locations and the redacted traceback with its exception messages.
+    # Every occurrence is recorded; the report itself is rendered within
+    # the window's budget (CWE-770).
     error_id = uuid.uuid4().hex
     logger.error(
-        "error_id=%s unhandled exception on %s %s exception=%s origin=%s"
-        "\ndiagnostics:\n%s",
+        "error_id=%s unhandled exception on %s %s exception=%s%s",
         error_id, _method_label(request), _route_label(request),
-        _exception_chain(exc), _exception_origin(exc), _diagnostics(exc),
+        _exception_chain(exc), _budgeted_diagnostics(request, exc),
     )
     return JSONResponse(
         status_code=500,

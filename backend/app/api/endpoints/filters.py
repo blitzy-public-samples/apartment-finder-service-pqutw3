@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from backend.app.db.database import get_db
 from backend.app.schema.filter import FilterCreate, Filter
 from backend.app.db.models import (
@@ -45,7 +45,18 @@ def create_filter(filter: FilterCreate, db: Session = Depends(get_db), current_u
 @router.get('/', response_model=List[Filter])
 def get_user_filters(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     # Query database for user's filters
-    filters = db.query(FilterModel).filter(FilterModel.user_id == current_user.id).all()
+    # SEC-05: both declared collections are loaded in a fixed number of
+    # statements, so one caller's own row count cannot multiply the round
+    # trips this read costs (CWE-770)
+    filters = (
+        db.query(FilterModel)
+        .filter(FilterModel.user_id == current_user.id)
+        .options(
+            selectinload(FilterModel.zip_codes),
+            selectinload(FilterModel.criteria),
+        )
+        .all()
+    )
 
     # Return list of filters
     return [Filter.from_orm(filter) for filter in filters]

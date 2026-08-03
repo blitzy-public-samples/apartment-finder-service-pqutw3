@@ -31,11 +31,17 @@ from backend.app.db.models import Base, User
 from backend.app.main import (
     _APPLICATION_LOGGER_NAME,
     _ApplicationLogHandler,
+    _DIAGNOSTIC_BURST,
     _JOINED_LINE_MARKER,
     _LOG_LEVEL,
+    _MAX_DIAGNOSTIC_BYTES,
+    _MAX_RENDERED_FRAMES,
+    _SUPPRESSED_DIAGNOSTICS,
+    _TRUNCATION_MARKER,
     _UNMATCHED_ROUTE,
     _UNSERVED_METHOD,
     _configure_application_logging,
+    _redact,
     app,
     logger as application_logger,
 )
@@ -1188,3 +1194,181 @@ def test_a_record_from_another_library_is_left_alone():
 
     written = captured.getvalue()
     assert written.splitlines()[:2] == ["first", "second"]
+
+
+# ---------------------------------------------------------------------
+# The diagnostic channel is bounded in size and in volume
+# ---------------------------------------------------------------------
+def _records_naming(caplog, error_id):
+    """Return every record quoting one correlation identifier."""
+    return [
+        record
+        for record in caplog.records
+        if error_id in record.getMessage()
+    ]
+
+
+def test_every_repeat_of_one_failure_is_still_recorded_once(
+    client, failing_database, caplog
+):
+    """Each reply's identifier resolves to exactly one record.
+
+    The budget below bounds what a record carries, never whether one is
+    written: a reference handed to a caller that resolves to nothing is
+    an unusable reference.
+    """
+    caplog.set_level(logging.ERROR)
+    replies = []
+    with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
+        for _ in range(_DIAGNOSTIC_BURST + 3):
+            replies.append(client.get("/listings/"))
+
+    identifiers = [reply.json()["error_id"] for reply in replies]
+    assert all(reply.status_code == 500 for reply in replies)
+    assert len(set(identifiers)) == len(identifiers)
+    for error_id in identifiers:
+        assert len(_records_naming(caplog, error_id)) == 1, error_id
+
+
+def test_the_diagnostic_report_is_rendered_within_a_budget(
+    client, failing_database, caplog
+):
+    """One route and one exception type render a bounded number of
+    reports.
+
+    A client that can reach a failing route repeats it as often as it
+    likes. Rendering, scrubbing and writing a full traceback for every
+    occurrence turns that into an unbounded amount of work on the request
+    path and an unbounded volume of log (CWE-770), so the report is
+    rendered within a window's budget and every occurrence past it is
+    recorded compactly.
+    """
+    caplog.set_level(logging.ERROR)
+    messages = []
+    with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
+        for _ in range(_DIAGNOSTIC_BURST + 3):
+            reply = client.get("/listings/")
+            assert reply.status_code == 500
+            messages.append(
+                _record_naming(caplog, reply.json()["error_id"]).getMessage()
+            )
+
+    rendered = [
+        message for message in messages
+        if "Traceback (most recent call last)" in message
+    ]
+    compact = [
+        message for message in messages
+        if "diagnostics={0}".format(_SUPPRESSED_DIAGNOSTICS) in message
+    ]
+
+    # SEC-08: the budget is spent on the first occurrences, and the rest
+    # are recorded without a rendered report
+    assert len(rendered) == _DIAGNOSTIC_BURST
+    assert len(compact) == len(messages) - _DIAGNOSTIC_BURST
+    assert messages[:_DIAGNOSTIC_BURST] == rendered
+
+    # SEC-08: a compact record still identifies the failure, counts the
+    # occurrence it stands for, and carries no rendered report
+    for position, message in enumerate(compact, start=_DIAGNOSTIC_BURST + 1):
+        assert "RuntimeError" in message
+        assert "occurrence={0} ".format(position) in message
+        assert "Traceback (most recent call last)" not in message
+        assert EXCEPTION_TEXT_SENTINEL not in message
+
+    # SEC-08: a compact record is a fraction of a rendered one
+    assert max(len(message) for message in compact) < min(
+        len(message) for message in rendered
+    )
+
+
+def test_a_diagnostic_record_stays_within_its_size_ceiling(
+    client, failing_database, caplog
+):
+    """A rendered record is bounded however long the failure text is.
+
+    An exception whose own message is long would otherwise decide the
+    size of a log record, so the rendered report stops at the ceiling and
+    says that it did.
+    """
+    caplog.set_level(logging.ERROR)
+    long_text = "{0}-{1}".format(
+        EXCEPTION_TEXT_SENTINEL, "y" * (4 * _MAX_DIAGNOSTIC_BYTES)
+    )
+
+    with failing_database(RuntimeError(long_text)):
+        response = client.get("/listings/")
+
+    assert response.status_code == 500
+    message = _record_naming(caplog, response.json()["error_id"]).getMessage()
+
+    # SEC-08: the report is truncated and marked, and the record stays
+    # within a bound the failure text cannot move
+    assert _TRUNCATION_MARKER in message
+    assert len(message) < 2 * _MAX_DIAGNOSTIC_BYTES
+
+    # SEC-08: the diagnosis still identifies the failure
+    assert "RuntimeError" in message
+    assert EXCEPTION_TEXT_SENTINEL in message
+    assert "Traceback (most recent call last)" in message
+
+    # SEC-08: and the caller still receives the reference alone
+    assert EXCEPTION_TEXT_SENTINEL not in response.text
+    _assert_no_internal_detail(response.text)
+
+
+def test_a_rendered_report_keeps_the_innermost_frames(
+    client, failing_database, caplog
+):
+    """The bounded report keeps the frames that raised the failure.
+
+    The outer frames of a request are the same server stack every time.
+    The innermost ones name the code that failed, so those are the frames
+    the bound keeps.
+    """
+    caplog.set_level(logging.ERROR)
+    with failing_database(RuntimeError(EXCEPTION_TEXT_SENTINEL)):
+        response = client.get("/listings/")
+
+    assert response.status_code == 500
+    message = _record_naming(caplog, response.json()["error_id"]).getMessage()
+
+    # SEC-08: the frame that raised is present, and the report carries no
+    # more frames than the bound allows per rendered exception
+    assert "in _raising_get_db" in message
+    quoted_frames = message.count('File "')
+    assert 0 < quoted_frames <= _MAX_RENDERED_FRAMES * 2
+
+
+def test_redaction_removes_a_credential_named_with_a_prefix():
+    """A prefixed credential name is redacted with its value.
+
+    The scrubber matches the credential word, so an identifier that ends
+    with it - a signing key, a client secret, an api token - is covered
+    while the identifier itself stays readable in the record (CWE-532).
+    """
+    planted = (
+        "signing_key=zzz-prefixed-signing-7401 "
+        "client_secret="  # blitzy-scan-allow: planted fixture
+        "'zzz-prefixed-client-7402' "
+        'api-token: "zzz-prefixed-api-7403" '
+        "COOKIE=zzz-prefixed-cookie-7404 "
+        "passphrase=zzz-prefixed-phrase-7405"
+    )
+
+    scrubbed = _redact(planted)
+
+    for secret in (
+        "zzz-prefixed-signing-7401",
+        "zzz-prefixed-client-7402",
+        "zzz-prefixed-api-7403",
+        "zzz-prefixed-cookie-7404",
+        "zzz-prefixed-phrase-7405",
+    ):
+        assert secret not in scrubbed, secret
+
+    # SEC-08: the name is left in place, so a reader still sees which
+    # value was removed
+    for name in ("signing_", "client_", "api-", "COOKIE", "passphrase"):
+        assert name in scrubbed, name
+    assert scrubbed.count(REDACTION_MARKER) == 5

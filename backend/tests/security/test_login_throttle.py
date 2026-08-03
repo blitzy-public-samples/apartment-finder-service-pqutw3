@@ -25,6 +25,7 @@ from slowapi.util import get_remote_address
 
 from backend.app.api.endpoints import auth as auth_endpoint
 from backend.app.core.config import settings
+from backend.app.core.security import get_password_hash
 from backend.app.db.database import get_db
 from backend.app.main import (
     _error_envelope,
@@ -1025,3 +1026,148 @@ def test_a_limiter_rejection_reaches_the_log(
     # SEC-08: no submitted value reaches the record
     assert WRONG_SECRET not in records[0]
     assert CAP_PROBE_EMAILS[0] not in records[0]
+
+
+# ---------------------------------------------------------------------
+# The credential path costs the same whether or not the account exists
+# ---------------------------------------------------------------------
+def _hash_identifier(stored):
+    """Return the algorithm and cost prefix of one bcrypt hash."""
+    # a bcrypt hash is $<scheme>$<cost>$<salt and digest>
+    return "$".join(stored.split("$")[:3])
+
+
+def test_an_absent_account_is_verified_against_a_stand_in_hash():
+    """The absent-account branch performs one verification.
+
+    Returning before the hasher runs makes the elapsed time of a refusal
+    an account-existence oracle, which no uniform reply can hide
+    (CWE-208). The branch is asserted directly, so the property holds
+    however the route is called.
+    """
+    stand_in = auth_endpoint._ABSENT_ACCOUNT_HASH
+
+    # the stand-in is a real hash from the live context, so verifying
+    # against it costs what verifying a stored hash costs
+    assert stand_in.startswith("$2")
+    assert _hash_identifier(stand_in) == _hash_identifier(
+        get_password_hash(WRONG_SECRET)
+    )
+
+    # it is built once and held for the process
+    assert auth_endpoint._ABSENT_ACCOUNT_HASH is stand_in
+
+    # and nothing verifies against it
+    matched, refusal = auth_endpoint._verified_credentials(None, WRONG_SECRET)
+    assert matched is False
+    assert refusal == ""
+
+
+def test_both_credential_failures_perform_the_same_hashing_work(
+    client, register_user, monkeypatch
+):
+    """An unknown address and a wrong secret each hash exactly once.
+
+    The two refusals are already indistinguishable by status and body.
+    Counting the verifications each one performs is what makes them
+    indistinguishable by cost as well.
+    """
+    account = register_user()
+    calls = []
+    real_verify = auth_endpoint.verify_password
+
+    def counted(submitted, stored):
+        calls.append(stored)
+        return real_verify(submitted, stored)
+
+    monkeypatch.setattr(auth_endpoint, "verify_password", counted)
+
+    unknown = _login_from_a_new_address(
+        "absent-{0}@example.com".format(next(_HOSTS)), WRONG_SECRET
+    )
+    wrong_secret = _login_from_a_new_address(account["email"], WRONG_SECRET)
+
+    assert unknown.status_code == 401
+    assert wrong_secret.status_code == 401
+    assert _without_correlation_id(unknown) == _without_correlation_id(
+        wrong_secret
+    )
+
+    # SEC-08: one verification each, against hashes of the same cost
+    assert len(calls) == 2
+    assert len({_hash_identifier(stored) for stored in calls}) == 1
+    # the stored hash is only reached for the account that exists
+    assert calls[0] == auth_endpoint._ABSENT_ACCOUNT_HASH
+    assert calls[1] != calls[0]
+
+
+def test_a_correct_secret_still_authenticates(client, register_user):
+    """The stand-in hash changes nothing for a valid credential."""
+    account = register_user()
+
+    accepted = _post_login(client, account["email"], account["password"])
+
+    assert accepted.status_code == 200, accepted.text
+    assert set(accepted.json()) == {"access_token", "token_type"}
+    assert accepted.cookies.get("access_token")
+
+
+def test_a_duplicate_registration_hashes_like_a_fresh_one(
+    client, register_user, monkeypatch
+):
+    """Registering a taken address performs the same hashing work.
+
+    The reply is the same generic 400 either way, so the hashing has to
+    happen on both paths for the refusal to disclose nothing about which
+    addresses are already registered (CWE-208).
+    """
+    account = register_user()
+    calls = []
+    real_hash = auth_endpoint.get_password_hash
+
+    def counted(secret):
+        calls.append(secret)
+        return real_hash(secret)
+
+    monkeypatch.setattr(auth_endpoint, "get_password_hash", counted)
+
+    duplicate = client.post(
+        REGISTER_PATH,
+        json={"email": account["email"], "password": account["password"]},
+    )
+    fresh = client.post(
+        REGISTER_PATH,
+        json={
+            "email": "fresh-{0}@example.com".format(next(_HOSTS)),
+            "password": account["password"],
+        },
+    )
+
+    assert duplicate.status_code == 400, duplicate.text
+    assert fresh.status_code == 200, fresh.text
+
+    # SEC-08: the refused registration hashed as well
+    assert len(calls) == 2
+
+
+def test_an_absent_account_pays_a_hashing_cost(client, register_user):
+    """A refusal for an absent address costs hashing time.
+
+    The threshold is half of one measured hash, so the case fails only if
+    the branch skips hashing altogether - which is the oracle - and does
+    not depend on how fast the host is.
+    """
+    account = register_user()
+
+    started = time.perf_counter()
+    get_password_hash(account["password"])
+    one_hash = time.perf_counter() - started
+
+    started = time.perf_counter()
+    unknown = _login_from_a_new_address(
+        "unmeasured-{0}@example.com".format(next(_HOSTS)), WRONG_SECRET
+    )
+    absent_cost = time.perf_counter() - started
+
+    assert unknown.status_code == 401
+    assert absent_cost > one_hash / 2, (absent_cost, one_hash)

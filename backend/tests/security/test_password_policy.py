@@ -10,6 +10,10 @@ policy rule. An account whose credential predates the policy still
 authenticates, and a shape the hasher refuses receives the counted uniform
 401 a wrong secret receives.
 
+One rejected value is not a character-class rule. A NUL byte is refused
+because the hasher cannot hold it, and registration refuses it ahead of
+the hasher rather than letting it raise there.
+
 The cases run at two layers. The HTTP layer pins the status code, the
 field name and the absence of any database row. The schema layer pins
 the character set and reports a direct failure when a rule moves.
@@ -96,6 +100,12 @@ ACCENTED_BYTES = 74
 EMOJI_OVER_CEILING = COMPLIANT + "\U0001f600" * 16
 EMOJI_BYTES = 76
 
+# SEC-05: the one byte the hasher refuses. UserCreate rejects it at the
+# request boundary, so it belongs with the rejected values below; the
+# login cases further down drive the same shape through UserLogin, which
+# carries no policy rule and hands it to the hasher.
+NUL_BYTE_PASSWORD = COMPLIANT + "\x00tail"  # blitzy-scan-allow: test fixture
+
 REJECTED_CASES = (
     ("eleven_characters", ELEVEN_CHARACTERS),
     ("empty", EMPTY),
@@ -109,6 +119,7 @@ REJECTED_CASES = (
     ("tilde_only", THREE_CLASSES + "~"),
     ("backtick_only", THREE_CLASSES + "`"),
     ("space_only", THREE_CLASSES + " "),
+    ("nul_byte", NUL_BYTE_PASSWORD),
 )
 
 REJECTED_PARAMS = [
@@ -389,6 +400,36 @@ def test_multibyte_password_over_the_byte_ceiling_is_rejected(
     assert "password" in response.json()["fields"]
 
 
+def test_a_nul_byte_is_refused_before_the_hasher_runs(
+    client, db_session, unique_email, monkeypatch
+):
+    """A NUL byte in a registration password stops at the schema.
+
+    bcrypt raises on a NUL byte in a secret, so the same value reaching
+    the hasher would surface as a server fault rather than as a refusal.
+    The schema takes it first: the reply is the uniform 422 naming the
+    password, the hasher is never called, and no row is written. The
+    login path is deliberately different, and the cases at the end of
+    this file cover it.
+    """
+    calls = []
+
+    def unreachable_hasher(secret):
+        calls.append(secret)
+        raise AssertionError("the hasher was reached")
+
+    monkeypatch.setattr(
+        auth_endpoint, "get_password_hash", unreachable_hasher
+    )
+
+    response = _register(client, unique_email, NUL_BYTE_PASSWORD)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["fields"] == ["password"], response.text
+    assert calls == []
+    assert _user_row_count(db_session, unique_email) == 0
+
+
 @pytest.mark.parametrize("password", REJECTED_PARAMS)
 def test_rejected_password_creates_no_user_row(
     client, db_session, unique_email, password
@@ -518,9 +559,9 @@ ENVELOPE_KEYS = {"detail", "error_id", "fields"}
 # The one raised detail the credential path logs for every refusal
 UNIFORM_LOGIN_DETAIL = "Incorrect email or password"
 
-# Shapes the hasher itself refuses: bcrypt rejects a NUL byte and
-# passlib caps a secret at 4096 characters.
-NUL_BYTE_PASSWORD = COMPLIANT + "\x00tail"  # blitzy-scan-allow: test fixture
+# Shapes the hasher itself refuses: bcrypt rejects the NUL byte declared
+# with the rejected values above, and passlib caps a secret at 4096
+# characters.
 PAST_PASSLIB_CEILING = "A" * 5000
 UNPARSEABLE_STORED_HASH = "not-a-bcrypt-digest"
 

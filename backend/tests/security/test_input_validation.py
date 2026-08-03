@@ -168,9 +168,9 @@ DECLARED_FILTER_RESPONSE_KEYS = frozenset({
 SEEDED_LISTING_COUNT = 5
 PAGE_SIZE = 2
 
-# AAP 0.8.3: the frozen bounds are plain integers with no declared
-# range, so a value the integer conversion refuses is the only bound the
-# request boundary stops
+# AAP 0.8.3: the frozen bounds keep their names, their types and their
+# defaults; a value outside the non-negative domain the read path can
+# serve is refused at the boundary rather than bound into the statement
 REFUSED_PAGINATION = (
     pytest.param({"skip": "abc"}, "skip", id="non-numeric-skip"),
     pytest.param({"limit": "abc"}, "limit", id="non-numeric-limit"),
@@ -573,6 +573,68 @@ def test_register_refuses_malformed_email(client):
         json={"email": "not-an-email", "password": POLICY_PASSWORD},
     )
     _assert_rejected(response, 422, "email")
+
+
+# SEC-05: every JSON type an address is not. Both account models declare
+# a string and refuse the type before any coercion runs, so a number, a
+# boolean or a container never reaches the address parser.
+WRONG_EMAIL_TYPES = (
+    pytest.param(2400, id="number"),
+    pytest.param(2400.5, id="float"),
+    pytest.param(True, id="boolean"),
+    pytest.param(["tenant@example.com"], id="array"),
+    pytest.param({"address": "tenant@example.com"}, id="object"),
+    pytest.param(None, id="null"),
+)
+
+# The two routes that carry an address in their body
+ADDRESS_BEARING_PATHS = (
+    pytest.param("/auth/register", id="register"),
+    pytest.param("/auth/login", id="login"),
+)
+
+
+@pytest.mark.parametrize("path", ADDRESS_BEARING_PATHS)
+@pytest.mark.parametrize("value", WRONG_EMAIL_TYPES)
+def test_the_account_routes_refuse_a_wrongly_typed_address(
+    client, db_session, path, value
+):
+    """Both account routes refuse an address that is not a string.
+
+    A field that coerced instead of refusing would turn a number or a
+    boolean into text and then register or authenticate against whatever
+    the coercion produced. Registration and authentication answer the
+    same refusal, so neither route is the softer way in, and the account
+    table is read afterwards to show the body stopped at the boundary.
+    """
+    response = client.post(
+        path, json={"email": value, "password": POLICY_PASSWORD}
+    )
+
+    _assert_rejected(response, 422, "email")
+    # SEC-05: the address is the only field named, so the refusal is the
+    # type check rather than a rule that ran further down the body
+    assert _rejected_fields(response) == ["email"], response.text
+    # SEC-05: nothing is written under any coercion of the value
+    assert db_session.execute(text("SELECT COUNT(*) FROM users")).scalar() == 0
+
+
+@pytest.mark.parametrize("model", (UserCreate, UserLogin))
+@pytest.mark.parametrize("value", WRONG_EMAIL_TYPES)
+def test_the_account_models_refuse_a_wrongly_typed_address(model, value):
+    """Both account models report a type failure on the address.
+
+    The route cases above pin the reply. This one pins the reason: the
+    error is a type failure at the address, not a parse failure on a
+    coerced string, so a validator that accepted the type and rejected
+    its text would fail here while the status code stayed 422.
+    """
+    with pytest.raises(ValidationError) as failure:
+        model(email=value, password=POLICY_PASSWORD)
+
+    error = failure.value.errors()[0]
+    assert error["loc"] == ("email",)
+    assert error["type"] == "type_error"
 
 
 def test_register_refuses_wrongly_typed_password(client, unique_email):
@@ -1227,10 +1289,10 @@ def test_the_public_read_statement_carries_no_ordering(db_session):
 
 
 @pytest.mark.parametrize("bounds,field", REFUSED_PAGINATION)
-def test_public_listing_page_refuses_a_non_numeric_bound(
+def test_public_listing_page_refuses_a_bound_it_cannot_serve(
     client, bounds, field
 ):
-    """A bound that is not an integer is refused at the boundary.
+    """A bound outside the servable domain is refused at the boundary.
 
     The refusal names the bound and carries no statement text.
     """
@@ -1429,6 +1491,113 @@ def test_filter_creation_refuses_a_client_supplied_owner(
 
     # SEC-05: an undeclared key is refused; closes the CWE-915 vector
     assert response.status_code == 422, response.text
+
+
+def test_the_filter_write_path_reads_back_through_its_own_route(
+    client, register_user
+):
+    """A created filter is served by the collection route that owns it.
+
+    One request writes and the next reads, so the write and the read are
+    asserted against each other rather than against a planted row. DL-384
+    """
+    account = register_user()
+    credentials = _bearer(account["access_token"])
+
+    created = client.post(
+        FILTER_PATH, json=DECLARED_FILTER_BODY, headers=credentials
+    )
+    assert created.status_code == 200, created.text
+
+    served = client.get(FILTER_PATH, headers=credentials)
+    assert served.status_code == 200, served.text
+
+    published = served.json()
+    assert len(published) == 1
+    assert published[0] == created.json()
+
+
+def test_filter_creation_scopes_criteria_to_the_new_row(
+    client, register_user, db_session
+):
+    """Two writes keep their criterion rows apart.
+
+    Each request owns the rows it creates, so a second filter neither
+    adopts nor reassigns the first one's children.
+    """
+    account = register_user()
+    headers = _bearer(account["access_token"])
+
+    first = client.post(
+        FILTER_PATH, json=DECLARED_FILTER_BODY, headers=headers
+    )
+    second = client.post(
+        FILTER_PATH,
+        json=dict(
+            DECLARED_FILTER_BODY,
+            name="Three bedrooms",
+            criteria=[dict(DECLARED_CRITERION, value="4500")],
+        ),
+        headers=headers,
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["id"] != second.json()["id"]
+
+    for created, expected in (
+        (first, DECLARED_CRITERION["value"]),
+        (second, "4500"),
+    ):
+        rows = (
+            db_session.query(CriteriaModel)
+            .filter(CriteriaModel.filter_id == created.json()["id"])
+            .all()
+        )
+        assert [row.value for row in rows] == [expected]
+
+
+def test_the_filter_read_holds_its_statement_count_as_rows_grow(
+    client, register_user, db_session
+):
+    """The read costs the same number of statements at any row count.
+
+    Both declared collections are loaded eagerly, so the round trips one
+    read makes are fixed rather than growing with the caller's own filter
+    count (CWE-770). The counts are compared against each other rather
+    than against a transcribed number, so the case measures the shape of
+    the query and not the loader's internal statement layout.
+    """
+    account = register_user()
+    headers = _bearer(account["access_token"])
+
+    for index in range(2):
+        seed_filter(db_session, account["id"], name="Filter {0}".format(index))
+
+    with _recorded_statements("SELECT") as few:
+        small = client.get(FILTER_PATH, headers=headers)
+    assert small.status_code == 200, small.text
+    assert len(small.json()) == 2
+    small_count = len(few)
+
+    for index in range(2, EAGER_LOAD_FILTER_COUNT):
+        seed_filter(db_session, account["id"], name="Filter {0}".format(index))
+
+    with _recorded_statements("SELECT") as many:
+        grown = client.get(FILTER_PATH, headers=headers)
+    assert grown.status_code == 200, grown.text
+    assert len(grown.json()) == EAGER_LOAD_FILTER_COUNT
+    grown_count = len(many)
+
+    # the statement count does not move with the row count
+    assert grown_count == small_count, [
+        statement.split("\n")[0] for statement in many
+    ]
+    # and it stays far below the two-per-row pattern it replaces
+    assert grown_count < 2 * EAGER_LOAD_FILTER_COUNT
+
+    # every criterion still reaches the response
+    assert all(entry["criteria"] for entry in grown.json())
 
 
 def test_a_stored_script_payload_round_trips_inside_json(
@@ -1635,10 +1804,14 @@ def test_filter_criteria_beyond_the_cap_are_refused(client, register_user):
     _assert_rejected(response, 422, "criteria")
 
 
-def test_filter_criteria_at_the_cap_are_admitted(client, register_user):
+def test_filter_criteria_at_the_cap_are_admitted(
+    client, register_user, db_session
+):
     """A criteria list exactly at the cap clears the request boundary.
 
-    The cap refuses one entry more, which the case above asserts.
+    The cap refuses one entry more, which the case above asserts. The
+    stored children are read back so the cap is asserted on the write as
+    well as on the reply. DL-384
     """
     account = register_user()
     at_cap = dict(
@@ -1656,7 +1829,15 @@ def test_filter_criteria_at_the_cap_are_admitted(client, register_user):
     # SEC-05: no field is rejected, so the cap did not refuse this list
     assert response.status_code != 422, response.text
     assert response.status_code == 200, response.text
-    assert len(response.json()["criteria"]) == MAX_CRITERIA
+    published = response.json()
+    assert len(published["criteria"]) == MAX_CRITERIA
+
+    stored = (
+        db_session.query(FilterModel)
+        .filter(FilterModel.id == published["id"])
+        .one()
+    )
+    assert len(stored.criteria) == MAX_CRITERIA
 
 
 def test_filter_criterion_text_beyond_its_cap_is_refused(
@@ -1724,8 +1905,8 @@ def test_identifiers_are_served_as_integers(
     account = register_user()
     credentials = _bearer(account["access_token"])
 
-    # AAP 0.8.3: the create route cannot write a row, so the read path is
-    # seeded through the session and the served types are read from it
+    # AAP 0.8.3: the read path is seeded through the session, so the
+    # served types are read from a row this case controls
     seeded_id = seed_filter(db_session, account["id"])
     served = client.get(FILTER_PATH, headers=credentials)
     assert served.status_code == 200, served.text
@@ -2123,3 +2304,24 @@ def test_the_filter_body_publishes_numeric_identifiers(
     for field in ("id", "user_id"):
         assert isinstance(body[field], int), field
         assert not isinstance(body[field], bool), field
+
+
+# SEC-05: filters enough that a per-row loader would be unmistakable
+EAGER_LOAD_FILTER_COUNT = 12
+
+
+@contextmanager
+def _recorded_statements(keyword):
+    """Collect every statement one block sends starting with ``keyword``."""
+    prefix = keyword.upper()
+    recorded = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith(prefix):
+            recorded.append(statement)
+
+    event.listen(test_engine, "before_cursor_execute", record)
+    try:
+        yield recorded
+    finally:
+        event.remove(test_engine, "before_cursor_execute", record)

@@ -11,6 +11,41 @@ export const API_BASE_URL = process.env.REACT_APP_API_BASE_URL;
 // SEC-06: sends the HttpOnly session cookie; no xsrf option is set
 axios.defaults.withCredentials = true;
 
+// SEC-08: the sanitized error envelope every route returns, carried to
+// the caller. `status` and `detail` separate one failure from another,
+// `fields` names the rejected input, `errorId` is the support handle and
+// `retryAfter` is the SEC-07 throttle recovery hint. `isNetworkError`
+// marks a request that never reached the server, so an outage can never
+// be reported as a rejected credential.
+export interface ApiError extends Error {
+  status?: number;
+  detail?: string;
+  fields: string[];
+  errorId?: string;
+  retryAfter?: number;
+  isNetworkError: boolean;
+}
+
+// SEC-08: preserves the envelope on the thrown error. A bare rethrown
+// message would discard the status, the field list and the correlation
+// identifier the server deliberately emits.
+export const toApiError = (error: unknown, fallback: string): ApiError => {
+  const response = (error as any)?.response;
+  const body = response?.data;
+  const detail = typeof body?.detail === 'string' ? body.detail : undefined;
+  const header = response?.headers?.['retry-after'];
+  const retryAfter = Number(header);
+  const enriched = new Error(detail || fallback) as ApiError;
+  enriched.status = response?.status;
+  enriched.detail = detail;
+  enriched.fields = Array.isArray(body?.fields) ? body.fields : [];
+  enriched.errorId =
+    typeof body?.error_id === 'string' ? body.error_id : undefined;
+  enriched.retryAfter = Number.isFinite(retryAfter) ? retryAfter : undefined;
+  enriched.isNetworkError = response === undefined;
+  return enriched;
+};
+
 export const fetchListings = async (
   query: ListingQuery = {}
 ): Promise<Listing[]> => {
@@ -20,7 +55,7 @@ export const fetchListings = async (
     return response.data;
   } catch (error) {
     console.error('Error fetching listings:', error);
-    throw error;
+    throw toApiError(error, 'Loading the listings failed');
   }
 };
 
@@ -82,6 +117,6 @@ export const createFilter = async (
     return response.data;
   } catch (error) {
     console.error('Error creating filter:', error);
-    throw error;
+    throw toApiError(error, 'Creating the filter failed');
   }
 };

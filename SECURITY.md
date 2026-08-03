@@ -182,6 +182,13 @@ fail to import during collection, and pytest then abandons the run before reachi
 suite. A command that appears to run the tests while running none is worse than one that fails, which
 is why the flag belongs in the documented invocation and in the pipeline.
 
+The last flag is load-bearing rather than cosmetic. A collection error aborts the whole session, so
+without it those three modules take the run down with them: pytest exits 2, not one test executes and
+no coverage artifact is written — a healthy tree reporting what looks like a total failure.
+[`ci.yml`](.github/workflows/ci.yml) carries the flag for that reason, and
+[`test_config_guards.py`](backend/tests/security/test_config_guards.py) compares the command above
+with the workflow's own, flag for flag, so the two cannot drift.
+
 ### 2.4 Dependency vulnerability gate
 
 Fifteen advisories cannot be patched on this runtime, so the gate suppresses exactly those fifteen
