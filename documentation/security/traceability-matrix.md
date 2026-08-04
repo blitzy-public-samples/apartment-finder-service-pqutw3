@@ -399,9 +399,9 @@ that "no new failures" means something.
 
 | Measure | Before | Now |
 | --- | --- | --- |
-| Tests collected under `backend/` | 0, with 3 collection errors | 738 collected, with the same 3 collection errors |
-| `tests/security` result | did not exist | 738 passed, 1 warning |
-| Style findings under `backend/` | 129 | 107 |
+| Tests collected under `backend/` | 0, with 3 collection errors | 959 collected, with the same 3 collection errors |
+| `tests/security` result | did not exist | 959 passed, 1 warning |
+| Style findings under `backend/` | 129 | 96 |
 | Undefined names | 4 | 1 |
 
 The collected figure needs the collection-error flag on the command, and

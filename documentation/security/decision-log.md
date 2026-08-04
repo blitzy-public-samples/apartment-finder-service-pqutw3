@@ -2775,3 +2775,41 @@ carried, it says so and names what changed the answer.
   this part of the pass, and the same 959 after the marker correction above. `flake8 .` across the backend reports the same 96 findings, and the whole-tree
   finding profile still differs from the last pre-work commit only by the nine lines the ingestion
   repair removed.
+
+## 49. The final branch validation pass — the five current-state count sites
+
+`SECURITY.md`, `documentation/security/traceability-matrix.md`
+
+Final branch validation re-measured every published figure against the tree rather than trusting the
+last pass that wrote it. Two figures had drifted: the suite count and the style count, in the same
+five sites `DL-435` enumerated for exactly this purpose. Rows are keyed from `DL-452`.
+
+### 49.1 The correction
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-452** — Move the five current-state count sites from 738 passed to 959 and from 107 style findings to 96, correct the substantive-finding breakdown from four to three, and leave every dated per-pass figure standing. **Third application of the procedure `DL-435` established, which extends `DL-404` and `DL-419`.** | (a) Leave the figures and footnote the drift. (b) Delete the figures and point at the verification commands. (c) Rewrite the dated per-pass records too. (d) Generate the figures at build time. | Both figures predated the commit that shipped them for the third time: `e7b44c9` added five test suites and repaired a lint finding, so the two numbers a reader can check in two commands were again the two that no longer matched. Section 48.14 already recorded the true 959 and 96, which localises the drift to the current-state sites and confirms nothing else was misstated. The breakdown was wrong in a second way this pass caught: it named three unused imports including one in the updater module, and that finding no longer exists — the count is two, both in the original files. Option (a) spends prose on a two-figure edit. Option (b) removes the only claims a reader can verify cheaply. Option (c) would falsify dated records, which `DL-404` and `DL-419` both settled. Option (d) needs a build step this repository does not have and would couple two documents to a test run. | The figures are transcribed rather than generated, so they drift again whenever the suite or the style baseline moves, and the five sites have to move together each time. This is the third occurrence, which makes the drift a property of the design rather than an accident: any pass that adds a test or removes a lint finding must move them. The durable fix is a generated figure, and it is out of scope here. |
+
+### 49.2 Measured evidence for section 49.1
+
+- **The four measurements behind the figures.** `python -m pytest tests/security -q` from `backend/`
+  reports 959 passed with one pre-existing warning, exit 0. The pipeline's own invocation reports 959
+  passed with the same three collection errors and exits 1. `--collect-only` reports 959 collected with
+  those three errors. `flake8 .` reports 96 findings, exit 1.
+- **The suite figure, cross-checked per module.** Running all thirteen suites individually sums to
+  exactly 959 — 42, 295, 38, 57, 40, 41, 193, 29, 30, 98, 56, 14 and 26 — so nothing is deselected or
+  lost when they run together.
+- **Determinism.** 959 passed in five consecutive runs across three configurations: from `backend/`,
+  from the repository root, and with the module order reversed. The top-level figure has one value.
+- **The style figure, decomposed.** 96 findings as E302 37, E501 22, W293 18, W292 14, F401 2, E305 2
+  and F821 1. Three are substantive: the one undefined name in the out-of-scope subscriptions module
+  and two unused imports, in the listings endpoint and the legacy API test module. Both unused imports
+  are present in the pre-work versions of those files. 37 + 22 + 18 + 14 + 2 = 93 accounts for the
+  remainder, which is the figure the published breakdown now carries.
+- **No new category, proved against the pre-work tree.** Archiving the last commit this remediation did
+  not author and running the same check reports 129 findings as E302 45, E501 33, W293 20, W292 20,
+  F821 4, F401 4 and E305 3. The category set after the work is a subset of the set before it, and
+  every category count fell. The undefined-name commitment holds at 4 to 1.
+- **No test asserts either figure.** Searched the suite for a numeric assertion on the published counts
+  and for any case comparing a document figure against a live measurement; there is none, so the edit
+  cannot break a case. Re-running the suite after the edit reports the same 959 passed.

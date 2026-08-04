@@ -162,7 +162,7 @@ The primary gate for eleven of the twelve findings.
 cd backend && python -m pytest tests/security -q
 ```
 
-Measured on 2026-08-04: **738 passed**, no failures. The suite covers the identity claim, the origin
+Measured on 2026-08-04: **959 passed**, no failures. The suite covers the identity claim, the origin
 allow-list, the password policy, request validation, cookie attributes, login throttling, the error
 boundary, the configuration guards, the charge seam, the provisioning script's publish and privilege
 statements, the build definitions, and the provider lock.
@@ -175,7 +175,7 @@ This matches the pipeline invocation. **The last flag is not optional.**
 cd backend && python -m pytest --cov=./ --cov-report=xml --continue-on-collection-errors
 ```
 
-Measured on 2026-08-04: **738 passed with 3 collection errors**, exit 1. The three errors are the
+Measured on 2026-08-04: **959 passed with 3 collection errors**, exit 1. The three errors are the
 pre-existing test modules explained in section 3.3. Coverage is reported, not gated.
 
 Without `--continue-on-collection-errors` the same command exits 2 with
@@ -259,11 +259,11 @@ The pipeline runs this, and creating the dependency manifest made it execute for
 cd backend && flake8 .
 ```
 
-Baseline: 129 findings, of which 4 are undefined names. Measured again on 2026-08-04: **107 findings,
-of which 4 are substantive and exactly 1 is an undefined name** — `datetime` at
-`app/api/endpoints/subscriptions.py:60`, the out-of-scope case section 3.3 records. The other three
-are unused imports in `app/api/endpoints/listings.py`, `app/tasks/listing_updater.py` and
-`tests/test_api.py`. The remaining 103 are blank-line, trailing-whitespace, line-length and
+Baseline: 129 findings, of which 4 are undefined names. Measured again on 2026-08-04: **96 findings,
+of which 3 are substantive and exactly 1 is an undefined name** — `datetime` at
+`app/api/endpoints/subscriptions.py:60`, the out-of-scope case section 3.3 records. The other two
+are unused imports in `app/api/endpoints/listings.py` and `tests/test_api.py`, both present in the
+original files. The remaining 93 are blank-line, trailing-whitespace, line-length and
 missing-final-newline findings in files this work did not reformat.
 
 No new category appears: the category set is the same seven as the baseline. Both figures were
@@ -797,8 +797,8 @@ Style checking reported 129 findings before this work, 4 of them undefined names
 collected zero tests with three collection errors, because all three existing test modules failed to
 import. The pipeline had never reached either step, because it failed at dependency installation.
 
-Measured on 2026-08-04: style checking reports 107 findings with 1 undefined name, and the suite
-reports 738 passed with the same three collection errors. Those three errors survive this work
+Measured on 2026-08-04: style checking reports 96 findings with 1 undefined name, and the suite
+reports 959 passed with the same three collection errors. Those three errors survive this work
 untouched. **A green pipeline is not on offer.**
 
 **The frontend does not type-check or build**, for reasons unrelated to security. Two packages are
