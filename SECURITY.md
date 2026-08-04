@@ -100,13 +100,15 @@ JSON, virtual environments, dependency trees, caches and coverage output.
 that the exclusions still admit the files each build needs.
 
 The settings class rejects weak or missing security values while it loads, so a misconfiguration
-surfaces as a failed boot rather than a silent weakening. Eleven variables are required with no
+surfaces as a failed boot rather than a silent weakening. Twelve variables are required with no
 default.
 
-Four settings carry an explicit domain. The origin allow-list refuses an empty list, the wildcard,
-the literal `null`, and any entry that is not an exact browser-serialized origin. The payment
-environment accepts only `sandbox` or `live`. The database SSL mode accepts only a value the driver
-understands. The token algorithm accepts only the HMAC family.
+Five settings carry an explicit domain. The origin allow-list refuses an empty list, the wildcard,
+the literal `null`, and any entry that is not an exact browser-serialized origin. The host allow-list
+refuses an empty list, the wildcard in any form, and any entry that is not a bare lowercase host, so
+a pattern can never turn the comparison into a suffix test. The payment environment accepts only
+`sandbox` or `live`. The database SSL mode accepts only a value the driver understands. The token
+algorithm accepts only the HMAC family.
 
 ### 1.3 What SEC-12 does not deliver
 
@@ -321,14 +323,25 @@ The workflow holds the marker's exact text and this document does not reproduce 
 reproduce the pattern: a line quoting either would be matched or admitted by it. `DL-208` carries the
 pattern's breadth and the four spellings left uncovered.
 
-Measured on 2026-08-03: the pattern matches **21 lines**, the allow-list admits all 21, and the gate
-reports **0**. Of the 21, five are the password-policy bounds in the request schema, three are values
-read from `settings.`, eight are constants and controls inside the guard tests, one is a line in the
-requirements document, and four are the marked lines. The marker appears on exactly **four**
-test-fixture passwords, all under `backend/tests/`, and on **no line of application source**.
-`backend/tests/security/test_config_guards.py` pins that count at four and requires every marked line
-to carry a reason and to be matched by the pattern. It also asserts that the allow-list admits no
-credential shape from its own positive-control set.
+Measured on the current tree: the pattern matches **24 lines**, the allow-list leaves **0**, **8** of
+the matched lines carry the reviewed-line marker, and the marker appears **10 times** in tracked
+content. Two of those ten are the workflow's own comment and its allow-list expression, which leaves
+eight reviewed lines — every one under `backend/tests/`, and none in application source.
+
+By admitting class, twelve match a name denoting a policy bound or a piece of metadata, eight carry
+the marker, four read a value from configuration, and one is an upper-case placeholder token. Those
+counts sum to twenty-five rather than twenty-four because one line, an upper-case character-class
+constant in the request schema, qualifies under two classes. By file, ten sit in the guard tests and
+five are the password-policy bounds in the request schema; of the remaining nine, three are one each
+in a service module and six are spread across five other test modules. No line of documentation
+matches the pattern any longer.
+
+`backend/tests/security/test_config_guards.py` pins all four numbers. It generates each from the tree
+using the workflow's own two expressions and compares the result against the numbers this document
+and [`documentation/security/traceability-matrix.md`](documentation/security/traceability-matrix.md)
+publish, so a stale metric fails a case rather than misleading a reader. It also requires every marked
+line to carry a reason and to be matched by the pattern, holds the marker out of application source,
+and asserts that the allow-list admits no credential shape from its own positive-control set.
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) holds the exact expression for all three, and
 this document describes rather than reproduces gate one: a pattern built from credential-shaped
@@ -398,6 +411,46 @@ A frontend dependency audit needs a clean install from a lock file. No lock file
 reproducible frontend advisory report is obtainable. Frontend posture rests instead on the exact
 `axios` pin and on gates two and three.
 
+### 2.10 The database privilege gate
+
+**A database provisioned before the revokes were written still carries PostgreSQL's defaults.**
+`init_database` stops at its `createdb` guard when the database already exists, so every statement
+after that guard — including both revokes — is skipped, and PUBLIC keeps the `CONNECT` and
+`TEMPORARY` a new database grants it. Reviewing the script tells you nothing about the server. Run
+the gate against the database itself:
+
+```bash
+ENFORCE_DATABASE_PRIVILEGES_ONLY=1 scripts/setup_dev_environment.sh
+```
+
+The gate reapplies the revokes, withdraws both privileges from `app_user` directly as well as
+through PUBLIC, and then reads the effective access lists back. Every statement it sends is safe to
+reissue, so it is a deployment step rather than a one-time repair. A wrong answer raises inside the
+batch and the run ends non-zero; it never reports success on the strength of the statements it just
+issued. Confirm the result independently:
+
+```bash
+psql -d dbname -c "SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+    ELSE a.grantee::regrole::text END AS grantee,
+  string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type) AS privileges
+  FROM pg_database d, aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a
+ WHERE d.datname = 'dbname' GROUP BY 1 ORDER BY 1;"
+psql -d dbname -c "SELECT has_database_privilege('app_user', 'dbname', 'CONNECT'),
+  has_database_privilege('app_user', 'dbname', 'TEMPORARY'),
+  has_database_privilege('public', 'dbname', 'CONNECT'),
+  has_database_privilege('public', 'dbname', 'TEMPORARY');"
+```
+
+Expected: no `PUBLIC` row at all, `app_owner` holding `CONNECT, CREATE, TEMPORARY`, `app_user`
+holding `CONNECT` and nothing else, and the second query returning `t, f, f, f`. Measured against a
+local instance whose access lists read `{=Tc/app_owner,app_owner=CTc/app_owner,app_user=c/app_owner}`
+beforehand, the gate left `{app_owner=CTc/app_owner,app_user=c/app_owner}`, and `CREATE TEMP TABLE`
+as `app_user` — which had succeeded — returned `permission denied to create temporary tables`.
+Permanent DDL stayed denied and the application's own reads and writes were unaffected.
+
+`PUBLIC` retains `USAGE` on schema `public`, which the read-back admits deliberately: withdrawing it
+breaks every role's ability to resolve a table name. `DL-449` carries the reasoning and the residual.
+
 ---
 
 ## 3. Residual-risk register
@@ -421,9 +474,9 @@ carries the measurement behind carrying the other five.
 
 | Package | Pinned | Advisory | Fix release | Installable here | Reachability |
 | --- | --- | --- | --- | --- | --- |
-| `starlette` | 0.49.3 | PYSEC-2026-161 | 1.0.1 | No | Partial. Host-header URL reconstruction without validation. No application code relies on the reconstructed URL or the Host header. Host-allow-list middleware ships in the pinned version as an optional compensating control |
+| `starlette` | 0.49.3 | PYSEC-2026-161 | 1.0.1 | No | Reachable, and now compensated. The earlier entry read that no application code relies on the reconstructed URL or the `Host` header, and that was wrong: the framework's own trailing-slash redirect reconstructs the URL, so `GET /listings` with `Host: attacker.example` answered `307` to `http://attacker.example/listings/`, and a malformed value poisoned the `Location` the same way. The compensating control the pinned release ships is now applied rather than recommended: an exact `ALLOWED_HOSTS` allow-list, registered outside every other layer, refuses an untrusted or malformed host with 400 before routing. `DL-439` and `DL-440` carry the correction |
 | `starlette` | 0.49.3 | PYSEC-2026-249 | 1.3.1 | No | Unreachable. Form-parsing limits ignored for URL-encoded bodies. No form parsing anywhere, and the multipart package is absent |
-| `starlette` | 0.49.3 | PYSEC-2026-248 | 1.3.0 | No | Low, partial. A request path not beginning with a slash can shift the authority boundary during URL reconstruction. Same non-reliance as PYSEC-2026-161 |
+| `starlette` | 0.49.3 | PYSEC-2026-248 | 1.3.0 | No | Low, and compensated by the same control. A request path not beginning with a slash can shift the authority boundary during URL reconstruction. The `ALLOWED_HOSTS` allow-list bounds the authority that reconstruction can produce to a configured host |
 | `starlette` | 0.49.3 | PYSEC-2026-2281 | 1.1.0 | No | Doubly unreachable. Static-file path traversal specific to Windows. No static-file mount exists, and deployment is Linux containers |
 | `starlette` | 0.49.3 | PYSEC-2026-2280 | 1.1.0 | No | Unreachable. Unrestricted handler selection in the class-based endpoint API. This application uses decorator routes exclusively |
 | `ecdsa` | 0.19.2 | PYSEC-2026-1325 | none, and none will ship | n/a | Unreachable. Timing side channel in elliptic-curve signing. This application signs with HMAC-SHA256 and never invokes the affected path |
@@ -432,8 +485,9 @@ carries the measurement behind carrying the other five.
 | `urllib3` | 2.6.3 | PYSEC-2026-142 | 2.7.0 | No | Unreachable. Over-decompression requiring an optional compression backend that is not installed |
 | `urllib3` | 2.6.3 | PYSEC-2026-141 | 2.7.0 | No | Unreachable. Header leakage on cross-origin redirect through a proxy manager configuration this application never uses |
 
-Eight of those ten are unreachable, one is low and partial, and one is partial with a named
-compensating control.
+Eight of those ten are unreachable. The remaining two both concern URL reconstruction from the
+`Host` header, and both are now covered by an applied compensating control rather than a recommended
+one.
 
 The five that sit outside the served application. Four arrive through the audit and test tooling; the
 last arrives through the direct `python-dotenv` pin, which `pydantic` reads to load `env_file`:
@@ -446,9 +500,11 @@ last arrives through the direct `python-dotenv` pin, which `pydantic` reads to l
 | `pytest` | 8.4.2 | PYSEC-2026-1845 | 9.0.3 | No | Unreachable from the network. A predictable temporary directory lets a local user cause denial of service. Test-runner only; the container command runs `uvicorn`, so the runner never executes in a deployed environment. This one is the clearest argument for keeping development tooling out of the production image |
 | `python-dotenv` | 1.2.1 | PYSEC-2026-2270 | 1.2.2 | No | Unreachable. `set_key()` and `unset_key()` follow symbolic links when **rewriting** a `.env` file. Pydantic calls the read helper only, and `backend/` holds zero references to `dotenv`, `set_key` or `unset_key`. Local access plus operator interaction, scored 5.9 Medium |
 
-Thirteen of the fifteen are unreachable, one is low and partial, and one is partial with a named
-compensating control. Not one is reachable by an unauthenticated network caller against the served
-application.
+Thirteen of the fifteen are unreachable. The two that are not are the pair above, and an applied
+host allow-list is what stands between them and an unauthenticated network caller. Before that
+control, `PYSEC-2026-161` was reachable by one: the acceptance gate demonstrated it. Suppression
+rests on the control, not on non-reliance, and if the control is removed the suppression must be
+re-argued.
 
 The single advisory that will never receive a patch is the `ecdsa` timing side channel, and it is
 unreachable by construction. This application signs tokens with HMAC-SHA256. The settings class

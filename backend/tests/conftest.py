@@ -19,7 +19,7 @@ DL-377, and DL-399.
 
 Module surface
 --------------
-``TEST_BASE_URL``, ``ALLOWED_ORIGIN``, ``FOREIGN_ORIGIN``,
+``TEST_BASE_URL``, ``TEST_HOST``, ``ALLOWED_ORIGIN``, ``FOREIGN_ORIGIN``,
 ``VALID_PASSWORD``
     Constants describing the harness HTTP identity and a password that
     satisfies the server-side policy.
@@ -78,6 +78,9 @@ for _import_root in (str(_BACKEND_DIR), str(_REPO_ROOT)):
 # SEC-06: an HTTPS base URL; a Secure cookie is dropped over plain http
 TEST_BASE_URL = "https://testserver"
 
+# QA-03: the Host the test client sends, carried by ALLOWED_HOSTS
+TEST_HOST = "testserver"
+
 # SEC-03: the origin the harness sends, carried by ALLOWED_ORIGINS
 ALLOWED_ORIGIN = TEST_BASE_URL
 
@@ -98,6 +101,9 @@ _HARNESS_ENVIRONMENT = {
     # SEC-03: the fail-closed allow-list, in the JSON array form pydantic
     # v1 parses for a list-typed environment value
     "ALLOWED_ORIGINS": json.dumps([ALLOWED_ORIGIN]),
+    # QA-03: the Host the test client sends, and the only host the
+    # application answers on under test
+    "ALLOWED_HOSTS": json.dumps([TEST_HOST]),
     # SEC-06: the session cookie carries the Secure attribute under test
     "COOKIE_SECURE": "true",
     # SEC-12: 64 bytes, clearing the RFC 7518 sec. 3.2 floor of every

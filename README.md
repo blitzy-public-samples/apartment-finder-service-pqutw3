@@ -21,7 +21,7 @@ A comprehensive web service for managing apartment rentals, allowing users to se
 
 1. Clone the repository:
    ```
-   git clone https://github.com/your-username/apartment-rental-web-service.git
+   git clone https://<host>/<owner>/apartment-rental-web-service.git
    ```
 
 2. Navigate to the project directory:
@@ -103,12 +103,15 @@ Please ensure your code follows the project's coding standards and includes appr
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. This repository tracks no `LICENSE` file, so the
+sentence above is the only licence declaration it carries.
 
 ## Contact Information
 
-For any questions or concerns, please contact the project maintainer:
+<!-- MAINTAINER: replace the two placeholders below with the real repository and contact before publishing. -->
 
-- Name: Your Name
-- Email: your.email@example.com
-- GitHub: [Your GitHub Profile](https://github.com/your-username)
+- Issues and questions: the issue tracker of this repository, at `https://<host>/<owner>/apartment-rental-web-service/issues`
+- Security reports: [SECURITY.md](SECURITY.md), which carries the reporting procedure
+
+No maintainer name or address is published here, because this repository does not record one and this
+file does not invent one.

@@ -97,7 +97,7 @@ register is part of the deliverable rather than a footnote.**
 
 | Decision | Alternatives considered | Rationale | Risk / residual gap |
 |---|---|---|---|
-| **DL-07** — Extend the suppression list from ten entries to fourteen, adding the four advisories measured in the resolved closure but absent from the original inventory. | (a) Ship the ten-entry list unchanged. (b) Raise the pins of `msgpack`, `filelock` and `pytest` to their fix releases. (c) Drop `--strict`, or stop failing the build on findings. | Option (a) installs a gate that fails on every run for reasons unrelated to any security finding — a permanently red gate teaches maintainers to ignore it, which is worse than no gate. Option (b) is impossible: every one of the three fix releases was probed directly and every probe returned a `Requires-Python >= 3.10` rejection, while the pinned versions download cleanly from the same index in the same session. Option (c) removes the gate's ability to detect anything. Each addition is justified individually in 2.2 with a reachability assessment, so the list was widened deliberately and visibly rather than silently. | Fourteen accepted advisories is a real exposure surface, not a clean bill of health. Eight of the fourteen are unreachable in this codebase, one is low and partial, one is partial with a compensating control available, and the four added here are unreachable from the network-facing application. The list is only defensible while the review trigger is honoured. **Superseded by DL-93.** |
+| **DL-07** — Extend the suppression list from ten entries to fourteen, adding the four advisories measured in the resolved closure but absent from the original inventory. | (a) Ship the ten-entry list unchanged. (b) Raise the pins of `msgpack`, `filelock` and `pytest` to their fix releases. (c) Drop `--strict`, or stop failing the build on findings. | Option (a) installs a gate that fails on every run for reasons unrelated to any security finding — a permanently red gate teaches maintainers to ignore it, which is worse than no gate. Option (b) is impossible: every one of the three fix releases was probed directly and every probe returned a `Requires-Python >= 3.10` rejection, while the pinned versions download cleanly from the same index in the same session. Option (c) removes the gate's ability to detect anything. Each addition is justified individually in 2.2 with a reachability assessment, so the list was widened deliberately and visibly rather than silently. | Fourteen accepted advisories is a real exposure surface, not a clean bill of health. Eight of the fourteen are unreachable in this codebase, two concern URL reconstruction from the `Host` header, and the four added here are unreachable from the network-facing application. **The two `Host` rows are superseded by DL-440: one was reachable, and both now rest on an applied control rather than on a control being available.** The list is only defensible while the review trigger is honoured. **Superseded by DL-93.** |
 | **DL-08** — Add a cross-check asserting that every suppression identifier still matches a live advisory, and fail the build when one does not. | Rely on the `--ignore-vuln` flags alone. | `pip-audit` 2.9.0 accepts an identifier that matches nothing **without emitting any diagnostic**: a run with a fabricated identifier reported `Found 14 known vulnerabilities in 8 packages` and said nothing about the unmatched entry. A mistyped or stale suppression therefore disables part of the gate invisibly. The cross-check converts that silent failure into a build failure. It is also what makes a pin change safe: an entry whose package leaves the closure is reported instead of ignored. That is how the `python-dotenv` entry was caught and removed when the pin first dropped the package, and how DL-61 knew to restore it when DL-01 declared the package again. | The cross-check adds a second `pip-audit` invocation to the CI step. It detects a stale entry but cannot decide whether the right response is to delete the entry or to investigate a changed closure — that judgment stays with the maintainer. **Superseded by DL-96.** |
 | **DL-09** — Allow GitHub advisory (`GHSA-`) identifiers in the suppression list alongside `PYSEC-` identifiers. | Restrict the list to `PYSEC-` identifiers only. | The `msgpack` advisory `GHSA-6v7p-g79w-8964` has **no `PYSEC-` form and no aliases at all**, so a `PYSEC-`-only policy cannot express it. Alias matching was verified to work: suppressing `GHSA-86qp-5c8j-p5mr` (an alias of `PYSEC-2026-161`) produced `ignored 1`. | A mixed-namespace list is marginally harder to read. DL-08 mitigates the associated hazard by proving every entry, in either namespace, still matches. **Moot after DL-93, which leaves no `GHSA-` entry in the list. See DL-94.** |
 | **DL-10** — Keep `pip-audit==2.9.0` inside `backend/requirements.txt`. | Install the audit tool outside the application manifest, so it stops contributing advisories to the closure it audits. | `pip-audit` is a declared requirement of the manifest contract, and its presence at the pinned version is a verified acceptance criterion. Removing it would violate an explicit requirement in order to improve a metric. | The audit tool injects two of the five added advisory-bearing packages into its own audit scope: `msgpack` and `filelock` reach the closure **only** through `pip-audit`'s `CacheControl[filecache] >= 0.13.0` dependency. Every future advisory in the audit tool's own tree therefore becomes a gate failure. Splitting build-time tooling out of the runtime manifest — and out of the production image, which currently installs the whole file — remains the correct long-term shape and is recommended as a follow-on. |
@@ -140,10 +140,15 @@ carries the correction.
 - **Row 1, `PYSEC-2026-161` in `starlette` 0.49.3.** Accepted 2026-07-31.
   - Aliases `CVE-2026-48710`, `GHSA-86qp-5c8j-p5mr`, `X41-2026-002`. Fix release 1.0.1; not
     installable on Python 3.9. Enters the closure through `fastapi`.
-  - Reachability: **PARTIAL** — host-header URL reconstruction without validation. No
-    application code relies on the reconstructed URL or on the `Host` header.
-  - Accepted. Host-allow-list middleware is available in the pinned version as an optional
-    compensating control and is recommended, not mandated.
+  - Reachability: **REACHABLE, now compensated** — host-header URL reconstruction without
+    validation. The earlier reading, that no application code relies on the reconstructed URL or
+    on the `Host` header, was wrong: the framework's own trailing-slash redirect reconstructs it,
+    which the acceptance gate demonstrated against `/listings` and `/filters`. `DL-440` carries
+    the correction.
+  - Accepted **on the strength of an applied control**, not on non-reliance: the host-allow-list
+    middleware the pinned version ships is registered outside every other layer and refuses an
+    untrusted or malformed host with 400 before routing. Removing that control re-opens this
+    advisory and this acceptance with it.
 
 - **Row 2, `PYSEC-2026-249` in `starlette` 0.49.3.** Accepted 2026-07-31.
   - Aliases `CVE-2026-54283`, `GHSA-82w8-qh3p-5jfq`. Fix release 1.3.1; not installable on
@@ -155,9 +160,11 @@ carries the correction.
 - **Row 3, `PYSEC-2026-248` in `starlette` 0.49.3.** Accepted 2026-07-31.
   - Aliases `CVE-2026-54282`, `GHSA-jp82-jpqv-5vv3`. Fix release 1.3.0; not installable on
     Python 3.9. Enters the closure through `fastapi`.
-  - Reachability: **LOW, partial** — a request path not beginning with a slash can shift the
-    authority boundary during URL reconstruction. Same non-reliance as row 1.
-  - Accepted with the same compensating control as row 1.
+  - Reachability: **LOW, compensated** — a request path not beginning with a slash can shift the
+    authority boundary during URL reconstruction. Row 1's non-reliance claim was withdrawn, so
+    this row's reference to it is withdrawn with it.
+  - Accepted with the same applied control as row 1: the allow-list bounds the authority any
+    reconstruction can produce to a configured host.
 
 - **Row 4, `PYSEC-2026-2281` in `starlette` 0.49.3.** Accepted 2026-07-31.
   - Aliases `CVE-2026-48818`, `GHSA-wqp7-x3pw-xc5r`. Fix release 1.1.0; not installable on
@@ -2439,3 +2446,332 @@ artifact it justified, because measurement showed the artifact right and the rea
 - **This file after the pass.** 435 four-column decision rows keyed `DL-01` through `DL-435`, with no
   gap and no duplicate. One row stands over 1,800 characters, DL-293 at 1,865, inherited and left alone
   for DL-419's reason; the three rows added here measure 1,773, 1,754 and 1,670.
+
+## 48. The sixteenth pass — eleven final-acceptance findings (QA-01 … QA-11)
+
+`backend/app/services/zillow_service.py`, `backend/app/tasks/listing_updater.py`,
+`backend/app/core/config.py`, `backend/app/core/security.py`, `backend/app/main.py`,
+`backend/app/schema/user.py`, `backend/app/api/endpoints/auth.py`,
+`backend/tests/conftest.py`, `backend/tests/security/*.py`,
+`infrastructure/docker/docker-compose.yml`, `scripts/setup_dev_environment.sh`,
+`.env.example`, `SECURITY.md`, `README.md`, `documentation/*`
+
+The final acceptance gate returned eleven findings, three major and eight minor, and failed the
+build on them. Three are new ground the twelve findings never reached: the Zillow ingestion path,
+`Host`-header validation, and response security headers. Five are contract or documentation defects
+in artifacts the twelve did deliver. The rest correct a live environment and two published metrics.
+
+Rows are keyed from `DL-436`. Where a row reverses a prohibition an earlier per-file instruction
+carried, it says so and names what changed the answer.
+
+### 48.1 The two major ingestion findings (QA-01, QA-02)
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-436** — Make `ListingCreate` the one provider-to-model mapping: the transform reads a table of provider key spellings per writable column, coerces each value, and constructs that model, so the allow-list decides what can reach a column. | (a) Keep constructing the `Listing` response model, as the pre-fix transform did, and supply the three columns it demands. (b) Construct the ORM row directly in the transform. (c) Add a third model for ingestion. (d) Add a provider-identifier column and map onto it. | The transform's declared job is to turn a provider record into something the database can hold, and the repository already declares exactly what a caller may write to that table: `ListingCreate`, the SEC-05 allow-list, whose eight fields correspond one-to-one with the eight writable columns. Reusing it means ingestion and `POST /listings/` cannot drift, and a provider key outside the allow-list is dropped rather than absorbed — the same CWE-915 property the create route relies on. Option (a) makes the transform mint the server-owned primary key and both server-owned timestamps from provider data, which is the mass-assignment shape SEC-05 exists to close. Option (b) puts persistence concerns in a module whose other function is an HTTP client, and leaves the values unvalidated. Option (c) adds a third contract for two callers to disagree about. Option (d) needs a migration, which AAP 0.9.2 excludes. | The mapping is a fixed table of key spellings, so a feed that renames a field silently supplies nothing for that column rather than failing loudly. Only `rent` is required, and its absence is refused, so a renamed optional field degrades to a null. The eight target names are pinned by the regression suite in both the canonical and the alternate spelling, so a rename is visible the moment the suite runs against a recorded payload. |
+| **DL-437** — Repair the scheduled updater in place: read the watched zip codes from the `ZipCode` table, call both helpers synchronously, match a stored row on `zillow_url`, write only the columns the provider supplied, and stamp both server-owned timestamps. | (a) Pass a configured zip-code list from a new setting. (b) Pass an empty list and let the provider decide. (c) Match on the primary key the feed supplies. (d) Write the full field set on every update. (e) Leave the updater alone and repair only the transform. | The fetch declares two required arguments and the updater passed none, so the choice was which authority supplies them. The `zip_codes` table exists for exactly this: it records the codes the stored filters watch, so it is the application's own answer rather than a new one. Option (a) adds a required setting to a contract whose parity with the template and the container definition is test-enforced, for a value the database already holds. Option (b) sends an empty key and gets whatever the provider defaults to. On the match column, `models.py` declares no provider identifier, and `zillow_url` is the only column carrying the provider's own reference; option (c) would let a feed choose primary keys, and option (d) would erase a stored value whenever a payload omitted an optional field, so `exclude_unset` is what makes a partial payload an update rather than a truncation. Option (e) leaves the finding open: the gate measured one rollback and zero commits, and the transform is only half of that. | With no stored filter naming a zip code the updater fetches nothing, which is correct but means ingestion is inert on a fresh database until a filter exists. Matching on a URL means a feed that changes its URL scheme for an existing property inserts a second row. The updater body still runs synchronously inside a coroutine; nothing schedules `run_listing_updater` today, so no event loop is blocked, and the bounded wait in `DL-438` caps the exposure if one ever does. |
+| **DL-438** — Carry the outbound `(connect, read)` bound as module constants and catch an elapsed wait in its own branch, ahead of the general transport failure. | (a) Declare a `ZILLOW_TIMEOUT` setting. (b) Pass one scalar timeout. (c) Fold the elapsed wait into the existing `RequestException` branch. (d) Wrap the call in a thread with a join deadline. | The finding is that the call has no bound at all, and a constant closes it completely. A setting would be the better shape if an operator needed to tune it, but it would also add a fifth artifact to keep in parity — the settings class, the template, the container definition, the harness environment and the guard baseline all assert against the declared field set — for a value with no deployment-specific answer. `requests` distinguishes connect from read, and a single scalar applies the same bound to both, so the pair is the more accurate statement of intent. Option (c) closes the finding for the caller but loses the distinction in the log, and the gate asked for the elapsed wait to be caught separately. Option (d) adds a thread to bound a call the library already bounds. | The bound is not operator-tunable without a code change, and a genuinely slow provider now fails closed where it previously succeeded late. Both numbers are asserted to sit inside a sane range by the regression suite, which also drives a server that answers late and a server that never answers, so the bound is measured rather than declared. The elapsed-wait branch prints to stdout like the branch beside it; AAP 0.5.8 records that print as noted rather than fixed, and this row does not widen that. |
+
+### 48.2 Measured evidence for section 48.1
+
+- **QA-01 before.** `process_listing` with a representative provider record raised
+  `ValidationError: 3 validation errors for Listing`, naming `created_at`, `updated_at` and `rent` as
+  required. `Listing` was confirmed to declare no `zillow_id`; its eleven columns are `id`,
+  `created_at`, `updated_at`, `rent`, `broker_fee`, `square_footage`, `bedrooms`, `bathrooms`,
+  `available_date`, `street_address` and `zillow_url`. `fetch_listings` was confirmed to declare
+  `(zip_codes, filters)`, and the updater to call it with neither.
+- **QA-01 after.** The same record maps to `ListingCreate` with all eight writable values, and the
+  alternate provider spellings — a currency-formatted `price`, a quoted `livingArea`, `beds`, `baths`,
+  `detailUrl` and a padded `address` — map to a byte-identical field set. One updater pass against a
+  seeded zip code stores one row whose eleven columns read back with both timestamps populated; a
+  second pass at a new rent updates that same row rather than inserting; a payload omitting
+  `broker_fee` and `street_address` leaves both stored values standing; and a batch of one unusable
+  and two usable records commits the two.
+- **QA-02 before.** Against a local server delaying 2.5 seconds, the calling thread was still alive
+  after 1.0 second and the call returned after 2.506 seconds.
+- **QA-02 after.** With a one-second read bound, a server delaying 8 seconds and a server that never
+  answers both return the empty batch in under 5 seconds, and every call is asserted to carry the
+  declared pair.
+- **The suite around both.** `python -m pytest tests/security -q` reports 764 passed, against the 738
+  measured before this pass: the 26 cases added here and no change to any existing case. `flake8` on
+  the three changed files reports no finding.
+
+### 48.3 Host-header validation and the advisory it compensates (QA-03)
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-439** — Apply the host allow-list the pinned release ships: a required, validated `ALLOWED_HOSTS` setting read by `TrustedHostMiddleware`, registered outside every other layer with `www_redirect=False`. **Reverses the instruction that this middleware not be added.** | (a) Leave it out, as the per-file instruction directed, and keep the suppression. (b) Write a bespoke host guard so the refusal uses the SEC-08 error envelope. (c) Disable the framework's trailing-slash redirect instead. (d) Derive the allowed hosts from `ALLOWED_ORIGINS`. (e) Give the setting a default. | The instruction not to add it rested on the specification's own reading that the advisory was unreachable because nothing relies on the `Host` header. Measurement overturned that reading — `DL-440` carries it — and an instruction whose premise is false is not an instruction to follow. The library control is the one the specification named, it is already installed, and it compares with equality, which is the property OWASP asks for and the reason the validator refuses a pattern entry. Option (b) buys envelope uniformity at the cost of reimplementing header parsing in the one place a mistake is a bypass; a pre-routing refusal that reads `Invalid host header` discloses nothing. Option (c) removes a documented framework behaviour to avoid one of its consequences, and leaves every other reconstruction site open. Option (d) conflates two different things: the browser origins allowed to send credentialed requests, and the host names this API answers on, which differ in every deployment that puts the client on its own domain. Option (e) is the failure mode this whole finding is an instance of — a default that silently admits traffic. | A misconfigured list is a hard outage: every request answers 400 until it is corrected, which is the fail-closed behaviour `SEC-03` already established for origins and is stated in `.env.example`. The comparison drops everything from the header's first colon, so an IPv6 literal can never match; the validator refuses one at startup rather than leaving an operator to discover it at request time, which means an IPv6-literal deployment has no expressible entry. The refusal does not carry the sanitized envelope the four handlers emit, because it is answered above them. |
+| **DL-440** — Correct the recorded reachability of `PYSEC-2026-161` and `PYSEC-2026-248` from a non-reliance claim to an applied control, in this register, in `SECURITY.md` section 3.1 and in `DL-07`'s residual column. The suppression set is unchanged. **Corrects register rows 1 and 3 and the residual column of DL-07.** | (a) Leave the recorded reachability and add the control silently. (b) Remove both suppressions and accept a permanently red gate. (c) Record the correction only in `SECURITY.md`. | The register said no application code relies on the reconstructed URL or the `Host` header. The framework's own `redirect_slashes` does, and the gate proved it: `GET /listings` with `Host: attacker.example` answered `307` to `http://attacker.example/listings/`, and `Host: attacker.example/abc?x=` produced `Location: http://attacker.example/abc?x=/listings/`. A suppression resting on a false premise is the exact failure this register exists to prevent, so the premise is replaced by the thing that is actually true: a control is applied. Option (a) leaves the false premise standing, which is the finding rather than the fix. Option (b) is refused on `DL-07`'s ground — the fix release requires a runtime this project does not run, so the gate would fail on every run for a reason no change here can address. Option (c) splits the register from the document that quotes it. | The two acceptances now depend on a control staying registered, which is a coupling a reader has to know about; both entries say so, and the regression suite asserts the middleware is registered with the configured list and with its redirect behaviour off. The review trigger is unchanged and shared: on a runtime upgrade the list is emptied and every entry re-measured, and these two expire with it. |
+
+### 48.4 Measured evidence for section 48.3
+
+- **QA-03 before.** Against the running application, `Host: attacker.example` answered `307` with
+  `location: http://attacker.example/listings/` on `/listings` and `http://attacker.example/filters/`
+  on `/filters`. A raw request carrying `Host: attacker.example/abc?x=` answered `location:
+  http://attacker.example/abc?x=/listings/`. No host middleware was registered.
+- **QA-03 after.** Both values answer `400 Invalid host header` on `/listings`, `/filters` and
+  `/subscriptions`, with no `Location` header and no echo of the submitted value. Three lookalike
+  hosts are refused, an empty header is refused, and a request to `/openapi.json`, `/auth/login`,
+  `/auth/logout` and an unrouted path is refused before any handler runs. The trusted host still
+  answers `307` to its own `/listings/` and still serves the public read path with 200.
+- **The allow-list itself.** Nineteen unsafe values stop startup, each naming `ALLOWED_HOSTS` alone:
+  an empty list, `*`, `*.example.com`, a wildcard among valid entries, a port, a scheme, a path, a
+  query, a fragment, userinfo, an uppercase host, a bracketed IPv6 literal, a space, an empty DNS
+  label, a leading-hyphen label, a trailing dot, a non-ASCII host and an empty entry. Four safe
+  values construct. Four non-JSON spellings are refused with the required form on the cause.
+- **The suite and the style baseline around the change.** `python -m pytest tests/security -q`
+  reports 805 passed, against 764 before this part of the pass. `flake8 .` reports 96 findings across
+  the same seven categories, down from 107 and with no new category; the four findings in
+  `app/core/config.py` and `app/main.py` are byte-for-byte the four the last pre-work commit
+  produced, measured on both versions of each file.
+
+### 48.5 The published API contract (QA-04, QA-05, QA-06)
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-441** — Publish the two credential channels the guard actually reads: a cookie scheme named for the session cookie and a bearer scheme, both optional, in place of the OAuth2 password flow. **Reverses the instruction to leave `tokenUrl='token'` alone.** | (a) Leave the declaration and accept that the authorization dialog cannot authenticate. (b) Add an OAuth2 form token route at the advertised path. (c) Correct the token URL to `/auth/login`. (d) Publish the bearer scheme only. | The instruction to leave it alone rested on the token URL being a documentation hint that traced to no finding; the gate made it a finding, on the ground that the hint points at a path answering 404 and the dialog it renders authenticates nothing. Option (b) is the largest available change: a form endpoint needs a multipart parser, and `DL-04` removed that package to close six advisories that cannot be patched on this runtime, so adding one back would reopen all six to fix a documentation defect. Option (c) is worse than wrong: the path exists, so the dialog would post form fields to a route that reads a JSON body and answer 422, which is a working-looking control that fails. Option (d) documents half of what the guard accepts and leaves the cookie undiscoverable. Declaring both is also what makes the guarded operations publish both, which is the accurate statement of what reaches them. | The dialog now asks for a token rather than credentials, so a reader has to call the login route first; both scheme descriptions say so and name the field to copy. Behaviour is unchanged and asserted so: cookie-only, bearer-only, cookie-wins-over-header, five unusable header spellings and no-credential-at-all all answer exactly as before. |
+| **DL-442** — Publish the password policy as the two bounds a schema keyword can carry plus one description naming everything it cannot, and put no bound at all on the login model. | (a) Description only, with no keywords. (b) A regular-expression pattern expressing the character classes. (c) Bounds on both models. (d) Move the byte check into a keyword and drop the validator. | A consumer cannot discover a rule that is written only in a validator body, and two of the five rules are expressible: the character minimum and a character ceiling at the byte number. Neither weakens anything — the byte-aware validator still decides, and it is stricter than the character ceiling for any multi-byte input, which the suite asserts with a password inside the character bound and outside the byte bound. Option (a) leaves a machine-readable contract emptier than it needs to be. Option (b) publishes a pattern a client would validate against, and a pattern cannot express the byte ceiling, so a client would accept input the server refuses. Option (c) is the one that would change behaviour: a bound on the login model refuses the credentials of an account registered before the policy with a 422 while every other refusal answers 401, which is an account-state oracle — the differential-response defect `SEC-08` exists to remove. Option (d) drops the only check that counts bytes. | The description restates constants that are also in code, so the two can drift; the suite reads all three constants from the schema module and asserts each appears in the published description, and asserts the special-character set is published whole rather than summarised. A short password is now refused by the field constraint rather than by the validator, so its message changes while the status, the named field and the absence of an echo do not. |
+| **DL-443** — Publish the three frozen authentication bodies through the route's `responses` mapping rather than a `response_model`. | (a) Attach `response_model` to each route. (b) Hand-write the OpenAPI schema for each 200 response. (c) Leave the schemas empty. | AAP 0.5.5 deliberately left these routes without a response model, because the bodies are frozen and a model filters keys out of them, and that reasoning still holds. The `responses` mapping is the one mechanism that publishes a schema without touching serialization, verified on the installed version in both directions: the document carries the model reference, and a body with a key the model does not declare survives the round trip intact. Option (a) puts a filter on a frozen contract. Option (b) writes by hand what a model generates, and hand-written schemas drift silently. Option (c) is the finding. | The published schema is now an assertion about the body that nothing enforces at runtime, so a future change to a handler could make it wrong. The suite closes that gap from the other side: it compares each published key set against the key set the served response actually carries, the nested user object included, and asserts every one of the three routes still declares no response model. |
+
+### 48.6 Measured evidence for section 48.5
+
+- **QA-04 before.** `components.securitySchemes` held one entry, an `oauth2` password flow with
+  `tokenUrl: token`. `GET /token` and `POST /token` both answered 404.
+- **QA-04 after.** The document holds exactly two schemes, `SessionCookie` as `apiKey` in `cookie`
+  named `access_token` and `BearerToken` as `http` `bearer`; the string `tokenUrl` appears nowhere in
+  the document; `/token` is absent from the route table and still answers 404 on both methods; and
+  `GET /filters/` declares both schemes. Cookie-only, bearer-only and cookie-over-conflicting-header
+  all answer 200, five unusable `Authorization` spellings and an absent credential all answer 401
+  with `WWW-Authenticate: Bearer`.
+- **QA-05 before.** `UserCreate.properties.password` was `{"type": "string", "title": "Password"}`.
+- **QA-05 after.** It carries `minLength` 12, `maxLength` 72 and a description naming the four
+  character classes, the NUL refusal, the byte ceiling and the full thirty-character special set.
+  `UserLogin.properties.password` carries neither bound. Eight non-compliant passwords still answer
+  422 naming the field with no echo, including one inside the character bound and outside the byte
+  bound; a compliant password still registers; a non-string password is still refused.
+- **QA-06 before.** All three 200 schemas were `{}`.
+- **QA-06 after.** Each publishes an object whose property set and required set equal the frozen key
+  set — `{user, access_token, token_type}`, `{access_token, token_type}` and `{detail}` — and each
+  published set is compared against the key set the served response carries, the nested
+  `{id, email}` object included. All three routes still declare `response_model is None`.
+- **The suite and style around the three.** `python -m pytest tests/security -q` reports 835 passed,
+  against 805 before this part of the pass. `flake8` on the three changed application files produces
+  a finding set byte-identical to the one the last pre-work commit produces for the same three files,
+  measured on both versions; the new test module produces none.
+
+### 48.7 Browser-facing response headers (QA-09)
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-444** — Add one response-header layer registered outside every other, carrying a fixed baseline set plus two conditional headers: a content policy chosen by path, and a transport claim sent only over TLS. Mark the three token-bearing routes uncacheable in their own handlers. | (a) Leave the headers to the production edge, which the finding says is absent from this repository. (b) Set the headers per route with a dependency. (c) Register the layer innermost, beside the error boundary. (d) One content policy for every path. (e) Send the transport claim unconditionally. (f) Mark every response uncacheable. (g) Add `Cross-Origin-Resource-Policy` alongside the other cross-origin header. | The acceptance gate measured every checked header absent from **every** response class, refusals included, and a control that only covers the routes reaching a handler would leave the host refusal, the preflight, the throttle refusal, the validation refusal, the framework 404 and the sanitized error bare — which is exactly the set an attacker probes. Option (a) is what produced the finding: this repository carries no edge definition, so "the edge will do it" is an unowned control. Option (b) covers handlers and misses every refusal, and would have to be repeated on each route. Option (c) puts the layer inside the host and cross-origin layers, so their answers escape it; registering last makes it outermost, which the suite asserts by reading position zero of the registered stack rather than trusting the comment. Option (d) cannot work: `default-src 'none'` is correct for a JSON API and would blank the two generated documentation pages, which load their bundles from a CDN, so the policy is chosen from the application's own `docs_url`, `redoc_url` and `swagger_ui_oauth2_redirect_url` and a change to any of the three cannot leave the policy behind. Option (e) claims a security property the connection does not have whenever the request arrived over plain HTTP, which is a false statement in local and plaintext-proxied deployments; the header follows the request scheme instead. Option (f) would make the public listing feed uncacheable, and `GET /listings/` is a frozen public read path — so the prohibition sits in the two cookie helpers, which is every response that mints or revokes a session and no other. Option (g) is consulted for no-cors loads; the client reads this API in cors mode with credentials, which SEC-03 already bounds by origin, so it would add risk without adding a control. | The transport claim still depends on the edge terminating TLS; over plain HTTP the header is correctly absent, so an operator who terminates TLS upstream and forwards plaintext without a forwarded-proto header gets no claim. The documentation policy permits `'unsafe-inline'` for script, because the generated pages carry an inline bootstrap this work does not own; a nonce becomes available only once those shells are application-owned. The layer skips any header the response already carries, which is what allows a route to narrow its own policy and equally what allows a route to weaken it — the suite pins the two policies' shared denials so a weakening is visible. |
+| **DL-445** — Name two further origins in the documentation policy that no served markup reveals: the bundle's own image origin under `img-src`, and the bundle origin under `connect-src`. | (a) Leave both blocked and document the console messages as accepted. (b) Add only the image origin and leave the source-map block. (c) Self-host both bundles so no third-party origin is named at all. | A policy is only correct if it describes what the page actually requests, and a document scan cannot discover a request the bundle makes from inside itself — a browser is what found both. The image origin is requested by the ReDoc bundle for its attribution glyph; blocking it left an enforcement violation firing on every visit for a glyph, and an image source cannot execute code, so naming it costs nothing an image tag does not already cost. The bundle origin under `connect-src` is the sharper call: `script-src` already trusts that origin to execute arbitrary code on the page, so a fetch destination cannot be meaningfully narrower than a code source for the same origin — withholding it suppressed nothing but the source maps a browser's own developer tools request, at the price of two permanent violations in the console of the one audience that reads violation reports. Option (a) trains an operator to ignore enforcement reports, which is a real cost paid for no control. Option (b) leaves that cost half-paid. Option (c) is the strongest answer and the wrong size: vendoring two bundles into this repository is a build change, not a header fix, and the minimal-change clause forbids it. | Two more third-party origins are named, and each is a place a compromised CDN could serve from — though `script-src` already concedes the graver half of that to the same origin. The suite pins the invariant rather than the string: every remote script source must also be a connect source, so narrowing one without the other fails a case instead of reappearing as a console message. Self-hosting the bundles is recorded as the follow-on that would remove all five origins. |
+
+### 48.8 Measured evidence for section 48.7
+
+- **Before.** Every one of the checked headers was absent from every response class the gate
+  inspected, and `POST /auth/register` carried no storage prohibition.
+- **After, the baseline set.** Six headers are present and exact on `/openapi.json`, `/docs`,
+  `/redoc`, `/docs/oauth2-redirect`, `GET /listings/`, all three `/auth` answers, a protected 200 and
+  a protected 401, a CORS preflight, a 422, the framework 404, a 429 and a sanitized 500 — and on the
+  400 the host layer produces, which is what the outermost registration buys.
+- **After, the content policy.** The API surface is served `default-src 'none'; frame-ancestors
+  'none'; base-uri 'none'; form-action 'none'`, which names no host and permits neither inline nor
+  evaluated code. The two generated pages are served a policy naming five hosts, and every absolute
+  origin parsed out of the served HTML of both pages is named by it, so the policy cannot silently
+  break the documentation.
+- **What a browser added to that, and why the policy changed twice.** A first browser pass rendered
+  both pages completely — the bundles executed, the inline bootstraps ran, the webfonts applied, the
+  ReDoc search worker started from a `blob:` URL — and still reported three enforcement violations a
+  document scan could not have found: two source-map fetches under `connect-src`, and the ReDoc
+  bundle's own attribution glyph under `img-src`. Two origins were added for the reasons `DL-445`
+  records. A second pass reports **zero violations across all three documentation paths**, on both a
+  warm and a cold cache, with the glyph fetched at 200 and painted at its declared size. That pass
+  also proved its own detector: two deliberately non-allow-listed requests were blocked and captured
+  with the right directives while two allow-listed ones loaded, and the captured disposition reads
+  `enforce`, so the zero is a measurement rather than an absence of evidence.
+- **After, the transport claim.** Present as `max-age=31536000; includeSubDomains` on the HTTPS
+  client, absent on an otherwise identical plain-HTTP client whose baseline set is unchanged.
+- **After, storage.** `Cache-Control: no-store` with `Pragma: no-cache` on register, login and
+  logout, on the same response that carries the `Set-Cookie`; absent from `GET /listings/`.
+- **The suite and style.** `python -m pytest tests/security -q` reports 890 passed, against 835
+  before this part of the pass. `flake8 .` across the backend reports the same 96 findings as before
+  this part of the pass, and the whole-tree finding profile differs from the last pre-work commit only
+  by the eleven findings the ingestion repair removed; the new test module produces none.
+
+
+### 48.9 Generated documentation accessibility (QA-07)
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-446** — Serve all three documentation paths from application-owned HTML shells, switching the framework's own documentation routes off and registering the replacements through the same call the framework used. | (a) Pass parameters to the framework's template helpers. (b) Self-host both bundles and patch their markup. (c) Add the missing structure with an injected script over the stock template. (d) Leave the documentation pages as the framework generates them and record the finding as third-party. | Every defect the gate named lives in the framework's own f-string: the `html` element carries no `lang`, the body opens with the bundle's mount node, and there is no heading above the bundle's own. Option (a) cannot reach any of them — the helpers expose asset URLs and bundle parameters, not document structure — so owning the markup is the smallest change that can close the finding at all. The replacements are registered with `add_route`, which is the call the framework itself makes, so each route keeps the same object type, the same GET and HEAD verbs and the same schema exclusion; the route table before and after is identical in path, verb and type, which two existing suites already assert and which is why neither needed changing. Option (b) vendors two bundles into this repository, a build change the minimal-change clause forbids. Option (c) leaves the `lang` attribute unreachable, because a script that adds it runs after the parser has already decided the document language. Option (d) declines a finding the gate raised against pages this application serves. | The shells now carry markup this project maintains, so a bundle upgrade that changes a mount contract becomes this project's problem rather than the framework's. The suite is the compensating control: it pins the asset URLs, the paths, the verbs and the schema exclusion, so a silent drift fails a case. The callback path no longer serves the framework's script, which means a future decision to publish an OAuth2 flow would have to restore it — recorded here so that is a decision rather than a surprise. |
+| **DL-447** — Correct what the bundles render at runtime with an attribute pass that adds only absent attributes and re-runs on every re-render, rather than by rewriting the bundles' DOM. | (a) Accept the runtime defects as third-party. (b) Replace the offending elements — retag ReDoc's control-less `label` elements as spans, retag Swagger's headings. (c) Override the bundles' CSS class hooks instead. (d) Run the pass once after load with no observer. | Three of the gate's defects exist only after a bundle has rendered: the query-parameter fields, the media-type selects and the heading ranks. A shell cannot contain markup it does not emit, so the choice is between a runtime pass and declining the finding. The pass is deliberately additive — it sets an attribute only where none is present, and the suite asserts the script contains no `removeAttribute`, `innerHTML`, `replaceChild` or `outerHTML` — so no bundle behaviour is replaced and a value the bundle sets always wins. Option (b) is the tempting one and is rejected on measured grounds: both bundles are React applications that hold references to the nodes they created, so replacing one risks a reconciliation failure later, which would trade an accessibility hint for a JavaScript error. Option (c) reaches presentation, not semantics. Option (d) fails the moment a caller expands an operation, which is exactly when the parameter fields appear. | The pass depends on two bundle-internal hooks — Swagger's `tr[data-param-name]` rows and its `h1.title`, and ReDoc's `h5` section headings — so a bundle redesign could make part of it inert. It fails open rather than closed: an unmatched selector leaves the page as the bundle rendered it, which is the state the gate measured, and the suite pins each hook so the drift is visible. The observer runs on every mutation of the mount subtree, which on the reference page is frequent; the work is a handful of `querySelectorAll` calls against an already-parsed subtree, and four viewport changes plus two menu cycles produced no measurable effect. |
+| **DL-448** — Accept one residual browser autofill hint on the reference page, and record the experiment that established why it cannot be closed. | (a) Give each control-less label a `for` attribute pointing at a real field. (b) Nest a hidden control inside each. (c) Replace each label element. (d) Report the finding as closed without saying the hint remains. | The reference bundle emits thirteen `label` elements as presentational row wrappers inside its own `menuitem` list; none labels anything, and each menu item takes its accessible name from its own `aria-label`. Marking them presentational is the semantically correct statement and is what an assistive technology acts on — the browser's accessibility tree contains no `label` node at all, and the rule-based accessibility audit's `label` check passes. The browser's autofill hint nonetheless still counts thirteen, and a four-probe controlled experiment established why: the check is purely structural, asking only whether a `label` has a `for` target or a nested control, and consults no ARIA — an in-form label carrying the presentational role still counts, and adding a role-less twin moved the count from one to two. Option (a) fabricates an association that does not exist, which is worse for a screen reader than none. Option (b) adds hidden controls to a navigation menu. Option (c) is the element replacement `DL-447` rejects on reconciliation grounds. Option (d) is the one this log exists to prevent. | The hint remains visible to anyone with developer tools open on the reference page, and a reader who counts console entries rather than reading them will think the finding is open. That is the reason this row exists. The count did not grow across four viewport widths and two menu cycles, so it is stable rather than accumulating, and the underlying assistive-technology outcome is correct and measured. |
+
+### 48.10 Measured evidence for section 48.9
+
+- **Before, measured at 1280 in a browser.** Both pages: `lang` null; zero `main`, zero `nav`, zero
+  `header`. The interactive page ran `h1 → h3 → h3 → h3 → h3 → h4` with no `h2` anywhere, so one rank
+  was skipped; the reference page ran `h2 → h5` eight times with no `h4` anywhere. Neither page's first
+  focusable element was a skip link. After expanding one operation, the two query-parameter fields
+  carried no id, no name and no accessible name beyond a placeholder, and the browser reported the
+  id-or-name hint four times on the interactive page and once on the reference page. The reference page
+  carried thirteen `label` elements, every one with no `for` and no nested control. The callback page
+  threw `Uncaught TypeError: Cannot read properties of null` on every direct visit and probed a
+  `/favicon.ico` that answers 404.
+- **After, structure.** All three pages: `lang` is `en`; one `header`, one `nav` named *API
+  documentation*, one `main`. The first element in each body, and the first element in real tab order
+  measured by five actual key presses, is the skip link, which moves from ten thousand pixels
+  off-screen to the top-left corner on focus and is the topmost hit-testable element there. The
+  previous first-focusable elements now sit fourth.
+- **After, headings.** Read from the browser's computed accessibility tree, not from tag names. The
+  interactive page computes `1 → 2 → 3 → 3 → 3 → 3 → 4`, and `1 → 2 → 3 → 3 → 4 → 4 → 3 → 3 → 4` with
+  an operation expanded. The reference page's forty-nine headings compute to one at level one, fourteen
+  at level two and thirty-four at level three, with none at level four or below. **Zero skipped ranks
+  on either page**, against one and eight before.
+- **After, controls.** Interactive page: four controls, **none** lacking an id or a name, **none**
+  lacking an accessible name; the two parameter fields read `skip (query parameter)` and
+  `limit (query parameter)` in the accessibility tree, and both media-type selects read `Media Type`.
+  Reference page: one control, named `Search`, with an id and a name. The id-or-name hint is **absent
+  from all three pages**, against four and one before.
+- **After, labels.** All thirteen carry `role="presentation"`, so **zero** control-less labels remain
+  unmarked. The reference page's 2,475-line accessibility tree contains no `label` node: every one is
+  ignored, and each menu item is exposed as a `menuitem` carrying its own name.
+- **After, no regression.** Both bundles render completely — nine operations and seventeen schemas on
+  the interactive page, the sidebar, content and sample columns on the reference page, with the Google
+  fonts applied, the search worker started from a `blob:` URL and the attribution glyph fetched at 200.
+  The Authorize flow still works end to end: login answered 200, the modal showed exactly the two
+  schemes with no password flow, and the authorized protected call answered **200**. Zero content-policy
+  messages, zero JavaScript errors and zero requests at 400 or above on any page at any width. The
+  callback page's exception is now structurally impossible rather than merely absent: the page carries
+  **no script element at all**, and its `/favicon.ico` probe is gone with it.
+- **After, at four widths.** 375, 768, 1280 and 1920 on both pages: `scrollWidth` equals
+  `clientWidth` at every width, so no page overflows horizontally, and no element is wider than its
+  viewport. The header occupies one 41-pixel row from 768 upward and wraps to two rows at 375 with the
+  heading first and both navigation links together. The reference bundle collapses its sidebar to a
+  full-viewport overlay at 375 and at 768; that overlay was opened and closed at 375 and covers the
+  header while open, reversibly, with the search field and all four sections reachable.
+- **Five findings the browser raised against this work, all closed by it.** Each was found by
+  measurement rather than review, and two took two passes.
+  1. The skip link moved the scroll position but not the keyboard caret, because the landmark it
+     targets could not take focus — the next key press returned to the header the link exists to
+     bypass. `tabindex="-1"` on the landmark was the necessary half.
+  2. It was not the sufficient half, and a second pass proved it: with the attribute in place the
+     reference and callback pages passed while the interactive page still failed, and a capturing
+     focus-event log showed no focus event on the landmark at all. The bundle that manages the
+     fragment to deep-link an operation pre-empts the browser's own move-focus-to-the-target step, so
+     both bundle-bearing shells now move the caret themselves on activation. Re-measured three ways on
+     the interactive page — keyboard, keyboard on a cold load, and a real mouse click — the landmark
+     itself takes focus in all three and the next key press lands inside it, with the header excluded
+     by a containment check rather than by inspection. The callback page needs no handler and keeps
+     none, which is what lets it stay free of script.
+  3. The request-body editor had an id and a name but no accessible name from any source; every editor
+     the bundle renders is now named, and the accessibility tree reports it as `Request body`.
+  4. The pass returned early on any field already carrying an id, so one content-type select the
+     bundle identifies itself never received a name. The id and the name are now supplied
+     independently, and all eight controls carry all three of an id, a name and an accessible name.
+  5. The callback page's copy rendered in a browser default serif face flush against the viewport
+     edge; it now carries the shell's own type, colour and measure, computed as system-ui at
+     sixteen pixels, inset sixteen pixels, wrapped at a 672-pixel measure.
+- **Three residuals recorded rather than closed.** The autofill hint of `DL-448`. The reference
+  bundle's sidebar box, whose full-viewport height is offset by the header's forty-one pixels, so at
+  scroll position zero its box extends that far past the fold; it snaps to exactly full height on any
+  scroll, and nothing is clipped, because the attribution sits in a viewport-fixed wrapper and the
+  search field and every section occupy the top quarter of the sidebar. And one duplicated id on the
+  interactive page: the bundle gives its content-type `label` the same id as the `select` it wraps.
+  That is the bundle's own markup — the attribute pass iterates `input`, `select` and `textarea` and
+  never touches a `label` — and it predates this work.
+- **The suite and style.** `python -m pytest tests/security -q` reports 948 passed, against 890 before
+  this part of the pass. `flake8 .` across the backend reports the same 96 findings, and the whole-tree
+  finding profile still differs from the last pre-work commit only by the eleven the ingestion repair
+  removed; the new test module produces none.
+
+### 48.11 Least privilege on the database that already exists (QA-08)
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-449** — Add a separate, re-runnable privilege gate to the provisioning script that reapplies the revokes against an existing database and then reads the effective access lists back, and expose it both standalone and as the closing privilege step of a full run. | (a) Apply the revokes to the live instance by hand and record the finding as environmental. (b) Make `init_database` tolerate an existing database so its own batch is reached. (c) Move the revokes into a migration. (d) Verify by reading the script rather than the server. | The script's statements were already correct, and reviewing them proved nothing: `init_database` stops at its `createdb` guard when the database exists, so both revokes — and the read-back that follows them — are skipped, and PUBLIC keeps the `CONNECT` and `TEMPORARY` a new database grants it. That is what the gate measured on a live instance. Option (a) fixes one server and leaves the next one wrong, with nothing to catch it. Option (b) is the tempting one and is rejected on blast radius: relaxing that guard makes every statement after it — two `CREATE ROLE` statements and two ownership changes — run against a populated database, where each raises, so the batch would abort later and less legibly than it does now. A separate function carries only the statements that are safe to reissue, which is why it can be a deployment step rather than a repair. Option (c) needs migration tooling this repository does not have and the plan excludes. Option (d) is the failure the finding names: the gate ends by asking the catalog what PUBLIC and the application role actually hold, and raises on the answer rather than trusting the statements it just sent. | Two definitions of least privilege now exist in one file, and they could drift. A case asserts they cannot: every statement `init_database` sends that constrains PUBLIC or the application role must also appear in the gate, and both must end with the same read-back block byte for byte. The gate needs the authority to change access lists, so it runs as the database owner or a superuser — an authority the provisioning path already assumes. `PUBLIC` keeps `USAGE` on schema `public`, which the read-back admits deliberately, because withdrawing it stops every role from resolving a table name; per-schema separation is the follow-on, not this change. State that only a run can fix stays wrong until someone runs it: the standalone form is what makes that one command rather than a procedure. |
+
+### 48.12 Measured evidence for section 48.11
+
+- **Before, on a live PostgreSQL 13 instance.** The database access list read
+  `{=Tc/app_owner,app_owner=CTc/app_owner,app_user=c/app_owner}`, so `aclexplode` reported PUBLIC
+  holding `CONNECT, TEMPORARY`. `has_database_privilege` returned true for all four of the
+  application role's `CONNECT` and `TEMPORARY` and PUBLIC's `CONNECT` and `TEMPORARY`. As
+  `app_user`, `CREATE TEMP TABLE` succeeded.
+- **After, from the shipped function invoked directly.** Ten statements and the read-back reported
+  four `REVOKE`, four `GRANT`, two `ALTER DEFAULT PRIVILEGES` and one `DO`, then the gate's own
+  success line. The access list reads `{app_owner=CTc/app_owner,app_user=c/app_owner}`; `aclexplode`
+  returns two rows and no PUBLIC row at all; `has_database_privilege` returns `t, f, f, f`.
+  `CREATE TEMP TABLE` as `app_user` returns `permission denied to create temporary tables in
+  database "dbname"`, permanent DDL stays denied at `permission denied for schema public`, and the
+  same role still reads the application's own tables.
+- **Re-runnable, measured.** A second consecutive invocation exits zero and leaves the access list
+  byte-identical. The standalone form runs the gate and nothing else: no software check, no virtual
+  environment, no credential step.
+- **Both polarities of the read-back, measured.** Granting `TEMPORARY` back to PUBLIC and running
+  the shipped read-back alone raises `PUBLIC still holds TEMPORARY on database dbname` and exits
+  three; the full gate then repairs and re-verifies in one run. Pointing the gate at an
+  unauthenticated role exits one and prints its operator message, so the shell guard reports the
+  failure rather than swallowing it.
+- **Four mutations, each detected.** Removing a shared statement from the gate, altering one byte of
+  the gate's read-back block, adding a statement that only succeeds on a new database, and removing
+  the standalone dispatch each fail a case. `init_database` is byte-identical to the last pre-work
+  commit, and so is every other function the script defines; the change is 74 added lines and no
+  modified line.
+- **The suite and style.** `python -m pytest tests/security -q` reports 957 passed, against 948
+  before this part of the pass. `flake8 .` across the backend reports the same 96 findings, and the
+  whole-tree finding profile still differs from the last pre-work commit only by the nine lines the
+  ingestion repair removed.
+
+### 48.13 Documents that publish a number, and documents that publish an address (QA-10, QA-11)
+
+| Decision | Alternatives considered | Rationale | Risk / residual gap |
+|---|---|---|---|
+| **DL-450** — Publish the same four credential-scan numbers in both operator documents and regenerate all four from the tree in a case that compares them against each document. | (a) Correct the numbers and leave them as prose. (b) Remove the numbers and describe the gate qualitatively. (c) Publish them in one document and cross-reference from the other. (d) Date the measurement instead of generating it. | The numbers were correct when written and the tree outgrew them, which is the whole failure mode of a published metric: a reader checking the gate reads the document rather than running it, so a stale number is worse than no number. Option (a) fixes today's value and guarantees tomorrow's drift — it is what produced this finding. Option (b) throws away the most useful thing the section says, which is that the gate reports zero against a pattern broad enough to match twenty-three lines. Option (c) leaves one document authoritative and the other paraphrasing, and the paraphrase is what drifts. Option (d) is what was there: a date makes the staleness attributable without preventing it. Generating each number from the workflow's own two expressions and comparing against both documents makes the drift a failing case instead of a reading error, and the comparison collapses whitespace so rewrapping a paragraph cannot break it. | The case pins four numbers, not the sentences around them, so a classification sentence beside them can still drift; the classification is stated by admitting rule and by directory, both re-derivable in one command, rather than by a list a reader must trust. Regenerating the counts walks every tracked file, which costs about a second. One line qualifies under two admitting rules, so the per-class counts sum to one more than the total — stated in both documents rather than quietly reconciled. Earlier passes' evidence sections still carry their own point-in-time counts; those are dated records of what was measured then, not current claims, and rewriting them would be falsifying a log. |
+| **DL-451** — Replace every non-resolving address rather than annotating it, pointing the specification snippets at the setting the shipped client already reads. | (a) Annotate each dead address as historical and leave it in place. (b) Substitute a currently documented provider endpoint. (c) Delete the snippets. (d) Add a licence file so the broken link resolves, and invent a maintainer contact. | Six addresses failed, and the three that matter most are inside snippets a reader would code against: the provider host does not resolve at all, so the specification instructs a reader to call something that does not exist. Option (a) preserves that instruction and adds a footnote to it. Option (b) requires guessing which endpoint replaced a retired API, and a guessed endpoint is a fabrication that looks authoritative; the honest substitute is the configuration value the implementation actually reads, which also makes the specification agree with the code instead of contradicting it. Option (c) removes the only worked examples the interface section carries. Option (d) is the tempting half of the README fix and is rejected on both halves: choosing a licence is the owner's decision and the MIT text needs a copyright holder, while a maintainer address cannot be supplied by anyone who does not have one — the same reason the security-reporting section of `SECURITY.md` states plainly that no contact is established. The two repository URLs become bracketed templates in the form `.env.example` already uses for a provider endpoint, so nothing on the page reads as a resolvable address. | The licence statement still names a licence the repository tracks no file for, and no maintainer contact is published; both gaps are now stated in the document rather than papered over with a link that fails. The reference-list entry points at a provider page outside this project's control, which can move like any external address — it is verified to answer today, and it is the provider's own entry point rather than a deep link, which is the form least likely to move. Removing the one placeholder assignment from the specification reduced the credential-scan match count by one, which is why the numbers `DL-450` publishes were taken after this change rather than before it. |
+
+### 48.14 Measured evidence for section 48.13
+
+- **Before, measured.** Both operator documents stated twenty-one matched lines and four marked lines.
+  The workflow's own two-stage gate, run verbatim over tracked content, reported twenty-four matched,
+  zero after the allow-list, seven marked, and nine marker occurrences.
+- **After, measured.** Both documents state twenty-four matched, zero left by the allow-list, eight
+  marked and ten marker occurrences, and a parametrized case regenerates all four and compares them
+  against each document. Two movements produced that total from the twenty-four the gate first
+  reported: the `QA-11` repair removed the one placeholder assignment the requirements document
+  carried, taking it to twenty-three, and committing the five new suites added one back. No line of
+  documentation matches the pattern any longer.
+- **The gate earned its place before the commit was an hour old.** The five security suites this pass
+  adds were untracked while they were being written, and both stages of gate one read tracked content
+  only, so nothing scanned them. The commit made them tracked, and the gate immediately reported one
+  line: a fixture row in the ingestion suite assigning a dummy value to the model's own
+  `hashed_password` column, matched by the lower-case branch of the pattern and admitted by no class.
+  Two independent cases caught it in the same run — the pre-existing zero-report case and the new
+  metric case — which is the difference between a gate and a claim. The line carries the reviewed-line
+  marker with a reason, in the form the seven fixtures before it use, and the pinned marker count moves
+  from seven to eight. Nothing about the finding was invisible to review; it was invisible to a scan
+  that cannot see an untracked file, which is why the check runs against the index rather than the
+  working tree.
+- **The metric case detects, proved three ways.** Changing one published match count fails the case for
+  that document only; changing one published marker count fails the other; planting an unadmitted
+  credential line in the tree fails both documents' cases and the gate's own passing case at the same
+  time. Each was reverted and the baseline re-run green.
+- **Every address, probed.** Before: the two repository URLs answered 404, `api.zillow.com` did not
+  resolve for any of its three paths, and the retired documentation page answered 403. After: every
+  external address in the three changed documents answers 200 — the provider's developer entry point,
+  the payment, cloud, language, framework, styling, accessibility and privacy references — and the two
+  remaining repository addresses are bracketed templates that are deliberately not addresses. A link
+  audit over all seven tracked Markdown documents reports zero broken relative links, checked against
+  both the filesystem and the index.
+- **The snippets are coherent.** All three provider snippets now reference the settings object and all
+  three import it, so no snippet names something it never obtained — the same defect class the gate
+  raised against the ingestion code in section 48.1.
+- **The two directions after the change.** An edge-set comparison reports 116 edges in Direction A and
+  116 non-exempt edges in Direction B with an empty difference both ways, against 111 and 111 before
+  it. The row count moves to 58 unique paths in 58 rows at 25 CREATE, 30 UPDATE and 3 REFERENCE, the
+  three added rows being the repository readme and the two specification documents, each recorded in
+  section 3.4 as an unplanned departure.
+- **The suite and style.** `python -m pytest tests/security -q` reports 959 passed, against 957 before
+  this part of the pass, and the same 959 after the marker correction above. `flake8 .` across the backend reports the same 96 findings, and the whole-tree
+  finding profile still differs from the last pre-work commit only by the nine lines the ingestion
+  repair removed.

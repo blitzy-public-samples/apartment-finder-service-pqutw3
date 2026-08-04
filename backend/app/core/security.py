@@ -3,19 +3,46 @@ from datetime import datetime, timedelta
 from typing import Optional
 from jose import jwt
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, Request, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi import Depends, HTTPException, status
+from fastapi.security import APIKeyCookie, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
 from backend.app.core.config import settings
 from backend.app.db.database import get_db
 from backend.app.db.models import User
 
 pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
-# SEC-06: optional header; a cookie-only request reaches the guard body
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token', auto_error=False)
 
 # SEC-06: session cookie name; the auth routes set and clear this cookie
 SESSION_COOKIE_NAME = "access_token"
+
+# QA-04: the two credential channels the guard actually accepts, published
+# under their real mechanisms. The pre-fix declaration advertised an OAuth2
+# password flow whose token URL resolves to no route, so a reader was
+# directed at an endpoint that answers 404 (CWE-1059). DL-441
+_COOKIE_DESCRIPTION = (
+    "Session cookie set by POST /auth/register and POST /auth/login and "
+    "cleared by POST /auth/logout. HttpOnly, so a browser sends it "
+    "automatically and script cannot read it. Read before the bearer header."
+)
+_BEARER_DESCRIPTION = (
+    "Bearer token for a non-browser client. Obtain it from the "
+    "access_token field of the POST /auth/login JSON response body. Used "
+    "only when no session cookie is present."
+)
+
+# SEC-06: both optional, so a cookie-only request reaches the guard body
+session_cookie_scheme = APIKeyCookie(
+    name=SESSION_COOKIE_NAME,
+    scheme_name="SessionCookie",
+    description=_COOKIE_DESCRIPTION,
+    auto_error=False,
+)
+bearer_scheme = HTTPBearer(
+    scheme_name="BearerToken",
+    description=_BEARER_DESCRIPTION,
+    auto_error=False,
+)
 
 # SEC-02: accepted sub claim - the canonical decimal spelling of a User.id,
 # bounded by the range the INTEGER primary key holds (CWE-287)
@@ -40,12 +67,12 @@ def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
     return encoded_jwt
 
 def get_current_user(
-    request: Request,
-    token: Optional[str] = Depends(oauth2_scheme),
+    session_cookie: Optional[str] = Depends(session_cookie_scheme),
+    bearer: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> User:
     # SEC-06: session cookie read before the bearer header
-    token = request.cookies.get(SESSION_COOKIE_NAME) or token
+    token = session_cookie or (bearer.credentials if bearer else None)
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

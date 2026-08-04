@@ -42,6 +42,11 @@ services:
       - ALGORITHM=${ALGORITHM:?set the token signing algorithm}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:?set the token lifetime in minutes}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:?set the JSON array of allowed origins}
+      # QA-03: the host names this stack answers on are fixed by this file -
+      # the healthcheck below probes localhost and the frontend service
+      # reaches the service name. Supplied as a literal for the same reason
+      # DB_SSLMODE is. DL-439
+      - ALLOWED_HOSTS=["localhost","127.0.0.1","backend"]
       - ZILLOW_API_URL=${ZILLOW_API_URL:?set the Zillow listings endpoint}
       - ZILLOW_API_KEY=${ZILLOW_API_KEY:?set the Zillow API key}
       - PAYPAL_CLIENT_ID=${PAYPAL_CLIENT_ID:?set the PayPal client identifier}

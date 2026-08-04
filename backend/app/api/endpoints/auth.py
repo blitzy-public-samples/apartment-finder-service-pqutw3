@@ -18,7 +18,13 @@ from backend.app.core.security import (
     verify_password,
 )
 from backend.app.db.database import get_db
-from backend.app.schema.user import UserCreate, UserLogin
+from backend.app.schema.user import (
+    LoginResponse,
+    LogoutResponse,
+    RegisterResponse,
+    UserCreate,
+    UserLogin,
+)
 from backend.app.db.models import User
 
 router = APIRouter()
@@ -205,7 +211,27 @@ def _clear_login_failures(*throttle_keys: str) -> None:
             _login_failures.pop(key, None)
 
 
+# QA-09: a response that mints or revokes a session must not be written to
+# any store between the server and the browser, so the bearer token in its
+# body and the cookie in its headers cannot be read back from a shared
+# cache or replayed from browser history (CWE-524, CWE-525). Pragma
+# accompanies it for an HTTP/1.0 intermediary. Applied to the token-bearing
+# routes only, so the public read path stays cacheable. DL-444
+_NO_STORE_HEADERS = (
+    ("Cache-Control", "no-store"),
+    ("Pragma", "no-cache"),
+)
+
+
+def _forbid_response_storage(response: Response) -> None:
+    # QA-09: marks one response uncacheable (CWE-524, CWE-525). DL-444
+    for name, value in _NO_STORE_HEADERS:
+        response.headers[name] = value
+
+
 def _set_session_cookie(response: Response, access_token: str) -> None:
+    # QA-09: the response carrying a new session is never stored. DL-444
+    _forbid_response_storage(response)
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=access_token,
@@ -218,6 +244,8 @@ def _set_session_cookie(response: Response, access_token: str) -> None:
 
 
 def _clear_session_cookie(response: Response) -> None:
+    # QA-09: the response revoking a session is never stored. DL-444
+    _forbid_response_storage(response)
     response.delete_cookie(
         key=SESSION_COOKIE_NAME,
         path=_SESSION_COOKIE_PATH,
@@ -226,7 +254,10 @@ def _clear_session_cookie(response: Response) -> None:
         samesite=_SESSION_COOKIE_SAMESITE,
     )
 
-@router.post('/register')
+# QA-06: publishes the frozen response body in the schema document.
+# Attached through `responses`, not `response_model`, so no key is
+# filtered out of the body this route already returns. DL-443
+@router.post('/register', responses={200: {"model": RegisterResponse}})
 def register_user(
     response: Response,
     user: UserCreate,
@@ -273,7 +304,10 @@ def register_user(
         "token_type": "bearer"
     }
 
-@router.post('/login')
+# QA-06: publishes the frozen response body in the schema document.
+# Attached through `responses`, not `response_model`, so no key is
+# filtered out of the body this route already returns. DL-443
+@router.post('/login', responses={200: {"model": LoginResponse}})
 @limiter.limit(LOGIN_RATE_LIMIT)
 def login_user(
     request: Request,
@@ -316,7 +350,10 @@ def login_user(
     }
 
 
-@router.post('/logout')
+# QA-06: publishes the frozen response body in the schema document.
+# Attached through `responses`, not `response_model`, so no key is
+# filtered out of the body this route already returns. DL-443
+@router.post('/logout', responses={200: {"model": LogoutResponse}})
 def logout_user(response: Response):
     # SEC-06: clears the session cookie server-side
     _clear_session_cookie(response)

@@ -305,7 +305,27 @@ CREDENTIAL_NEGATIVE_CONTROLS = (
 
 # The marker admitting one reviewed line, and how many lines carry it
 ALLOW_LIST_MARKER = "blitzy-scan" + "-allow"
-EXPECTED_ALLOW_LIST_COUNT = 7
+EXPECTED_ALLOW_LIST_COUNT = 8
+
+# SEC-01/Rule 1: the four gate-one numbers both operator documents publish,
+# each with the sentence shape it is published in. A remembered metric goes
+# stale silently, so each is regenerated from the tree and compared against
+# both documents. DL-450
+# Each expression is applied to the document with its whitespace collapsed,
+# so rewrapping a paragraph cannot break the comparison.
+PUBLISHED_SCAN_METRICS = (
+    ("matched", r"pattern matches \*\*(\d+) lines\*\*"),
+    ("reported", r"allow-list leaves \*\*(\d+)\*\*"),
+    (
+        "marked",
+        r"\*\*(\d+)\*\* of the matched lines carry the reviewed-line marker",
+    ),
+    ("markers", r"marker appears \*\*(\d+) times\*\* in tracked content"),
+)
+METRIC_DOCUMENTS = (
+    "SECURITY.md",
+    "documentation/security/traceability-matrix.md",
+)
 
 # One line per class the reviewed allow-list admits. Each is matched by the
 # scan and then dropped, so both halves of the gate are exercised.
@@ -375,7 +395,7 @@ TRACEABILITY_MATRIX = (
 )
 DIRECTION_B_HEADING = "## 2. Direction B"
 COVERAGE_HEADING = "## 3. Coverage reconciliation"
-DECLARED_MODE_COUNTS = {"CREATE": 20, "UPDATE": 25, "REFERENCE": 3}
+DECLARED_MODE_COUNTS = {"CREATE": 25, "UPDATE": 30, "REFERENCE": 3}
 CHANGE_STATUS_MODES = {"A": "CREATE", "M": "UPDATE", "D": "DELETE"}
 REMEDIATION_AUTHOR = "Blitzy Agent"
 
@@ -445,6 +465,31 @@ EFFECTIVE_PRIVILEGE_FAILURES = (
 
 # SEC-11: the owner role performs schema work
 OWNER_ROLE_GRANT = "GRANT CREATE, USAGE ON SCHEMA public TO app_owner;"
+
+# SEC-11: the re-runnable gate. init_database provisions a new database and
+# stops at its createdb guard when one is already present, so the revokes
+# never reach a database provisioned before they were written. This function
+# applies them against an existing database and reads the effective access
+# lists back. DL-449
+PRIVILEGE_GATE = "enforce_database_privileges"
+PRIVILEGE_GATE_BATCH = "ACL"
+PRIVILEGE_GATE_INVOCATION = "psql -v ON_ERROR_STOP=1 -d dbname"
+PRIVILEGE_GATE_STANDALONE = 'if [ -n "${ENFORCE_DATABASE_PRIVILEGES_ONLY:-}" ]'
+PRIVILEGE_GATE_STEP = "enforce_database_privileges || exit 1"
+
+# SEC-11: statements that provision state rather than constrain it. Each is
+# correct once, on a database that does not exist yet, and raises on a rerun,
+# so the gate carries none of them. DL-449
+NON_RERUNNABLE_SQL = ("CREATE ROLE", "ALTER DATABASE", "ALTER SCHEMA")
+
+# SEC-11: the gate removes an explicit grant of the two privileges the
+# application role must never hold, not only PUBLIC's default grant of them,
+# so a privilege granted directly to the role is corrected rather than merely
+# reported. DL-449
+PRIVILEGE_GATE_REVOKES = (
+    "REVOKE TEMPORARY ON DATABASE dbname FROM app_user;",
+    "REVOKE CREATE ON SCHEMA public FROM app_user;",
+)
 
 # SEC-11: privileges no provisioning statement may confer
 FORBIDDEN_PROVISIONING_SQL = (
@@ -677,6 +722,7 @@ def valid_settings_kwargs(**overrides):
         "PAYPAL_CLIENT_ID": "guard-paypal-client-id",
         "PAYPAL_CLIENT_SECRET": "guard-paypal-token",
         "ALLOWED_ORIGINS": ["https://app.example.com"],
+        "ALLOWED_HOSTS": ["api.example.com"],
         "SENDGRID_API_KEY": "guard-sendgrid-key",
         "FROM_EMAIL": "guard@example.com",
         "ZILLOW_API_URL": "https://api.example.com/v1",
@@ -1814,6 +1860,42 @@ def _reported_credential_lines():
     return reported
 
 
+def _credential_scan_metrics():
+    """Return gate one's four counts, generated from the tracked tree.
+
+    Both stages are read out of the workflow, so the numbers describe the
+    gate the pipeline runs rather than a copy of it. DL-450
+    """
+    pattern = _credential_scan_pattern()
+    allowed = _credential_allow_list_pattern()
+    counts = {"matched": 0, "reported": 0, "marked": 0, "markers": 0}
+
+    for path in _tracked_files():
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, FileNotFoundError):
+            # the workflow passes -I, which skips binary content likewise
+            continue
+        for line in content.splitlines():
+            if ALLOW_LIST_MARKER in line:
+                counts["markers"] += 1
+            if not pattern.search(line):
+                continue
+            counts["matched"] += 1
+            if ALLOW_LIST_MARKER in line:
+                counts["marked"] += 1
+            if not allowed.search(line):
+                counts["reported"] += 1
+    return counts
+
+
+def _collapsed(path):
+    """Return one document's text with its whitespace collapsed."""
+    document = REPOSITORY_ROOT / path
+    assert document.is_file(), document
+    return re.sub(r"\s+", " ", document.read_text(encoding="utf-8"))
+
+
 def _tracked_files():
     """Return every path the repository tracks."""
     listed = subprocess.run(
@@ -1875,6 +1957,36 @@ def test_the_credential_scan_reports_nothing_across_tracked_content():
     without editing this case.
     """
     assert not _reported_credential_lines()
+
+
+# SEC-01/Rule 1: a published metric is generated, not remembered. DL-450
+@pytest.mark.parametrize("path", METRIC_DOCUMENTS)
+def test_the_published_scan_metrics_match_the_tree(path):
+    """Both operator documents publish gate one's measured counts.
+
+    Every number is regenerated here from the tracked tree using the
+    workflow's own pattern and allow-list, then compared against what the
+    document states. A metric that goes stale as the tree grows is worse
+    than no metric, because a reader checking the gate reads the document
+    rather than running it. DL-450
+    """
+    measured = _credential_scan_metrics()
+    document = _collapsed(path)
+
+    for name, expression in PUBLISHED_SCAN_METRICS:
+        published = re.findall(expression, document)
+        assert len(published) == 1, (path, name, published)
+        assert int(published[0]) == measured[name], (
+            path,
+            name,
+            published[0],
+            measured[name],
+        )
+
+    # the gate's own passing direction, stated as a number rather than
+    # implied by the absence of one
+    assert measured["reported"] == 0, measured
+    assert measured["marked"] == EXPECTED_ALLOW_LIST_COUNT, measured
 
 
 # SEC-01: the reviewed allow-list stays small and stays out of the source
@@ -2378,6 +2490,28 @@ def _provisioning_verification():
     return batch[batch.index(EFFECTIVE_PRIVILEGE_BLOCK):]
 
 
+def _privilege_gate_batch():
+    """Return the batch the re-runnable privilege gate sends to psql.
+
+    The gate pipes its here-document directly into psql, so the opening
+    line carries the pipeline as well as the delimiter. DL-449
+    """
+    body = _shell_function(PRIVILEGE_GATE)
+    opened = "cat <<'{0}'".format(PRIVILEGE_GATE_BATCH)
+    assert body.count(opened) == 1, opened
+    batch = body[body.index(opened):]
+    batch = batch[batch.index("\n") + 1:]
+    return batch[:batch.index("\n{0}\n".format(PRIVILEGE_GATE_BATCH))]
+
+
+def _privilege_gate_statements():
+    """Return the gate's privilege statements, one per line."""
+    batch = _privilege_gate_batch()
+    assert EFFECTIVE_PRIVILEGE_BLOCK in batch, EFFECTIVE_PRIVILEGE_BLOCK
+    opened = batch.index(EFFECTIVE_PRIVILEGE_BLOCK)
+    return [line for line in batch[:opened].splitlines() if line.strip()]
+
+
 # SEC-11: the application role reaches table data and nothing else
 def test_the_application_role_is_granted_data_access_only():
     """Every privilege the application role receives is a data operation.
@@ -2481,6 +2615,128 @@ def test_the_provisioning_batch_verifies_the_effective_privileges():
     body = _shell_function("init_database")
     assert PSQL_INVOCATION in body
     assert GRANT_BATCH_STATUS in body
+
+
+# SEC-11: an existing database is gated on its effective ACLs. DL-449
+def test_the_privilege_gate_runs_against_a_database_that_already_exists():
+    """The gate is re-runnable and aborts on the state the server reports.
+
+    init_database creates a database and stops at its createdb guard when
+    one is already present, so its revokes never reach a database
+    provisioned before they were written. The gate carries no statement
+    that only succeeds once, sends its batch under the stop-on-error
+    setting, and returns on a failure rather than reporting success.
+    DL-449
+    """
+    body = _shell_function(PRIVILEGE_GATE)
+    statements = _privilege_gate_statements()
+
+    # every statement is safe to reissue against a populated database
+    assert statements
+    for statement in statements:
+        assert not statement.startswith(NON_RERUNNABLE_SQL), statement
+        assert statement.startswith(("REVOKE", "GRANT", "ALTER DEFAULT")), (
+            statement
+        )
+
+    # the batch reads the catalog back, and closes
+    batch = _privilege_gate_batch()
+    assert EFFECTIVE_PRIVILEGE_BLOCK in batch
+    assert batch.index(EFFECTIVE_PRIVILEGE_BLOCK) > batch.index(
+        DATABASE_REVOKED_FROM_PUBLIC
+    )
+    assert batch.rstrip().endswith("$$;"), batch[-80:]
+
+    # a raise inside the block reaches the shell, which returns
+    assert PRIVILEGE_GATE_INVOCATION in body
+    assert GRANT_BATCH_STATUS in body
+    failing = body[body.index(GRANT_BATCH_STATUS):]
+    assert "return 1" in failing[:failing.index("\n    fi")], failing
+
+
+# SEC-11: one definition of least privilege, not two. DL-449
+def test_the_privilege_gate_and_the_provisioning_batch_cannot_drift():
+    """Both batches constrain the same roles with the same statements.
+
+    Every statement init_database sends that constrains PUBLIC or the
+    application role is sent by the gate as well, and both end with the
+    same verification block, so tightening one cannot leave the other
+    behind. DL-449
+    """
+    provisioned = _provisioning_statements()
+    gated = _privilege_gate_statements()
+
+    constraining = [
+        line
+        for line in provisioned
+        if ("PUBLIC" in line or "app_user" in line)
+        and not line.startswith(NON_RERUNNABLE_SQL)
+    ]
+    assert constraining
+    for statement in constraining:
+        assert statement in gated, statement
+
+    # the gate adds only the direct revokes, and nothing else
+    assert [line for line in gated if line not in provisioned] == list(
+        PRIVILEGE_GATE_REVOKES
+    )
+
+    # the read-back is one block of bytes, shared verbatim
+    assert _privilege_gate_batch()[
+        _privilege_gate_batch().index(EFFECTIVE_PRIVILEGE_BLOCK):
+    ] == _provisioning_verification()
+
+
+# SEC-11: the gate confers nothing, and discloses nothing. DL-449
+@pytest.mark.parametrize("privilege", FORBIDDEN_PROVISIONING_SQL)
+def test_the_privilege_gate_confers_no_broad_privilege(privilege):
+    """The gate carries no broad grant, and no role password.
+
+    The gate runs with the authority to change access lists, so the same
+    prohibitions the provisioning batch is held to apply to it. DL-449
+    """
+    batch = _privilege_gate_batch()
+
+    assert privilege.upper() not in batch.upper(), privilege
+    assert SQL_PASSWORD_LITERAL.search(batch) is None, batch
+    assert [
+        line
+        for line in _privilege_gate_statements()
+        if line.startswith("GRANT") and "PUBLIC" in line
+    ] == []
+
+
+# SEC-11: the gate is reachable both ways. DL-449
+def test_the_privilege_gate_is_reachable_standalone_and_in_a_run():
+    """A deployment can gate on the ACLs without reprovisioning.
+
+    The standalone branch runs the gate and nothing else, so an existing
+    database is verified without the steps that refuse to reprovision it.
+    A full run reaches the gate as its closing privilege step, and the
+    four ordered steps are unchanged. DL-449
+    """
+    body = _shell_function("main")
+
+    # the standalone branch runs the gate alone and ends the run on failure
+    assert body.count(PRIVILEGE_GATE_STANDALONE) == 1
+    branch = body[body.index(PRIVILEGE_GATE_STANDALONE):]
+    branch = branch[:branch.index("\n    fi")]
+    assert "if ! {0}; then".format(PRIVILEGE_GATE) in branch, branch
+    assert "exit 1" in branch, branch
+    assert "return 0" in branch, branch
+    assert body.index(PRIVILEGE_GATE_STANDALONE) < body.index(
+        PROVISIONING_ORDER[0]
+    )
+
+    # a full run ends its privilege work on the gate
+    assert body.count(PRIVILEGE_GATE_STEP) == 1
+    assert body.index(PROVISIONING_ORDER[-1]) < body.index(
+        PRIVILEGE_GATE_STEP
+    )
+
+    # the script still runs main with no arguments, the form the harness
+    # strips when it sources the script for the guards above
+    assert _provisioning_source().endswith("\nmain\n")
 
 
 # SEC-11: no provisioning statement confers a broad privilege

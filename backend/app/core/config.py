@@ -136,6 +136,24 @@ def _is_valid_origin(origin: str) -> bool:
     return origin == "{0}://{1}".format(parts.scheme, serialized)
 
 
+def _is_bare_host(host: str) -> bool:
+    # QA-03: accepts the host a browser sends with nothing else attached - a
+    # DNS name or an IPv4 literal, in printable lowercase ASCII. The Host
+    # header is compared with everything from its first colon removed, so an
+    # entry carrying a port, or a bracketed IPv6 literal, could never match
+    # and is refused at startup rather than at request time (CWE-20,
+    # CWE-350). DL-439
+    if not host or not host.isascii():
+        return False
+    if any(c.isspace() or not c.isprintable() for c in host):
+        return False
+    if host != host.lower():
+        return False
+    if any(c in host for c in "*@:/?#[]\\"):
+        return False
+    return _is_valid_host(host)
+
+
 class Settings(BaseSettings):
     DATABASE_URL: str
     # SEC-12: character floor on the HMAC signing key; the byte floor per
@@ -151,6 +169,11 @@ class Settings(BaseSettings):
 
     # SEC-03: fail-closed origin allow-list; required, no default
     ALLOWED_ORIGINS: List[str]
+
+    # QA-03: fail-closed Host allow-list; required, no default. The
+    # compensating control for PYSEC-2026-161 reads this list (CWE-20,
+    # CWE-350). DL-439
+    ALLOWED_HOSTS: List[str]
 
     # SEC-09: payment environment domain
     PAYPAL_MODE: str = "sandbox"
@@ -223,6 +246,26 @@ class Settings(BaseSettings):
                     "present, a non-default port in 1-65535, with no "
                     "userinfo, path, query or fragment, "
                     f"got: {origin!r}"
+                )
+        return value
+
+    @validator("ALLOWED_HOSTS")
+    def validate_allowed_hosts(cls, value):
+        # QA-03: rejects an empty allow-list, the wildcard in any form and
+        # any entry that is not a bare host. A pattern entry would make the
+        # comparison a suffix test rather than an equality test, which is
+        # the bypass OWASP names for an unanchored match (CWE-20, CWE-350)
+        if not value:
+            raise ValueError(
+                "ALLOWED_HOSTS must contain at least one host"
+            )
+        for host in value:
+            if not _is_bare_host(host):
+                raise ValueError(
+                    "ALLOWED_HOSTS entries must be lowercase bare hosts "
+                    "carrying no wildcard, scheme, userinfo, port, path, "
+                    "query or fragment, each a valid DNS name or IPv4 "
+                    f"literal, got: {host!r}"
                 )
         return value
 

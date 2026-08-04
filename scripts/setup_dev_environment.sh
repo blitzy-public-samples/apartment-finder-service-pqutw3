@@ -306,6 +306,67 @@ SQL
     echo "Local database initialized."
 }
 
+# SEC-11: re-runnable privilege enforcement for a database that already
+# exists. init_database stops at its createdb guard when the database is
+# present, so a database provisioned before these revokes were written keeps
+# the CONNECT and TEMPORARY that PostgreSQL grants PUBLIC by default
+# (CWE-250, CWE-269)
+# SEC-11: the batch reapplies the revokes and then reads the effective access
+# lists back, so a deployment gates on the state the server reports rather
+# than on the statements it was sent (CWE-269)
+enforce_database_privileges() {
+    echo "Enforcing least-privilege database access..."
+
+    cat <<'ACL' | psql -v ON_ERROR_STOP=1 -d dbname
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE CONNECT, TEMPORARY ON DATABASE dbname FROM PUBLIC;
+REVOKE TEMPORARY ON DATABASE dbname FROM app_user;
+REVOKE CREATE ON SCHEMA public FROM app_user;
+GRANT CONNECT ON DATABASE dbname TO app_user;
+GRANT USAGE ON SCHEMA public TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO app_user;
+DO $$
+DECLARE
+    held text;
+BEGIN
+    SELECT string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type) INTO held
+      FROM pg_database d, aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) a
+     WHERE d.datname = current_database() AND a.grantee = 0;
+    IF held IS NOT NULL THEN
+        RAISE EXCEPTION 'PUBLIC still holds % on database %', held, current_database();
+    END IF;
+    SELECT string_agg(a.privilege_type, ', ' ORDER BY a.privilege_type) INTO held
+      FROM pg_namespace n, aclexplode(coalesce(n.nspacl, acldefault('n', n.nspowner))) a
+     WHERE n.nspname = 'public' AND a.grantee = 0 AND a.privilege_type <> 'USAGE';
+    IF held IS NOT NULL THEN
+        RAISE EXCEPTION 'PUBLIC still holds % on schema public', held;
+    END IF;
+    IF NOT has_database_privilege('app_user', current_database(), 'CONNECT') THEN
+        RAISE EXCEPTION 'app_user cannot connect to %', current_database();
+    END IF;
+    IF has_database_privilege('app_user', current_database(), 'TEMPORARY') THEN
+        RAISE EXCEPTION 'app_user retains TEMPORARY on %', current_database();
+    END IF;
+    IF has_schema_privilege('app_user', 'public', 'CREATE') THEN
+        RAISE EXCEPTION 'app_user retains CREATE on schema public';
+    END IF;
+    IF NOT has_schema_privilege('app_user', 'public', 'USAGE') THEN
+        RAISE EXCEPTION 'app_user cannot use schema public';
+    END IF;
+END
+$$;
+ACL
+    if [ "${PIPESTATUS[1]}" -ne 0 ]; then
+        echo "The effective database privileges are not the least-privilege set. Read the message above, correct the grant it names, then rerun." >&2
+        return 1
+    fi
+
+    echo "Least-privilege database access enforced and verified."
+}
+
 # Run initial data migrations
 run_migrations() {
     echo "Running initial data migrations..."
@@ -319,6 +380,16 @@ run_migrations() {
 
 # Main execution
 main() {
+    # SEC-11: the privilege gate runs on its own against a database that
+    # already exists, which the steps below refuse to reprovision
+    # (CWE-250, CWE-269)
+    if [ -n "${ENFORCE_DATABASE_PRIVILEGES_ONLY:-}" ]; then
+        if ! enforce_database_privileges; then
+            exit 1
+        fi
+        return 0
+    fi
+
     check_software
     # SEC-11: prepares the interpreter the owner bootstrap needs before the
     # credential and database steps
@@ -327,6 +398,9 @@ main() {
     # SEC-01/SEC-11: a failed credential or role provisioning step stops the run
     configure_env_vars || exit 1
     init_database || exit 1
+    # SEC-11: a provisioning run ends on the effective access lists the
+    # server reports, whether or not it created the database (CWE-269)
+    enforce_database_privileges || exit 1
     run_migrations
     
     echo "Development environment setup completed successfully!"
