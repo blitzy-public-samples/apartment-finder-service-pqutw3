@@ -907,6 +907,8 @@ Example of interfacing with Zillow API using Python:
 import requests
 from google.cloud import secretmanager
 
+from backend.app.core.config import settings
+
 def get_zillow_api_key():
     client = secretmanager.SecretManagerServiceClient()
     name = f"projects/your-project-id/secrets/zillow-api-key/versions/latest"
@@ -915,7 +917,9 @@ def get_zillow_api_key():
 
 def fetch_listings(zip_code):
     api_key = get_zillow_api_key()
-    url = f"https://api.zillow.com/v2/search"
+    # The endpoint is configuration, not a literal: the provider host this
+    # document was drafted against no longer resolves.
+    url = settings.ZILLOW_API_URL
     params = {
         "zip": zip_code,
         "status": "for_rent",
@@ -1025,9 +1029,14 @@ These external interfaces provide a comprehensive overview of how the apartment 
 
 ### ADDITIONAL REFERENCES
 
-1. Zillow API Documentation
-   - URL: https://www.zillow.com/howto/api/APIOverview.htm
-   - Description: Official documentation for integrating with Zillow's API
+1. Zillow developer resources
+   - URL: https://www.zillowgroup.com/developers/
+   - Description: The provider's own developer entry point, and the only Zillow
+     address in this document that resolves. The public listings API this
+     specification was drafted against has been retired: its documentation page
+     no longer serves, and `api.zillow.com` does not resolve at all. The endpoint
+     the implementation calls is therefore supplied by the `ZILLOW_API_URL`
+     setting rather than taken from a documented host
 
 2. PayPal Developer Documentation
    - URL: https://developer.paypal.com/docs/
@@ -1102,12 +1111,16 @@ export default Button;
 import requests
 from google.cloud import storage
 
+from backend.app.core.config import settings
+
 def fetch_and_store_listings(zip_code: str, bucket_name: str):
     """
     Fetches listings from Zillow API and stores them in Google Cloud Storage.
     """
-    api_key = "YOUR_ZILLOW_API_KEY"
-    url = f"https://api.zillow.com/webservice/GetSearchResults.htm?zws-id={api_key}&address={zip_code}"
+    # Both the key and the endpoint come from configuration. The provider host
+    # this document was drafted against no longer resolves.
+    api_key = settings.ZILLOW_API_KEY
+    url = f"{settings.ZILLOW_API_URL}?zws-id={api_key}&address={zip_code}"
     
     response = requests.get(url)
     if response.status_code == 200:

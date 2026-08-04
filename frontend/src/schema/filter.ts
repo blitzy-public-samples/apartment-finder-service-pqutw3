@@ -1,22 +1,43 @@
-interface ZipCode {
+export interface ZipCode {
   code: string;
 }
 
-interface Criteria {
+export interface Criteria {
   field: string;
   operator: string;
   value: string;
 }
 
-interface Filter {
-  id: string;
-  userId: string;
+// The body GET /filters/ and POST /filters/ serve, exactly as
+// backend/app/schema/filter.py declares it: integer key and foreign key,
+// snake_case names, and ISO-8601 date-time strings.
+export interface Filter {
+  id: number;
+  user_id: number;
   name: string;
-  createdAt: Date;
-  lastUsed: Date;
-  zipCodes: ZipCode[];
+  created_at: string;
+  last_used: string | null;
+  zip_codes: ZipCode[];
   criteria: Criteria[];
 }
 
-// HUMAN ASSISTANCE NEEDED
-// Please review the Filter interface to ensure all properties are correctly defined and no additional properties are needed for production use.
+// SEC-05: the writable-field allow-list POST /filters/ accepts. Any other
+// key is refused with 422. The server owns id, user_id, created_at and
+// last_used. zip_codes is not writable through this endpoint either, and no
+// code path populates it, so Filter.zip_codes always arrives empty.
+export interface FilterCreate {
+  name: string;
+  criteria: Criteria[];
+}
+
+// The value the filter form holds while a user edits it. It is a UI model,
+// not a wire body: criteria arrive keyed by input name in camelCase, and the
+// zip-code field is a plain list of strings. frontend/src/services/api.ts
+// maps it to FilterCreate; nothing sends this shape to the server. The
+// mapping drops zipCodes, which the form collects but no request body
+// carries and no server field stores.
+export interface FilterFormValue {
+  name?: string;
+  zipCodes?: string[];
+  criteria: Record<string, string | number> | Criteria[];
+}

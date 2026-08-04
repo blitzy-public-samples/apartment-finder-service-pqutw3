@@ -38,9 +38,15 @@ The data subscriber is implemented using Python, leveraging its robust libraries
 import requests
 from google.cloud import sql
 
+from backend.app.core.config import settings
+
 def fetch_zillow_data():
-    # Fetch data from Zillow API
-    response = requests.get('https://api.zillow.com/listings', params={'api_key': 'YOUR_API_KEY'})
+    # Fetch data from Zillow API. The endpoint and the key are configuration,
+    # never literals: the provider host this document was drafted against no
+    # longer resolves, and a hardcoded host cannot be rotated.
+    response = requests.get(
+        settings.ZILLOW_API_URL, params={'api_key': settings.ZILLOW_API_KEY}
+    )
     return response.json()
 
 def process_listing(listing):

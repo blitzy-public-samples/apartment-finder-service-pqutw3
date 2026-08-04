@@ -21,17 +21,146 @@ jobs:
     - name: Set up Node.js
       uses: actions/setup-node@v2
       with:
-        node-version: '14'
+        # Lowest platform-permitted Node line that builds the pinned
+        # frontend toolchain
+        node-version: '22'
 
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r backend/requirements.txt
 
+    - name: Audit Python dependencies
+      id: dependency_audit
+      continue-on-error: true
+      run: |
+        set -euo pipefail
+        # CWE-1104: dependency advisory gate; the register and the
+        # reachability assessment sit in
+        # documentation/security/decision-log.md section 2.2
+        pip freeze > /tmp/frozen.txt
+        # CWE-1104: suppression register staleness check;
+        # documentation/security/decision-log.md section 20. Both sets are
+        # read in either namespace: the report's own identifier and its
+        # aliases. The expression is assembled from two fragments. DL-373
+        pip-audit --no-deps -r /tmp/frozen.txt --format json \
+          --output /tmp/audit-report.json || true
+        python - <<'PY'
+        import json
+        import re
+        import sys
+
+        NAMESPACES = r"(PYSEC-[0-9]{4}-[0-9]+|GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})"
+        with open(".github/workflows/ci.yml", encoding="utf-8") as handle:
+            workflow = handle.read()
+        declared = set(re.findall("--ignore" + r"-vuln +" + NAMESPACES, workflow))
+
+        with open("/tmp/audit-report.json", encoding="utf-8") as handle:
+            report = json.load(handle)
+        reported = set()
+        for dependency in report.get("dependencies", []):
+            for advisory in dependency.get("vulns", []):
+                identifier = advisory.get("id")
+                if identifier:
+                    reported.add(identifier)
+                reported.update(advisory.get("aliases") or [])
+
+        print("declared suppression identifiers: {0}".format(len(declared)))
+        print("reported identifiers and aliases: {0}".format(len(reported)))
+        stale = sorted(declared - reported)
+        if stale:
+            print("stale suppressions: " + ", ".join(stale), file=sys.stderr)
+            sys.exit(1)
+        PY
+        pip-audit --strict --no-deps -r /tmp/frozen.txt \
+          --ignore-vuln PYSEC-2026-1325 --ignore-vuln PYSEC-2026-2132 \
+          --ignore-vuln PYSEC-2026-161  --ignore-vuln PYSEC-2026-248 \
+          --ignore-vuln PYSEC-2026-249  --ignore-vuln PYSEC-2026-2280 \
+          --ignore-vuln PYSEC-2026-2281 --ignore-vuln PYSEC-2026-2275 \
+          --ignore-vuln PYSEC-2026-141  --ignore-vuln PYSEC-2026-142 \
+          --ignore-vuln PYSEC-2026-1374 --ignore-vuln PYSEC-2026-1375 \
+          --ignore-vuln PYSEC-2026-1845 --ignore-vuln PYSEC-2026-2270 \
+          --ignore-vuln GHSA-6v7p-g79w-8964
+
+    # SEC-01, SEC-12: credential scan over tracked content, this workflow
+    # included. An assignment matches with or without spaces around the
+    # separator and with or without a quote. Bracket expressions keep the
+    # pattern off its own line: [:] matches a colon, [W] a W, [w] a w.
+    # DL-373
+    - name: Scan for hardcoded credentials
+      run: |
+        status=0
+        git grep -In -E "postgres[:]postgres|PASS[W]ORD +'[^']+'|pass[w]ord@|postgres[:][A-Za-z0-9+/_-]+@|SECRET_KEY[A-Z_]*[ ]*=[ ]*[\"'-]?[A-Za-z0-9_+/]|[A-Z_]*(PASS[W]ORD|API_KEY|ACCESS_KEY|ACCESS_KEY_ID|CLIENT_SECRET|PRIVATE_KEY)[A-Z_]*[ ]*=[ ]*[\"']?[-A-Za-z0-9+/]|[a-z_]*(pass[w]ord|api_key|access_key|client_secret|private_key|secret_key)[a-z_]*[ ]*=[ ]*[\"'][^\"']|-----BEGIN [A-Z ]*PRIVATE KEY-----" > /tmp/credential-matches.txt || status=$?
+        if [ "$status" -gt 1 ]; then
+          echo "SEC-01: credential scan exited $status" >&2
+          exit 1
+        fi
+        # SEC-01: the reviewed allow-list. A value read from configuration, a
+        # policy bound and an upper-case placeholder token are not
+        # credentials; a line carrying the blitzy-scan-allow marker has been
+        # reviewed and is recorded in documentation/security/decision-log.md
+        grep -vE "blitzy-scan-allow|=[ ]*(settings|os|var|process|self)\.|(MIN_LENGTH|MAX_BYTES|UPPERCASE|LOWERCASE|DIGITS|SPECIAL_CHARACTERS|_VARIABLE|_ARGUMENT|_FIELD|_LITERAL|_REFERENCE|_PATTERN)[ ]*=|=[ ]*[\"'][A-Z_]+[\"']" /tmp/credential-matches.txt > /tmp/credential-scan.txt || true
+        if [ -s /tmp/credential-scan.txt ]; then
+          # CWE-532: path and line only; matched content stays out of the log
+          cut -d: -f1,2 /tmp/credential-scan.txt
+          echo "SEC-01: credential pattern present at the paths above" >&2
+          exit 1
+        fi
+        echo "SEC-01: credential scan clean"
+
+    # SEC-09: frontend client-secret guard; only the location of a match is
+    # printed (CWE-532)
+    - name: Scan frontend for client secrets
+      run: |
+        status=0
+        grep -rIn -iE "client[_-]?secret|paypal[_-]?secret" frontend/ \
+          --exclude-dir=node_modules --exclude-dir=build \
+          --exclude-dir=coverage > /tmp/client-secret-scan.txt || status=$?
+        if [ "$status" -eq 0 ]; then
+          # CWE-532: path and line only; matched content stays out of the log
+          cut -d: -f1,2 /tmp/client-secret-scan.txt
+          echo "SEC-09: client-secret pattern present at the paths above" >&2
+          exit 1
+        fi
+        if [ "$status" -ne 1 ]; then
+          echo "SEC-09: client-secret scan exited $status" >&2
+          exit 1
+        fi
+        echo "SEC-09: client-secret scan clean"
+
+    # SEC-06: browser-storage guard
+    - name: Scan frontend for browser token storage
+      run: |
+        status=0
+        grep -rIn -E "localStorage|sessionStorage|indexedDB|Storage\.prototype|document\.cookie|window\.name" frontend/ \
+          --exclude-dir=node_modules --exclude-dir=build \
+          --exclude-dir=coverage > /tmp/browser-storage-scan.txt || status=$?
+        if [ "$status" -eq 0 ]; then
+          # CWE-532: path and line only; matched content stays out of the log
+          cut -d: -f1,2 /tmp/browser-storage-scan.txt
+          echo "SEC-06: browser storage present at the paths above" >&2
+          exit 1
+        fi
+        if [ "$status" -ne 1 ]; then
+          echo "SEC-06: browser-storage scan exited $status" >&2
+          exit 1
+        fi
+        echo "SEC-06: browser-storage scan clean"
+
+    # SEC-02 to SEC-12: the security regression suite; runs regardless of an
+    # earlier step's exit status
+    - name: Run backend security tests
+      if: always()
+      run: |
+        cd backend
+        python -m pytest tests/security -q
+
+    # The install resolves from the manifest alone; no lock file is
+    # tracked. DL-373
     - name: Install Node.js dependencies
       run: |
         cd frontend
-        npm ci
+        npm install --no-audit --no-fund
 
     - name: Run ESLint
       run: |
@@ -48,10 +177,15 @@ jobs:
         cd frontend
         npm test -- --coverage
 
+    # Known non-zero baseline: three legacy test modules fail to import, so
+    # this step reports three collection errors and still runs the rest.
+    # documentation/security/decision-log.md records the disposition.
     - name: Run backend unit tests
+      if: always()
       run: |
         cd backend
-        python -m pytest --cov=./ --cov-report=xml
+        python -m pytest --cov=./ --cov-report=xml \
+          --continue-on-collection-errors
 
     - name: Run integration tests
       run: |
@@ -70,3 +204,10 @@ jobs:
       with:
         name: backend-coverage
         path: backend/coverage.xml
+
+    # CWE-1104: job-level enforcement of the dependency advisory gate;
+    # documentation/security/decision-log.md section 20
+    - name: Enforce dependency audit result
+      if: always()
+      run: |
+        if [ "${{ steps.dependency_audit.outcome }}" != "success" ]; then exit 1; fi

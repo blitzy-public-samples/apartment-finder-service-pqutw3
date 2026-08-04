@@ -1,0 +1,17 @@
+# Version control metadata
+.git/
+
+# Environment files
+**/.env
+**/.env.tmp.*
+
+# Credentials, certificates, and keys
+**/secrets/
+**/*.pem
+**/*.key
+**/*credentials*.json
+
+# Node and build artifacts
+**/node_modules/
+build/
+coverage/

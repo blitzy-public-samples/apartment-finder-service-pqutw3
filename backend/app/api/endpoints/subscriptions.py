@@ -21,7 +21,13 @@ async def create_subscription(
         raise HTTPException(status_code=400, detail="Invalid subscription data")
 
     # Process payment through PayPal
-    payment_successful = await process_payment(subscription.payment_method, subscription.amount)
+    # SEC-09: binds the requested plan to the charge; a reusable agreement
+    # authorizes only the plan the request names (CWE-863)
+    payment_successful = await process_payment(
+        subscription.payment_method,
+        subscription.amount,
+        plan_id=subscription.plan_id,
+    )
     if not payment_successful:
         raise HTTPException(status_code=400, detail="Payment processing failed")
 

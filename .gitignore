@@ -1,0 +1,32 @@
+# Environment files
+.env
+.env.tmp.*
+
+# Credentials, certificates, and keys
+secrets/
+*.pem
+*.key
+*credentials*.json
+
+# SEC-01, SEC-11: Terraform state, plan and variable files. DL-371
+.terraform/
+.terraform.tfstate.lock.info
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+crash.log
+crash.*.log
+
+# Build, cache, and coverage artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+.venv/
+node_modules/
+/frontend/build/
+/frontend/coverage/

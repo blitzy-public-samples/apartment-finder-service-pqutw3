@@ -4,15 +4,20 @@ services:
   frontend:
     build:
       context: ../../frontend
-      dockerfile: Dockerfile
+      # the image definition lives beside this file, not in the context
+      dockerfile: ../infrastructure/docker/Dockerfile.frontend
+      args:
+        # SEC-12: build-time only. The :? form fails the build on an
+        # unset or empty value. DL-367
+        - REACT_APP_API_BASE_URL=${REACT_APP_API_BASE_URL:?set the API origin the bundle calls}
+        - REACT_APP_PAYPAL_CLIENT_ID=${REACT_APP_PAYPAL_CLIENT_ID:?set the public PayPal client identifier}
     ports:
       - "80:80"
     depends_on:
       - backend
-    environment:
-      - REACT_APP_API_URL=http://backend:5000
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      # probe program: busybox wget, present in this base image. DL-367
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:80/"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -21,16 +26,42 @@ services:
   backend:
     build:
       context: ../../backend
-      dockerfile: Dockerfile
+      # the image definition lives beside this file, not in the context
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
     ports:
-      - "5000:5000"
+      - "8000:8000"
     depends_on:
       - db
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/myapp
-      - JWT_SECRET=${JWT_SECRET}
+      # SEC-01/SEC-12: every setting Settings declares without a default,
+      # each in the :? form, which fails the container start on an unset
+      # value. DL-367
+      - DATABASE_URL=${DATABASE_URL:?set the application database URL}
+      # SEC-01: backend reads SECRET_KEY
+      - SECRET_KEY=${SECRET_KEY:?set the token signing key, 32 characters or more}
+      - ALGORITHM=${ALGORITHM:?set the token signing algorithm}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:?set the token lifetime in minutes}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:?set the JSON array of allowed origins}
+      # QA-03: the host names this stack answers on are fixed by this file -
+      # the healthcheck below probes localhost and the frontend service
+      # reaches the service name. Supplied as a literal for the same reason
+      # DB_SSLMODE is. DL-439
+      - ALLOWED_HOSTS=["localhost","127.0.0.1","backend"]
+      - ZILLOW_API_URL=${ZILLOW_API_URL:?set the Zillow listings endpoint}
+      - ZILLOW_API_KEY=${ZILLOW_API_KEY:?set the Zillow API key}
+      - PAYPAL_CLIENT_ID=${PAYPAL_CLIENT_ID:?set the PayPal client identifier}
+      - PAYPAL_CLIENT_SECRET=${PAYPAL_CLIENT_SECRET:?set the PayPal client secret}
+      - SENDGRID_API_KEY=${SENDGRID_API_KEY:?set the SendGrid API key}
+      - FROM_EMAIL=${FROM_EMAIL:?set the verified sender address}
+      # SEC-10: db service is the Cloud SQL Auth Proxy on plain local TCP
+      - DB_SSLMODE=disable
+      # SEC-06: this stack serves plain HTTP, and a browser discards a
+      # Secure cookie over it. DL-409
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      # probe program: python urllib against the schema document, which
+      # is served without reaching the database. DL-367
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json')"]
       interval: 30s
       timeout: 10s
       retries: 3
