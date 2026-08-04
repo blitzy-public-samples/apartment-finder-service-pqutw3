@@ -349,6 +349,24 @@ ACCEPTANCE_DATE = "2026-07-31"
 # Rule 1: the operational document that carries the residual register
 SECURITY_DOCUMENT = REPOSITORY_ROOT / "SECURITY.md"
 
+# SEC-07: the register section carrying the partial remediations, and the
+# section that follows it, which bound the block the posture is read from
+PARTIAL_REMEDIATION_HEADING = "### 3.2 The four partial remediations"
+OTHER_RESIDUAL_HEADING = "### 3.3 Other residual risks"
+
+# SEC-07: what the posture record has to state to be usable — the flag
+# that ships, the flag that replaces it behind a proxy, the header and the
+# allow-list that decide the key, the shared-key failure mode the flag
+# accepts, and the register row carrying the decision. DL-433
+PROXY_HEADER_POSTURE_STATEMENTS = (
+    "--no-proxy-headers",
+    "--forwarded-allow-ips",
+    "X-Forwarded-For",
+    "FORWARDED_ALLOW_IPS",
+    "share one key",
+    "DL-433",
+)
+
 # Rule 1: the bidirectional map, and the accountability set it declares.
 # The map's central claim is that no path the branch changed sits outside
 # it, which is checkable against version control rather than by eye.
@@ -4097,6 +4115,57 @@ def test_the_backend_image_starts_the_module_the_application_declares():
     # the context lands where that module path resolves from
     assert "WORKDIR /app/backend" in body, body
     assert re.search(r"^WORKDIR /app$", body, re.MULTILINE), body
+
+
+# SEC-07: the throttle key comes from the connection, not from a header
+def test_the_backend_image_keys_the_throttle_on_the_connection():
+    """The served command refuses to take a client address from a header.
+
+    The limiter keys on ``request.client.host``, and uvicorn overwrites
+    that value from ``X-Forwarded-For`` whenever proxy-header handling is
+    on and the connection arrives from a trusted address, which its
+    defaults make loopback. A caller reaching the process that way then
+    chooses its own throttle key, and rotating the header spends no
+    budget at all. The flag that closes it is a server option rather than
+    application code, so the assertion belongs to the image definition.
+    DL-433
+    """
+    body = _dockerfile_for("backend")
+    served = re.search(r"^CMD \[(.+)\]$", body, re.MULTILINE)
+    assert served, body
+
+    arguments = [
+        token.strip().strip('"') for token in served.group(1).split(",")
+    ]
+    assert "--no-proxy-headers" in arguments, arguments
+
+    # nothing in the same command re-enables the rewrite
+    assert "--proxy-headers" not in arguments, arguments
+    trusting = [
+        argument for argument in arguments
+        if argument.startswith("--forwarded-allow-ips")
+    ]
+    assert not trusting, arguments
+
+
+# SEC-07: a posture set nowhere in writing is a posture nobody keeps
+def test_the_operational_document_records_the_proxy_header_posture():
+    """SECURITY.md names the flag, the header and both failure modes.
+
+    The flag is one token in a command, so what it defends against is not
+    readable from the artifact. An operator introducing a reverse proxy
+    has to know that the flag moves with it, and that the alternative
+    posture shares one throttle key across every caller. DL-433
+    """
+    assert SECURITY_DOCUMENT.is_file(), SECURITY_DOCUMENT
+    document = SECURITY_DOCUMENT.read_text(encoding="utf-8")
+
+    opened = document.index(PARTIAL_REMEDIATION_HEADING)
+    closed = document.index(OTHER_RESIDUAL_HEADING)
+    section = document[opened:closed]
+
+    for statement in PROXY_HEADER_POSTURE_STATEMENTS:
+        assert statement in section, statement
 
 
 @pytest.mark.parametrize("service", ("backend", "frontend"))

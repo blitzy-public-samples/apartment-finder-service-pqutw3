@@ -160,10 +160,10 @@ The primary gate for eleven of the twelve findings.
 cd backend && python -m pytest tests/security -q
 ```
 
-Measured: **689 passed**, no failures. The suite covers the identity claim, the origin allow-list,
-the password policy, request validation, cookie attributes, login throttling, the error boundary, the
-configuration guards, the charge seam, the provisioning script's publish and privilege statements,
-the build definitions, and the provider lock.
+Measured on 2026-08-04: **738 passed**, no failures. The suite covers the identity claim, the origin
+allow-list, the password policy, request validation, cookie attributes, login throttling, the error
+boundary, the configuration guards, the charge seam, the provisioning script's publish and privilege
+statements, the build definitions, and the provider lock.
 
 ### 2.3 Full suite with coverage
 
@@ -173,8 +173,8 @@ This matches the pipeline invocation. **The last flag is not optional.**
 cd backend && python -m pytest --cov=./ --cov-report=xml --continue-on-collection-errors
 ```
 
-Measured: **689 passed with 3 collection errors**, exit 1. The three errors are the pre-existing test
-modules explained in section 3.3. Coverage is reported, not gated.
+Measured on 2026-08-04: **738 passed with 3 collection errors**, exit 1. The three errors are the
+pre-existing test modules explained in section 3.3. Coverage is reported, not gated.
 
 Without `--continue-on-collection-errors` the same command exits 2 with
 `Interrupted: 3 errors during collection` and runs **zero tests** — the three pre-existing modules
@@ -194,6 +194,16 @@ with the workflow's own, flag for flag, so the two cannot drift.
 Fifteen advisories cannot be patched on this runtime, so the gate suppresses exactly those fifteen
 and fails on anything else. Section 3.1 lists each one with its reachability assessment, and the
 decision log's register in section 2.2 carries the justification and the review trigger for each.
+
+**Ten of the fifteen are the set the specification approves, and the other five are recorded here
+rather than absorbed quietly.** Measured on 2026-08-04: with the ten alone the gate reports `Found 5
+known vulnerabilities, ignored 10 in 4 packages` and exits 1, and with all fifteen it reports `No known
+vulnerabilities found, 15 ignored` and exits 0. The five it reports at ten are `msgpack`, `filelock`
+twice, `pytest` and `python-dotenv` — each unpatchable on Python 3.9 and unreachable from the served
+application, as the second table in section 3.1 records. The exit status is decided by
+`pip-audit --strict` itself rather than by the staleness cross-check, which passes at either list size;
+`DL-434` carries that measurement, and the five stay accepted only until the runtime upgrade empties
+the list.
 
 ```bash
 pip freeze > /tmp/frozen.txt
@@ -247,11 +257,11 @@ The pipeline runs this, and creating the dependency manifest made it execute for
 cd backend && flake8 .
 ```
 
-Baseline: 129 findings, of which 4 are undefined names. Measured again on 2026-08-03: **108 findings,
+Baseline: 129 findings, of which 4 are undefined names. Measured again on 2026-08-04: **107 findings,
 of which 4 are substantive and exactly 1 is an undefined name** — `datetime` at
 `app/api/endpoints/subscriptions.py:60`, the out-of-scope case section 3.3 records. The other three
 are unused imports in `app/api/endpoints/listings.py`, `app/tasks/listing_updater.py` and
-`tests/test_api.py`. The remaining 104 are blank-line, trailing-whitespace, line-length and
+`tests/test_api.py`. The remaining 103 are blank-line, trailing-whitespace, line-length and
 missing-final-newline findings in files this work did not reformat.
 
 No new category appears: the category set is the same seven as the baseline. Both figures were
@@ -405,7 +415,9 @@ versions download cleanly from the same index in the same session.
 
 Ten of the fifteen reach the closure through the application's own runtime dependencies. The
 remaining five, listed separately below, arrive through the audit and test tooling or through the
-`python-dotenv` pin, and none of them is reachable from the served application at all.
+`python-dotenv` pin, and none of them is reachable from the served application at all. That split is
+also the authorisation boundary: the ten are the set the specification approves, and section 2.4
+carries the measurement behind carrying the other five.
 
 | Package | Pinned | Advisory | Fix release | Installable here | Reachability |
 | --- | --- | --- | --- | --- | --- |
@@ -479,6 +491,35 @@ the limit therefore denies a tracking slot to any further account, whose first a
 until an entry expires. Reaching that state needs roughly 4,096 distinct source addresses, because
 the address-keyed limiter allows only five attempts per address per window. `DL-49` carries that
 bound, and both variants close with the durable store in item 8 of section 4.
+
+**The address layer keys on the connection, and keeping it there is a server flag rather than
+application code.** The limiter reads `request.client.host`, which is the TCP peer. Uvicorn overwrites
+that peer from `X-Forwarded-For` when two conditions hold together: proxy-header handling is enabled,
+which is its default, and the connection arrives from an address in `FORWARDED_ALLOW_IPS`, which
+defaults to `127.0.0.1` alone.
+
+Under those defaults a caller reaching the process over loopback picks its own throttle key by sending
+a header. Measured: a fixed header gives five 401s and then a 429, while a rotating one gives an
+unbroken run of 401s. Any string is accepted as the identity, so the key space is unbounded rather
+than merely attacker-chosen.
+
+**The shipped container command therefore carries `--no-proxy-headers`**, which returns the key to the
+connection. `DL-433` carries the decision, and a suite case reads the flag out of the image definition
+so it cannot be dropped silently.
+
+Two failure modes sit either side of that flag, and the second is the price of closing the first. With
+proxy headers enabled and no proxy in front — the state before this change — a loopback caller rewrites
+its own key, which is the bypass above; a same-host proxy, a sidecar, a port-forward or a co-located
+process all reach the process that way. With proxy headers disabled and a proxy in front, every request
+carries the proxy's address, so callers share one key and five failures from one of them answer 429 to
+all of them for the rest of the window. The account-keyed layer contains both, because it reads no
+address at all.
+
+**When a real reverse proxy is introduced, this flag moves with it.** Replace `--no-proxy-headers` with
+`--forwarded-allow-ips` naming that proxy's address, and confirm the proxy appends to `X-Forwarded-For`
+rather than replacing it. Nginx's `$proxy_add_x_forwarded_for` appends, and uvicorn then reads the
+rightmost untrusted entry, which is the real caller. An allow-list of `*` restores the bypass in full
+and is never correct here.
 
 **SEC-10 gained encryption, not certificate verification.** Both ends now require encryption: the
 Cloud SQL instance is set to accept encrypted connections only, and the application requests
@@ -700,9 +741,9 @@ Style checking reported 129 findings before this work, 4 of them undefined names
 collected zero tests with three collection errors, because all three existing test modules failed to
 import. The pipeline had never reached either step, because it failed at dependency installation.
 
-Measured now: style checking reports 108 findings with 1 undefined name, and the suite reports 689
-passed with the same three collection errors. Those three errors survive this work untouched. **A
-green pipeline is not on offer.**
+Measured on 2026-08-04: style checking reports 107 findings with 1 undefined name, and the suite
+reports 738 passed with the same three collection errors. Those three errors survive this work
+untouched. **A green pipeline is not on offer.**
 
 **The frontend does not type-check or build**, for reasons unrelated to security. Two packages are
 imported but declared nowhere. One service module holds component markup and extends a component
