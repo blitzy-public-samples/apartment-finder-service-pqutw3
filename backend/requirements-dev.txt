@@ -1,31 +1,18 @@
 # apartment-finder-service - backend development / CI dependencies
-#
-# Install alongside the runtime manifest:
+# Target interpreter: CPython 3.9
+# Install together with the runtime manifest:
 #   pip install -r backend/requirements.txt -r backend/requirements-dev.txt
-#
-# Every pin below is the highest release installable on CPython 3.9, the project
-# runtime pin. Nothing here is shipped to production.
-#
-# httpx is intentionally NOT repeated here: fastapi.testclient.TestClient needs it
-# and it is already pinned in backend/requirements.txt.
+# Decision rationale: docs/security/DECISION_LOG.md
 
 # --- Test framework ----------------------------------------------------------
 pytest==8.4.2
-# Required by the async tests (backend/tests/test_tasks.py uses @pytest.mark.asyncio)
-# but declared nowhere in the repository today.
 pytest-asyncio==1.2.0
-# .github/workflows/ci.yml runs pytest with --cov.
 pytest-cov==7.1.0
+httpx==0.28.1
 
-# --- Security gates ----------------------------------------------------------
-# Dependency audit. Always invoke against a manifest, e.g.
-#   pip-audit -r backend/requirements.txt
-# A bare invocation audits the whole environment and mixes pip-audit's own
-# dependency tree into the report, inflating the count.
+# --- Security scanning -------------------------------------------------------
 pip-audit==2.9.0
-# Static analysis gate: bandit -r backend/app -ll must exit 0.
 bandit==1.8.6
 
 # --- Lint --------------------------------------------------------------------
-# .github/workflows/ci.yml runs `flake8 .` from backend/ but never installs it.
 flake8==7.3.0
