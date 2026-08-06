@@ -1,0 +1,86 @@
+# Environment files
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+.env.test
+!.env.example
+
+# Secrets directory
+secrets/
+**/secrets/
+
+# Cloud service-account and credential files
+google-credentials.json
+*credentials*.json
+service-account*.json
+*-service-account*.json
+gcp-*.json
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.crt
+id_rsa*
+id_ed25519*
+
+# Kubernetes cluster credentials
+kubeconfig
+*.kubeconfig
+
+# Python bytecode and packaging artefacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Node dependencies and build output
+node_modules/
+frontend/build/
+frontend/coverage/
+npm-debug.log*
+yarn-error.log*
+
+# Terraform state and variable files
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+override.tf
+override.tf.json
+
+# Logs
+*.log
+logs/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
