@@ -1,4 +1,4 @@
-﻿"""Structured JSON logging with credential redaction.
+"""Structured JSON logging with credential redaction.
 
 This module is the application's single logging entry point. It emits one
 JSON object per record on standard output and rewrites credential-shaped

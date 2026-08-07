@@ -11,10 +11,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
-COPY . .
+COPY . ./backend
+
+# Create an unprivileged group and user, and give it ownership of /app
+RUN groupadd --system --gid 1001 appgroup \
+    && useradd --system --uid 1001 --gid appgroup --no-create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appgroup /app
+
+# Switch to the unprivileged user
+USER appuser
 
 # Make port 8000 available to the world outside this container
 EXPOSE 8000
 
 # Run the FastAPI server when the container launches
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

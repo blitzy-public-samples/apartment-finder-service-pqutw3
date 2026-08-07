@@ -1,57 +1,67 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from typing import Optional
+
+from backend.app.core.authorization import Role, require_role
+from backend.app.core.plans import get_plan
 from backend.app.db.database import get_db
 from backend.app.schema.subscription import SubscriptionCreate, Subscription
 from backend.app.db.models import Subscription as SubscriptionModel, User
-from backend.app.core.security import get_current_user
-from backend.app.services.paypal_service import process_payment
 
 router = APIRouter()
 
-# HUMAN ASSISTANCE NEEDED
-# The confidence level for this function is below 0.8. Please review and adjust as necessary.
+#: Status stored on a subscription row created here.
+ACTIVE_STATUS = "active"
+
+
 @router.post('/')
 async def create_subscription(
     subscription: SubscriptionCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_role(Role.REGISTERED))
 ) -> Subscription:
     # Validate subscription data
-    if not subscription.plan_id or not subscription.payment_method:
-        raise HTTPException(status_code=400, detail="Invalid subscription data")
+    if not subscription.plan_id:
+        raise HTTPException(
+            status_code=400, detail="Invalid subscription data"
+        )
 
-    # Process payment through PayPal
-    payment_successful = await process_payment(subscription.payment_method, subscription.amount)
-    if not payment_successful:
-        raise HTTPException(status_code=400, detail="Payment processing failed")
+    # Read the amount, currency and period from the server-owned catalog
+    plan = get_plan(subscription.plan_id)
+
+    # Compute the entitlement window from the server clock
+    start_date = datetime.now(timezone.utc)
+    end_date = start_date + timedelta(days=plan.period_days)
 
     # Create new subscription in database
     new_subscription = SubscriptionModel(
         user_id=current_user.id,
-        plan_id=subscription.plan_id,
-        start_date=subscription.start_date,
-        end_date=subscription.end_date
+        plan_id=plan.plan_id,
+        amount=plan.amount,
+        currency=plan.currency,
+        status=ACTIVE_STATUS,
+        start_date=start_date,
+        end_date=end_date
     )
     db.add(new_subscription)
     db.commit()
     db.refresh(new_subscription)
 
-    # Associate subscription with current user
-    current_user.subscription_id = new_subscription.id
-    db.commit()
-
     # Return created subscription
     return Subscription.from_orm(new_subscription)
+
 
 @router.get('/')
 async def get_user_subscription(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-) -> Subscription:
+    current_user: User = Depends(require_role(Role.REGISTERED))
+) -> Optional[Subscription]:
     # Query database for user's active subscription
     subscription = db.query(SubscriptionModel).filter(
         SubscriptionModel.user_id == current_user.id,
-        SubscriptionModel.end_date > datetime.utcnow()
+        SubscriptionModel.end_date > datetime.now(timezone.utc)
     ).first()
 
     # Return subscription if found, else return None

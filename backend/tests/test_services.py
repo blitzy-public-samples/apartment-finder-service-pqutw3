@@ -1,68 +1,146 @@
 import unittest
-from unittest.mock import patch, MagicMock
-from services.zillow_service import ZillowService
-from services.paypal_service import PayPalService
-from services.email_service import EmailService
+from unittest.mock import MagicMock, patch
+
+from backend.app.services.email_service import send_email
+from backend.app.services.zillow_service import fetch_listings
+
+ZILLOW_MODULE = 'backend.app.services.zillow_service'
+EMAIL_MODULE = 'backend.app.services.email_service'
+
+
+def _provider_response(payload):
+    response = MagicMock()
+    response.json.return_value = payload
+    response.raise_for_status.return_value = None
+    return response
+
 
 class TestZillowService(unittest.TestCase):
-    def setUp(self):
-        self.zillow_service = ZillowService()
-
-    @patch('services.zillow_service.requests.get')
-    def test_fetch_listings(self, mock_get):
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
+    def test_fetch_listings(self):
+        response = _provider_response({
             'listings': [
                 {'id': 1, 'address': '123 Main St', 'price': 300000},
                 {'id': 2, 'address': '456 Elm St', 'price': 250000}
             ]
-        }
-        mock_get.return_value = mock_response
+        })
 
-        listings = self.zillow_service.fetch_listings(zip_code='12345')
+        with patch(ZILLOW_MODULE + '.httpx.get', return_value=response):
+            listings = fetch_listings(zip_codes=['12345'], filters={})
 
         self.assertEqual(len(listings), 2)
         self.assertEqual(listings[0]['address'], '123 Main St')
         self.assertEqual(listings[1]['price'], 250000)
 
-class TestPayPalService(unittest.TestCase):
-    def setUp(self):
-        self.paypal_service = PayPalService()
+    def test_api_key_travels_in_a_header_never_in_the_url(self):
+        response = _provider_response({'listings': []})
 
-    @patch('services.paypal_service.paypalrestsdk.Payment.create')
-    def test_process_payment(self, mock_create):
-        mock_create.return_value = True
-        payment_data = {
-            'amount': 100,
-            'currency': 'USD',
-            'description': 'Test payment'
-        }
+        with patch(
+            ZILLOW_MODULE + '.httpx.get', return_value=response
+        ) as mock_get:
+            fetch_listings(zip_codes=['12345'], filters={})
 
-        result = self.paypal_service.process_payment(payment_data)
+        args, kwargs = mock_get.call_args
+        from backend.app.core.config import settings
 
-        self.assertTrue(result)
-        mock_create.assert_called_once()
+        key = settings.ZILLOW_API_KEY
+        self.assertEqual(kwargs['headers']['X-API-Key'], key)
+        self.assertNotIn(key, str(args))
+        self.assertNotIn(key, str(kwargs['params']))
+        self.assertNotIn('api_key', kwargs['params'])
+
+    def test_every_request_carries_a_timeout(self):
+        response = _provider_response({'listings': []})
+
+        with patch(
+            ZILLOW_MODULE + '.httpx.get', return_value=response
+        ) as mock_get:
+            fetch_listings(zip_codes=['12345'], filters={})
+
+        self.assertIn('timeout', mock_get.call_args.kwargs)
+        self.assertGreater(mock_get.call_args.kwargs['timeout'], 0)
+
+    def test_provider_failure_yields_an_empty_list(self):
+        import httpx
+
+        with patch(
+            ZILLOW_MODULE + '.httpx.get',
+            side_effect=httpx.ConnectError('unreachable'),
+        ):
+            self.assertEqual(
+                fetch_listings(zip_codes=['12345'], filters={}), []
+            )
+
+    def test_api_key_is_absent_from_every_log_record(self):
+        import httpx
+
+        from backend.app.core.config import settings
+        from backend.app.core.logging import BASE_LOGGER_NAME
+
+        key = settings.ZILLOW_API_KEY
+        records = []
+
+        import logging
+
+        class Collector(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = Collector(level=logging.DEBUG)
+        logger = logging.getLogger(BASE_LOGGER_NAME)
+        logger.addHandler(handler)
+        try:
+            with patch(
+                ZILLOW_MODULE + '.httpx.get',
+                side_effect=httpx.ConnectError(
+                    'unreachable ' + settings.ZILLOW_API_URL
+                ),
+            ):
+                fetch_listings(zip_codes=['12345'], filters={})
+        finally:
+            logger.removeHandler(handler)
+
+        self.assertTrue(records)
+        for record in records:
+            self.assertNotIn(key, repr(vars(record)))
+
 
 class TestEmailService(unittest.TestCase):
-    def setUp(self):
-        self.email_service = EmailService()
+    def test_send_email_reports_a_delivered_message(self):
+        client = MagicMock()
+        client.send.return_value = MagicMock(status_code=202)
 
-    @patch('services.email_service.smtplib.SMTP')
-    def test_send_notification(self, mock_smtp):
-        mock_server = MagicMock()
-        mock_smtp.return_value.__enter__.return_value = mock_server
+        with patch(
+            EMAIL_MODULE + '.SendGridAPIClient', return_value=client
+        ):
+            delivered = send_email(
+                'test@example.com',
+                'Test Notification',
+                'This is a test notification.',
+            )
 
-        recipient = 'test@example.com'
-        subject = 'Test Notification'
-        body = 'This is a test notification.'
+        self.assertTrue(delivered)
+        client.send.assert_called_once()
 
-        self.email_service.send_notification(recipient, subject, body)
+    def test_send_email_reports_a_rejected_message(self):
+        client = MagicMock()
+        client.send.return_value = MagicMock(status_code=400)
 
-        mock_server.send_message.assert_called_once()
-        args, kwargs = mock_server.send_message.call_args
-        self.assertIn(recipient, args[0]['To'])
-        self.assertEqual(args[0]['Subject'], subject)
-        self.assertIn(body, args[0].get_payload())
+        with patch(
+            EMAIL_MODULE + '.SendGridAPIClient', return_value=client
+        ):
+            self.assertFalse(
+                send_email('test@example.com', 'Subject', 'Body')
+            )
+
+    def test_send_email_swallows_a_transport_failure(self):
+        with patch(
+            EMAIL_MODULE + '.SendGridAPIClient',
+            side_effect=RuntimeError('transport down'),
+        ):
+            self.assertFalse(
+                send_email('test@example.com', 'Subject', 'Body')
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

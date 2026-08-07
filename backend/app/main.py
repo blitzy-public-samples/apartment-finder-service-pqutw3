@@ -31,10 +31,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.utils import is_body_allowed_for_status_code
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIASGIMiddleware
-from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -130,19 +129,17 @@ _REQUEST_MESSAGE = "http.request"
 # ASGI message type reported once the client has gone away.
 _DISCONNECT_MESSAGE = "http.disconnect"
 
-#: Rate limiter keyed by remote address. The credential endpoints
-#: decorate their handlers against this object.
-limiter = Limiter(key_func=get_remote_address)
-
 #: Rate limit applied to the login endpoint.
 LOGIN_RATE_LIMIT = settings.RATE_LIMIT_LOGIN
 
 #: Rate limit applied to the registration endpoint.
 REGISTER_RATE_LIMIT = settings.RATE_LIMIT_REGISTER
 
-# Ordering invariant: ``limiter`` is bound above these imports. The
-# endpoint modules they reach reference it from this module while this
-# module is still initialising.
+# Ordering invariant: the credential endpoints own ``limiter`` and
+# decorate their handlers against it, so it is imported from there and
+# bound to ``app.state.limiter`` below. Every module in this chain
+# imports nothing from this one and stays independently importable.
+from backend.app.api.endpoints.auth import limiter  # noqa: E402
 from backend.app.api.router import api_router  # noqa: E402
 from backend.app.db.database import (  # noqa: E402
     Base,
