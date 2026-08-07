@@ -73,6 +73,7 @@ class ZipCode(BaseModel):
     class Config:
         orm_mode = True
 
+
 class Criteria(BaseModel):
     # Projection of a criteria row.
     field: str
@@ -81,6 +82,7 @@ class Criteria(BaseModel):
 
     class Config:
         orm_mode = True
+
 
 class Filter(BaseModel):
     id: int

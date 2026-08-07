@@ -182,13 +182,21 @@ variable "secret_key" {
   ephemeral   = true
 
   validation {
-    condition     = length(trimspace(var.secret_key)) >= 32 && length(distinct(split("", trimspace(var.secret_key)))) >= 5
-    error_message = "The signing key must be at least 32 characters once trimmed and must use at least 5 distinct characters, matching the floor the application enforces at startup."
+    condition     = trimspace(var.secret_key) == var.secret_key
+    error_message = "The signing key must carry no leading or trailing whitespace, matching the canonical form the application accepts at startup."
   }
 
   validation {
-    condition     = !can(regex("(?i)^(change[-_]?me|replace[-_]?|your[-_]|placeholder|insecure)", trimspace(var.secret_key)))
-    error_message = "The signing key must not be a placeholder value."
+    # UTF-8 byte length. base64 encodes every three bytes as four
+    # characters, so the encoded length less its padding characters
+    # carries the byte count the application measures.
+    condition     = (length(base64encode(var.secret_key)) / 4 * 3) - length(regexall("=", base64encode(var.secret_key))) >= 32
+    error_message = "The signing key must measure at least 32 UTF-8 bytes, matching the floor the application enforces at startup."
+  }
+
+  validation {
+    condition     = !can(regex("(?i)^(change[-_]?me|replace(me|[-_])|your(secret|[-_])|placeholder|insecure)", var.secret_key))
+    error_message = "The signing key must not be a placeholder value, matching the placeholder set the application rejects at startup."
   }
 }
 

@@ -8,10 +8,8 @@ defaulted, generated or downgraded in response to a failed check.
 The checks applied here are:
 
 * the token signing key must carry no surrounding whitespace, must be
-  at least :data:`MIN_SIGNING_KEY_BYTES` bytes long once measured on
-  its canonical form, must use at least
-  :data:`MIN_DISTINCT_KEY_CHARACTERS` distinct characters, and must not
-  be a known placeholder value
+  at least :data:`MIN_SIGNING_KEY_BYTES` UTF-8 bytes long once measured
+  on its canonical form, and must not be a known placeholder value
 * the JWT algorithm list must be non-empty and must name only entries
   present in :data:`ALLOWED_JWT_ALGORITHMS`, with ``none`` refused in
   any letter case
@@ -73,7 +71,6 @@ __all__ = [
     "LOCAL_ENVIRONMENT",
     "MANAGED_BACKEND_NAME",
     "MANAGED_SECRET_SETTINGS",
-    "MIN_DISTINCT_KEY_CHARACTERS",
     "MIN_SIGNING_KEY_BYTES",
     "PAYPAL_API_BASES",
     "PAYPAL_MODES",
@@ -148,11 +145,8 @@ MANAGED_SECRET_SETTINGS = (
     "SENDGRID_API_KEY",
 )
 
-#: Smallest accepted length of the token signing key, in bytes.
+#: Smallest accepted length of the token signing key, in UTF-8 bytes.
 MIN_SIGNING_KEY_BYTES = 32
-
-#: Smallest accepted number of distinct characters in the signing key.
-MIN_DISTINCT_KEY_CHARACTERS = 4
 
 #: URL scheme required of every outbound provider endpoint.
 TLS_SCHEME = "https"
@@ -573,11 +567,10 @@ class Settings(BaseSettings):
 
         The value is refused when it is blank once stripped, when it
         carries surrounding whitespace, when its canonical form measures
-        fewer than :data:`MIN_SIGNING_KEY_BYTES` encoded bytes, when it
-        uses fewer than :data:`MIN_DISTINCT_KEY_CHARACTERS` distinct
-        characters, and when it matches the rejected-value set or opens
-        with a placeholder marker. The returned value is the canonical
-        form, and the placeholder comparison ignores letter case.
+        fewer than :data:`MIN_SIGNING_KEY_BYTES` UTF-8 bytes, and when
+        it matches the rejected-value set or opens with a placeholder
+        marker. The returned value is the canonical form, and the
+        placeholder comparison ignores letter case.
         """
         candidate = value.strip()
         if not candidate:
@@ -588,12 +581,8 @@ class Settings(BaseSettings):
             )
         if len(candidate.encode("utf-8")) < MIN_SIGNING_KEY_BYTES:
             raise ValueError(
-                f"must be at least {MIN_SIGNING_KEY_BYTES} bytes long"
-            )
-        if len(set(candidate)) < MIN_DISTINCT_KEY_CHARACTERS:
-            raise ValueError(
-                "must use at least "
-                f"{MIN_DISTINCT_KEY_CHARACTERS} distinct characters"
+                f"must be at least {MIN_SIGNING_KEY_BYTES} UTF-8 bytes"
+                " long"
             )
         folded = candidate.lower()
         if folded in _REJECTED_KEY_VALUES:

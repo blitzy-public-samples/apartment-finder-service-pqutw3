@@ -158,9 +158,19 @@ class TestSigningKeyValidation:
 
     @pytest.mark.parametrize(
         "key",
-        ["a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6", "\u00e9" * 16 + "Zq7"],
+        [
+            "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+            "\u00e9" * 16 + "Zq7",
+            "Ab" * 16,
+        ],
     )
     def test_keys_meeting_the_byte_floor_are_accepted(self, key):
+        """The byte floor is the only length measure applied.
+
+        The second key measures 35 UTF-8 bytes across 19 characters and
+        the third repeats two characters, so neither a character count
+        nor a character-variety count governs acceptance.
+        """
         assert build_settings(SECRET_KEY=key).SECRET_KEY == key
 
 
