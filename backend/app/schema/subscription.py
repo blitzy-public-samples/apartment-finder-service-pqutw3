@@ -36,9 +36,10 @@ class SubscriptionCreate(BaseModel):
     """Request contract for subscription creation.
 
     The plan identifier is the complete allowlist of values a client may
-    supply. The charge amount, the currency, the payment method and the
-    entitlement dates are server-assigned: they are absent from this
-    contract, and a request carrying any of them is rejected.
+    supply. The charge amount, the currency, the payment method, the
+    payment-flow selection and the entitlement dates are server-assigned:
+    they are absent from this contract, and a request carrying any of
+    them is rejected.
     """
 
     plan_id: _PlanIdField

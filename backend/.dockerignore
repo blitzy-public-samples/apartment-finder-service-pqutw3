@@ -1,9 +1,15 @@
-# Docker build context exclusions.
-# Effective when the build context is this directory, which is the context
-# the backend image is built from:
-#   docker build -f infrastructure/docker/Dockerfile.backend backend/
-# The repository-root .dockerignore covers a build whose context is the
-# repository root.
+# Build context exclusions for the backend image.
+#
+# Docker reads .dockerignore from the root of the build context. The
+# backend image is built with backend/ as its context
+# (infrastructure/docker/docker-compose.yml declares
+# "context: ../../backend", and the documented build command is
+# "docker build -f infrastructure/docker/Dockerfile.backend ... backend/"),
+# so this file is the one that governs that build. The repository-root
+# .dockerignore governs any build whose context is the repository root.
+#
+# Dockerfile.backend copies the whole context, so anything left here is
+# copied into a published image layer.
 
 # Environment files
 .env

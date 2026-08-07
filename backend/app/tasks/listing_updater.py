@@ -4,13 +4,14 @@ from sqlalchemy.orm import Session
 from backend.app.db.database import SessionLocal
 from backend.app.services.zillow_service import fetch_listings, process_listing
 from backend.app.db.models import Listing
+from backend.app.core.logging import get_logger
 
 UPDATE_INTERVAL = timedelta(hours=1)
 
+logger = get_logger(__name__)
+
 @asyncio.coroutine
 async def update_listings():
-    # HUMAN ASSISTANCE NEEDED
-    # This function may need additional error handling and logging for production readiness
     db: Session = SessionLocal()
     try:
         new_listings = await fetch_listings()
@@ -25,8 +26,7 @@ async def update_listings():
         db.commit()
     except Exception as e:
         db.rollback()
-        # Log the error here
-        print(f"An error occurred while updating listings: {str(e)}")
+        logger.error("An error occurred while updating listings", exc_info=e)
     finally:
         db.close()
 

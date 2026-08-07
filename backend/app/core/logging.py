@@ -32,10 +32,12 @@ quotes are plain or backslash-escaped.
 The handler is installed on the ``backend`` logger and, at WARNING, on
 the third-party ``python_http_client`` and ``sendgrid`` loggers, whose
 records carry outbound request headers and bodies. Propagation is
-disabled on each, so no record reaches a handler installed elsewhere.
-Discovery and installation run under a lock, and a handler found under
-the reserved name whose type, formatter, filter or stream does not match
-is replaced.
+disabled on each, so no record reaches a handler installed elsewhere,
+whatever level the root logger is configured at. Loggers outside those
+namespaces are not governed by this module. Discovery and installation
+run under a lock and are idempotent: repeated or concurrent calls leave
+exactly one handler per logger, and a handler found under the reserved
+name whose type, formatter, filter or stream does not match is replaced.
 
 The module uses only the Python standard library and reads no
 configuration and no environment variable.
