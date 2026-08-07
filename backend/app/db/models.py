@@ -1,4 +1,6 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import (
+    Column, Integer, String, Float, DateTime, ForeignKey, Numeric, func,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 
@@ -12,6 +14,9 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     created_at = Column(DateTime, nullable=False)
     last_login = Column(DateTime)
+    role = Column(String, nullable=False, server_default="registered")
+    failed_login_attempts = Column(Integer, nullable=False, server_default="0")
+    locked_until = Column(DateTime, nullable=True)
 
     filters = relationship("Filter", back_populates="user")
     subscriptions = relationship("Subscription", back_populates="user")
@@ -72,12 +77,17 @@ class Subscription(Base):
     start_date = Column(DateTime, nullable=False)
     end_date = Column(DateTime)
     status = Column(String, nullable=False)
+    plan_id = Column(String, nullable=True)
+    amount = Column(Numeric(10, 2), nullable=True)
+    currency = Column(String, nullable=False, server_default="USD")
+    paypal_order_id = Column(String, unique=True, nullable=True)
 
     user = relationship("User", back_populates="subscriptions")
 
-# HUMAN ASSISTANCE NEEDED
-# Please review the following:
-# 1. Ensure that all necessary indexes are added for optimal query performance.
-# 2. Consider adding any additional constraints or validations that may be required.
-# 3. Verify if any additional relationships or cascade behaviors need to be defined.
-# 4. Check if any fields should have default values or additional constraints.
+class WebhookEvent(Base):
+    __tablename__ = 'webhook_events'
+
+    id = Column(Integer, primary_key=True)
+    transmission_id = Column(String, unique=True, nullable=False)
+    event_type = Column(String, nullable=False)
+    received_at = Column(DateTime, nullable=False, server_default=func.now())

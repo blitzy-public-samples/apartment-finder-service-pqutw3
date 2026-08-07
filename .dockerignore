@@ -1,0 +1,148 @@
+# Docker build context exclusions
+
+# Environment files
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Secrets directory
+secrets/
+**/secrets/
+
+# Cloud service-account and credential files
+google-credentials.json
+**/google-credentials.json
+*service-account*.json
+**/*service-account*.json
+*credentials*.json
+**/*credentials*.json
+gcp-*.json
+**/gcp-*.json
+
+# Private keys, certificates, and keystores
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
+*.jks
+**/*.jks
+*.keystore
+**/*.keystore
+*.crt
+**/*.crt
+id_rsa*
+**/id_rsa*
+id_ed25519*
+**/id_ed25519*
+
+# Kubernetes cluster credentials
+kubeconfig
+**/kubeconfig
+*.kubeconfig
+**/*.kubeconfig
+
+# Version-control metadata
+.git
+.git/**
+**/.git
+**/.git/**
+.gitignore
+**/.gitignore
+.gitattributes
+**/.gitattributes
+
+# CI workflow definitions
+.github/
+**/.github/
+
+# Container build definitions
+.dockerignore
+**/.dockerignore
+**/Dockerfile*
+**/docker-compose*.yml
+
+# Python bytecode and packaging artefacts
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/*.egg-info/
+**/.eggs/
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+**/venv/
+**/.venv/
+
+# Test, type-check, and lint caches
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.tox/
+
+# Coverage output
+**/.coverage
+**/.coverage.*
+**/coverage.xml
+**/htmlcov/
+**/coverage/
+
+# Node dependencies and build output
+**/node_modules/
+**/build/
+**/dist/
+**/npm-debug.log*
+**/yarn-error.log*
+
+# Terraform state and variable files
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+**/override.tf
+**/override.tf.json
+
+# Logs
+**/*.log
+**/logs/
+
+# Editor and OS files
+**/.DS_Store
+**/Thumbs.db
+**/.idea/
+**/.vscode/
+**/*.swp
+**/*~
+
+# Documentation and presentation assets
+documentation/
+**/documentation/
+docs/
+**/docs/
+blitzy-deck/
+**/blitzy-deck/
+README.md
+**/README.md
+SECURITY.md
+**/SECURITY.md
+
+# Frontend application source
+frontend/
+**/frontend/
+
+# Infrastructure definitions and operational scripts
+infrastructure/
+**/infrastructure/
+scripts/
+**/scripts/
+
+# Test suites
+tests/
+**/tests/
