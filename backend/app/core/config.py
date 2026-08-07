@@ -88,6 +88,7 @@ __all__ = [
     "LOCAL_ENVIRONMENT",
     "MANAGED_BACKEND_NAME",
     "MANAGED_SECRET_SETTINGS",
+    "MAX_PAGINATION_OFFSET",
     "MAX_SIGNING_KEY_REPEAT_RUN",
     "MAX_SIGNING_KEY_SEQUENCE_RUN",
     "MIN_SIGNING_KEY_BYTES",
@@ -218,6 +219,12 @@ SHARED_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
     for scheme in RATE_LIMIT_STORAGE_SCHEMES
     if scheme not in IN_PROCESS_RATE_LIMIT_SCHEMES
 )
+
+#: Largest row offset a paged read may name. It is the ceiling of the
+#: signed 64-bit integer the database binds an ``OFFSET`` parameter to, so
+#: an offset above it cannot be executed at all and is refused by request
+#: validation rather than reaching SQL.
+MAX_PAGINATION_OFFSET = 2 ** 63 - 1
 
 #: Smallest accepted length of the token signing key, in UTF-8 bytes.
 MIN_SIGNING_KEY_BYTES = 32

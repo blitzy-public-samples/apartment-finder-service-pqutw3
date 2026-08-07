@@ -39,9 +39,21 @@ suppresses.
 :func:`bind_request_id` records an identifier for the current task or
 thread, and every record emitted while it is bound carries it under
 ``context.request_id``, joining an inbound request to the outbound calls
-and database transitions it caused. :func:`mark_audited` records that an
-exception's rejection has already been written to the audit trail, so a
-generic handler downstream can leave it at one record.
+and database transitions it caused. The identifier is read from the
+record's own logging thread, before the record is queued, so a record
+drained by the listener thread carries the value that was bound where the
+call was made. :func:`mark_audited` records that an exception's rejection
+has already been written to the audit trail, so a generic handler
+downstream can leave it at one record.
+
+Alongside the shapes above, a value registered through
+:func:`register_secret_values` is replaced wherever it appears, whatever
+surrounds it. Shape matching needs a credential-shaped key name next to
+the value, so it cannot reach a credential quoted inside free prose --
+the text of a provider error, for instance. A registered value is matched
+literally, which covers that case. The module holds the values it is
+given and reads none for itself: each caller registers the credential it
+handles.
 
 Redaction runs twice. Every part of a record -- message, interpolated
 arguments, formatted exception text and each ``extra`` value, walked
@@ -128,6 +140,8 @@ __all__ = [
     "EXCEPTION_MESSAGE_LIMIT",
     "GOVERNED_LOGGER_NAMES",
     "HANDLER_NAME",
+    "MAX_REGISTERED_SECRETS",
+    "MIN_SECRET_VALUE_LENGTH",
     "QUEUE_CAPACITY",
     "QUEUE_DRAIN_TIMEOUT_SECONDS",
     "REDACTION_PLACEHOLDER",
@@ -150,6 +164,8 @@ __all__ = [
     "mark_audited",
     "redact",
     "redact_structure",
+    "registered_secret_count",
+    "register_secret_values",
     "reset_request_id",
     "unredacted_handler_names",
 ]
@@ -189,6 +205,16 @@ EXCEPTION_MESSAGE_LIMIT = 512
 
 #: Attribute set on an exception whose rejection is already audited.
 AUDITED_ATTRIBUTE = "_audit_record_emitted"
+
+#: Shortest value :func:`register_secret_values` accepts. A shorter value
+#: is refused, because replacing it literally would rewrite text that
+#: merely contains those characters.
+MIN_SECRET_VALUE_LENGTH = 8
+
+#: Most values the registry holds. A further value is refused once the
+#: registry is full, so the per-record replacement stays bounded.
+MAX_REGISTERED_SECRETS = 32
+
 #: Records the queue holds before an emission falls back to inline
 #: writing on the calling thread.
 QUEUE_CAPACITY = 4096
@@ -201,6 +227,15 @@ _MAX_REDACTION_DEPTH = 8
 
 # Serialises handler discovery and installation across threads.
 _CONFIGURE_LOCK = threading.RLock()
+
+# Serialises registration of secret values across threads.
+_SECRETS_LOCK = threading.RLock()
+
+# Values replaced wherever they appear, longest first so a value that
+# contains another is replaced whole. Rebound as a complete tuple under
+# _SECRETS_LOCK and read without the lock, so a reader always sees one
+# consistent generation of it.
+_SECRET_VALUES: Tuple[str, ...] = ()
 
 # Labels of the handlers removed from the governed namespaces, in the
 # order they were first removed. Read through
@@ -538,20 +573,69 @@ _REDACTION_RULES: Tuple[Tuple[Any, Callable[[Any], str]], ...] = (
 )
 
 
+def register_secret_values(*values: Any) -> int:
+    """Registers values replaced wherever they appear in a record.
+
+    Each caller registers the credential it handles. A value is accepted
+    when it is text of at least :data:`MIN_SECRET_VALUE_LENGTH`
+    characters, is not the placeholder itself, and the registry holds
+    fewer than :data:`MAX_REGISTERED_SECRETS` values; anything else is
+    ignored. Registering a value already held changes nothing. Returns the
+    number of values the registry holds afterwards, and never raises.
+    """
+    global _SECRET_VALUES
+    try:
+        with _SECRETS_LOCK:
+            held = set(_SECRET_VALUES)
+            for value in values:
+                if len(held) >= MAX_REGISTERED_SECRETS:
+                    break
+                if not isinstance(value, str):
+                    continue
+                candidate = value.strip()
+                if len(candidate) < MIN_SECRET_VALUE_LENGTH:
+                    continue
+                if candidate.lower() in _SKIP_VALUES:
+                    continue
+                held.add(candidate)
+            _SECRET_VALUES = tuple(
+                sorted(held, key=lambda entry: (-len(entry), entry))
+            )
+            return len(_SECRET_VALUES)
+    except Exception:
+        return len(_SECRET_VALUES)
+
+
+def registered_secret_count() -> int:
+    """Returns how many values the secret registry holds."""
+    return len(_SECRET_VALUES)
+
+
+def _replace_secret_values(rendered: str) -> str:
+    """Replaces every registered secret value found in ``rendered``."""
+    for secret in _SECRET_VALUES:
+        if secret in rendered:
+            rendered = rendered.replace(secret, REDACTION_PLACEHOLDER)
+    return rendered
+
+
 def redact(text: Any) -> str:
     """Returns ``text`` with unsafe values replaced.
 
-    Credential-shaped values, internal filesystem paths and electronic
-    mail addresses are all substituted. For a credential the key name is
-    preserved and only the value is replaced; for a path the file's base
-    name is preserved and the directory part is replaced. A non-string
-    input is rendered with :func:`str` first. Any failure during
-    redaction yields the placeholder in place of the whole input.
+    Registered secret values, credential-shaped values, internal
+    filesystem paths and electronic mail addresses are all substituted. A
+    registered value is replaced wherever it appears, including inside
+    free prose that names no key. For a credential matched by shape the
+    key name is preserved and only the value is replaced; for a path the
+    file's base name is preserved and the directory part is replaced. A
+    non-string input is rendered with :func:`str` first. Any failure
+    during redaction yields the placeholder in place of the whole input.
     """
     try:
         rendered = text if isinstance(text, str) else str(text)
         if not rendered:
             return rendered
+        rendered = _replace_secret_values(rendered)
         for pattern, replacement in _REDACTION_RULES:
             rendered = pattern.sub(replacement, rendered)
         return rendered
@@ -809,6 +893,23 @@ def _emit_fallback(message: str, fields: Dict[str, Any]) -> None:
         return
 
 
+def _attach_request_id(record: logging.LogRecord) -> None:
+    """Attaches the bound request identifier to ``record``.
+
+    The identifier is read from the current task or thread, so this must
+    run on the thread that logged rather than on the listener thread. A
+    record already carrying the field keeps its value, and a failure
+    leaves the record untouched.
+    """
+    try:
+        if getattr(record, REQUEST_ID_FIELD, None) is None:
+            bound = current_request_id()
+            if bound is not None:
+                setattr(record, REQUEST_ID_FIELD, bound)
+    except Exception:
+        return
+
+
 class RedactingFilter(logging.Filter):
     """Scrubs unsafe values from a record and adds the request id.
 
@@ -816,6 +917,11 @@ class RedactingFilter(logging.Filter):
     attaches the bound request identifier when the record carries none,
     and always admits the record. A failure while scrubbing replaces the
     message with the placeholder and drops the arguments.
+
+    On the queue-backed path the identifier is attached earlier, by
+    :meth:`QueueDispatchHandler.prepare` on the thread that logged; the
+    attachment here covers a record reaching this filter without having
+    passed through that handler.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -831,13 +937,7 @@ class RedactingFilter(logging.Filter):
         except Exception:
             record.msg = REDACTION_PLACEHOLDER
             record.args = None
-        try:
-            if getattr(record, REQUEST_ID_FIELD, None) is None:
-                bound = current_request_id()
-                if bound is not None:
-                    setattr(record, REQUEST_ID_FIELD, bound)
-        except Exception:
-            return True
+        _attach_request_id(record)
         return True
 
 
@@ -982,10 +1082,13 @@ def _handler_label(handler: Any) -> str:
 class QueueDispatchHandler(logging.handlers.QueueHandler):
     """Hands a record to the listener queue without rendering it.
 
-    ``prepare`` returns the record unchanged, so no redaction, no
-    formatting and no serialisation happens on the thread that logged.
-    The queue is drained in the same process, so the record needs no
-    pickling and keeps its ``exc_info`` and its ``extra`` fields.
+    ``prepare`` attaches the bound request identifier and returns the
+    record otherwise unchanged, so no redaction, no formatting and no
+    serialisation happens on the thread that logged. The identifier is
+    read there because it is bound per task and per thread, and the
+    listener that drains the queue runs on a thread of its own. The queue
+    is drained in the same process, so the record needs no pickling and
+    keeps its ``exc_info`` and its ``extra`` fields.
 
     A record that finds the queue full is written through ``target``
     inline. That bounds the queue's memory without discarding a record,
@@ -1001,7 +1104,8 @@ class QueueDispatchHandler(logging.handlers.QueueHandler):
         self.target = target
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
-        """Returns ``record`` unchanged."""
+        """Attaches the bound request identifier and returns ``record``."""
+        _attach_request_id(record)
         return record
 
     def enqueue(self, record: logging.LogRecord) -> None:

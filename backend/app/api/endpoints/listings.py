@@ -5,7 +5,7 @@ from typing import List
 from datetime import datetime, timezone
 
 from backend.app.core.authorization import Role, require_role
-from backend.app.core.config import settings
+from backend.app.core.config import MAX_PAGINATION_OFFSET, settings
 from backend.app.core.logging import get_logger
 from backend.app.db.database import get_db
 from backend.app.schema.listing import ListingCreate, Listing
@@ -25,7 +25,7 @@ LISTING_NOT_STORED_DETAIL = "Listing could not be stored"
 @router.get("/")
 def get_listings(
     db: Session = Depends(get_db),
-    skip: int = Query(0, ge=0),
+    skip: int = Query(0, ge=0, le=MAX_PAGINATION_OFFSET),
     limit: int = Query(
         DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE
     ),

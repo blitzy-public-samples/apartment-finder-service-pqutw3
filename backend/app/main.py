@@ -67,6 +67,9 @@ Usage::
     uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 """
 
+import base64
+import hashlib
+import re
 import uuid
 from contextlib import asynccontextmanager
 from types import MappingProxyType
@@ -84,7 +87,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.utils import is_body_allowed_for_status_code
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -120,9 +123,18 @@ __all__ = [
     "CORS_ALLOW_ORIGIN_HEADER",
     "DOCS_PATH",
     "DOCUMENTATION_ENABLED",
+    "DOCUMENTATION_FONT_ORIGIN",
+    "DOCUMENTATION_FONT_STYLE_ORIGIN",
+    "DOCUMENTATION_ICON_ORIGIN",
+    "DOCUMENTATION_MARK_ORIGIN",
+    "DOCUMENTATION_PATHS",
+    "DOCUMENTATION_VIEWER_ORIGIN",
+    "DOCUMENTATION_WORKER_SOURCE",
     "HEALTH_STATUS",
+    "INVALID_HOST_DETAIL",
     "INVALID_REQUEST_DETAIL",
     "LOG_DRAIN_INCOMPLETE_MESSAGE",
+    "OAUTH2_REDIRECT_PATH",
     "OPENAPI_PATH",
     "REDOC_PATH",
     "REQUEST_ID_FIELD",
@@ -136,10 +148,12 @@ __all__ = [
     "SECURITY_HEADERS",
     "SERVER_ERROR_DETAIL",
     "THROTTLED_MESSAGE",
+    "TOO_MANY_REQUESTS_DETAIL",
     "BodySizeLimitMiddleware",
     "RequestIdMiddleware",
     "RateLimitGateMiddleware",
     "SecurityHeadersMiddleware",
+    "TrustedHostGateMiddleware",
     "app",
     "health_check",
     "http_exception_handler",
@@ -202,6 +216,13 @@ INVALID_REQUEST_DETAIL = "Invalid request"
 
 SERVER_ERROR_DETAIL = "Internal server error"
 
+#: Detail returned when a request exceeds its rate limit.
+TOO_MANY_REQUESTS_DETAIL = "Too many requests"
+
+#: Detail returned when the request names a host outside
+#: ``settings.ALLOWED_HOSTS``.
+INVALID_HOST_DETAIL = "Invalid host header"
+
 HEALTH_STATUS = "ok"
 
 #: Path the interactive documentation is published at.
@@ -210,8 +231,40 @@ DOCS_PATH = "/docs"
 #: Path the alternative documentation viewer is published at.
 REDOC_PATH = "/redoc"
 
+#: Path the documentation viewer publishes its OAuth2 redirection at.
+OAUTH2_REDIRECT_PATH = DOCS_PATH + "/oauth2-redirect"
+
 #: Path the OpenAPI schema is published at.
 OPENAPI_PATH = "/openapi.json"
+
+#: Paths answering with a documentation page rather than with API data,
+#: so :func:`_documentation_policy` governs them in place of the policy
+#: in :data:`SECURITY_HEADERS`.
+DOCUMENTATION_PATHS: Tuple[str, ...] = (
+    DOCS_PATH,
+    REDOC_PATH,
+    OAUTH2_REDIRECT_PATH,
+)
+
+#: Origin the pinned documentation viewers and their stylesheets are
+#: loaded from.
+DOCUMENTATION_VIEWER_ORIGIN = "https://cdn.jsdelivr.net"
+
+#: Origin one viewer declares its web fonts through.
+DOCUMENTATION_FONT_STYLE_ORIGIN = "https://fonts.googleapis.com"
+
+#: Origin those web fonts are served from.
+DOCUMENTATION_FONT_ORIGIN = "https://fonts.gstatic.com"
+
+#: Origin the documentation favicon is served from.
+DOCUMENTATION_ICON_ORIGIN = "https://fastapi.tiangolo.com"
+
+#: Origin one viewer serves its own mark from.
+DOCUMENTATION_MARK_ORIGIN = "https://cdn.redoc.ly"
+
+#: Source a viewer builds its own worker from, which one of them uses to
+#: index the schema for its search.
+DOCUMENTATION_WORKER_SOURCE = "blob:"
 
 #: Whether the interactive documentation and the schema are published.
 #: True only while ``ENVIRONMENT`` names the local environment, so a
@@ -260,7 +313,29 @@ REASON_MESSAGE_COUNT = "message_count"
 # Request header carrying the body size the client declares.
 _CONTENT_LENGTH_HEADER = "content-length"
 
+# Response header naming the media type the body carries.
+_CONTENT_TYPE_HEADER = "content-type"
+
+# Response header carrying the content-security policy.
+_CSP_HEADER = "content-security-policy"
+
+# Media type a documentation page is served as.
+_HTML_MEDIA_TYPE = "text/html"
+
+# Script elements written into a page rather than fetched: those are the
+# ones a policy admits by the digest of their content.
+_INLINE_SCRIPT_PATTERN = re.compile(
+    r"<script(?![^>]*\ssrc\s*=)[^>]*>(.*?)</script>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Request header carrying the host the client addressed.
+_HOST_HEADER = "host"
+
 _HTTP_SCOPE = "http"
+
+# Scope types the host check applies to, as the base middleware defines.
+_HOST_CHECKED_SCOPES = ("http", "websocket")
 
 _REQUEST_MESSAGE = "http.request"
 
@@ -323,8 +398,119 @@ app = FastAPI(
 app.state.limiter = limiter
 
 
+def _inline_script_sources(body: bytes) -> Tuple[str, ...]:
+    """Returns one policy source expression per inline script in ``body``.
+
+    Each expression is the base64 SHA-256 digest of one script element's
+    own content, in the form a policy names it.
+    """
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return ()
+    sources = []
+    for script in _INLINE_SCRIPT_PATTERN.findall(text):
+        digest = hashlib.sha256(script.encode("utf-8")).digest()
+        encoded = base64.b64encode(digest).decode("ascii")
+        sources.append("'sha256-" + encoded + "'")
+    return tuple(sources)
+
+
+def _documentation_policy(body: bytes) -> str:
+    """Returns the content-security policy for one documentation page.
+
+    Everything stays denied by default. Script and stylesheet are
+    admitted from the pinned viewer origin, and an inline script only by
+    the digest of its own content, so a script this page did not itself
+    carry cannot run. Inline style is admitted because the viewers write
+    their styles into the page as they render it, the worker one viewer
+    builds from the page to index the schema for its search is admitted
+    from that blob source, and same-origin connections are admitted so
+    the page can read the schema it documents. Framing, base URI and form
+    submission stay denied exactly as they are on an API response.
+    """
+    script_sources = " ".join(
+        (DOCUMENTATION_VIEWER_ORIGIN,) + _inline_script_sources(body)
+    )
+    style_sources = " ".join(
+        (
+            "'unsafe-inline'",
+            DOCUMENTATION_VIEWER_ORIGIN,
+            DOCUMENTATION_FONT_STYLE_ORIGIN,
+        )
+    )
+    image_sources = " ".join(
+        (
+            DOCUMENTATION_ICON_ORIGIN,
+            DOCUMENTATION_MARK_ORIGIN,
+            "data:",
+        )
+    )
+    return "; ".join(
+        (
+            "default-src 'none'",
+            "script-src " + script_sources,
+            "style-src " + style_sources,
+            "font-src " + DOCUMENTATION_FONT_ORIGIN,
+            "img-src " + image_sources,
+            "worker-src " + DOCUMENTATION_WORKER_SOURCE,
+            "connect-src 'self'",
+            "frame-ancestors 'none'",
+            "base-uri 'none'",
+            "form-action 'none'",
+        )
+    )
+
+
+def _is_documentation_page(
+    request: Request, response: Response
+) -> bool:
+    """Reports whether ``response`` is a published documentation page."""
+    if not DOCUMENTATION_ENABLED:
+        return False
+    if request.scope.get("path") not in DOCUMENTATION_PATHS:
+        return False
+    if response.status_code != status.HTTP_200_OK:
+        return False
+    media_type = response.headers.get(_CONTENT_TYPE_HEADER, "")
+    return media_type.startswith(_HTML_MEDIA_TYPE)
+
+
+async def _with_documentation_policy(response: Response) -> Response:
+    """Returns ``response`` carrying the documentation policy.
+
+    The body is read so the policy can name the digest of each inline
+    script the page carries, and is returned byte-for-byte as it was.
+    """
+    iterator = getattr(response, "body_iterator", None)
+    if iterator is None:
+        body = getattr(response, "body", b"")
+    else:
+        chunks = []
+        async for chunk in iterator:
+            chunks.append(chunk)
+        body = b"".join(chunks)
+    headers = {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() not in (_CONTENT_LENGTH_HEADER, _CSP_HEADER)
+    }
+    headers[_CSP_HEADER] = _documentation_policy(body)
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+    )
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Sets :data:`SECURITY_HEADERS` on every outgoing response."""
+    """Sets :data:`SECURITY_HEADERS` on every outgoing response.
+
+    A response on one of :data:`DOCUMENTATION_PATHS` then has its policy
+    replaced by the one :func:`_documentation_policy` builds, so the
+    viewer this application publishes in a local run loads its own assets
+    while every API response keeps the policy that denies everything.
+    """
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
@@ -332,6 +518,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         for name, value in SECURITY_HEADERS.items():
             response.headers[name] = value
+        if _is_documentation_page(request, response):
+            return await _with_documentation_policy(response)
         return response
 
 
@@ -612,7 +800,7 @@ class RateLimitGateMiddleware:
             self.limiter._check_request_limit(request, endpoint, False)
         except RateLimitExceeded as exceeded:
             self._log_rejection(scope, exceeded)
-            response = _rate_limit_exceeded_handler(request, exceeded)
+            response = _throttled_response(request, exceeded)
             await response(scope, receive, send)
             return
 
@@ -637,6 +825,52 @@ class RateLimitGateMiddleware:
                 "policy": _rate_limit_policy(exceeded),
             },
         )
+
+
+class TrustedHostGateMiddleware(TrustedHostMiddleware):
+    """Host validation answered in this application's error envelope.
+
+    An accepted host and the ``www.`` redirect are left to the base
+    middleware, which decides both. A host outside ``allowed_hosts`` is
+    answered here with :data:`INVALID_HOST_DETAIL` under ``detail`` and
+    ``application/json``, the same shape as every other rejection this
+    application returns.
+    """
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        if not self._is_refused(scope):
+            await super().__call__(scope, receive, send)
+            return
+        response = JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": INVALID_HOST_DETAIL},
+        )
+        await response(scope, receive, send)
+
+    def _is_refused(self, scope: Scope) -> bool:
+        """Reports whether the base middleware would refuse this request.
+
+        The host is matched exactly and against a ``*.`` suffix pattern,
+        as the base middleware matches it, and a host it would redirect
+        to the ``www.`` form counts as not refused so that the redirect
+        is still the base middleware's to issue.
+        """
+        if (
+            self.allow_any
+            or scope["type"] not in _HOST_CHECKED_SCOPES
+        ):
+            return False
+        host = Headers(scope=scope).get(_HOST_HEADER, "").split(":")[0]
+        for pattern in self.allowed_hosts:
+            if host == pattern or (
+                pattern.startswith("*") and host.endswith(pattern[1:])
+            ):
+                return False
+            if self.www_redirect and "www." + host == pattern:
+                return False
+        return True
 
 
 async def http_exception_handler(
@@ -765,14 +999,38 @@ async def unhandled_exception_handler(
     )
 
 
+def _throttled_response(
+    request: Request, exc: RateLimitExceeded
+) -> Response:
+    """Returns the response one request refused by its rate limit gets.
+
+    The body carries :data:`TOO_MANY_REQUESTS_DETAIL` under ``detail``,
+    the key every other rejection this application returns uses, and the
+    policy that was exceeded is reported through headers rather than in
+    the body. The limiter writes those headers onto the response it is
+    handed, so the reply carries ``Retry-After`` in seconds together with
+    the request count the window admits, the count remaining and the
+    time the window resets.
+    """
+    response = JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": TOO_MANY_REQUESTS_DETAIL},
+    )
+    evaluated = getattr(
+        request.state, _EVALUATED_LIMIT_ATTRIBUTE, None
+    )
+    return limiter._inject_headers(response, evaluated)
+
+
 async def rate_limit_exceeded_handler(
     request: Request, exc: RateLimitExceeded
 ) -> Response:
-    """Records one throttling decision and returns the stock response.
+    """Records one throttling decision and returns its response.
 
     The record carries the request path and method and the policy that
-    was exceeded. The response body, status and headers are the limiter's
-    own, so the throttling contract is unchanged.
+    was exceeded. The response is the one :func:`_throttled_response`
+    builds, so a refusal taken here reads exactly like one taken by
+    :class:`RateLimitGateMiddleware`.
     """
     logger.warning(
         THROTTLED_MESSAGE,
@@ -782,7 +1040,7 @@ async def rate_limit_exceeded_handler(
             "policy": _rate_limit_policy(exc),
         },
     )
-    return _rate_limit_exceeded_handler(request, exc)
+    return _throttled_response(request, exc)
 
 
 def _rate_limit_policy(exc: RateLimitExceeded) -> Optional[str]:
@@ -823,7 +1081,7 @@ app.add_middleware(
 )
 app.add_middleware(RateLimitGateMiddleware, limiter=limiter)
 app.add_middleware(
-    TrustedHostMiddleware, allowed_hosts=settings.ALLOWED_HOSTS
+    TrustedHostGateMiddleware, allowed_hosts=settings.ALLOWED_HOSTS
 )
 app.add_middleware(
     CORSMiddleware,

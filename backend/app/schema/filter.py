@@ -7,11 +7,11 @@ from typing import List, Optional
 # stored filter carries and the number the Filter response projects.
 MAX_ZIP_CODES = 5
 
-# Number of predicates accepted in one request. Creation is the only path
-# that writes criteria rows, so this is also the number a stored filter
-# carries and the number the Filter response projects.
+# Bounds on the number of predicates accepted in one request. Creation is
+# the only path that writes criteria rows, so the maximum is also the most
+# a stored filter carries and the most the Filter response projects.
 MIN_CRITERIA = 1
-MAX_CRITERIA = 1
+MAX_CRITERIA = 5
 
 # Largest number of child rows one Filter response can project, which
 # bounds the rows a page of filters loads at MAX_PAGE_SIZE times this.

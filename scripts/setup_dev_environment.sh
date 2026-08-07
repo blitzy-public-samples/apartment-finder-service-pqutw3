@@ -31,11 +31,32 @@ readonly DB_PORT="5432"
 readonly DB_NAME="apartment_finder"
 readonly DB_ROLE="apartment_finder"
 
+# Variety rules the settings validator applies to SECRET_KEY. A key must
+# carry at least this many distinct characters, must not repeat one
+# character more times in a row than this, and must not carry a longer run
+# of consecutive code points than this.
+readonly MIN_SIGNING_KEY_DISTINCT_CHARACTERS=12
+readonly MAX_SIGNING_KEY_REPEAT_RUN=3
+readonly MAX_SIGNING_KEY_SEQUENCE_RUN=4
+
+# Keys generate_signing_key produces before it gives up
+readonly SIGNING_KEY_ATTEMPTS=10
+
 # Interpreter found by check_software
 PYTHON_BIN=""
 
 # Interpreter of the virtual environment, set by setup_virtual_env
 VENV_PYTHON=""
+
+# Activation script of the virtual environment, set by setup_virtual_env
+VENV_ACTIVATE=""
+
+# Key produced by generate_signing_key
+GENERATED_SIGNING_KEY=""
+
+# Variety rule the key last measured by check_signing_key_variety fails,
+# or the empty string when that key clears every rule
+SIGNING_KEY_REJECTION=""
 
 # Files removed when the script exits
 TEMP_FILES=()
@@ -48,8 +69,13 @@ cleanup() {
     done
 }
 
-# Report the line a failed command was on
+# Report the line a failed command was on. The shell that started this
+# script reports; a subshell that inherited the ERR trap does not, so one
+# failure produces one line.
 report_failure() {
+    if [ "${BASHPID:-$$}" != "$$" ]; then
+        return 0
+    fi
     echo "Setup failed at line ${1}. The environment is incomplete." >&2
 }
 
@@ -135,8 +161,10 @@ setup_virtual_env() {
 
     if [ -x "${VENV_DIR}/bin/python" ]; then
         VENV_PYTHON="${VENV_DIR}/bin/python"
+        VENV_ACTIVATE="${VENV_DIR}/bin/activate"
     elif [ -x "${VENV_DIR}/Scripts/python.exe" ]; then
         VENV_PYTHON="${VENV_DIR}/Scripts/python.exe"
+        VENV_ACTIVATE="${VENV_DIR}/Scripts/activate"
     else
         echo "The virtual environment at ${VENV_DIR} carries no" \
             "interpreter." >&2
@@ -171,6 +199,129 @@ install_dependencies() {
     npm ci --prefix "${REPO_ROOT}/frontend"
 
     echo "Project dependencies installed."
+}
+
+# Record which of the variety rules a signing key fails, if any
+check_signing_key_variety() {
+    local value="$1"
+    local length="${#value}"
+    local index
+    local character
+    local seen=""
+    local distinct=0
+    local code=0
+    local previous_code=0
+    local delta=0
+    local step=0
+    local repeat_run=0
+    local sequence_run=0
+    local longest_repeat=0
+    local longest_sequence=0
+
+    SIGNING_KEY_REJECTION=""
+
+    for ((index = 0; index < length; index++)); do
+        character="${value:index:1}"
+
+        # Count the character unless an earlier position carried it
+        case "${seen}" in
+            *"${character}"*) ;;
+            *)
+                seen="${seen}${character}"
+                distinct=$((distinct + 1))
+                ;;
+        esac
+
+        printf -v code '%d' "'${character}"
+
+        if [ "${index}" -eq 0 ]; then
+            repeat_run=1
+            sequence_run=1
+        else
+            if [ "${code}" -eq "${previous_code}" ]; then
+                repeat_run=$((repeat_run + 1))
+            else
+                repeat_run=1
+            fi
+
+            # Extend the run while the code points step by one in the
+            # direction the run already carries
+            delta=$((code - previous_code))
+            if { [ "${delta}" -eq 1 ] || [ "${delta}" -eq -1 ]; } \
+                && { [ "${step}" -eq 0 ] \
+                    || [ "${delta}" -eq "${step}" ]; }; then
+                step="${delta}"
+                sequence_run=$((sequence_run + 1))
+            elif [ "${delta}" -eq 1 ] || [ "${delta}" -eq -1 ]; then
+                step="${delta}"
+                sequence_run=2
+            else
+                step=0
+                sequence_run=1
+            fi
+        fi
+
+        if [ "${repeat_run}" -gt "${longest_repeat}" ]; then
+            longest_repeat="${repeat_run}"
+        fi
+        if [ "${sequence_run}" -gt "${longest_sequence}" ]; then
+            longest_sequence="${sequence_run}"
+        fi
+
+        previous_code="${code}"
+    done
+
+    if [ "${distinct}" -lt "${MIN_SIGNING_KEY_DISTINCT_CHARACTERS}" ]; then
+        printf -v SIGNING_KEY_REJECTION \
+            'carries fewer than %s distinct characters' \
+            "${MIN_SIGNING_KEY_DISTINCT_CHARACTERS}"
+    elif [ "${longest_repeat}" -gt "${MAX_SIGNING_KEY_REPEAT_RUN}" ]; then
+        printf -v SIGNING_KEY_REJECTION \
+            'repeats one character more than %s times in a row' \
+            "${MAX_SIGNING_KEY_REPEAT_RUN}"
+    elif [ "${longest_sequence}" -gt "${MAX_SIGNING_KEY_SEQUENCE_RUN}" ]
+    then
+        printf -v SIGNING_KEY_REJECTION \
+            'carries a run of more than %s consecutive characters' \
+            "${MAX_SIGNING_KEY_SEQUENCE_RUN}"
+    fi
+}
+
+# Generate a signing key that clears every variety rule
+generate_signing_key() {
+    local attempt
+    local candidate
+
+    GENERATED_SIGNING_KEY=""
+    SIGNING_KEY_REJECTION=""
+
+    for ((attempt = 1; attempt <= SIGNING_KEY_ATTEMPTS; attempt++)); do
+        if command -v openssl > /dev/null 2>&1; then
+            candidate="$(openssl rand -hex 32)"
+        else
+            require_venv_python
+            candidate="$("${VENV_PYTHON}" -c \
+                'import secrets; print(secrets.token_hex(32))')"
+        fi
+
+        if [ -z "${candidate}" ]; then
+            echo "Failed to generate a value for SECRET_KEY." >&2
+            exit 1
+        fi
+
+        check_signing_key_variety "${candidate}"
+        if [ -z "${SIGNING_KEY_REJECTION}" ]; then
+            GENERATED_SIGNING_KEY="${candidate}"
+            return 0
+        fi
+    done
+
+    echo "Generated ${SIGNING_KEY_ATTEMPTS} values for SECRET_KEY and" \
+        "none of them cleared the variety rules the settings validator" \
+        "applies." >&2
+    echo "The last one ${SIGNING_KEY_REJECTION}. Re-run this script to" \
+        "try again." >&2
+    exit 1
 }
 
 configure_env_vars() {
@@ -208,18 +359,8 @@ configure_env_vars() {
     fi
 
     # Generate the token signing key
-    if command -v openssl > /dev/null 2>&1; then
-        secret_key="$(openssl rand -hex 32)"
-    else
-        require_venv_python
-        secret_key="$("${VENV_PYTHON}" -c \
-            'import secrets; print(secrets.token_hex(32))')"
-    fi
-
-    if [ -z "${secret_key}" ]; then
-        echo "Failed to generate a value for SECRET_KEY." >&2
-        exit 1
-    fi
+    generate_signing_key
+    secret_key="${GENERATED_SIGNING_KEY}"
 
     env_tmp="$(mktemp "${env_file}.XXXXXX")"
     TEMP_FILES+=("${env_tmp}")
@@ -236,21 +377,6 @@ configure_env_vars() {
     if ! grep -q '^SECRET_KEY=.\{32,\}$' "${env_tmp}"; then
         echo "Failed to write a generated SECRET_KEY into" \
             "${env_file}." >&2
-        exit 1
-    fi
-
-    # Confirm the generated key clears the variety rules the settings
-    # validator applies, so setup cannot leave a value startup refuses
-    distinct_characters="$(printf '%s' "${secret_key}" \
-        | grep -o . | sort -u | wc -l | tr -d '[:space:]')"
-    if [ "${distinct_characters}" -lt 12 ]; then
-        echo "The generated SECRET_KEY carries fewer than 12 distinct" \
-            "characters. Re-run this script to generate another." >&2
-        exit 1
-    fi
-    if printf '%s' "${secret_key}" | grep -Eq '(.)\1{3,}'; then
-        echo "The generated SECRET_KEY repeats one character more than" \
-            "3 times in a row. Re-run this script to generate another." >&2
         exit 1
     fi
 
@@ -411,7 +537,7 @@ main() {
     run_migrations
 
     echo "Development environment setup completed successfully!"
-    echo "Activate the virtual environment with: source ${VENV_DIR}/bin/activate"
+    echo "Activate the virtual environment with: source ${VENV_ACTIVATE}"
 }
 
 main "$@"

@@ -115,7 +115,11 @@ from sqlalchemy.orm import Session
 
 from backend.app.core.authorization import load_owned
 from backend.app.core.config import TLS_SCHEME, settings
-from backend.app.core.logging import exception_fields, get_logger
+from backend.app.core.logging import (
+    exception_fields,
+    get_logger,
+    register_secret_values,
+)
 from backend.app.core.plans import format_amount, get_plan
 from backend.app.db.models import Subscription
 
@@ -183,6 +187,13 @@ PAYPAL_CLIENT_ID = settings.PAYPAL_CLIENT_ID
 PAYPAL_CLIENT_SECRET = settings.PAYPAL_CLIENT_SECRET
 
 logger = get_logger(__name__)
+
+# Replaces the provider credentials wherever they appear in a record, so
+# they are removed from text that names no key -- provider error prose
+# included.
+register_secret_values(
+    PAYPAL_CLIENT_SECRET, settings.PAYPAL_WEBHOOK_ID
+)
 
 #: Header naming the signature algorithm, mapped to ``auth_algo``.
 AUTH_ALGO_HEADER = "PAYPAL-AUTH-ALGO"
@@ -1631,6 +1642,27 @@ def webhook_body_object(body: Any) -> Optional[Dict[str, Any]]:
     return decoded
 
 
+def _raw_notification_bytes(body: Any) -> Optional[bytes]:
+    """Returns the raw notification bytes ``body`` carries, or ``None``.
+
+    A binary body is returned as ``bytes``, and text is encoded as UTF-8,
+    so the decoded notification and the postback document are built from
+    one representation of the same body. ``None`` is returned for a value
+    of any other type and for text that does not encode.
+    """
+    if isinstance(body, str):
+        try:
+            return body.encode("utf-8")
+        except (UnicodeEncodeError, ValueError):
+            return None
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        try:
+            return bytes(body)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _postback_document(
     lookup: Dict[str, str],
     certificate_url: str,
@@ -1674,8 +1706,11 @@ async def verify_webhook_signature(
     """Check an inbound PayPal notification and report the outcome.
 
     ``headers`` is the inbound header mapping, matched without regard to
-    letter case, and ``body`` is the **raw request bytes**. The checks are
-    applied in this order:
+    letter case, and ``body`` is the **raw request bytes**. Text is
+    accepted too and is encoded as UTF-8, so the same bytes are both
+    decoded and transmitted whichever form the caller holds; a value of
+    any other type is rejected as :data:`REASON_MALFORMED_BODY`. The
+    checks are applied in this order:
 
     1. the host of the ``PAYPAL-CERT-URL`` header is checked against
        ``settings.PAYPAL_CERT_HOST_ALLOWLIST``, before that value is
@@ -1717,13 +1752,16 @@ async def verify_webhook_signature(
     if any(name not in lookup for name in REQUIRED_WEBHOOK_HEADERS):
         return _rejected(REASON_MISSING_HEADER)
 
-    notification = webhook_body_object(body)
+    raw_body = _raw_notification_bytes(body)
+    notification = (
+        webhook_body_object(raw_body) if raw_body is not None else None
+    )
     if notification is None:
         return _rejected(REASON_MALFORMED_BODY)
 
     transmission_id = lookup[TRANSMISSION_ID_HEADER]
     document = _postback_document(
-        lookup, certificate_url, transmission_id, body
+        lookup, certificate_url, transmission_id, raw_body
     )
 
     try:

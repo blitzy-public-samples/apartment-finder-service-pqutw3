@@ -6,7 +6,7 @@ from backend.app.core.config import (
     is_allowed_listing_provider_url,
     settings,
 )
-from backend.app.core.logging import get_logger
+from backend.app.core.logging import get_logger, register_secret_values
 from backend.app.schema.listing import ListingCreate
 
 ZILLOW_API_URL = settings.ZILLOW_API_URL
@@ -14,9 +14,23 @@ ZILLOW_API_KEY = settings.ZILLOW_API_KEY
 
 logger = get_logger(__name__)
 
+# Replaces the provider credential wherever it appears in a record, so it
+# is removed from text that names no key -- provider error prose included.
+register_secret_values(ZILLOW_API_KEY)
+
 
 class ListingMappingError(ValueError):
-    """Raised when a provider record cannot be mapped to a listing."""
+    """Raised when a provider record cannot be mapped to a listing.
+
+    ``fields`` names the contract fields that failed, so a caller can
+    report which field a systematic discard comes from. Only names
+    declared by :class:`backend.app.schema.listing.ListingCreate` are
+    carried, and no provider value ever is.
+    """
+
+    def __init__(self, message: str, fields: Tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.fields = tuple(fields)
 
 
 #: Listing columns a provider record may set, and the provider keys read
@@ -127,6 +141,22 @@ def _first_present(raw_listing: Dict, names: Tuple[str, ...]) -> Any:
     return None
 
 
+def _failed_fields(error: ValidationError) -> Tuple[str, ...]:
+    """Returns the contract fields ``error`` reports, sorted and unique.
+
+    A location part is kept only when it names a field
+    :class:`ListingCreate` declares, so the result carries contract names
+    and never a provider key or value.
+    """
+    declared = set(ListingCreate.__fields__)
+    names = set()
+    for entry in error.errors():
+        for part in entry.get("loc", ()):
+            if isinstance(part, str) and part in declared:
+                names.add(part)
+    return tuple(sorted(names))
+
+
 def process_listing(raw_listing: Dict) -> ListingCreate:
     """Maps one provider record onto the listing creation contract.
 
@@ -140,7 +170,8 @@ def process_listing(raw_listing: Dict) -> ListingCreate:
     The mapped values are validated by
     :class:`backend.app.schema.listing.ListingCreate`, which bounds each
     one. Raises :class:`ListingMappingError` when ``raw_listing`` is not
-    a mapping or when the mapped values fail that validation.
+    a mapping or when the mapped values fail that validation; the raised
+    error names the contract fields that failed under ``fields``.
     """
     if not isinstance(raw_listing, dict):
         raise ListingMappingError(
@@ -156,5 +187,6 @@ def process_listing(raw_listing: Dict) -> ListingCreate:
     except ValidationError as error:
         raise ListingMappingError(
             "A provider listing did not satisfy the listing contract: "
-            + str(error)
+            + str(error),
+            _failed_fields(error),
         ) from None

@@ -31,7 +31,7 @@ from backend.app.db.models import (
     ZipCode as ZipCodeModel,
 )
 from backend.app.core.authorization import Role, require_role
-from backend.app.core.config import settings
+from backend.app.core.config import MAX_PAGINATION_OFFSET, settings
 from datetime import datetime, timezone
 from typing import List
 
@@ -100,15 +100,17 @@ def create_filter(
 def get_user_filters(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(Role.REGISTERED)),
-    skip: int = Query(0, ge=0),
+    skip: int = Query(0, ge=0, le=MAX_PAGINATION_OFFSET),
     limit: int = Query(
         DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE
     ),
 ):
     """Return one page of the caller's own filters.
 
-    ``skip`` and ``limit`` are applied in SQL, and ``limit`` is bounded
-    by ``settings.MAX_PAGE_SIZE``. The postal codes and the predicates
+    ``skip`` and ``limit`` are applied in SQL, and both are bounded:
+    ``limit`` by ``settings.MAX_PAGE_SIZE`` and ``skip`` by
+    ``MAX_PAGINATION_OFFSET``, so an offset the database cannot bind is
+    refused by request validation. The postal codes and the predicates
     of the returned filters are loaded by two further statements for the
     whole page rather than by two per filter, so the number of
     statements does not follow the page size. The number of children per

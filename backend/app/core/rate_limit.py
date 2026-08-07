@@ -23,6 +23,12 @@ provides, which schedules a sweep of every tracked key roughly every
 read path and by the capped sweep instead, so the cost of a hit does not
 follow the number of keys held.
 
+:class:`HeaderWritingLimiter` is the limiter this module builds. It
+writes the rate-limit headers and ``Retry-After`` onto a response it is
+handed and leaves a call that carries none untouched, so a refused
+request reports the policy it exceeded while an admitted one is answered
+exactly as its endpoint wrote it.
+
 :func:`build_limiter` reads ``settings.RATE_LIMIT_STORAGE_URI``, which
 accepts any scheme in
 :data:`backend.app.core.config.RATE_LIMIT_STORAGE_SCHEMES`. A scheme
@@ -44,6 +50,7 @@ from typing import Any, Optional, Union
 from limits.storage import MemoryStorage
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from starlette.responses import Response
 
 from backend.app.core.config import (
     BOUNDED_MEMORY_SCHEME,
@@ -56,12 +63,33 @@ from backend.app.core.logging import get_logger
 
 __all__ = [
     "IN_PROCESS_STORE_MESSAGE",
+    "RATE_LIMIT_HEADERS",
     "RETAINED_KEY_RATIO",
+    "RETRY_AFTER_FORMAT",
+    "RETRY_AFTER_HEADER",
     "BoundedMemoryStorage",
+    "HeaderWritingLimiter",
     "build_limiter",
 ]
 
 logger = get_logger(__name__)
+
+#: Header naming how long a refused caller waits, and the format its
+#: value carries: a whole number of seconds rather than an HTTP date.
+RETRY_AFTER_HEADER = "Retry-After"
+RETRY_AFTER_FORMAT = "delta-seconds"
+
+#: Header carrying the time the current window resets, as a whole number
+#: of seconds since the epoch.
+RATE_LIMIT_RESET_HEADER = "X-RateLimit-Reset"
+
+#: Headers describing the policy a refused request exceeded: the number
+#: of requests the window admits, how many remain, and when it resets.
+RATE_LIMIT_HEADERS = (
+    "X-RateLimit-Limit",
+    "X-RateLimit-Remaining",
+    RATE_LIMIT_RESET_HEADER,
+)
 
 #: Share of the key cap kept after an eviction pass, so the pass runs
 #: once per batch of new keys rather than once per hit.
@@ -185,6 +213,47 @@ class BoundedMemoryStorage(MemoryStorage):
             self.clear(key)
 
 
+class HeaderWritingLimiter(Limiter):
+    """Limiter that writes its headers onto a response, and only that.
+
+    With rate-limit headers enabled the limiter is handed something to
+    describe the policy on after every call it counts. The endpoints of
+    this application answer with models rather than responses and declare
+    no response parameter, so what it is handed for a call it admitted is
+    ``None``; the base class rejects that outright. A call that carries no
+    response is left untouched here, and the headers are written when a
+    response is supplied -- which is the path that refuses a request.
+
+    The reset header is rewritten as a whole number of seconds since the
+    epoch, since the window the store reports carries a fraction that no
+    consumer of that header expects.
+    """
+
+    def _inject_headers(
+        self, response: Optional[Response], current_limit: Any
+    ) -> Optional[Response]:
+        if not isinstance(response, Response):
+            return response
+        written = super()._inject_headers(response, current_limit)
+        _as_whole_number(written, RATE_LIMIT_RESET_HEADER)
+        return written
+
+
+def _as_whole_number(response: Response, header: str) -> None:
+    """Rewrites a numeric response header as a whole number.
+
+    A header the response does not carry, or one carrying a value that is
+    not a number, is left as it is.
+    """
+    value = response.headers.get(header)
+    if value is None:
+        return
+    try:
+        response.headers[header] = str(int(float(value)))
+    except (TypeError, ValueError):
+        return
+
+
 def _resolve_key_cap(override: Any) -> int:
     """Return the number of keys one storage instance may track.
 
@@ -209,6 +278,11 @@ def build_limiter() -> Limiter:
     by ``settings.RATE_LIMIT_STORAGE_URI``. One record naming the setting
     is emitted when that store counts inside a single process outside a
     local environment.
+
+    Rate-limit response headers are enabled, so a refused request carries
+    :data:`RATE_LIMIT_HEADERS` together with ``Retry-After`` expressed in
+    seconds, and a client learns the policy it exceeded and when it may
+    call again rather than having to guess.
     """
     storage_uri = settings.RATE_LIMIT_STORAGE_URI
     scheme = rate_limit_storage_scheme(storage_uri)
@@ -227,4 +301,9 @@ def build_limiter() -> Limiter:
                 ),
             },
         )
-    return Limiter(key_func=get_remote_address, storage_uri=storage_uri)
+    return HeaderWritingLimiter(
+        key_func=get_remote_address,
+        storage_uri=storage_uri,
+        headers_enabled=True,
+        retry_after=RETRY_AFTER_FORMAT,
+    )

@@ -17,16 +17,24 @@ server-assigned ``id`` and ``created_at`` are never reassigned.
 A record carrying no identity is discarded rather than recorded, because
 it cannot be reconciled on a later pass and would otherwise be inserted
 again on every one. A record that fails the contract is discarded the
-same way. Both are counted and reported once per pass.
+same way, and names the contract fields it failed. A record the database
+refuses for a reason that describes that record -- one of
+:data:`RECORD_FAILURES` -- is discarded too: each record is written inside
+its own savepoint, so one unwritable record is counted and dropped while
+every other record in the same payload is still recorded. All three are
+counted and reported once per pass.
 
-The pass owns one session, commits once, and rolls back and reports on
-any failure rather than propagating it, so a failing provider or
-database never ends the schedule.
+The pass owns one session and commits once. Any failure rolls the session
+back and is reported rather than propagated, so a failing provider or
+database never ends the schedule. A failure is reported by exception
+class -- and by the driver's error class where the database raised it --
+carrying no message text, so no provider value travels with it.
 """
 
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
 from backend.app.db.database import SessionLocal
 from backend.app.services.zillow_service import (
@@ -53,7 +61,36 @@ PROVIDER_FILTERS: Dict[str, str] = {}
 #: Message recorded when one ingestion pass does not complete.
 INGESTION_FAILED_MESSAGE = "An error occurred while updating listings"
 
+#: Message recorded when the database refuses one provider record.
+RECORD_REFUSED_MESSAGE = "Discarded a provider listing the database refused"
+
+#: Failures attributed to the one record being written rather than to the
+#: pass. A constraint violation and a value the column cannot hold both
+#: describe that record, and the driver raises ``ValueError`` for a value
+#: it cannot adapt at all. Every other failure -- a lost connection, a
+#: missing privilege, a schema mismatch -- describes the session or the
+#: database, applies to every record equally, and ends the pass.
+RECORD_FAILURES = (IntegrityError, DataError, ValueError)
+
 logger = get_logger(__name__)
+
+
+def _failure_fields(error: BaseException) -> Dict[str, Optional[str]]:
+    """Returns the class-level description of ``error``.
+
+    The exception's class and defining module are reported, together with
+    the driver error class when the exception wraps one. No message text
+    is included: a driver message carries the server's own detail line,
+    which repeats the value it refused.
+    """
+    origin = getattr(error, "orig", None)
+    return {
+        "exception_type": type(error).__name__,
+        "exception_module": getattr(type(error), "__module__", None),
+        "database_error": (
+            type(origin).__name__ if origin is not None else None
+        ),
+    }
 
 
 def tracked_zip_codes(db: Session) -> List[str]:
@@ -102,7 +139,10 @@ def _refresh_listing(
 ) -> None:
     """Assigns ``processed`` onto the declared mutable columns of ``row``.
 
-    ``id``, ``created_at`` and the identity column are not assigned.
+    ``id``, ``created_at`` and the identity column are not assigned. Every
+    other declared column is, so a column the provider no longer supplies
+    is set to ``None``: the stored row states what the provider currently
+    reports rather than accumulating values from earlier passes.
     """
     row.rent = processed.rent
     row.broker_fee = processed.broker_fee
@@ -118,13 +158,17 @@ def _mapped(raw_listing: Dict) -> Optional[ListingCreate]:
     """Returns ``raw_listing`` mapped, or ``None`` when it is unusable.
 
     A record that fails the contract and a record carrying no identity
-    both return ``None``. Neither the record nor any provider value
-    reaches the log line.
+    both return ``None``. A contract failure names the contract fields it
+    failed, so a systematic discard can be attributed to a field. Neither
+    the record nor any provider value reaches the log line.
     """
     try:
         processed = process_listing(raw_listing)
-    except ListingMappingError:
-        logger.warning("Discarded a provider listing that failed the contract")
+    except ListingMappingError as error:
+        logger.warning(
+            "Discarded a provider listing that failed the contract",
+            extra={"contract_fields": list(error.fields)},
+        )
         return None
     if not getattr(processed, IDENTITY_COLUMN):
         logger.warning(
@@ -133,6 +177,38 @@ def _mapped(raw_listing: Dict) -> Optional[ListingCreate]:
         )
         return None
     return processed
+
+
+def _write(
+    db: Session,
+    existing_listing: Optional[Listing],
+    mapped: ListingCreate,
+    moment: datetime,
+) -> bool:
+    """Writes one record inside its own savepoint. Reports whether it was.
+
+    The row is constructed or refreshed and flushed within a nested
+    transaction, so a record the database refuses is rolled back to the
+    savepoint on its own and the records already written in this pass stay
+    pending. A failure listed in :data:`RECORD_FAILURES` is attributed to
+    the record: it is recorded by exception class, naming no provider
+    value, and False is returned. Every other failure describes the
+    session or the database rather than the record and is raised, ending
+    the pass.
+    """
+    try:
+        with db.begin_nested():
+            if existing_listing is None:
+                db.add(_new_listing(mapped, moment))
+            else:
+                _refresh_listing(existing_listing, mapped, moment)
+            db.flush()
+    except RECORD_FAILURES as error:
+        fields = _failure_fields(error)
+        fields["identity_column"] = IDENTITY_COLUMN
+        logger.warning(RECORD_REFUSED_MESSAGE, extra=fields)
+        return False
+    return True
 
 
 @asyncio.coroutine
@@ -169,8 +245,9 @@ async def update_listings():
         recorded = 0
         refreshed = 0
         discarded = 0
+        refused = 0
         for raw_listing in raw_listings:
-            # Only the count is carried outside this loop, so a failure
+            # Only the counts are carried outside this loop, so a failure
             # record names how far the pass got and never a listing.
             mapped = _mapped(raw_listing)
             if mapped is None:
@@ -178,16 +255,18 @@ async def update_listings():
                 continue
             processed += 1
             identity = getattr(mapped, IDENTITY_COLUMN)
-            # The identity column is uniquely constrained, so this
-            # matches the one row carrying the value or none at all.
+            # The identity column is uniquely constrained and each record
+            # is flushed as it is written, so this matches the one row
+            # carrying the value -- including one written earlier in this
+            # same pass -- or none at all.
             existing_listing = db.query(Listing).filter(
                 getattr(Listing, IDENTITY_COLUMN) == identity
             ).first()
-            if existing_listing is None:
-                db.add(_new_listing(mapped, moment))
+            if not _write(db, existing_listing, mapped, moment):
+                refused += 1
+            elif existing_listing is None:
                 recorded += 1
             else:
-                _refresh_listing(existing_listing, mapped, moment)
                 refreshed += 1
         db.commit()
         logger.info(
@@ -198,17 +277,21 @@ async def update_listings():
                 "recorded": recorded,
                 "refreshed": refreshed,
                 "discarded": discarded,
+                "refused": refused,
             },
         )
     except Exception as e:
         db.rollback()
-        # Records the failure as the exception's class, module and
-        # redacted message together with the pass metadata.
+        # Records the failure as the exception's class, the module that
+        # defines it and the driver's error class, together with the pass
+        # metadata. No message text is carried.
         log_exception(
             logger,
             INGESTION_FAILED_MESSAGE,
             e,
             processed_listings=processed,
+            exception_message=None,
+            database_error=_failure_fields(e)["database_error"],
         )
     finally:
         db.close()
