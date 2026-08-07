@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,10 @@ from backend.app.db.models import Base, User
 from backend.app.main import app
 
 PASSWORD = 'testpassword123'
+
+SUBSCRIPTIONS_MODULE = 'backend.app.api.endpoints.subscriptions'
+
+ORDER_ID = 'ORDER-TEST-1'
 
 
 @pytest.fixture
@@ -147,11 +152,19 @@ def test_filter_listing_is_scoped_to_the_caller(
 def test_subscription_creation_and_retrieval(
     client, registered_user
 ):
-    created = client.post(
-        '/subscriptions/',
-        json={'plan_id': 'premium_monthly'},
-        headers=bearer(registered_user),
-    )
+    """The PayPal order and capture calls are stood in for here."""
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value={'id': ORDER_ID},
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+        return_value={'status': 'COMPLETED'},
+    ):
+        created = client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=bearer(registered_user),
+        )
     assert created.status_code == 200
     assert created.json()['user_id'] == registered_user.id
 

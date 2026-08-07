@@ -35,7 +35,7 @@ def create_listing(
 ) -> Listing:
     # Timestamps are taken from the server clock.
     recorded_at = datetime.now(timezone.utc)
-    # Each column is named explicitly; no request field is unpacked.
+    # Create new listing in database
     db_listing = ListingModel(
         created_at=recorded_at,
         updated_at=recorded_at,
