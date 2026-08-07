@@ -195,8 +195,23 @@ variable "secret_key" {
   }
 
   validation {
+    # Distinct-character count. split("", s) yields one element per
+    # character, so distinct() collapses a repeated unit such as "a" * 32
+    # or "Ab" * 16 to fewer entries than the floor admits.
+    condition     = length(distinct(split("", var.secret_key))) >= 12
+    error_message = "The signing key must carry at least 12 distinct characters, matching the variety floor the application enforces at startup. A key built by repeating one short unit, such as 32 copies of a single character, is rejected."
+  }
+
+  validation {
     condition     = !can(regex("(?i)^(change[-_]?me|replace(me|[-_])|your(secret|[-_])|placeholder|insecure)", var.secret_key))
     error_message = "The signing key must not be a placeholder value, matching the placeholder set the application rejects at startup."
+  }
+
+  validation {
+    # Longest run of one repeated character, matching the run ceiling the
+    # application enforces at startup.
+    condition     = !can(regex("(.)\\1{3,}", var.secret_key))
+    error_message = "The signing key must not repeat one character more than 3 times in a row, matching the run ceiling the application enforces at startup."
   }
 }
 

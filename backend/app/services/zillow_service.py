@@ -1,16 +1,39 @@
 import httpx
-from typing import List, Dict
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, Tuple
+from pydantic import ValidationError
 from backend.app.core.config import (
     is_allowed_listing_provider_url,
     settings,
 )
 from backend.app.core.logging import get_logger
-from backend.app.schema.listing import Listing
+from backend.app.schema.listing import ListingCreate
 
 ZILLOW_API_URL = settings.ZILLOW_API_URL
 ZILLOW_API_KEY = settings.ZILLOW_API_KEY
 
 logger = get_logger(__name__)
+
+
+class ListingMappingError(ValueError):
+    """Raised when a provider record cannot be mapped to a listing."""
+
+
+#: Listing columns a provider record may set, and the provider keys read
+#: for each. Keys are tried in order and the first one carrying a value
+#: wins. Any key the provider sends that appears in no entry is ignored.
+PROVIDER_FIELD_SOURCES: Mapping[str, Tuple[str, ...]] = MappingProxyType(
+    {
+        "rent": ("rent", "price"),
+        "broker_fee": ("broker_fee",),
+        "square_footage": ("square_footage", "square_feet"),
+        "bedrooms": ("bedrooms",),
+        "bathrooms": ("bathrooms",),
+        "available_date": ("available_date",),
+        "street_address": ("street_address", "address"),
+        "zillow_url": ("zillow_url", "listing_url"),
+    }
+)
 
 # Failures translated into an empty result. httpx.InvalidURL,
 # httpx.CookieConflict and httpx.StreamError sit outside the
@@ -32,9 +55,8 @@ def fetch_listings(zip_codes: List[str], filters: Dict) -> List[Dict]:
     Returns the provider's listing objects, or an empty list when the
     request fails, when the response body is not decodable JSON, or when
     the decoded body does not carry a list of listing objects. Every
-    failure is logged once and none propagates to the caller. A transient
-    failure is not retried inside this call; the caller's schedule is the
-    retry interval.
+    failure is logged once and none propagates to the caller. The call
+    issues one request and performs no retry.
     """
     if not is_allowed_listing_provider_url(ZILLOW_API_URL):
         logger.error(
@@ -92,18 +114,47 @@ def fetch_listings(zip_codes: List[str], filters: Dict) -> List[Dict]:
     return accepted
 
 
-def process_listing(raw_listing: Dict) -> Listing:
+def _first_present(raw_listing: Dict, names: Tuple[str, ...]) -> Any:
+    """Returns the value of the first name ``raw_listing`` carries.
+
+    Names are tried in order and a ``None`` value is treated as absent.
+    ``None`` is returned when no name carries a value.
     """
-    Processes raw listing data into Listing schema
+    for name in names:
+        value = raw_listing.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def process_listing(raw_listing: Dict) -> ListingCreate:
+    """Maps one provider record onto the listing creation contract.
+
+    :data:`PROVIDER_FIELD_SOURCES` is the complete allowlist of the
+    columns a provider record may set, and each entry names the provider
+    keys read for it, in order. A key outside that allowlist is ignored,
+    so nothing the provider sends can reach a column the contract does
+    not declare. ``id``, ``created_at`` and ``updated_at`` are assigned
+    by the caller and are not read here.
+
+    The mapped values are validated by
+    :class:`backend.app.schema.listing.ListingCreate`, which bounds each
+    one. Raises :class:`ListingMappingError` when ``raw_listing`` is not
+    a mapping or when the mapped values fail that validation.
     """
-    return Listing(
-        id=raw_listing.get("id"),
-        address=raw_listing.get("address"),
-        price=float(raw_listing.get("price", 0)),
-        bedrooms=int(raw_listing.get("bedrooms", 0)),
-        bathrooms=float(raw_listing.get("bathrooms", 0)),
-        square_feet=int(raw_listing.get("square_feet", 0)),
-        description=raw_listing.get("description", ""),
-        image_url=raw_listing.get("image_url"),
-        listing_url=raw_listing.get("listing_url")
+    if not isinstance(raw_listing, dict):
+        raise ListingMappingError(
+            "A provider listing must be an object, not "
+            + type(raw_listing).__name__
+        )
+    mapped = dict(
+        (column, _first_present(raw_listing, sources))
+        for column, sources in PROVIDER_FIELD_SOURCES.items()
     )
+    try:
+        return ListingCreate(**mapped)
+    except ValidationError as error:
+        raise ListingMappingError(
+            "A provider listing did not satisfy the listing contract: "
+            + str(error)
+        ) from None

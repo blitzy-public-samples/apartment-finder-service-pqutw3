@@ -3,6 +3,11 @@
 Maps each plan identifier to its amount, currency, period and the role a
 subscriber holds. The catalog is fixed at import time and is published as
 a read-only mapping.
+
+This module also holds the values the ``subscriptions.status`` column
+takes. They live here, beside the catalog, because both the endpoint that
+writes the column and the authorization module that reads it need them,
+and this module imports nothing from the application.
 """
 
 import decimal
@@ -15,6 +20,10 @@ __all__ = [
     "PLAN_IDS",
     "PREMIUM_ANNUAL",
     "PREMIUM_MONTHLY",
+    "STATUS_ACTIVE",
+    "STATUS_FAILED",
+    "STATUS_PENDING",
+    "STATUS_VALUES",
     "Plan",
     "ROLE_PREMIUM",
     "UnknownPlanError",
@@ -28,6 +37,23 @@ PREMIUM_ANNUAL = "premium_annual"
 CURRENCY_USD = "USD"
 
 ROLE_PREMIUM = "premium"
+
+#: Status of a row recorded before its payment is captured. It grants no
+#: entitlement.
+STATUS_PENDING = "pending"
+
+#: Status of a row whose payment was captured. It is the only status that
+#: grants an entitlement.
+STATUS_ACTIVE = "active"
+
+#: Status of a row whose payment did not complete. It grants no
+#: entitlement and is retained for reconciliation.
+STATUS_FAILED = "failed"
+
+#: Every value the status column takes.
+STATUS_VALUES: typing.FrozenSet[str] = frozenset(
+    {STATUS_PENDING, STATUS_ACTIVE, STATUS_FAILED}
+)
 
 _AMOUNT_QUANTUM = decimal.Decimal("0.01")
 _AMOUNT_ROUNDING = decimal.ROUND_HALF_UP
@@ -53,8 +79,15 @@ class Plan(typing.NamedTuple):
 
     ``amount`` is a Decimal carrying exactly two places and ``currency``
     is its ISO 4217 code. ``period_days`` is the length of the
-    entitlement the plan buys, and ``required_role`` is the role name a
-    subscriber on the plan holds.
+    entitlement the plan buys.
+
+    ``required_role`` is the role name a subscriber on the plan holds. It
+    is applied to ``User.role`` by
+    :func:`backend.app.api.endpoints.subscriptions.grant_plan_role`,
+    which runs only after a capture has settled for this amount and
+    currency, and it is withdrawn by
+    :func:`backend.app.api.endpoints.subscriptions.revoke_expired_entitlement`
+    once no active subscription remains.
     """
 
     plan_id: str
@@ -69,9 +102,8 @@ def _to_amount(value: _AmountInput) -> decimal.Decimal:
 
     Accepts Decimal, int and str. Raises TypeError for any other type,
     including bool and float, and ValueError when the value is not a
-    finite decimal number that fits two places. A value carrying more
-    precision than two places is rejected rather than rounded, so the
-    returned amount is always equal to the value supplied.
+    finite decimal number that fits two places. The returned amount
+    always equals the value supplied.
     """
     if isinstance(value, decimal.Decimal):
         candidate = value

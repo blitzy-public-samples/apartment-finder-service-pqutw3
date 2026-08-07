@@ -2,12 +2,20 @@ from pydantic import BaseModel, conlist, constr, validator
 from datetime import datetime
 from typing import List, Optional
 
-# Maximum number of postal codes accepted in one request.
+# Maximum number of postal codes accepted in one request. Creation is
+# the only path that writes zip_codes rows, so this is also the number a
+# stored filter carries and the number the Filter response projects.
 MAX_ZIP_CODES = 5
 
-# Number of predicates accepted in one request.
+# Number of predicates accepted in one request. Creation is the only path
+# that writes criteria rows, so this is also the number a stored filter
+# carries and the number the Filter response projects.
 MIN_CRITERIA = 1
 MAX_CRITERIA = 1
+
+# Largest number of child rows one Filter response can project, which
+# bounds the rows a page of filters loads at MAX_PAGE_SIZE times this.
+MAX_CHILDREN_PER_FILTER = MAX_ZIP_CODES + MAX_CRITERIA
 
 # Comparison operators accepted in a predicate. Matching ignores letter
 # case and an accepted operator is stored in lower case.

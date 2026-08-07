@@ -39,9 +39,9 @@ _EmailField = constr(
 def _enforce_email_format(value: str) -> str:
     """Reject an address that does not match the accepted shape.
 
-    Matching uses :func:`re.fullmatch`, so a trailing newline cannot
-    satisfy the pattern the way an end-of-string anchor would, and
-    control characters are refused before the shape is tested.
+    Control characters are refused first. The shape is then tested with
+    :func:`re.fullmatch`, which requires the whole value to match, so a
+    trailing newline does not satisfy the pattern.
     """
     if _CONTROL_CHARACTER_PATTERN.search(value):
         raise ValueError("email must not contain control characters")

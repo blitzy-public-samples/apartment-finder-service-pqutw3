@@ -1,28 +1,24 @@
-# Use an official Python runtime as a parent image
 FROM python:3.9-slim
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Copy the requirements file into the container
 COPY requirements.txt .
 
-# Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
 COPY . ./backend
 
-# Create an unprivileged group and user, and give it ownership of /app
+# Create an unprivileged system group and user, then leave every path
+# under /app owned by root with write permission removed for all
+# principals, read granted to all, and execute granted on directories and
+# on files that already carry it.
 RUN groupadd --system --gid 1001 appgroup \
     && useradd --system --uid 1001 --gid appgroup --no-create-home --shell /usr/sbin/nologin appuser \
-    && chown -R appuser:appgroup /app
+    && chown -R root:root /app \
+    && chmod -R a-w,a+rX /app
 
-# Switch to the unprivileged user
 USER appuser
 
-# Make port 8000 available to the world outside this container
 EXPOSE 8000
 
-# Run the FastAPI server when the container launches
 CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

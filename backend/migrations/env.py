@@ -1,20 +1,17 @@
-"""Alembic migration environment for the apartment-finder-service."""
+"""Alembic migration environment for the apartment-finder-service.
 
-import os
-import sys
+The repository root reaches ``sys.path`` through ``prepend_sys_path`` in
+``backend/alembic.ini``, which Alembic applies before this module is
+imported. The ``backend.app.*`` imports below resolve from there.
+"""
+
 from logging.config import fileConfig
 
 from alembic import context
 
-_MIGRATIONS_DIR = os.path.dirname(os.path.abspath(__file__))
-_BACKEND_DIR = os.path.dirname(_MIGRATIONS_DIR)
-_REPOSITORY_ROOT = os.path.dirname(_BACKEND_DIR)
-if _REPOSITORY_ROOT not in sys.path:
-    sys.path.insert(0, _REPOSITORY_ROOT)
-
-from backend.app.core.config import settings  # noqa: E402
-from backend.app.db.database import engine  # noqa: E402
-from backend.app.db.models import Base  # noqa: E402
+from backend.app.core.config import settings
+from backend.app.db.database import engine
+from backend.app.db.models import Base
 
 config = context.config
 

@@ -9,7 +9,13 @@ The checks applied here are:
 
 * the token signing key must carry no surrounding whitespace, must be
   at least :data:`MIN_SIGNING_KEY_BYTES` UTF-8 bytes long once measured
-  on its canonical form, and must not be a known placeholder value
+  on its canonical form -- and at least the floor
+  :data:`MIN_SIGNING_KEY_BYTES_BY_ALGORITHM` sets for the strongest
+  configured algorithm -- must carry at least
+  :data:`MIN_SIGNING_KEY_DISTINCT_CHARS` distinct characters with no run
+  longer than :data:`MAX_SIGNING_KEY_REPEAT_RUN` repeated characters or
+  :data:`MAX_SIGNING_KEY_SEQUENCE_RUN` consecutive code points, and
+  must not be a known placeholder value
 * the JWT algorithm list must be non-empty and must name only entries
   present in :data:`ALLOWED_JWT_ALGORITHMS`, with ``none`` refused in
   any letter case
@@ -27,12 +33,21 @@ The checks applied here are:
   carry bare PayPal hostnames only
 * the PayPal API base must be the entry in :data:`PAYPAL_API_BASES`
   that corresponds to ``PAYPAL_MODE``
+* the PayPal hosted-redirect base must be one complete
+  ``<scheme>://<host>[:<port>]`` base carrying no wildcard, path, query
+  string, fragment or user information, and outside
+  :data:`LOCAL_ENVIRONMENT` must use :data:`TLS_SCHEME` and address
+  neither this host nor a private network
 * the production environment must not be paired with sandbox payment
   configuration
 * the sender address must be a routable ``<local-part>@<domain>``
   address
 * each rate limit must carry a positive, bounded count and period
   multiple
+* the rate-limit storage URI must name a scheme in
+  :data:`RATE_LIMIT_STORAGE_SCHEMES`, and a scheme outside
+  :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` must carry the address of the
+  store it names
 * placeholder values and reserved example domains are refused outside
   :data:`LOCAL_ENVIRONMENT`
 * when ``SECRET_BACKEND`` names :data:`MANAGED_BACKEND_NAME`, every
@@ -43,8 +58,8 @@ Constructing :class:`Settings` raises ``ValidationError`` for a rejected
 value, and the module-level :data:`settings` instance applies that
 validation during import.
 
-This module imports nothing from the application, and it reports a
-rejected value by raising rather than by logging.
+This module imports nothing from the application. A rejected value is
+reported by raising.
 
 Usage::
 
@@ -65,22 +80,32 @@ from pydantic import BaseSettings, Field, root_validator, validator
 
 __all__ = [
     "ALLOWED_JWT_ALGORITHMS",
+    "BOUNDED_MEMORY_SCHEME",
     "ENVIRONMENT_BACKEND_NAME",
     "ENVIRONMENT_NAMES",
+    "IN_PROCESS_RATE_LIMIT_SCHEMES",
     "LIVE_MODE",
     "LOCAL_ENVIRONMENT",
     "MANAGED_BACKEND_NAME",
     "MANAGED_SECRET_SETTINGS",
+    "MAX_SIGNING_KEY_REPEAT_RUN",
+    "MAX_SIGNING_KEY_SEQUENCE_RUN",
     "MIN_SIGNING_KEY_BYTES",
+    "MIN_SIGNING_KEY_BYTES_BY_ALGORITHM",
+    "MIN_SIGNING_KEY_DISTINCT_CHARS",
     "PAYPAL_API_BASES",
     "PAYPAL_MODES",
     "PRODUCTION_ENVIRONMENT",
+    "RATE_LIMIT_STORAGE_SCHEMES",
     "SANDBOX_MODE",
     "SECRET_BACKENDS",
+    "SHARED_RATE_LIMIT_STORAGE_SCHEMES",
     "Settings",
     "TLS_SCHEME",
     "ZILLOW_API_DOMAINS",
     "is_allowed_listing_provider_url",
+    "required_signing_key_bytes",
+    "rate_limit_storage_scheme",
     "settings",
 ]
 
@@ -145,8 +170,80 @@ MANAGED_SECRET_SETTINGS = (
     "SENDGRID_API_KEY",
 )
 
+#: Rate-limit storage scheme served from this process's own memory and
+#: bounded by ``Settings.RATE_LIMIT_MAX_TRACKED_KEYS``. Implemented by
+#: :mod:`backend.app.core.rate_limit`.
+BOUNDED_MEMORY_SCHEME = "bounded-memory"
+
+#: Storage schemes accepted by ``Settings.RATE_LIMIT_STORAGE_URI``. The
+#: names are the ones the rate-limiting backend registers, together with
+#: the bounded in-process scheme this application registers itself.
+RATE_LIMIT_STORAGE_SCHEMES = frozenset(
+    {
+        BOUNDED_MEMORY_SCHEME,
+        "memcached",
+        "memory",
+        "mongodb",
+        "mongodb+srv",
+        "redis",
+        "redis+cluster",
+        "redis+sentinel",
+        "redis+unix",
+        "rediss",
+        "etcd",
+        "async+memory",
+        "async+redis",
+        "async+rediss",
+        "async+redis+unix",
+        "async+redis+cluster",
+        "async+redis+sentinel",
+        "async+memcached",
+        "async+mongodb",
+        "async+mongodb+srv",
+        "async+etcd",
+    }
+)
+
+#: The accepted schemes that keep their counters inside this process, so
+#: each process counts separately and the counters end with it.
+IN_PROCESS_RATE_LIMIT_SCHEMES = frozenset(
+    {BOUNDED_MEMORY_SCHEME, "memory", "async+memory"}
+)
+
+#: Rate-limit storage schemes whose counters are shared by every process
+#: that addresses them. A scheme outside this set keeps its counters in
+#: the memory of one process.
+SHARED_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
+    scheme
+    for scheme in RATE_LIMIT_STORAGE_SCHEMES
+    if scheme not in IN_PROCESS_RATE_LIMIT_SCHEMES
+)
+
 #: Smallest accepted length of the token signing key, in UTF-8 bytes.
 MIN_SIGNING_KEY_BYTES = 32
+
+#: Smallest accepted signing-key length for each accepted algorithm, in
+#: UTF-8 bytes. Each value equals the algorithm's hash output size, which
+#: RFC 7518 section 3.2 requires an HMAC key to match or exceed. The
+#: floor applied to a configuration is the largest value among the
+#: algorithms it names.
+MIN_SIGNING_KEY_BYTES_BY_ALGORITHM: Mapping[str, int] = MappingProxyType(
+    {
+        "HS256": 32,
+        "HS384": 48,
+        "HS512": 64,
+    }
+)
+
+#: Smallest accepted number of distinct characters in a signing key.
+MIN_SIGNING_KEY_DISTINCT_CHARS = 12
+
+#: Longest accepted run of one repeated character in a signing key.
+MAX_SIGNING_KEY_REPEAT_RUN = 3
+
+#: Longest accepted run of consecutive code points in a signing key,
+#: ascending or descending.
+MAX_SIGNING_KEY_SEQUENCE_RUN = 4
 
 #: URL scheme required of every outbound provider endpoint.
 TLS_SCHEME = "https"
@@ -342,10 +439,10 @@ _RATE_LIMIT_PATTERN = re.compile(
 def _parse_delimited_list(value: Any) -> Any:
     """Return a list for a JSON array or comma-separated string value.
 
-    A value that is not a string is returned unchanged, which makes this
-    the single parsing implementation for both the environment and the
-    keyword-argument path. Empty comma-separated segments are preserved
-    so that the field validators refuse them.
+    Applies to both the environment and the keyword-argument path. A
+    value that is not a string is returned unchanged. Empty
+    comma-separated segments are preserved, and the field validators
+    refuse them.
     """
     if not isinstance(value, str):
         return value
@@ -452,6 +549,83 @@ def _split_url(value: str) -> Any:
     return parts
 
 
+def _rate_limit_storage_scheme(value: str) -> str:
+    """Return the scheme of a rate-limit storage URI, in lower case."""
+    return value.strip().split("://", 1)[0].strip().lower()
+
+
+def required_signing_key_bytes(algorithms: Any) -> int:
+    """Return the signing-key length ``algorithms`` requires, in bytes.
+
+    The result is the largest per-algorithm floor among the named
+    algorithms, and never less than :data:`MIN_SIGNING_KEY_BYTES`. An
+    algorithm carrying no declared floor contributes only that global
+    minimum, and a value that is not an iterable of names returns it
+    unchanged.
+    """
+    floor = MIN_SIGNING_KEY_BYTES
+    if not isinstance(algorithms, (list, tuple, set, frozenset)):
+        return floor
+    for entry in algorithms:
+        if not isinstance(entry, str):
+            continue
+        required = MIN_SIGNING_KEY_BYTES_BY_ALGORITHM.get(
+            entry.strip().upper()
+        )
+        if required is not None and required > floor:
+            floor = required
+    return floor
+
+
+def _longest_repeat_run(value: str) -> int:
+    """Return the length of the longest run of one repeated character."""
+    longest = 0
+    run = 0
+    previous = None
+    for char in value:
+        run = run + 1 if char == previous else 1
+        previous = char
+        if run > longest:
+            longest = run
+    return longest
+
+
+def _longest_sequence_run(value: str) -> int:
+    """Return the longest run of consecutive code points in ``value``.
+
+    A run counts characters whose code points step by exactly one in a
+    single direction, so both ``abcd`` and ``4321`` are runs of four.
+    """
+    longest = 0
+    run = 1
+    step = 0
+    for index in range(1, len(value)):
+        delta = ord(value[index]) - ord(value[index - 1])
+        if delta in (1, -1) and (step == 0 or delta == step):
+            step = delta
+            run += 1
+        else:
+            step = delta if delta in (1, -1) else 0
+            run = 2 if step else 1
+        if run > longest:
+            longest = run
+    return max(longest, 1 if value else 0)
+
+
+def rate_limit_storage_scheme(uri: Any) -> str:
+    """Return the storage scheme ``uri`` names, in lower case.
+
+    Returns an empty string for a value that is not a string or that
+    carries no scheme.
+    """
+    if not isinstance(uri, str):
+        return ""
+    try:
+        return urlsplit(uri.strip()).scheme.strip().lower()
+    except ValueError:
+        return ""
+
+
 def is_allowed_listing_provider_url(url: Any) -> bool:
     """Report whether ``url`` may receive the listing-provider key.
 
@@ -511,9 +685,13 @@ class Settings(BaseSettings):
     ]
     ALLOWED_HOSTS: List[str] = ["localhost", "127.0.0.1"]
     MAX_REQUEST_BODY_BYTES: int = Field(1048576, ge=1, le=104857600)
+    MAX_REQUEST_BODY_CHUNKS: int = Field(2048, ge=1, le=1048576)
     MAX_PAGE_SIZE: int = Field(100, ge=1, le=1000)
     RATE_LIMIT_LOGIN: str = "5/minute"
     RATE_LIMIT_REGISTER: str = "3/minute"
+    RATE_LIMIT_WEBHOOK: str = "60/minute"
+    RATE_LIMIT_STORAGE_URI: str = BOUNDED_MEMORY_SCHEME + "://"
+    RATE_LIMIT_MAX_TRACKED_KEYS: int = Field(4096, ge=64, le=1048576)
 
     # Login lockout
     LOGIN_MAX_ATTEMPTS: int = Field(5, ge=1, le=100)
@@ -536,6 +714,8 @@ class Settings(BaseSettings):
         "api-m.paypal.com",
         "api-m.sandbox.paypal.com",
     ]
+    PAYPAL_MAX_CONNECTIONS: int = Field(20, ge=1, le=1000)
+    PAYPAL_RETURN_BASE_URL: str = "http://localhost:3000"
 
     # Email delivery
     SENDGRID_API_KEY: str
@@ -567,10 +747,21 @@ class Settings(BaseSettings):
 
         The value is refused when it is blank once stripped, when it
         carries surrounding whitespace, when its canonical form measures
-        fewer than :data:`MIN_SIGNING_KEY_BYTES` UTF-8 bytes, and when
-        it matches the rejected-value set or opens with a placeholder
-        marker. The returned value is the canonical form, and the
-        placeholder comparison ignores letter case.
+        fewer than :data:`MIN_SIGNING_KEY_BYTES` UTF-8 bytes, when it
+        matches the rejected-value set or opens with a placeholder
+        marker, and when it carries too little variety: fewer than
+        :data:`MIN_SIGNING_KEY_DISTINCT_CHARS` distinct characters, a
+        repeated character run longer than
+        :data:`MAX_SIGNING_KEY_REPEAT_RUN`, or a consecutive code-point
+        run longer than :data:`MAX_SIGNING_KEY_SEQUENCE_RUN`.
+
+        The length floor applied here is the one that holds whatever
+        algorithms are configured. The algorithm-specific floor is
+        applied by :meth:`_check_signing_key_strength`, which runs once
+        both this field and ``JWT_ALGORITHMS`` have been validated.
+
+        The returned value is the canonical form, and the placeholder
+        comparison ignores letter case.
         """
         candidate = value.strip()
         if not candidate:
@@ -589,6 +780,24 @@ class Settings(BaseSettings):
             raise ValueError("must not be a placeholder value")
         if folded.startswith(_PLACEHOLDER_KEY_PREFIXES):
             raise ValueError("must not be a placeholder value")
+        if len(set(candidate)) < MIN_SIGNING_KEY_DISTINCT_CHARS:
+            raise ValueError(
+                "must carry at least "
+                f"{MIN_SIGNING_KEY_DISTINCT_CHARS} distinct characters"
+            )
+        if _longest_repeat_run(candidate) > MAX_SIGNING_KEY_REPEAT_RUN:
+            raise ValueError(
+                "must not repeat one character more than "
+                f"{MAX_SIGNING_KEY_REPEAT_RUN} times in a row"
+            )
+        if (
+            _longest_sequence_run(candidate)
+            > MAX_SIGNING_KEY_SEQUENCE_RUN
+        ):
+            raise ValueError(
+                "must not carry a run of more than "
+                f"{MAX_SIGNING_KEY_SEQUENCE_RUN} consecutive characters"
+            )
         return candidate
 
     @validator("DATABASE_URL")
@@ -741,6 +950,28 @@ class Settings(BaseSettings):
             hosts.append(candidate)
         return hosts
 
+    @validator("RATE_LIMIT_STORAGE_URI")
+    def _check_rate_limit_storage(cls, value: str) -> str:
+        """Return the rate-limit storage URI, refusing an unknown scheme.
+
+        The value must be a ``<scheme>://`` URI whose scheme appears in
+        :data:`RATE_LIMIT_STORAGE_SCHEMES`. A scheme outside
+        :data:`SHARED_RATE_LIMIT_STORAGE_SCHEMES` keeps its counters in
+        one process, which :meth:`_check_rate_limit_sharing` refuses
+        outside :data:`LOCAL_ENVIRONMENT`.
+        """
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("must not be empty")
+        if "://" not in candidate:
+            raise ValueError("must be a <scheme>:// URI")
+        scheme = _rate_limit_storage_scheme(candidate)
+        if scheme not in RATE_LIMIT_STORAGE_SCHEMES:
+            raise ValueError(
+                f"must name one of {sorted(RATE_LIMIT_STORAGE_SCHEMES)}"
+            )
+        return candidate
+
     @validator("ZILLOW_API_URL")
     def _check_zillow_api_url(cls, value: str) -> str:
         """Return the listing-provider URL, refusing an unsafe target.
@@ -799,6 +1030,54 @@ class Settings(BaseSettings):
             )
         return candidate
 
+    @validator("PAYPAL_RETURN_BASE_URL")
+    def _check_paypal_return_base_url(
+        cls, value: str, values: Dict[str, Any]
+    ) -> str:
+        """Return the hosted-redirect base in canonical form.
+
+        The value must be one complete
+        ``<scheme>://<host>[:<port>]`` base whose scheme appears in
+        :data:`_ORIGIN_SCHEMES`, carrying no wildcard, path, query
+        string, fragment or user information. Outside
+        :data:`LOCAL_ENVIRONMENT` the scheme must be :data:`TLS_SCHEME`
+        and the host must not address this host or a private network, so
+        a plaintext or loopback payment callback cannot reach a deployed
+        environment. A trailing slash is removed, and the scheme and
+        host are returned in lower case with the port as written.
+        """
+        candidate = value.strip().rstrip("/")
+        if not candidate:
+            raise ValueError("must not be empty")
+        if "*" in candidate:
+            raise ValueError("must not carry a wildcard host")
+        parts = _split_url(candidate)
+        scheme = parts.scheme.lower()
+        if scheme not in _ORIGIN_SCHEMES:
+            raise ValueError(
+                "must carry a <scheme>://<host>[:<port>] base using one "
+                f"of {sorted(_ORIGIN_SCHEMES)}"
+            )
+        if parts.path or parts.query or parts.fragment:
+            raise ValueError(
+                "must not carry a path, query string or fragment"
+            )
+        if parts.username or parts.password:
+            raise ValueError("must not carry user information")
+        host = _require_hostname(parts.hostname or "")
+        if values.get("ENVIRONMENT") != LOCAL_ENVIRONMENT:
+            if scheme != TLS_SCHEME:
+                raise ValueError(
+                    f"must use the {TLS_SCHEME} scheme unless "
+                    f"ENVIRONMENT is {LOCAL_ENVIRONMENT}"
+                )
+            if _is_internal_host(host):
+                raise ValueError(
+                    "must not address this host or a private network "
+                    f"unless ENVIRONMENT is {LOCAL_ENVIRONMENT}"
+                )
+        return f"{scheme}://{parts.netloc.lower()}"
+
     @validator("PAYPAL_API_BASE")
     def _check_paypal_api_base(cls, value: str) -> str:
         """Return the PayPal API base in canonical form.
@@ -814,7 +1093,9 @@ class Settings(BaseSettings):
             )
         return candidate
 
-    @validator("RATE_LIMIT_LOGIN", "RATE_LIMIT_REGISTER")
+    @validator(
+        "RATE_LIMIT_LOGIN", "RATE_LIMIT_REGISTER", "RATE_LIMIT_WEBHOOK"
+    )
     def _check_rate_limit(cls, value: str) -> str:
         """Return the rate-limit expression stripped.
 
@@ -852,6 +1133,88 @@ class Settings(BaseSettings):
                     f"{_MAX_RATE_LIMIT_PERIOD_MULTIPLE}"
                 )
         return candidate
+
+    @validator("RATE_LIMIT_STORAGE_URI")
+    def _check_rate_limit_storage_uri(cls, value: str) -> str:
+        """Return the rate-limit storage URI, refusing an unusable one.
+
+        The scheme must appear in :data:`RATE_LIMIT_STORAGE_SCHEMES`. A
+        scheme outside :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` addresses a
+        separate store and must therefore carry that store's address.
+        """
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("must not be empty")
+        scheme = rate_limit_storage_scheme(candidate)
+        if scheme not in RATE_LIMIT_STORAGE_SCHEMES:
+            raise ValueError(
+                f"must name one of {sorted(RATE_LIMIT_STORAGE_SCHEMES)}"
+            )
+        if scheme in IN_PROCESS_RATE_LIMIT_SCHEMES:
+            return candidate
+        parts = _split_url(candidate)
+        if not (parts.netloc or parts.path.strip("/")):
+            raise ValueError(
+                f"must carry the address of the {scheme} store"
+            )
+        return candidate
+
+    @root_validator(skip_on_failure=True)
+    def _check_rate_limit_sharing(
+        cls, values: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Require shared rate-limit storage outside local runs.
+
+        A scheme outside
+        :data:`SHARED_RATE_LIMIT_STORAGE_SCHEMES` counts requests in the
+        memory of one process, so a deployment running more than one
+        process enforces its credential-endpoint limits once per process
+        rather than once per caller. Such a scheme is accepted only while
+        ``ENVIRONMENT`` names :data:`LOCAL_ENVIRONMENT`.
+        """
+        uri = values.get("RATE_LIMIT_STORAGE_URI")
+        if not isinstance(uri, str):
+            return values
+        if values.get("ENVIRONMENT") == LOCAL_ENVIRONMENT:
+            return values
+        if _rate_limit_storage_scheme(uri) not in (
+            SHARED_RATE_LIMIT_STORAGE_SCHEMES
+        ):
+            raise ValueError(
+                "RATE_LIMIT_STORAGE_URI must name storage shared by "
+                "every process, one of "
+                f"{sorted(SHARED_RATE_LIMIT_STORAGE_SCHEMES)}, unless "
+                f"ENVIRONMENT is {LOCAL_ENVIRONMENT}"
+            )
+        return values
+
+    @root_validator(skip_on_failure=True)
+    def _check_signing_key_strength(
+        cls, values: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Refuse a signing key too short for the configured algorithms.
+
+        The floor is the largest entry of
+        :data:`MIN_SIGNING_KEY_BYTES_BY_ALGORITHM` among the algorithms
+        ``JWT_ALGORITHMS`` names, as returned by
+        :func:`required_signing_key_bytes`. A configuration naming
+        ``HS384`` therefore requires 48 UTF-8 bytes and one naming
+        ``HS512`` requires 64, while ``HS256`` alone keeps the
+        32-byte floor :meth:`_check_signing_key` already applied.
+        """
+        key = values.get("SECRET_KEY")
+        algorithms = values.get("JWT_ALGORITHMS")
+        if not isinstance(key, str) or algorithms is None:
+            return values
+        required = required_signing_key_bytes(algorithms)
+        measured = len(key.encode("utf-8"))
+        if measured < required:
+            raise ValueError(
+                f"SECRET_KEY must be at least {required} UTF-8 bytes "
+                f"long for JWT_ALGORITHMS {sorted(algorithms)}, and "
+                f"measures {measured}"
+            )
+        return values
 
     @root_validator(skip_on_failure=True)
     def _check_payment_configuration(

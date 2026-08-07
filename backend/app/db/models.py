@@ -7,6 +7,7 @@ from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
 
+
 class User(Base):
     __tablename__ = 'users'
 
@@ -17,12 +18,15 @@ class User(Base):
     last_login = Column(DateTime)
     role = Column(String, nullable=False, server_default="registered")
     failed_login_attempts = Column(Integer, nullable=False, server_default="0")
+    # Instant the account's lock expires, held with its offset so the
+    # comparison against the server clock needs no zone assumption.
     locked_until = Column(
-        DateTime, nullable=True, server_default=text("NULL")
+        DateTime(timezone=True), nullable=True, server_default=text("NULL")
     )
 
     filters = relationship("Filter", back_populates="user")
     subscriptions = relationship("Subscription", back_populates="user")
+
 
 class Listing(Base):
     __tablename__ = 'listings'
@@ -39,6 +43,7 @@ class Listing(Base):
     street_address = Column(String)
     zillow_url = Column(String)
 
+
 class Filter(Base):
     __tablename__ = 'filters'
 
@@ -52,6 +57,7 @@ class Filter(Base):
     zip_codes = relationship("ZipCode", back_populates="filter")
     criteria = relationship("Criteria", back_populates="filter")
 
+
 class ZipCode(Base):
     __tablename__ = 'zip_codes'
 
@@ -60,6 +66,7 @@ class ZipCode(Base):
     code = Column(String, nullable=False)
 
     filter = relationship("Filter", back_populates="zip_codes")
+
 
 class Criteria(Base):
     __tablename__ = 'criteria'
@@ -71,6 +78,7 @@ class Criteria(Base):
     value = Column(String, nullable=False)
 
     filter = relationship("Filter", back_populates="criteria")
+
 
 class Subscription(Base):
     __tablename__ = 'subscriptions'
@@ -88,6 +96,17 @@ class Subscription(Base):
     paypal_order_id = Column(
         String, unique=True, nullable=True, server_default=text("NULL")
     )
+    # Idempotency key sent to PayPal as PayPal-Request-Id. Written before
+    # the order is created, so a retry reuses it rather than opening a
+    # second order for the same request.
+    paypal_request_id = Column(
+        String, unique=True, nullable=True, server_default=text("NULL")
+    )
+    # Identifier of the settled capture. Its presence marks the payment
+    # as reconciled, so a repeated notification activates nothing twice.
+    paypal_capture_id = Column(
+        String, unique=True, nullable=True, server_default=text("NULL")
+    )
 
     user = relationship("User", back_populates="subscriptions")
 
@@ -98,4 +117,7 @@ class WebhookEvent(Base):
     id = Column(Integer, primary_key=True)
     transmission_id = Column(String, unique=True, nullable=False)
     event_type = Column(String, nullable=False)
-    received_at = Column(DateTime, nullable=False, server_default=func.now())
+    # Instant the delivery was recorded, held with its offset.
+    received_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

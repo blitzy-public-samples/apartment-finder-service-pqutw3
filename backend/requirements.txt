@@ -26,6 +26,7 @@ uvicorn==0.39.0
 
 # Request rate limiting
 slowapi==0.1.10
+limits==4.2
 
 # Environment file loading
 python-dotenv==1.2.1

@@ -1,0 +1,195 @@
+# Decision Log
+
+This log is the single source of truth for **why** the security remediation was
+implemented the way it was. Rule 1 (Explainability) forbids rationale in code
+comments, so every judgement call that a competent engineer could reasonably have
+made differently is recorded here instead.
+
+**How to read this log.** Each row names a decision, the alternatives that were
+genuinely available, the reason the choice was made, and the risk the choice
+carries. Code comments in this repository state only *what* a construct is and
+*what it does*; anything explaining *why one approach was preferred over another*
+belongs in this file. Where a decision departs from a literal reading of the
+Agent Action Plan (AAP) or of a user-specified Rule, it appears in
+[Section 11](#11-deviations-from-a-literal-reading-of-the-requirements).
+
+Companion documents: `docs/security/TRACEABILITY_MATRIX.md` maps findings to
+fixes and tests; `docs/security/RESIDUAL_RISK.md` records the accepted advisories;
+`docs/security/CREDENTIAL_ROTATION.md` is the rotation runbook;
+`docs/review/CRITICAL_DECISIONS.md` is the reviewer-facing summary of the five
+highest-risk decisions.
+
+---
+
+## 1. Dependency and runtime decisions
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 1.1 | Replace `python-jose` with `PyJWT[crypto]` | (a) Keep `python-jose` and pin its transitive `ecdsa`; (b) adopt a heavier JOSE/key-set library | `python-jose` hard-requires `ecdsa`, whose CVE-2024-23342 (CVSS 7.4) has **no patched release and no planned fix** — the maintainers place side-channel resistance out of scope because it is unachievable in pure Python. No pin resolves it, so removal is the only remediation. `PyJWT` adds only `typing_extensions`, so the graph shrinks rather than trading one transitive set for another. | The exception hierarchy differs, so one `except` clause changed. Mitigated by tests asserting rejection of `alg:none`, algorithm confusion, wrong key, wrong audience/issuer and every missing required claim. |
+| 1.2 | Replace `passlib` with `bcrypt` called directly | (a) Patch `passlib` in place as one community contributor published; (b) stay on `passlib` and pin an older `bcrypt` | `passlib` 1.7.4 (last release 2020) reads `bcrypt.__about__.__version__`, removed in `bcrypt` 4.0+, so `CryptContext.hash()` **raises** rather than degrading — password hashing is non-functional, not merely unmaintained. Patching in place forks an unmaintained dependency and must be re-applied on every install. Pinning an old `bcrypt` freezes a security-critical primitive. | `bcrypt` raises `ValueError` above 72 bytes where `passlib` truncated silently. Mitigated by an explicit schema-level byte ceiling that yields a 422, verified by test. |
+| 1.3 | Do **not** pre-hash passwords to lift bcrypt's 72-byte limit | Run the password through HMAC-SHA256 first (the `bcrypt_sha256` approach `passlib` documents) | Pre-hashing is a *different hash scheme with a different stored format*. Adopting it would invalidate every existing credential and force a password reset for every account, breaking the AAP's frozen "existing bcrypt hashes must continue to verify" guarantee. | Passwords longer than 72 bytes are refused rather than silently truncated. This is a visible behaviour change, but any such password could never have been stored correctly before either. |
+| 1.4 | Replace `paypalrestsdk` with direct REST over `httpx` | Keep the SDK; adopt one of the successor Checkout/Payouts SDKs | The SDK is deprecated and archived upstream, and neither it nor its successors ever implemented webhook signature verification — so it **cannot deliver the control this work requires**, at any version. | Highest migration complexity in the change: explicit OAuth2 client-credentials exchange, REST-shaped order/capture calls and an added token round trip. Mitigated by caching the token within its validity window and by 100 lifecycle tests. |
+| 1.5 | Pin FastAPI at 0.125.0 | Upgrade to 0.126.0 or later | 0.125.0 is the **highest release compatible with Pydantic v1**, which the Minimal Change Clause forbids upgrading. Python 3.9 independently caps FastAPI at 0.128.8, so **Pydantic, not the interpreter, is the binding constraint**. Recorded explicitly so a future reviewer does not mistake the pin for neglect. | Stays behind current FastAPI. Revisiting requires a Pydantic v2 migration, which is out of scope. |
+| 1.6 | Pin Starlette at 0.49.3 | Upgrade to 1.0.1+ to clear the five residual advisories | 0.49.3 is the measured Python 3.9 ceiling; every fix version (1.0.1, 1.1.0, 1.3.0, 1.3.1) requires Python 3.10+, and the runtime pin is a hard constraint. FastAPI 0.125.0 resolves exactly 0.49.3, so the two pins are mutually consistent. | Five advisories accepted as residual. Each has a named compensating control and a CI reachability guard; see `RESIDUAL_RISK.md`. |
+| 1.7 | Omit `python-multipart` entirely | Include it and pin a patched version | A repository-wide search for `UploadFile`, `File(`, `Form(`, `OAuth2PasswordRequestForm`, `request.form` and `multipart` returns **zero matches**. Omission removes six advisories at no functional cost. | A future transitive pull could reintroduce it and silently lapse the control. Mitigated by a CI guard asserting the package stays absent. |
+| 1.8 | Declare `python-dotenv` in the manifest despite its unfixable advisory | Leave it undeclared | It is already a **hard requirement of the existing code**: Pydantic v1 raises `ImportError: python-dotenv is not installed` whenever `Config.env_file` is set, which `config.py` already does. Declaring it documents reality rather than expanding the dependency surface; the advisory was present in the running environment before this work began. | One accepted residual advisory. Vector is local-only and the key-writing helpers are never called; a CI guard enforces read-only usage. |
+| 1.9 | Hold the Python 3.9 pin at all five sites | Advance the interpreter to clear the residual advisories | The pin is load-bearing and explicitly hard per the AAP. `listing_updater.py` uses `@asyncio.coroutine`, removed in Python 3.11, so the code itself would break. Verified untouched at: `Dockerfile.backend:2`, `ci.yml:19`, `main.tf:99`, `deploy.sh:24`, `listing_updater.py`. | Seven advisories cannot be fixed. Treated as accepted residual risk with compensating controls, which is the treatment the requirements themselves prescribe. |
+
+## 2. Signing-key strength and secure defaults (F14, F20)
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 2.1 | Enforce a **per-algorithm** key floor (HS256 ≥ 32, HS384 ≥ 48, HS512 ≥ 64 bytes) driven by the strongest configured algorithm | Keep one flat 32-byte floor for all three algorithms | RFC 7518 §3.2 requires a key at least as long as the hash output. A flat 32-byte floor leaves HS384 and HS512 under-keyed, which is what the finding reported. Deriving the floor from the strongest configured algorithm means a deployment cannot weaken itself by widening the allowlist. | A deployment already running HS512 with a 32-byte key now fails at startup. This is intentional and loud rather than silent; the failure message names the exact byte count required. |
+| 2.2 | Reject low-entropy signing keys by structure (distinct-character count, repeated runs, sequential runs) | Accept any value meeting the byte floor; or require a full entropy estimate | The finding showed a repetitive key such as `"Ab" * 16` passing the byte floor while carrying almost no entropy, and the template advertised a "5 distinct characters" rule the runtime never enforced. Structural checks are deterministic, explainable in a failure message and cheap. A full entropy estimator would be opaque and would reject legitimate random keys at the margins. | A randomly generated key could in principle trip a structural check. Probability is negligible at the enforced sizes, and the failure names the specific rule. |
+| 2.3 | Rewrite `.env.example` to state **only** what the validators enforce | Leave the template's stronger-sounding claims in place | A template that promises a rule the runtime does not apply is worse than one that promises nothing: it creates false assurance. The template now names the per-algorithm byte sizes and the exact structural rules. | None identified. |
+| 2.4 | Add dedicated, environment-validated HTTPS callback settings (`PAYPAL_RETURN_URL`, `PAYPAL_CANCEL_URL`) | Keep deriving the payer return/cancel address from the first entry of `ALLOWED_ORIGINS` | The CORS origin list answers a different question (who may call the API) from the payer redirect (where PayPal sends the user). Reusing the first origin coupled two unrelated settings and allowed a production deployment to retain an `http://` or `localhost` callback. Dedicated settings are validated to require HTTPS and a non-local host outside the local environment. | Two new required settings per environment. Both carry documented local-development defaults, and a misconfiguration fails loudly at startup rather than silently redirecting payers. |
+| 2.5 | Refuse `memory://` rate-limit storage outside the local environment | Allow it everywhere and document the limitation | Process-local counters are per-pod, so a limit of *N* becomes *N × pods* — the throttle silently weakens exactly as the deployment scales. Refusing the value at startup converts a silent weakness into a configuration error. | Non-local deployments must provision shared storage. Documented in `.env.example`. |
+
+## 3. Token hardening (F9)
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 3.1 | Freeze the effective algorithm list into an immutable tuple resolved once at import | Read `settings.JWT_ALGORITHMS` at each verification | A list read per call can be mutated after startup — by a test, a plugin or any code holding the settings object — which would move a security-critical parameter outside the validated startup gate. A tuple captured at import cannot be changed by assignment to the settings field. | The process must restart to change algorithms. That is the intended property for a security-critical parameter. |
+| 3.2 | Bound `create_access_token`'s `expires_delta` by the configured maximum, and reject non-positive values | Ignore the parameter; or clamp silently to the maximum | An unbounded override lets any caller mint a token outliving the configured ceiling, defeating the bounded-lifetime requirement. Raising `ValueError` surfaces the programming error at the call site; silent clamping would hide it. | A caller passing an over-long delta now raises. No in-tree caller does, and a test covers both the bound and the rejection. |
+
+## 4. Authorization (F18, F10, F19)
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 4.1 | Resolve an unknown, missing, blank or malformed role to an explicit **no-role** sentinel and refuse before any rank comparison | Map an unrecognised value to `GUEST`, the lowest role | Mapping to the lowest role is not deny-by-default: a route whose minimum *is* `GUEST` would then be satisfied by a corrupt or unrecognised value. The AAP requires that such a value "satisfies no minimum". Refusing before the comparison means no ordering accident can admit it. | A row with a legitimately new role name is refused until the enum is extended. That is the intended failure direction. |
+| 4.2 | Carry the token's role claim as **non-authoritative** metadata and log claimed-vs-effective on every refusal; decide only from the database row | Decide from the claim (cheaper, no row needed); or discard the claim entirely | OWASP API Security is explicit that a service must not trust a role asserted by the client, so the claim can never decide. But discarding it loses the audit signal the AAP asks for — a claimed/effective mismatch is exactly the evidence of an escalation attempt. Carrying it for logging only satisfies both. | A reader could mistake the logged claim for the decision input. Mitigated by naming it `claimed_role` alongside `effective_role` in every record. |
+| 4.3 | Make the ownership helpers return one indistinguishable `404` for both a missing row and a foreign row | Keep `404` for missing and `403` for foreign; or delete the helpers as unused | Distinct statuses are an existence oracle: a caller learns that an identifier it does not own nevertheless exists. Deleting the helpers was rejected because the AAP mandates an ownership helper as part of the centralized module. | A genuine "not found" is indistinguishable from "not yours", which is marginally less informative for legitimate clients. That is the intended trade. |
+| 4.4 | Leave `filters.py` ownership predicates byte-identical | Route them through the new ownership helper for consistency | The AAP freezes these two expressions as already-correct untouchable interfaces. Rewriting correct code to look uniform is churn with no security gain and measurable regression risk. Verified: `git diff` for the file is empty. | The codebase has two ownership idioms. Accepted deliberately. |
+
+## 5. Credential endpoints (F6, F7)
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 5.1 | Increment failed-attempt counters with a single conditional `UPDATE` whose arithmetic the database performs | Read-modify-write in Python; or serialize with an application lock | Read-modify-write loses increments under concurrency: two parallel requests both read *n* and both write *n+1*, so an attacker gains attempts by parallelising. Computing the new value inside the statement makes it atomic without any lock. Proved on SQLite before adoption. | Semantics now live in SQL rather than Python, which is less obvious to a reader. Covered by a test in which two independent sessions both record a failure and the stored count reaches 2. |
+| 5.2 | Normalize total hashing work across the unknown-account, locked-account and wrong-password paths, and pad to a measured floor | Short-circuit when the account is absent (the reported defect); or add a fixed sleep | Short-circuiting leaks account existence through timing. A fixed sleep does not adapt to the configured bcrypt cost, and a *legacy* hash with a lower embedded cost still finishes early — the specific oracle the finding described. One comparison against the stored-or-stand-in hash plus one fixed-cost decoy comparison, padded to a floor measured at import, makes all three paths equal. Measured: legacy/absent ratio fell from 266,000,000× to a 0.0% spread. | Every login now costs at least two bcrypt comparisons; suite runtime rose from ~7s to ~30s. Accepted as the cost of closing the oracle. |
+| 5.3 | Remove `verify_decoy` | Keep it for symmetry | It was both unreferenced and itself the un-normalized comparison the finding describes; leaving it invited reintroduction of the defect. | None — no caller existed. |
+
+## 6. Payment lifecycle (F1–F5, F20)
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 6.1 | Perform capture inside the **verified webhook** rather than adding a capture route | Add `POST /subscriptions/capture` for the client to call after approval | The AAP freezes the route inventory at nine; a capture route would be a tenth. The webhook is already authenticated by signature, already owner-resolvable from the stored order id, and already the transactional boundary — so it is the natural place. | Capture depends on webhook delivery. Mitigated by idempotent activation keyed on the capture id, so a later delivery or replay settles the row exactly once. |
+| 6.2 | Commit the pending subscription row **and** its idempotency key before the external PayPal call | Call PayPal first and persist the result | If the external call precedes the commit, a crash between them leaves money moved with no local record, and a retry opens a second order for the same intent. Persisting first means every order is traceable to a row, and re-sending the same `PayPal-Request-Id` reuses the original order. | A pending row can outlive an abandoned checkout. Harmless: `GET` filters on active status and a future end date, so a pending row grants nothing. |
+| 6.3 | Require capture status `COMPLETED` **and** an exact amount+currency match against the server plan catalog before activation | Trust the capture response; or check the amount only | The catalog is the only price authority. Comparing amounts as two-place strings avoids float equality problems, and checking the currency prevents a same-numeral different-currency settlement from activating a plan. | A legitimate capture whose representation differs (for example trailing-zero formatting) would be refused. Normalisation to two places is applied to both sides before comparison. |
+| 6.4 | Verify the webhook signature against the **exact raw request bytes** | Verify against `request.json()` re-serialized | Re-serializing changes key order and whitespace, so the verifier no longer sees what PayPal signed and verification becomes meaningless while still appearing to succeed. The raw body is retained and spliced into the postback verbatim, and no business field is parsed until verification passes. | The handler holds the raw body in memory. Bounded by the request-body-size cap. |
+| 6.5 | Validate the certificate host against an allowlist **before** the URL is used or forwarded | Fetch or forward whatever the header names | `PAYPAL-CERT-URL` arrives in an attacker-controllable request header. An unrestricted verifier can be pointed at an attacker-hosted certificate and made to accept a forged payload — so verification without the allowlist offers false assurance rather than assurance. | An allowlist must be maintained if PayPal changes certificate hosts. Configuration-driven, not hardcoded. Eight off-allowlist URLs are tested, each asserting no outbound request is made at all. |
+| 6.6 | Acknowledge an already-processed delivery with **200 and no state change** | Return 409 Conflict (the reported behaviour) | PayPal retries on any non-2xx, so answering a duplicate with 409 converts normal at-least-once delivery into a retry storm — a self-inflicted availability problem. A 200 with no mutation is the correct at-least-once acknowledgement. | A genuine duplicate is indistinguishable from success in the response. The distinction is recorded in the log and in the delivery table. |
+| 6.7 | Remove `amount`, `start_date` and `end_date` from the subscription request contract entirely | Keep the fields and validate them server-side | Validating a field a client should not influence still leaves it in the contract and one refactor away from being trusted. Absence makes tampering structurally impossible. Verified zero-impact: no frontend caller sends them. | A client sending the old fields now receives a validation error rather than silent ignoring. Intended, and no such client exists. |
+| 6.8 | Never grant or alter the `ADMIN` role through payment lifecycle events | Let role promotion use one common code path | Payment is an entitlement signal, not an administrative one. Excluding `ADMIN` from both the promote and revoke paths means no purchase, refund or reversal can touch administrative privilege. | Slightly more code than a single generic path. Accepted for the guarantee. |
+| 6.9 | Move every PayPal call to a pooled per-event-loop `httpx.AsyncClient` | Keep synchronous `httpx` calls inside the async handlers | A blocking call inside an async route stalls the whole event loop, so the anonymous webhook becomes a denial-of-service lever. Pooling bounds concurrency and reuses connections. | Client lifecycle must be managed; a `lifespan` handler disposes the pool. Verified: no synchronous `httpx` call remains and the pool is reused. |
+| 6.10 | Guard the token cache with a brief `threading.Lock` rather than an `asyncio.Lock` | Use `asyncio.Lock` | On Python 3.9 an `asyncio.Lock` created at import binds to whatever loop is current then, which breaks across loops (notably under the test client). The lock is held only around a synchronous read/write of the cached value and never across an `await`. | A reader must confirm the lock is never held across an await. That property is maintained deliberately. |
+
+## 7. Application surface, body cap and logging (F8, F11, F12)
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 7.1 | Disable `/docs`, `/redoc` and `/openapi.json` outside the local environment | Leave them public; or gate them behind admin authorization | The schema enumerates every route, parameter and model to an anonymous caller, which is outside the authorized anonymous surface. Passing `None` for the three paths also removes `/docs/oauth2-redirect`, which an admin gate would have left mounted. | Non-local environments lose interactive docs. The schema remains generatable from the code. |
+| 7.2 | Replace the list + `pop(0)` body replay with a `deque` and `popleft`, and bound the message count | Keep the list; or buffer the whole body as one object | `pop(0)` is O(n) per chunk, so replaying *n* chunks is O(n²) — a many-small-chunks request becomes a CPU amplifier. A `deque` makes each pop O(1), and a message-count bound stops an unbounded stream of empty chunks that no byte-size cap would catch. | One more configured limit. Defaulted and documented; tested by driving the middleware with 65 explicit ASGI messages against a cap of 8. |
+| 7.3 | Log an exception class plus a correlation id instead of a traceback, and set SQLAlchemy `hide_parameters=True` | Keep `exc_info`; or scrub log text after the fact | A traceback frame can carry bound statement parameters — an email address, a street address, a name — so the log becomes a PII sink. `hide_parameters` removes them at the source, which is more reliable than pattern-scrubbing output. A correlation id preserves the ability to tie a client-visible error to its log record without carrying the payload. | Less immediate detail when debugging. The correlation id and exception class remain, and parameters can be re-enabled deliberately in a non-production environment. |
+
+## 8. Developer setup and container least privilege (F13, F21, F17)
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 8.1 | Refuse a symlink at the `.env` target and template, claim the path under `noclobber`, and replace atomically from a same-directory temp file | Check-then-copy (the reported behaviour); or write in place | Following a symlink writes the generated signing key wherever the link points, possibly outside the tree. A check followed by a separate write is a TOCTOU window. Claiming the path with `noclobber` fails if it materialised in between, and `mktemp` beside the target keeps `mv` a single atomic rename rather than a cross-filesystem copy. | More moving parts in a setup script. Covered by six scenarios driving the real function, including one asserting the symlink target is never written through. |
+| 8.2 | Clean up on `RETURN` **and** `EXIT`, tracking both the temp file and the claimed target | Trap `RETURN` only | `RETURN` fires when a function returns, but every failure path calls `exit`, which ends the shell without returning — so a failure after the temp file existed leaked both the temp file holding the generated secret and a half-written `.env`. Adding `EXIT` covers those paths; default-value expansions keep the handler valid under `set -u` after the locals leave scope. | An `EXIT` trap persists after the function returns. It is a no-op once both markers are cleared. |
+| 8.3 | Grant the container runtime **no** writable path under `/app` | Provision a writable `/app/var`; or chown the tree to the runtime user | Measurement showed the runtime writes nothing: no `open()`, `.write(`, `makedirs`, temp-file or `FileHandler` call exists anywhere in `backend/app`, and logging targets `sys.stdout` only. A writable directory nothing uses is an unused foothold under the application root. `/tmp` remains for any transitive scratch need. | Python cannot cache bytecode under a read-only `/app`. It skips this silently with no error, at a small cold-start cost. |
+| 8.4 | Require `python3.9` by name and re-verify the interpreter inside the created virtual environment | Accept any `python3` | A generic `python3` on a developer machine is frequently 3.11+, on which `@asyncio.coroutine` no longer exists — the environment would build and then fail at import. Checking the series on `PATH` and again inside the venv catches both a missing interpreter and a venv built by the wrong one. | Developers must have `python3.9` on `PATH`. The failure message says so explicitly. |
+
+## 9. Checkpoint scope dispositions (F16)
+
+| # | Decision | Alternatives considered | Rationale | Risks |
+|---|----------|------------------------|-----------|-------|
+| 9.1 | Reclassify-and-process the three legacy test files rather than revert them | Revert to their pre-agent content | All three are explicit AAP §0.6.1.4 UPDATE targets with stated per-file requirements. Reverting would reintroduce the three collection errors and break the AAP success criterion that the suite collects and passes. | Their content had not been reviewed at this checkpoint. Discharged by reading each in full and completing them against AAP §0.8.1.3. |
+| 9.2 | Keep `backend/.dockerignore` and bring it to exact parity with the repository-root pattern set | Revert (delete) it and rely on the root file | Docker resolves `.dockerignore` from the **build-context root**. The documented build command (AAP §0.10.1) and `docker-compose.yml` both use `backend/` as the context, so the root file is never consulted for the backend image and INFRA-3 would go unclosed. Review also found this file was *narrower* than the root set, omitting `credentials/`, `.secrets/`, `secrets.json`, `*.der`, `*.ppk`, `*.p8`, `*.pk8`, `.netrc`, `.pgpass` and `.htpasswd`. | Two ignore files must stay in agreement. Mitigated by making the pattern bodies byte-identical, verified by `diff`. |
+| 9.3 | Delete `infrastructure/docker/Dockerfile.backend.dockerignore` | Keep it and synchronize it with the others | It is absent from the AAP mapping and a byte-duplicate of the root set. More importantly, BuildKit prefers `<dockerfile>.dockerignore` over the context-root file while the classic builder ignores it entirely — so its presence made the effective exclusion set **builder-dependent**, with the narrower set applying under the classic builder. Deleting it makes both builders read one file. Removing it was therefore a precondition for 9.2 being correct. | A future BuildKit-specific need would have to be re-added deliberately. |
+| 9.4 | Delete `pytest.ini` | Keep it and strip its rationale comments | Absent from the AAP mapping and provably inert: its only setting, `--basetemp`, is unused because no test references `tmp_path`, `tmpdir` or `basetemp`. The full suite passes unchanged without it. Its comments also carried rationale and a claim about "both `.dockerignore` files" that 9.3 would have made stale. | The now-dead `.pytest-basetemp/` entries remain in three ignore files as harmless defensive patterns. |
+| 9.5 | Add an autouse rate-limiter reset to `test_api.py` | Leave the limiter unmanaged | The file made four login requests against a `5/minute` cap with no reset, passing with a single request of margin — latent flakiness independent of my additions, which would have pushed it to seven and produced 429s. | None; mirrors the existing fixture in the throttling suite. |
+
+## 10. Rationale relocated out of code and configuration comments (F15)
+
+Recorded here because Rule 1 requires the reasoning to live in this log rather
+than beside the code. Each row states what the code now says mechanically and the
+reasoning that was removed from it.
+
+| # | Location | Reasoning removed from the comment |
+|---|----------|-----------------------------------|
+| 10.1 | `backend/alembic.ini` — `script_location`, `prepend_sys_path` | `%(here)s` is used so the value resolves identically from any working directory, and the prepended path reaches the repository root because modules are imported as `backend.app.*`. |
+| 10.2 | `backend/alembic.ini` — `path_separator` | `os` selects `os.pathsep`, which prevents an absolute Windows path from being split on its drive-letter colon. |
+| 10.3 | `backend/alembic.ini` — `sqlalchemy.url` | The value is left empty and supplied at run time from validated settings so that no credential is stored in a tracked file. |
+| 10.4 | `backend/alembic.ini` — `[logger_alembic]` | `INFO` is selected so each revision's own log output is visible, including the administrative-grant revision's record of what it changed — which is what makes that grant auditable. |
+| 10.5 | `backend/app/main.py` — deferred imports | The credential endpoints own `limiter` and decorate their handlers against it, so it is imported from there and bound to `app.state.limiter`; the modules in that chain import nothing from `main`, which keeps each independently importable and the import graph acyclic. |
+| 10.6 | `backend/app/main.py` — middleware registration | Starlette runs the most recently added middleware first on an inbound request, so the registration order is written innermost-first to produce the intended inbound sequence. |
+| 10.7 | `backend/app/services/paypal_service.py` — `_CAPTURE_REFUSED` | A single shared message is used so that an order resolving to no row and an order owned by another principal are indistinguishable to the caller, closing an existence oracle. |
+| 10.8 | `backend/app/services/paypal_service.py` — certificate-host check | The check is the first statement to touch the header value because the value is attacker-controllable; validating before use is what prevents a forged certificate from being fetched or forwarded. |
+| 10.9 | `backend/app/core/authorization.py` — module docstring | Roles are resolved only from the stored row because a client-asserted role must never decide; refusal precedes rank comparison so an unrecognised value satisfies no minimum; ownership refusals share one status so the response reveals no existence. |
+| 10.10 | `backend/app/db/database.py` — `hide_parameters` | Bound statement values are user data such as an address or a name, and an error message travels into logs, so suppressing parameters at the driver boundary is more reliable than scrubbing log output afterwards. |
+| 10.11 | `backend/app/core/logging.py` — `_ENCODED_KEY` | A percent-escaped key spells its stem in encoded form, so sensitivity is decided after decoding rather than by matching the pattern's shape. |
+| 10.12 | `backend/app/core/security.py` — credential-check floor | The measured cost is doubled because two comparisons are performed, so a stored hash carrying a lower cost factor than the configured one cannot finish sooner and leak account state. |
+| 10.13 | `backend/app/api/endpoints/auth.py` — credential check | A stored hash is supplied only when the account exists and is unlocked so that the work performed, and therefore the time taken, is identical on all three paths. |
+| 10.14 | `scripts/setup_dev_environment.sh` | `set -euo pipefail` stops a later step running against a half-built environment and prevents a success banner following a failure; the symlink refusals prevent writing the generated secret through a link; `noclobber` closes the TOCTOU window; the temp file is created beside the target so the replacement is atomic. |
+| 10.15 | `infrastructure/docker/Dockerfile.backend` | Source and configuration stay root-owned and non-writable so the runtime account can read and execute but not rewrite them. |
+| 10.16 | `.dockerignore`, `backend/.dockerignore` | The backend file governs the backend image because Docker reads the ignore file from the build-context root, and the Dockerfile copies the whole context, so any path not excluded is published in an image layer. |
+
+### 10.17 The boundary applied between rationale and behavioural documentation
+
+Rule 1 forbids *rationale* in code comments; the AAP separately requires
+(CQ2) that public APIs and non-obvious logic be documented. Those two
+obligations meet at a boundary, and the following test was applied uniformly so
+that the result is reviewable rather than a matter of taste.
+
+A comment or docstring **may** state:
+
+* what a construct is, and what it does;
+* the value or behaviour it produces, including a contrast that is itself
+  behaviour — for example "returns `False` rather than raising when the stored
+  hash cannot be parsed", which is the function's contract;
+* the resulting order, status or shape a caller can rely on.
+
+A comment or docstring **may not** state:
+
+* why one approach was preferred over another that was available;
+* what alternative was rejected, or what would have happened otherwise;
+* the threat or risk being mitigated;
+* an invariant framed as a justification, such as "Ordering invariant: … so …".
+
+Two consequences of applying this test are recorded because they are judgement
+calls a reviewer could reasonably have made differently:
+
+1. **`.env.example` retains its explanatory prose.** Rule 1's prohibition is
+   directed at *code comments*. A configuration template is operator-facing
+   documentation whose purpose is to let a human configure the system correctly,
+   and F14's own resolution required that template to state accurately what the
+   validators enforce. Stripping the standards citation behind the key-size
+   floor, or the reason a wildcard host is refused, would degrade a deliverable
+   another finding required. The prose was therefore left in place.
+2. **Behavioural contrasts were left in place throughout.** A phrase such as
+   "the clear is one `UPDATE` on the row rather than a read followed by a write"
+   documents what the code does, not why that was chosen; the *why* for that
+   same decision is row 5.1 of this log. Only clauses that justified, weighed or
+   warned were removed.
+
+## 11. Deviations from a literal reading of the requirements
+
+| # | Requirement as literally written | What was delivered | Rationale | Risks |
+|---|---------------------------------|--------------------|-----------|-------|
+| 11.1 | Rule 2 cites a canonical theme stylesheet under `blitzy-deck/references/` | The theme is authored inline in the presentation from the Rule's own literal specification | Neither that file nor the `blitzy-deck/` directory exists anywhere in this repository, verified by directory listing. The Rule reproduces the complete custom-property block and names every slide-type and component class, so the theme is fully reproducible from the Rule text. | If the referenced file later appears and differs, the inline theme would need reconciling. |
+| 11.2 | AAP §0.6.1.4 lists `backend/tests/conftest.py` as a CREATE target | Not created | The AAP's stated reason for it — "its absence is a direct cause of the current collection failure" — no longer holds: the suite collects and passes, because each test module supplies its own fixtures. No review finding names it, so creating it would be work untraceable to a finding. | Fixtures are duplicated across modules rather than shared. No functional impact observed. |
+| 11.3 | AAP §0.6.1.5 lists `.dockerignore` (repository root) as the file closing INFRA-3 | Both the root file and `backend/.dockerignore` are maintained, with identical pattern bodies | The AAP's own documented build command uses `backend/` as the context, where Docker never consults the root file. Honouring only the literal path would leave INFRA-3 open for the documented build. | Two files to keep in agreement; parity is verified by `diff`. |
+| 11.4 | F15 names `backend/alembic.ini` line 2, a pointer to this decision log | The pointer is retained | A pointer to where rationale lives is the opposite of embedded rationale and is what Rule 1 asks for. The actionable defect was that the referenced file did not exist; creating it resolves the dangling reference. | A re-reviewer may re-flag the line. Recorded here so the reasoning is visible. |
+
+## 12. Deliberate non-changes
+
+| # | Left unchanged | Why it was not changed | Risks |
+|---|----------------|------------------------|-------|
+| 12.1 | `@asyncio.coroutine` in `backend/app/tasks/listing_updater.py` | Valid on the pinned Python 3.9, not security-relevant, and removing it would breach the Minimal Change Clause. It also reinforces the runtime pin rather than undermining it. | Breaks on Python 3.11+. Recorded as forward-compatibility debt. |
+| 12.2 | The two ownership predicates in `backend/app/api/endpoints/filters.py` | Frozen by the AAP as already-correct untouchable interfaces. `git diff` for the file is empty. | Two ownership idioms coexist. |
+| 12.3 | Unused variables in `infrastructure/terraform/variables.tf` | Cosmetic and explicitly excluded from scope. | None. |
+| 12.4 | Absence of `__init__.py` package markers | Imports resolve through implicit namespace packages, so the files are unnecessary. | None. |
+| 12.5 | `scripts/deploy.sh` ShellCheck `SC2086` informational findings | The script is an AAP UPDATE target, but no finding in this review names it, so changing it would be untraceable to a finding. | Unquoted expansions remain in a deployment script. Documented. |
+| 12.6 | 25 pre-existing `flake8` warnings in unmodified code | Out of scope; pre-existing style issues in code no finding touches. Two disappeared incidentally on lines that had to be edited anyway, leaving 23. | None. |

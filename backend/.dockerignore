@@ -1,15 +1,8 @@
-# Build context exclusions for the backend image.
-#
-# Docker reads .dockerignore from the root of the build context. The
-# backend image is built with backend/ as its context
-# (infrastructure/docker/docker-compose.yml declares
-# "context: ../../backend", and the documented build command is
-# "docker build -f infrastructure/docker/Dockerfile.backend ... backend/"),
-# so this file is the one that governs that build. The repository-root
-# .dockerignore governs any build whose context is the repository root.
-#
-# Dockerfile.backend copies the whole context, so anything left here is
-# copied into a published image layer.
+# Docker build context exclusions.
+# Effective when the build context is the backend directory, which is the
+# context declared by infrastructure/docker/docker-compose.yml and named by
+# the documented backend build command.
+# The pattern set below is identical to the repository-root .dockerignore.
 
 # Environment files
 .env
@@ -31,6 +24,18 @@ google-credentials.json
 gcp-*.json
 **/gcp-*.json
 
+# Generic credential directories and secret files
+credentials/
+**/credentials/
+.secrets/
+**/.secrets/
+secrets.json
+**/secrets.json
+secret.json
+**/secret.json
+*.secrets.json
+**/*.secrets.json
+
 # Private keys, certificates, and keystores
 *.pem
 **/*.pem
@@ -46,10 +51,28 @@ gcp-*.json
 **/*.keystore
 *.crt
 **/*.crt
+*.der
+**/*.der
+*.ppk
+**/*.ppk
+*.p8
+**/*.p8
+*.pk8
+**/*.pk8
 id_rsa*
 **/id_rsa*
 id_ed25519*
 **/id_ed25519*
+
+# Machine credential files read by command-line tools
+.netrc
+**/.netrc
+_netrc
+**/_netrc
+.pgpass
+**/.pgpass
+.htpasswd
+**/.htpasswd
 
 # Kubernetes cluster credentials
 kubeconfig
@@ -113,13 +136,25 @@ ENV/
 **/npm-debug.log*
 **/yarn-error.log*
 
-# Terraform state and variable files
+# Terraform state, variable files and saved plans
 **/.terraform/
+**/.terraform.tfstate.lock.info
 **/*.tfstate
 **/*.tfstate.*
 **/*.tfvars
+**/*.tfvars.json
+**/*.auto.tfvars
+**/*.auto.tfvars.json
+**/*.tfplan
+**/*.tfplan.*
+**/tfplan
+**/tfplan.*
+**/plan.out
+**/plan.json
 **/override.tf
 **/override.tf.json
+**/crash.log
+**/crash.*.log
 
 # Logs
 **/*.log
