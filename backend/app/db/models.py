@@ -41,7 +41,11 @@ class Listing(Base):
     bathrooms = Column(Integer)
     available_date = Column(DateTime)
     street_address = Column(String)
-    zillow_url = Column(String)
+    # Provider address a scheduled ingestion pass reconciles a record
+    # against. The uniqueness constraint applies to the values present,
+    # so at most one row carries any given address while a row carrying
+    # none stays permitted.
+    zillow_url = Column(String, unique=True)
 
 
 class Filter(Base):
@@ -94,17 +98,6 @@ class Subscription(Base):
     )
     currency = Column(String, nullable=False, server_default="USD")
     paypal_order_id = Column(
-        String, unique=True, nullable=True, server_default=text("NULL")
-    )
-    # Idempotency key sent to PayPal as PayPal-Request-Id. Written before
-    # the order is created, so a retry reuses it rather than opening a
-    # second order for the same request.
-    paypal_request_id = Column(
-        String, unique=True, nullable=True, server_default=text("NULL")
-    )
-    # Identifier of the settled capture. Its presence marks the payment
-    # as reconciled, so a repeated notification activates nothing twice.
-    paypal_capture_id = Column(
         String, unique=True, nullable=True, server_default=text("NULL")
     )
 

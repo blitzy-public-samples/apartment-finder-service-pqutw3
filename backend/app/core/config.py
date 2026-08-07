@@ -715,7 +715,12 @@ class Settings(BaseSettings):
         "api-m.sandbox.paypal.com",
     ]
     PAYPAL_MAX_CONNECTIONS: int = Field(20, ge=1, le=1000)
-    PAYPAL_RETURN_BASE_URL: str = "http://localhost:3000"
+    PAYPAL_RETURN_URL: str = (
+        "http://localhost:3000/subscription?paypal=return"
+    )
+    PAYPAL_CANCEL_URL: str = (
+        "http://localhost:3000/subscription?paypal=cancel"
+    )
 
     # Email delivery
     SENDGRID_API_KEY: str
@@ -1030,21 +1035,25 @@ class Settings(BaseSettings):
             )
         return candidate
 
-    @validator("PAYPAL_RETURN_BASE_URL")
-    def _check_paypal_return_base_url(
+    @validator("PAYPAL_RETURN_URL", "PAYPAL_CANCEL_URL")
+    def _check_paypal_callback_url(
         cls, value: str, values: Dict[str, Any]
     ) -> str:
-        """Return the hosted-redirect base in canonical form.
+        """Return one payer-callback address in canonical form.
 
         The value must be one complete
-        ``<scheme>://<host>[:<port>]`` base whose scheme appears in
-        :data:`_ORIGIN_SCHEMES`, carrying no wildcard, path, query
-        string, fragment or user information. Outside
+        ``<scheme>://<host>[:<port>][/<path>][?<query>]`` address whose
+        scheme appears in :data:`_ORIGIN_SCHEMES`, carrying no wildcard,
+        fragment or user information. A query string is carried through,
+        which is what lets both addresses name the single subscription
+        page the frontend router declares while staying distinguishable.
+        Outside
         :data:`LOCAL_ENVIRONMENT` the scheme must be :data:`TLS_SCHEME`
         and the host must not address this host or a private network, so
         a plaintext or loopback payment callback cannot reach a deployed
-        environment. A trailing slash is removed, and the scheme and
-        host are returned in lower case with the port as written.
+        environment. A trailing slash is removed, and the scheme and host
+        are returned in lower case with the port, path and query string as
+        written.
         """
         candidate = value.strip().rstrip("/")
         if not candidate:
@@ -1055,13 +1064,11 @@ class Settings(BaseSettings):
         scheme = parts.scheme.lower()
         if scheme not in _ORIGIN_SCHEMES:
             raise ValueError(
-                "must carry a <scheme>://<host>[:<port>] base using one "
-                f"of {sorted(_ORIGIN_SCHEMES)}"
+                "must carry a <scheme>://<host>[:<port>][/<path>] "
+                f"address using one of {sorted(_ORIGIN_SCHEMES)}"
             )
-        if parts.path or parts.query or parts.fragment:
-            raise ValueError(
-                "must not carry a path, query string or fragment"
-            )
+        if parts.fragment:
+            raise ValueError("must not carry a fragment")
         if parts.username or parts.password:
             raise ValueError("must not carry user information")
         host = _require_hostname(parts.hostname or "")
@@ -1076,7 +1083,24 @@ class Settings(BaseSettings):
                     "must not address this host or a private network "
                     f"unless ENVIRONMENT is {LOCAL_ENVIRONMENT}"
                 )
-        return f"{scheme}://{parts.netloc.lower()}"
+        query = f"?{parts.query}" if parts.query else ""
+        return f"{scheme}://{parts.netloc.lower()}{parts.path}{query}"
+
+    @validator("PAYPAL_CANCEL_URL")
+    def _check_paypal_cancel_url_is_distinct(
+        cls, value: str, values: Dict[str, Any]
+    ) -> str:
+        """Refuse a cancel address equal to the return address.
+
+        The two values are handed to PayPal as the separate addresses an
+        approving and an abandoning payer are returned to, and an equal
+        pair is rejected.
+        """
+        if value == values.get("PAYPAL_RETURN_URL"):
+            raise ValueError(
+                "must differ from PAYPAL_RETURN_URL"
+            )
+        return value
 
     @validator("PAYPAL_API_BASE")
     def _check_paypal_api_base(cls, value: str) -> str:

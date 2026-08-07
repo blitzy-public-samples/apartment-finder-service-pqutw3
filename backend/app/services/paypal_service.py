@@ -10,8 +10,10 @@ here.
 Every call is issued through an asynchronous client, so no request here
 blocks the event loop the API handlers run on. The client is opened by
 :func:`open_http_client` while the application starts and released by
-:func:`close_http_client` while it stops; a call made outside that
-lifetime gets a client of its own.
+:func:`close_http_client` while it stops. It is recorded against the
+event loop it was opened on and is issued only from that loop, since a
+connection pool belongs to the loop that created it; a call made outside
+that lifetime, or on another loop, gets a client of its own.
 
 Four operations are published:
 
@@ -26,14 +28,20 @@ Four operations are published:
   through :func:`backend.app.core.authorization.load_owned`, so the
   decision, the route and the object are recorded by the one centralized
   authorization path, and an order that does not resolve to a row owned
-  by the principal is refused before any request leaves the process.
+  by the principal is refused before any request leaves the process. The
+  capture asks for a complete representation and reads the order back
+  when the response carries no settled capture, so what it returns always
+  states the amount, the currency and the capture identifier.
 * :func:`read_capture` reads a capture response and reports whether the
   provider completed it for the expected order, amount and currency. A
   response that does not satisfy every one of those is not a completed
   capture, and the reason names the check that failed.
 * :func:`verify_webhook_signature` checks an inbound notification
-  against PayPal's verify-webhook-signature endpoint. The host named by
-  the ``PAYPAL-CERT-URL`` header is checked against
+  against PayPal's verify-webhook-signature endpoint. It takes the **raw
+  request bytes** and transmits them verbatim as the postback's
+  ``webhook_event``, so PayPal checks the signature against the
+  notification as it arrived rather than against a re-encoded copy of it.
+  The host named by the ``PAYPAL-CERT-URL`` header is checked against
   ``settings.PAYPAL_CERT_HOST_ALLOWLIST`` before that value is used,
   transmitted or logged, and all five ``PAYPAL-*`` headers are required.
   The function reads and writes no database state on any path, emits no
@@ -57,21 +65,21 @@ and TLS sessions it pools serve all four operations. The pool is bounded
 by :data:`MAX_CONNECTIONS` and :data:`MAX_KEEPALIVE_CONNECTIONS`, and
 :func:`close_http_client` releases it when the application stops.
 
-No function here writes, flushes or commits database state on any path.
+No function here writes, flushes, commits or discards database state on
+any path, so a caller's own transaction is exactly as it left it when a
+call returns.
 
 The access token is held in a process-wide cache for the lifetime the
 grant reports, less :data:`EXPIRY_MARGIN_SECONDS`, and
 :func:`reset_access_token_cache` discards it. A call the provider answers
 ``401`` discards the cached token and is retried exactly once with a
-fresh grant. No credential, no token and no ``Authorization`` value is
-written to a log record.
-:func:`reset_access_token_cache` discards it. When no usable token is
-held, one caller performs the exchange and the others wait to be
-notified of its outcome, bounded by the request timeout plus
-:data:`WAIT_MARGIN_SECONDS`; the exchange itself runs with no lock held.
-A failed exchange is recorded for :data:`FAILURE_BACKOFF_SECONDS`, during
-which callers are refused without a request being sent. No credential, no
-token and no ``Authorization`` value is written to a log record.
+fresh grant. When no usable token is held, one caller performs the
+exchange behind a single-flight lock and the others re-read the cache
+once it has finished; the exchange itself runs with no cache lock held. A
+failed exchange is held back for :data:`FAILURE_BACKOFF_SECONDS`, during
+which callers are refused with that same failure and no request is sent,
+and a successful exchange ends the window. No credential, no token and no
+``Authorization`` value is written to a log record.
 
 Usage::
 
@@ -81,10 +89,11 @@ Usage::
     )
     captured = await capture_order(db, order["id"], current_user)
     outcome = read_capture(captured, order["id"], plan.amount, plan.currency)
-    result = await verify_webhook_signature(headers, payload)
+    result = await verify_webhook_signature(headers, raw_body)
 """
 
 import asyncio
+import json
 import math
 import threading
 import time
@@ -132,9 +141,11 @@ __all__ = [
     "KEEPALIVE_EXPIRY_SECONDS",
     "MAX_CONNECTIONS",
     "MAX_KEEPALIVE_CONNECTIONS",
-    "WAIT_MARGIN_SECONDS",
+    "PREFER_HEADER",
+    "PREFER_REPRESENTATION",
     "REASON_CERTIFICATE_HOST",
     "REASON_CURRENCY_MISMATCH",
+    "REASON_MALFORMED_BODY",
     "REASON_MALFORMED_CAPTURE",
     "REASON_MISSING_HEADER",
     "REASON_NOT_COMPLETED",
@@ -147,6 +158,7 @@ __all__ = [
     "TRANSMISSION_SIG_HEADER",
     "TRANSMISSION_TIME_HEADER",
     "VERIFICATION_SUCCESS",
+    "WEBHOOK_EVENT_FIELD",
     "CaptureOutcome",
     "OrderOwnershipError",
     "PayPalAPIError",
@@ -164,6 +176,7 @@ __all__ = [
     "reset_access_token_cache",
     "verify_settled_order",
     "verify_webhook_signature",
+    "webhook_body_object",
 ]
 
 PAYPAL_CLIENT_ID = settings.PAYPAL_CLIENT_ID
@@ -185,6 +198,15 @@ TRANSMISSION_SIG_HEADER = "PAYPAL-TRANSMISSION-SIG"
 
 #: Header carrying the send time, mapped to ``transmission_time``.
 TRANSMISSION_TIME_HEADER = "PAYPAL-TRANSMISSION-TIME"
+
+#: Request header asking the provider for a complete representation of
+#: the resource a mutating call produced.
+PREFER_HEADER = "Prefer"
+
+#: Value sent as :data:`PREFER_HEADER` on the capture call, which is what
+#: makes the response carry the settled amount, currency and capture
+#: identifier rather than only an identifier and a status.
+PREFER_REPRESENTATION = "return=representation"
 
 #: Relation naming the hosted approval target among an order's links.
 APPROVAL_REL = "approve"
@@ -210,6 +232,12 @@ REASON_CERTIFICATE_HOST = "certificate_host_not_allowlisted"
 
 #: Rejection reason: at least one required header is absent or blank.
 REASON_MISSING_HEADER = "required_header_missing"
+
+#: Rejection reason: the raw body does not decode to a JSON object.
+REASON_MALFORMED_BODY = "malformed_body"
+
+#: Field of the postback document that carries the notification.
+WEBHOOK_EVENT_FIELD = "webhook_event"
 
 #: Rejection reason: PayPal did not report a passing check.
 REASON_SIGNATURE = "signature_not_verified"
@@ -295,10 +323,6 @@ EXPIRY_MARGIN_SECONDS = 60.0
 #: Seconds a failed credential exchange is not repeated for.
 FAILURE_BACKOFF_SECONDS = 5.0
 
-#: Seconds added to the request timeout when waiting for another
-#: caller's credential exchange to finish.
-WAIT_MARGIN_SECONDS = 1.0
-
 #: Connections the shared client keeps open at once.
 MAX_CONNECTIONS = 20
 
@@ -382,26 +406,50 @@ _cached_access = None  # type: Optional[str]
 
 _cached_deadline = 0.0
 
-# Client shared by every call for the lifetime of the process, or None
-# when the application has not opened one.
+# Instant before which no further credential exchange is attempted, and
+# the failure that set it. Both are cleared by a successful exchange and
+# by reset_access_token_cache.
+_backoff_deadline = 0.0
+
+_backoff_failure = None  # type: Optional[Tuple[str, Optional[int], bool]]
+
+# Client shared by every call issued on the event loop that opened it,
+# with the loop it belongs to, or None when the application has not
+# opened one.
 _shared_client = None  # type: Optional[httpx.AsyncClient]
 
-# One refresh lock per event loop, so concurrent callers that find no
-# held token perform a single credential exchange between them. Keyed by
-# loop because a process may run more than one.
-_REFRESH_LOCKS = {}  # type: Dict[int, "asyncio.Lock"]
+_shared_client_loop = None  # type: Optional[Any]
+
+# Single-flight token-refresh lock, with the loop it was created on. An
+# asyncio lock belongs to one loop, so it is replaced when the running
+# loop is not the one it was created on.
+_refresh_lock_object = None  # type: Optional["asyncio.Lock"]
+
+_refresh_lock_loop = None  # type: Optional[Any]
+
+
+def _running_loop() -> Optional[Any]:
+    """Returns the event loop this call is running on, or ``None``."""
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        return None
 
 
 def _refresh_lock() -> "asyncio.Lock":
-    """Returns the single-flight token-refresh lock for this loop."""
-    loop = asyncio.get_event_loop()
-    key = id(loop)
+    """Returns the single-flight token-refresh lock for this loop.
+
+    A lock created on another loop is replaced, so the lock returned is
+    always one the awaiting caller's own loop can hold. At most one lock
+    is held at a time, so a loop that has ended leaves nothing behind.
+    """
+    global _refresh_lock_object, _refresh_lock_loop
+    loop = _running_loop()
     with _CACHE_STATE:
-        lock = _REFRESH_LOCKS.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _REFRESH_LOCKS[key] = lock
-    return lock
+        if _refresh_lock_object is None or _refresh_lock_loop is not loop:
+            _refresh_lock_object = asyncio.Lock()
+            _refresh_lock_loop = loop
+        return _refresh_lock_object
 
 
 def _build_client() -> "httpx.AsyncClient":
@@ -427,15 +475,19 @@ def _build_client() -> "httpx.AsyncClient":
 
 
 async def open_http_client() -> None:
-    """Opens the client every call in this process shares.
+    """Opens the client every call on this event loop shares.
 
-    Called once while the application starts. Calling it again while a
-    client is already open leaves that client in place.
+    Called once while the application starts. The client is recorded
+    against the loop it was opened on, and :func:`_client` yields it only
+    to a call running on that same loop, because a connection pool
+    belongs to the loop that created it. Calling this again while a client
+    is already open leaves that client in place.
     """
-    global _shared_client
+    global _shared_client, _shared_client_loop
     if _shared_client is not None:
         return
     _shared_client = _build_client()
+    _shared_client_loop = _running_loop()
 
 
 async def close_http_client() -> None:
@@ -444,9 +496,10 @@ async def close_http_client() -> None:
     Called once while the application stops. Calling it when no client is
     open does nothing.
     """
-    global _shared_client
+    global _shared_client, _shared_client_loop
     client = _shared_client
     _shared_client = None
+    _shared_client_loop = None
     if client is None:
         return
     await client.aclose()
@@ -456,13 +509,13 @@ async def close_http_client() -> None:
 async def _client() -> "AsyncIterator[httpx.AsyncClient]":
     """Yields the client a single call should be issued through.
 
-    The shared client is yielded when the application has opened one. A
-    call made outside the application's lifetime -- from a task or a test
-    driving a function directly -- gets a client of its own, which is
-    closed when the block ends.
+    The shared client is yielded to a call running on the loop that
+    opened it. A call made outside the application's lifetime -- from a
+    task or a test driving a function directly -- or on any other loop
+    gets a client of its own, which is closed when the block ends.
     """
     shared = _shared_client
-    if shared is not None:
+    if shared is not None and _shared_client_loop is _running_loop():
         yield shared
         return
     async with _build_client() as temporary:
@@ -547,11 +600,12 @@ class CaptureOutcome(NamedTuple):
     """What a capture response reports about the payment it settled.
 
     ``completed`` is True only when the response names the expected
-    order, reports :data:`CAPTURE_COMPLETED_STATUS`, and carries the
-    expected amount and currency. ``capture_id`` is the provider's own
-    identifier for the settlement, recorded on the row so a charge can be
-    reconciled against the provider afterwards. ``reason`` names the first
-    check that failed and is ``None`` on a completed capture.
+    order, reports :data:`CAPTURE_COMPLETED_STATUS`, carries the
+    expected amount and currency, and carries a provider identifier for
+    the settlement. ``capture_id`` is that identifier, recorded on the
+    row so a charge can be reconciled against the provider afterwards;
+    it is populated on every completed outcome. ``reason`` names the
+    first check that failed and is ``None`` on a completed capture.
     """
 
     completed: bool
@@ -715,11 +769,56 @@ def _read_cached_token() -> Optional[str]:
 
 
 def _store_cached_token(granted: str, lifetime: float) -> None:
-    """Holds ``granted`` for ``lifetime`` seconds, or holds nothing."""
+    """Holds ``granted`` for ``lifetime`` seconds, or holds nothing.
+
+    Any recorded exchange failure is cleared, so a successful exchange
+    ends the backoff immediately.
+    """
     global _cached_access, _cached_deadline
+    global _backoff_deadline, _backoff_failure
     with _CACHE_STATE:
         _cached_access = granted if lifetime > 0.0 else None
         _cached_deadline = time.monotonic() + lifetime
+        _backoff_deadline = 0.0
+        _backoff_failure = None
+
+
+def _record_exchange_failure(error: PayPalAPIError) -> None:
+    """Holds ``error`` back for :data:`FAILURE_BACKOFF_SECONDS`.
+
+    The category, provider status and retryability are held with the
+    deadline, so a caller refused during the window is answered as the
+    failure that caused it rather than as a different kind of failure.
+    """
+    global _backoff_deadline, _backoff_failure
+    with _CACHE_STATE:
+        _backoff_deadline = time.monotonic() + FAILURE_BACKOFF_SECONDS
+        _backoff_failure = (
+            getattr(error, "category", CATEGORY_TRANSPORT),
+            getattr(error, "status_code", None),
+            bool(getattr(error, "retryable", True)),
+        )
+
+
+def _held_back_failure() -> Optional[PayPalAPIError]:
+    """Returns the failure to raise while the backoff window holds.
+
+    ``None`` is returned once the window has elapsed, or when no failure
+    is recorded.
+    """
+    with _CACHE_STATE:
+        if _backoff_failure is None:
+            return None
+        if time.monotonic() >= _backoff_deadline:
+            return None
+        category, status_code, retryable = _backoff_failure
+    return PayPalAPIError(
+        _CALL_FAILED,
+        category=category,
+        status_code=status_code,
+        retryable=retryable,
+        operation=_OPERATION_TOKEN,
+    )
 
 
 async def _bearer_credential() -> str:
@@ -734,15 +833,29 @@ async def _bearer_credential() -> str:
     find no held token wait on a single-flight lock and then re-read the
     cache, so a burst arriving as a token expires performs one exchange
     rather than one per caller.
+
+    A failed exchange is held back for :data:`FAILURE_BACKOFF_SECONDS`,
+    during which callers are refused with that same failure and no
+    request is sent. A successful exchange ends the window.
     """
     cached = _read_cached_token()
     if cached is not None:
         return cached
+    held_back = _held_back_failure()
+    if held_back is not None:
+        raise held_back
     async with _refresh_lock():
         cached = _read_cached_token()
         if cached is not None:
             return cached
-        granted, lifetime = await _exchange_credentials()
+        held_back = _held_back_failure()
+        if held_back is not None:
+            raise held_back
+        try:
+            granted, lifetime = await _exchange_credentials()
+        except PayPalAPIError as error:
+            _record_exchange_failure(error)
+            raise
         _store_cached_token(granted, lifetime)
         return granted
 
@@ -754,27 +867,37 @@ def reset_access_token_cache() -> None:
     grant credentials are rotated. A refresh already in flight is left to
     finish; its result is discarded by the caller that observes the reset.
     """
-    global _cached_access, _cached_deadline, _backoff_deadline
+    global _cached_access, _cached_deadline
+    global _backoff_deadline, _backoff_failure
     with _CACHE_STATE:
         _cached_access = None
         _cached_deadline = 0.0
         _backoff_deadline = 0.0
+        _backoff_failure = None
         _CACHE_STATE.notify_all()
 
 
 async def _post_json(
     path: str,
-    body: Dict[str, Any],
+    body: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     operation: Optional[str] = None,
     allow_refresh: bool = True,
+    extra_headers: Optional[Mapping[str, str]] = None,
+    document: Optional[bytes] = None,
 ) -> Dict[str, Any]:
     """Return the decoded object from a Bearer-authenticated POST.
 
     ``path`` is appended to ``settings.PAYPAL_API_BASE`` and the call
-    carries ``settings.HTTP_TIMEOUT_SECONDS``. ``idempotency_key``, when
-    supplied, is sent as :data:`IDEMPOTENCY_HEADER`, so a repeat of the
-    call resolves to the result of the first one.
+    carries ``settings.HTTP_TIMEOUT_SECONDS``. ``body`` is serialised to
+    JSON by the client; ``document``, when supplied, is sent as the
+    request content exactly as given and takes the place of ``body``, so a
+    caller that has already assembled its own bytes transmits those bytes
+    unchanged. ``idempotency_key``, when supplied, is sent as
+    :data:`IDEMPOTENCY_HEADER`, so a repeat of the call resolves to the
+    result of the first one. ``extra_headers``, when supplied, is sent
+    alongside the headers built here and cannot displace the
+    authorization, content or idempotency headers.
 
     A ``401`` discards the cached access token and repeats the call once
     with a fresh grant; the repeat runs with ``allow_refresh`` cleared,
@@ -783,21 +906,29 @@ async def _post_json(
     status and the provider's debug identifier. No response body, URL or
     credential reaches the raised message or a log record.
     """
-    headers = {
-        "Authorization": "Bearer " + await _bearer_credential(),
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    headers = {}  # type: Dict[str, str]
+    if extra_headers:
+        for name, value in extra_headers.items():
+            if isinstance(name, str) and isinstance(value, str):
+                headers[name] = value
+    headers["Authorization"] = "Bearer " + await _bearer_credential()
+    headers["Content-Type"] = "application/json"
+    headers["Accept"] = "application/json"
     if idempotency_key:
         headers[IDEMPOTENCY_HEADER] = idempotency_key
+
+    if document is None:
+        content = {"json": body if body is not None else {}}
+    else:
+        content = {"content": document}
 
     try:
         async with _client() as client:
             response = await client.post(
                 settings.PAYPAL_API_BASE + path,
-                json=body,
                 headers=headers,
                 timeout=settings.HTTP_TIMEOUT_SECONDS,
+                **content
             )
         if (
             response.status_code == _UNAUTHORIZED_STATUS
@@ -821,6 +952,8 @@ async def _post_json(
                 idempotency_key=idempotency_key,
                 operation=operation,
                 allow_refresh=False,
+                extra_headers=extra_headers,
+                document=document,
             )
         response.raise_for_status()
         payload = response.json()
@@ -1097,9 +1230,13 @@ async def capture_order(
     for that record. The capture call is issued only after that check
     passes.
 
-    ``db`` is the caller's request-scoped session. Nothing is written,
-    flushed or committed here, and an order that resolves to no row or to
-    another principal's row is refused with
+    ``db`` is the caller's request-scoped session and is only read here.
+    Nothing is written, flushed, committed or rolled back, so the
+    caller's transaction -- including work it has already flushed, such
+    as a webhook delivery record -- is still open and intact when this
+    returns, and the caller remains free to commit that work together
+    with the state change this capture drives. An order that resolves to
+    no row or to another principal's row is refused with
     :class:`OrderOwnershipError` before any request leaves the process.
     The row the lookup resolves must therefore already be durable when
     this is called, which is why the endpoint commits the pending row
@@ -1108,28 +1245,43 @@ async def capture_order(
     ``idempotency_key`` defaults to the key derived from the resolved
     row, so a repeated capture resolves to the capture already performed.
 
-    The transaction the lookup opens is ended before the capture call is
-    issued, so the pooled connection is returned to the pool for the
-    duration of that call. The caller must therefore have committed or
-    discarded its own pending work before calling: work still pending on
-    ``db`` is discarded here.
+    The call carries :data:`PREFER_HEADER` set to
+    :data:`PREFER_REPRESENTATION`, so the response carries the settled
+    amount, currency and capture identifier. A response that still
+    carries no capture object is followed by :func:`fetch_order`, and the
+    order read back is returned in its place, so the envelope handed to
+    the caller always describes what the provider settled.
+
+    The caller's transaction is neither committed nor discarded here, so
+    a caller that has already claimed state in it -- the webhook's
+    delivery record -- still holds that claim when this returns.
 
     The lookup is read-only: nothing is written, flushed or committed.
     """
     subscription = _resolve_owned_order(
         db, order_id, current_user, request
     )
+    # Read after the ownership check, so no attribute is loaded again.
     key = idempotency_key or capture_request_id(subscription.id)
-    # Ends the lookup's transaction and releases its connection before
-    # the capture call is issued. Read after the ownership check, so no
-    # attribute is loaded again.
-    db.rollback()
-    return await _post_json(
+    captured = await _post_json(
         _ORDERS_PATH + "/" + str(order_id) + _CAPTURE_SUFFIX,
         {},
         idempotency_key=key,
         operation=_OPERATION_CAPTURE,
+        extra_headers={PREFER_HEADER: PREFER_REPRESENTATION},
     )
+    if _first_capture(captured) is not None:
+        return captured
+    logger.info(
+        "Reading a captured PayPal order back because its capture "
+        "response carried no settled capture",
+        extra={
+            "provider_operation": _OPERATION_CAPTURE,
+            "paypal_request_id": key,
+            "capture_status": _capture_status(captured, None),
+        },
+    )
+    return await fetch_order(order_id)
 
 
 async def fetch_order(order_id: str) -> Dict[str, Any]:
@@ -1164,12 +1316,14 @@ async def verify_settled_order(
     notification reporting a capture that has already settled and for a
     repeated capture of an order the API reports as captured.
 
+    ``db`` is the caller's request-scoped session and is only read here:
+    nothing is written, flushed, committed or rolled back, so the
+    caller's transaction is intact when this returns.
+
     Raises :class:`OrderOwnershipError` when the order resolves to no
     owned row and :class:`PayPalAPIError` when the read fails.
     """
     _resolve_owned_order(db, order_id, current_user, request)
-    # Ends the lookup's transaction before the read call is issued.
-    db.rollback()
     payload = await fetch_order(order_id)
     return read_capture(
         payload, order_id, expected_amount, expected_currency
@@ -1212,9 +1366,14 @@ def read_capture(
 
     The response is a completed capture only when it names ``order_id``,
     reports :data:`CAPTURE_COMPLETED_STATUS` at the order or the capture
-    level, and carries an amount equal to ``expected_amount`` rendered to
-    two decimal places in ``expected_currency``. The first check that
+    level, carries an amount equal to ``expected_amount`` rendered to
+    two decimal places in ``expected_currency``, and carries the
+    provider's own identifier for the settlement. The first check that
     fails names the ``reason``, and no later check is applied.
+
+    A completed outcome therefore always carries a non-blank
+    ``capture_id``, so the row a caller activates from it is
+    reconcilable against the provider.
     """
     if not isinstance(payload, dict):
         return CaptureOutcome(
@@ -1278,13 +1437,25 @@ def read_capture(
             currency=currency,
             reason=REASON_CURRENCY_MISMATCH,
         )
+    capture_id = _capture_identifier(capture)
+    if capture_id is None:
+        # Reports a settlement carrying no provider identifier as a
+        # malformed capture rather than as a completed one.
+        return CaptureOutcome(
+            completed=False,
+            order_id=reported_id,
+            status=status,
+            amount=amount,
+            currency=currency,
+            reason=REASON_MALFORMED_CAPTURE,
+        )
     return CaptureOutcome(
         completed=True,
         order_id=reported_id,
         status=status,
         amount=amount,
         currency=currency,
-        capture_id=_capture_identifier(capture),
+        capture_id=capture_id,
     )
 
 
@@ -1433,24 +1604,96 @@ def _rejected(
     )
 
 
+def webhook_body_object(body: Any) -> Optional[Dict[str, Any]]:
+    """Returns the notification ``body`` carries, or ``None``.
+
+    ``body`` is the raw request bytes. ``None`` is returned when they are
+    empty, are not UTF-8, do not decode as JSON, or decode to anything
+    other than an object.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        if not body:
+            return None
+        try:
+            text = bytes(body).decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return None
+    elif isinstance(body, str):
+        text = body
+    else:
+        return None
+    try:
+        decoded = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    return decoded
+
+
+def _postback_document(
+    lookup: Dict[str, str],
+    certificate_url: str,
+    transmission_id: str,
+    body: bytes,
+) -> bytes:
+    """Returns the postback document PayPal's verifier is sent.
+
+    Every field except ``webhook_event`` is serialised from a value read
+    here, and ``webhook_event`` carries ``body`` verbatim, so the
+    notification PayPal checks the signature against is byte-for-byte the
+    one that arrived. ``webhook_id`` is a field of this document rather
+    than of the notification, so a ``webhook_id`` inside the notification
+    is nested under ``webhook_event`` and cannot displace it.
+    """
+    fields = json.dumps(
+        {
+            "auth_algo": lookup[AUTH_ALGO_HEADER],
+            "cert_url": certificate_url,
+            "transmission_id": transmission_id,
+            "transmission_sig": lookup[TRANSMISSION_SIG_HEADER],
+            "transmission_time": lookup[TRANSMISSION_TIME_HEADER],
+            "webhook_id": settings.PAYPAL_WEBHOOK_ID,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return (
+        fields[:-1]
+        + b',"'
+        + WEBHOOK_EVENT_FIELD.encode("utf-8")
+        + b'":'
+        + bytes(body)
+        + b"}"
+    )
+
+
 async def verify_webhook_signature(
     headers: Mapping[str, str],
-    body: Any,
+    body: bytes,
 ) -> WebhookVerification:
     """Check an inbound PayPal notification and report the outcome.
 
     ``headers`` is the inbound header mapping, matched without regard to
-    letter case, and ``body`` is the already-decoded notification. The
-    checks are applied in this order:
+    letter case, and ``body`` is the **raw request bytes**. The checks are
+    applied in this order:
 
     1. the host of the ``PAYPAL-CERT-URL`` header is checked against
        ``settings.PAYPAL_CERT_HOST_ALLOWLIST``, before that value is
        transmitted or logged
     2. every header of :data:`REQUIRED_WEBHOOK_HEADERS` must be present
        and non-blank
-    3. the assembled payload is posted to PayPal's
+    3. ``body`` must decode to a JSON object; a body that does not is
+       rejected as :data:`REASON_MALFORMED_BODY` and no request is sent
+    4. the document assembled by :func:`_postback_document`, carrying
+       ``body`` verbatim under ``webhook_event``, is posted to PayPal's
        verify-webhook-signature endpoint, and only
        :data:`VERIFICATION_SUCCESS` is treated as a passing check
+
+    The bytes that arrived are what the verifier is sent, so PayPal
+    checks the signature against the notification as it was signed rather
+    than against a re-encoded copy of it. No field of the notification is
+    read until step 4 has passed, and the only one read then is the event
+    type.
 
     Reads and writes no database state on any path and emits no record of
     its own. Every failed check is *returned* rather than raised, as a
@@ -1474,20 +1717,21 @@ async def verify_webhook_signature(
     if any(name not in lookup for name in REQUIRED_WEBHOOK_HEADERS):
         return _rejected(REASON_MISSING_HEADER)
 
+    notification = webhook_body_object(body)
+    if notification is None:
+        return _rejected(REASON_MALFORMED_BODY)
+
     transmission_id = lookup[TRANSMISSION_ID_HEADER]
-    postback = {
-        "auth_algo": lookup[AUTH_ALGO_HEADER],
-        "cert_url": certificate_url,
-        "transmission_id": transmission_id,
-        "transmission_sig": lookup[TRANSMISSION_SIG_HEADER],
-        "transmission_time": lookup[TRANSMISSION_TIME_HEADER],
-        "webhook_id": settings.PAYPAL_WEBHOOK_ID,
-        "webhook_event": body,
-    }
+    document = _postback_document(
+        lookup, certificate_url, transmission_id, body
+    )
 
     try:
         payload = await _post_json(
-            _VERIFY_PATH, postback, operation=_OPERATION_VERIFY
+            _VERIFY_PATH,
+            None,
+            operation=_OPERATION_VERIFY,
+            document=document,
         )
     except PayPalError as error:
         return _rejected(
@@ -1501,5 +1745,5 @@ async def verify_webhook_signature(
     return WebhookVerification(
         verified=True,
         transmission_id=transmission_id,
-        event_type=_event_type(body),
+        event_type=_event_type(notification),
     )

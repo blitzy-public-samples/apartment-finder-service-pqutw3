@@ -81,7 +81,9 @@ flush therefore run on that thread rather than on the thread that logged
 asynchronous middleware, dependencies and handlers. A record placed on a
 full queue is emitted inline instead, so the queue caps memory without
 discarding a record. :func:`flush_log_queue` waits for the queue to
-drain, and the listener is stopped at interpreter exit.
+drain and reports whether it emptied within the timeout. At interpreter
+exit, and before a listener is replaced, the queue is drained and the
+listener thread is then stopped.
 
 The record object itself is queued, so a mutable value passed through
 ``extra={...}`` is read at emission rather than at the call.
@@ -1090,10 +1092,15 @@ def _build_stream_handler() -> logging.Handler:
     return handler
 
 
-def _listener_is_running() -> bool:
-    """Reports whether the listener thread is alive."""
-    thread = getattr(_listener, "_thread", None)
+def _thread_is_alive(listener: Any) -> bool:
+    """Reports whether ``listener`` carries a live monitor thread."""
+    thread = getattr(listener, "_thread", None)
     return thread is not None and thread.is_alive()
+
+
+def _listener_is_running() -> bool:
+    """Reports whether the installed listener's thread is alive."""
+    return _thread_is_alive(_listener)
 
 
 def _ensure_listener() -> None:
@@ -1124,19 +1131,24 @@ def _stop_listener() -> None:
     """Drains the queue and stops the listener thread, if one is running.
 
     Registered to run at interpreter exit, and called before a listener
-    is replaced. Leaves the module ready to build a fresh listener.
+    is replaced. Whether a listener is running is read from the saved
+    reference, and the drain runs while that listener is still installed,
+    so the records already queued are written. The module reference is
+    then released and the thread stopped, and it stays released even when
+    the thread does not stop cleanly. Leaves the module ready to build a
+    fresh listener.
     """
     global _listener
     listener = _listener
-    if listener is None:
+    if not _thread_is_alive(listener):
+        _listener = None
         return
+    flush_log_queue()
     _listener = None
-    if _listener_is_running():
-        flush_log_queue()
-        try:
-            listener.stop()
-        except Exception:
-            return
+    try:
+        listener.stop()
+    except Exception:
+        return
 
 
 def flush_log_queue(

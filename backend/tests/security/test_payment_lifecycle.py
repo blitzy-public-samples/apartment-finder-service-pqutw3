@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -254,6 +255,25 @@ def client(session_factory):
 
 
 @pytest.fixture
+def tracked_client(session_factory):
+    """A client that records every request-scoped session handed out."""
+    sessions = []
+
+    def override_get_db():
+        session = session_factory()
+        sessions.append(session)
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[database_module.get_db] = override_get_db
+    with TestClient(app, base_url="http://localhost") as test_client:
+        yield test_client, sessions
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
 def subscriber(db):
     user = User(
         email="payer@example.com",
@@ -370,7 +390,6 @@ class TestHostedApprovalIsNotSkipped:
         stored = db.query(Subscription).one()
         assert stored.status == subscriptions_module.PENDING_STATUS
         assert stored.end_date is None
-        assert stored.paypal_capture_id is None
 
         fetched = client.get(
             "/subscriptions/", headers=bearer(subscriber)
@@ -457,12 +476,17 @@ class TestPaymentIntegrity:
         db.expire_all()
         stored = db.query(Subscription).one()
         assert stored.status == subscriptions_module.FAILED_STATUS
-        assert stored.paypal_request_id
         assert stored.paypal_order_id is None
 
-    def test_an_idempotency_key_is_persisted_and_sent(
+    def test_an_idempotency_key_is_derived_and_sent(
         self, client, db, subscriber
     ):
+        """The key is a function of the committed row's own identifier.
+
+        Nothing is stored for it, so a repeat of an uncertain call
+        re-derives the same value from the same row rather than reading a
+        column back.
+        """
         creator = AsyncMock(return_value=order_response())
         with patch(MODULE + ".create_order", new=creator):
             client.post(
@@ -472,10 +496,174 @@ class TestPaymentIntegrity:
             )
         db.expire_all()
         stored = db.query(Subscription).one()
-        assert stored.paypal_request_id
-        assert creator.await_args.kwargs["idempotency_key"] == (
-            stored.paypal_request_id
+        sent = creator.await_args.kwargs["idempotency_key"]
+        assert sent
+        assert sent == paypal_service.order_request_id(stored.id)
+
+    def test_a_repeated_request_reuses_the_open_attempt_and_its_key(
+        self, client, db, subscriber
+    ):
+        """A retry cannot leave a second order orphaned at the provider.
+
+        The open attempt already recorded is reused, so the repeat
+        presents the same idempotency key and PayPal resolves it to the
+        order the first attempt opened.
+        """
+        creator = AsyncMock(return_value=order_response())
+        with patch(MODULE + ".create_order", new=creator):
+            first = client.post(
+                "/subscriptions/",
+                json={"plan_id": PREMIUM_MONTHLY},
+                headers=bearer(subscriber),
+            )
+            second = client.post(
+                "/subscriptions/",
+                json={"plan_id": PREMIUM_MONTHLY},
+                headers=bearer(subscriber),
+            )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["id"] == first.json()["id"]
+
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        keys = [
+            call.kwargs["idempotency_key"]
+            for call in creator.await_args_list
+        ]
+        expected = paypal_service.order_request_id(stored.id)
+        assert keys == [expected] * 2
+
+    def test_a_failed_attempt_is_reused_rather_than_duplicated(
+        self, client, db, subscriber
+    ):
+        """A failed attempt stays open to the retry that reuses its key."""
+        with patch(
+            MODULE + ".create_order",
+            new=AsyncMock(
+                side_effect=paypal_service.PayPalAPIError("down")
+            ),
+        ):
+            assert client.post(
+                "/subscriptions/",
+                json={"plan_id": PREMIUM_MONTHLY},
+                headers=bearer(subscriber),
+            ).status_code == 502
+        db.expire_all()
+        failed = db.query(Subscription).one()
+        assert failed.status == subscriptions_module.FAILED_STATUS
+        first_key = paypal_service.order_request_id(failed.id)
+
+        creator = AsyncMock(return_value=order_response())
+        with patch(MODULE + ".create_order", new=creator):
+            retried = client.post(
+                "/subscriptions/",
+                json={"plan_id": PREMIUM_MONTHLY},
+                headers=bearer(subscriber),
+            )
+        assert retried.status_code == 200
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.id == failed.id
+        assert paypal_service.order_request_id(stored.id) == first_key
+        assert stored.status == subscriptions_module.PENDING_STATUS
+        assert stored.paypal_order_id == ORDER_ID
+        assert creator.await_args.kwargs["idempotency_key"] == first_key
+
+    def test_a_known_order_identifier_survives_a_failed_attempt(
+        self, client, db, subscriber
+    ):
+        """A failed mark never erases the order the provider holds."""
+        assert open_subscription(client, subscriber).status_code == 200
+        db.expire_all()
+        assert db.query(Subscription).one().paypal_order_id == ORDER_ID
+
+        with patch(
+            MODULE + ".create_order",
+            new=AsyncMock(
+                side_effect=paypal_service.PayPalAPIError("down")
+            ),
+        ):
+            assert client.post(
+                "/subscriptions/",
+                json={"plan_id": PREMIUM_MONTHLY},
+                headers=bearer(subscriber),
+            ).status_code == 502
+
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == subscriptions_module.FAILED_STATUS
+        assert stored.paypal_order_id == ORDER_ID
+
+    def test_an_unrecordable_order_is_answered_as_reconciliation(
+        self, client, db, subscriber
+    ):
+        """An order the provider holds is never answered as a client fault.
+
+        The provider was already asked to open the order, so a local write
+        that fails afterwards leaves provider and local state to be
+        reconciled rather than reporting a rejected request.
+        """
+        from sqlalchemy.exc import SQLAlchemyError
+        from sqlalchemy.orm import Session as SqlAlchemySession
+
+        real_commit = SqlAlchemySession.commit
+        state = {"calls": 0}
+
+        def fail_the_second_commit(self):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return real_commit(self)
+            raise SQLAlchemyError("order identifier could not be stored")
+
+        with patch(
+            MODULE + ".create_order",
+            new=AsyncMock(return_value=order_response()),
+        ), patch.object(
+            SqlAlchemySession, "commit", fail_the_second_commit
+        ):
+            response = client.post(
+                "/subscriptions/",
+                json={"plan_id": PREMIUM_MONTHLY},
+                headers=bearer(subscriber),
+            )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            subscriptions_module.RECONCILIATION_DETAIL
         )
+
+    def test_no_transaction_is_open_while_the_provider_is_called(
+        self, tracked_client, subscriber
+    ):
+        """The database connection is not held across the provider call.
+
+        The row is committed first and only plain values are carried past
+        the commit, so the request-scoped session holds no transaction --
+        and therefore no pooled connection -- while the order is opened.
+        """
+        client, sessions = tracked_client
+        observed = {}
+
+        async def order_observing_the_session(*args, **kwargs):
+            observed["open"] = [
+                session.in_transaction() for session in sessions
+            ]
+            return order_response()
+
+        with patch(
+            MODULE + ".create_order",
+            new=AsyncMock(side_effect=order_observing_the_session),
+        ):
+            response = client.post(
+                "/subscriptions/",
+                json={"plan_id": PREMIUM_MONTHLY},
+                headers=bearer(subscriber),
+            )
+
+        assert response.status_code == 200
+        assert observed["open"]
+        assert not any(observed["open"])
 
     def test_the_capture_call_carries_an_idempotency_header(self):
         sent = {}
@@ -610,17 +798,22 @@ class TestWebhookAuthenticity:
     def test_the_postback_carries_the_notification_and_stored_id(self):
         """The postback names the stored webhook, not a supplied one.
 
-        The notification is embedded as the object the route decoded, and
+        The notification is embedded as the exact bytes that arrived, and
         the webhook identifier is read from configuration, so a caller
         cannot nominate the webhook its own notification is checked
         against.
         """
         notification = approved_event()
+        # Indented bytes carrying whitespace a compact re-encoding would
+        # not reproduce, so a re-encoded copy is distinguishable from the
+        # bytes that arrived.
+        raw = json.dumps(notification, indent=2).encode("utf-8")
         sent = {}
 
         class Client:
             async def post(self, path, **kwargs):
                 sent["path"] = path
+                sent["content"] = kwargs.get("content")
                 sent["json"] = kwargs.get("json")
                 return StubResponse({"verification_status": "SUCCESS"})
 
@@ -632,14 +825,19 @@ class TestWebhookAuthenticity:
         ):
             outcome = self._run(
                 paypal_service.verify_webhook_signature(
-                    webhook_headers(), notification
+                    webhook_headers(), raw
                 )
             )
 
         assert outcome.verified is True
         assert outcome.transmission_id == TRANSMISSION_ID
         assert outcome.event_type == notification["event_type"]
-        posted = sent["json"]
+        # The bytes that arrived are what PayPal is asked to check.
+        assert sent["json"] is None
+        document = sent["content"]
+        assert isinstance(document, bytes)
+        assert raw in document
+        posted = json.loads(document.decode("utf-8"))
         assert posted["webhook_event"] == notification
         assert posted["webhook_id"] == settings.PAYPAL_WEBHOOK_ID
         assert posted["transmission_id"] == TRANSMISSION_ID
@@ -649,12 +847,14 @@ class TestWebhookAuthenticity:
 
     def test_no_supplied_webhook_id_can_displace_the_stored_one(self):
         """A notification naming another webhook is checked against ours."""
-        notification = dict(approved_event(), webhook_id="WH-SUPPLIED")
+        raw = json.dumps(
+            dict(approved_event(), webhook_id="WH-SUPPLIED")
+        ).encode("utf-8")
         sent = {}
 
         class Client:
             async def post(self, path, **kwargs):
-                sent["json"] = kwargs.get("json")
+                sent["content"] = kwargs.get("content")
                 return StubResponse({"verification_status": "SUCCESS"})
 
         with patch(
@@ -665,12 +865,16 @@ class TestWebhookAuthenticity:
         ):
             self._run(
                 paypal_service.verify_webhook_signature(
-                    webhook_headers(), notification
+                    webhook_headers(), raw
                 )
             )
 
-        assert sent["json"]["webhook_id"] == settings.PAYPAL_WEBHOOK_ID
-        assert sent["json"]["webhook_id"] != "WH-SUPPLIED"
+        posted = json.loads(sent["content"].decode("utf-8"))
+        assert posted["webhook_id"] == settings.PAYPAL_WEBHOOK_ID
+        assert posted["webhook_id"] != "WH-SUPPLIED"
+        # The supplied value survives only where it arrived, nested
+        # inside the notification being checked.
+        assert posted["webhook_event"]["webhook_id"] == "WH-SUPPLIED"
 
     @pytest.mark.parametrize(
         "cert_url",
@@ -721,19 +925,30 @@ class TestWebhookAuthenticity:
         )
 
     @pytest.mark.parametrize(
-        "raw", [b"", b"not json", b"[]", b'"text"', b"123"]
+        "raw", [b"", b"not json", b"[]", b'"text"', b"123", b"\xff\xfe"]
     )
     def test_a_body_that_is_not_an_object_is_refused(
         self, client, db, raw
     ):
-        """The route decodes the body, so the route is what refuses one.
+        """A body that cannot be a notification is never transmitted.
 
-        A body that does not decode to an object is refused before the
-        verifier is reached, so nothing is transmitted to PayPal and no
-        delivery is recorded.
+        The verifier owns the transition from raw bytes to an object, so
+        it refuses such a body itself, before any request is made to
+        PayPal and before any delivery is recorded.
         """
-        verifier = AsyncMock()
-        with patch(MODULE + ".verify_webhook_signature", new=verifier):
+        reached = {"called": False}
+
+        class Client:
+            async def post(self, path, **kwargs):
+                reached["called"] = True
+                raise AssertionError("no request may be made")
+
+        with patch(
+            SERVICE + "._client", new=stub_client(Client())
+        ), patch(
+            SERVICE + "._bearer_credential",
+            new=AsyncMock(return_value="token"),
+        ):
             response = client.post(
                 "/subscriptions/webhook",
                 content=raw,
@@ -743,8 +958,19 @@ class TestWebhookAuthenticity:
                 ),
             )
         assert response.status_code == 400
-        verifier.assert_not_awaited()
+        assert reached["called"] is False
         assert db.query(WebhookEvent).count() == 0
+
+    def test_a_malformed_body_is_reported_as_such(self):
+        """The rejection names the check that failed."""
+        outcome = self._run(
+            paypal_service.verify_webhook_signature(
+                webhook_headers(), b"not json"
+            )
+        )
+        assert outcome.verified is False
+        assert outcome.reason == paypal_service.REASON_MALFORMED_BODY
+        assert outcome.retryable is False
 
     def test_a_failing_verification_status_is_refused(self):
         class Client:
@@ -759,7 +985,7 @@ class TestWebhookAuthenticity:
         ):
             outcome = self._run(
                 paypal_service.verify_webhook_signature(
-                    webhook_headers(), {"event_type": "X"}
+                    webhook_headers(), b'{"event_type": "X"}'
                 )
             )
         assert outcome.verified is False
@@ -883,6 +1109,129 @@ class TestWebhookReplay:
             == subscriptions_module.REFUNDED_STATUS
         )
 
+    def test_the_capture_leaves_the_replay_claim_in_place(
+        self, client, db, subscriber
+    ):
+        """The delivery record survives the call that captures the order.
+
+        The claim on the transmission identifier is taken before the
+        capture and must still be held when the transition commits, or the
+        first delivery is not recorded and PayPal's redelivery is
+        processed as a fresh event.
+        """
+        open_subscription(client, subscriber)
+        seen = {}
+
+        async def capture_observing_the_claim(
+            session, order_id, current_user, **kwargs
+        ):
+            seen["claimed"] = (
+                session.query(WebhookEvent)
+                .filter(WebhookEvent.transmission_id == TRANSMISSION_ID)
+                .count()
+            )
+            return capture_response()
+
+        with patch(
+            MODULE + ".capture_order",
+            new=AsyncMock(side_effect=capture_observing_the_claim),
+        ):
+            first = deliver(client, approved_event())
+        assert first.status_code == 200
+        # The claim was already held when the provider was called, and it
+        # is still recorded afterwards.
+        assert seen["claimed"] == 1
+        db.expire_all()
+        recorded = db.query(WebhookEvent).all()
+        assert [row.transmission_id for row in recorded] == [
+            TRANSMISSION_ID
+        ]
+
+        # The redelivery PayPal would send is therefore a replay.
+        capture = AsyncMock(return_value=capture_response())
+        with patch(MODULE + ".capture_order", new=capture):
+            replay = deliver(client, approved_event())
+        assert replay.json()["status"] == (
+            subscriptions_module.OUTCOME_DUPLICATE
+        )
+        capture.assert_not_awaited()
+
+    def test_a_settled_order_is_recovered_from_its_full_outcome(
+        self, client, db, subscriber
+    ):
+        """A charge the provider already took still entitles its buyer.
+
+        The provider refuses the capture because the order is settled, so
+        the order is read back and the complete outcome that read produced
+        is what activation is measured from.
+        """
+        open_subscription(client, subscriber)
+        already = paypal_service.PayPalAPIError(
+            "already captured",
+            category=paypal_service.CATEGORY_PROVIDER_CLIENT,
+            status_code=422,
+        )
+        settled = paypal_service.CaptureOutcome(
+            completed=True,
+            order_id=ORDER_ID,
+            status="COMPLETED",
+            amount=format_amount(PLAN.amount),
+            currency=PLAN.currency,
+            capture_id=CAPTURE_ID,
+        )
+        reader = AsyncMock(return_value=settled)
+        with patch(
+            MODULE + ".capture_order", new=AsyncMock(side_effect=already)
+        ), patch(MODULE + ".verify_settled_order", new=reader):
+            recovered = deliver(client, approved_event())
+
+        assert recovered.status_code == 200
+        assert recovered.json()["status"] == (
+            subscriptions_module.OUTCOME_PROCESSED
+        )
+        reader.assert_awaited_once()
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == subscriptions_module.ACTIVE_STATUS
+        assert not hasattr(stored, "paypal_capture_id")
+        assert stored.end_date is not None
+        assert db.query(WebhookEvent).count() == 1
+
+    def test_a_settled_order_below_the_plan_price_entitles_nothing(
+        self, client, db, subscriber
+    ):
+        """The read-back outcome is measured, not merely trusted."""
+        open_subscription(client, subscriber)
+        already = paypal_service.PayPalAPIError(
+            "already captured",
+            category=paypal_service.CATEGORY_PROVIDER_CLIENT,
+            status_code=422,
+        )
+        short = paypal_service.CaptureOutcome(
+            completed=False,
+            order_id=ORDER_ID,
+            status="COMPLETED",
+            amount="0.01",
+            currency=PLAN.currency,
+            reason=paypal_service.REASON_AMOUNT_MISMATCH,
+        )
+        with patch(
+            MODULE + ".capture_order", new=AsyncMock(side_effect=already)
+        ), patch(
+            MODULE + ".verify_settled_order",
+            new=AsyncMock(return_value=short),
+        ):
+            refused = deliver(client, approved_event())
+
+        assert refused.status_code == 200
+        assert refused.json()["status"] == (
+            subscriptions_module.OUTCOME_IGNORED
+        )
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == subscriptions_module.PENDING_STATUS
+        assert stored.end_date is None
+
 
 class TestEntitlementLifecycle:
     """Verified events move the status and the role together."""
@@ -900,7 +1249,6 @@ class TestEntitlementLifecycle:
         db.expire_all()
         stored = db.query(Subscription).one()
         assert stored.status == subscriptions_module.ACTIVE_STATUS
-        assert stored.paypal_capture_id == CAPTURE_ID
         assert stored.end_date is not None
         expected = stored.start_date + timedelta(
             days=PLAN.period_days
@@ -958,7 +1306,6 @@ class TestEntitlementLifecycle:
         stored = db.query(Subscription).one()
         assert stored.status == subscriptions_module.PENDING_STATUS
         assert stored.end_date is None
-        assert stored.paypal_capture_id is None
         assert (
             db.query(User).filter(User.id == subscriber.id).one().role
             == "registered"
@@ -1265,6 +1612,119 @@ class TestOutboundCallsDoNotBlockTheEventLoop:
 
         assert asyncio.get_event_loop().run_until_complete(run())
 
+    def test_the_shared_client_is_not_handed_to_another_loop(self):
+        """A pool belongs to the loop that created it.
+
+        The client opened on one loop is never yielded to a call running
+        on another; that call gets a client of its own and closes it with
+        the block.
+        """
+        import asyncio
+
+        async def open_it():
+            await paypal_service.close_http_client()
+            await paypal_service.open_http_client()
+            async with paypal_service._client() as own:
+                assert own is paypal_service._shared_client
+            return paypal_service._shared_client
+
+        async def use_it_from_another_loop(opened):
+            async with paypal_service._client() as other:
+                assert other is not opened
+                assert not other.is_closed
+            return True
+
+        first = asyncio.new_event_loop()
+        second = asyncio.new_event_loop()
+        try:
+            opened = first.run_until_complete(open_it())
+            assert second.run_until_complete(
+                use_it_from_another_loop(opened)
+            )
+        finally:
+            first.run_until_complete(
+                paypal_service.close_http_client()
+            )
+            first.close()
+            second.close()
+
+    def test_a_failed_exchange_is_not_repeated_within_the_backoff(self):
+        """A refused credential exchange is not retried on every call.
+
+        The failure is held back for the configured window, and a caller
+        arriving inside it is refused with that same failure without a
+        request being sent.
+        """
+        import asyncio
+
+        refusal = paypal_service.PayPalAPIError(
+            "grant refused",
+            category=paypal_service.CATEGORY_AUTHENTICATION,
+            status_code=401,
+        )
+        exchange = AsyncMock(side_effect=refusal)
+
+        async def run():
+            paypal_service.reset_access_token_cache()
+            with patch(
+                SERVICE + "._exchange_credentials", new=exchange
+            ):
+                outcomes = []
+                for _ in range(3):
+                    try:
+                        await paypal_service._bearer_credential()
+                    except paypal_service.PayPalAPIError as error:
+                        outcomes.append(error.category)
+                return outcomes
+
+        try:
+            categories = asyncio.get_event_loop().run_until_complete(
+                run()
+            )
+        finally:
+            paypal_service.reset_access_token_cache()
+
+        assert categories == [
+            paypal_service.CATEGORY_AUTHENTICATION
+        ] * 3
+        # Only the first caller reached the provider.
+        assert exchange.await_count == 1
+
+    def test_a_successful_exchange_ends_the_backoff(self):
+        """A window opened by a failure does not outlive a success."""
+        import asyncio
+
+        results = [
+            paypal_service.PayPalAPIError(
+                "grant refused",
+                category=paypal_service.CATEGORY_AUTHENTICATION,
+                status_code=401,
+            ),
+        ]
+
+        async def exchange():
+            if results:
+                raise results.pop()
+            return "token", 3600.0
+
+        async def run():
+            paypal_service.reset_access_token_cache()
+            with patch(
+                SERVICE + "._exchange_credentials",
+                new=AsyncMock(side_effect=exchange),
+            ):
+                with pytest.raises(paypal_service.PayPalAPIError):
+                    await paypal_service._bearer_credential()
+                paypal_service.reset_access_token_cache()
+                return await paypal_service._bearer_credential()
+
+        try:
+            assert asyncio.get_event_loop().run_until_complete(
+                run()
+            ) == "token"
+        finally:
+            paypal_service.reset_access_token_cache()
+
     def test_the_token_cache_is_not_held_across_the_exchange(self):
         """A second caller must not wait on the first one's network.
 
@@ -1335,7 +1795,7 @@ class TestRequestContractStaysPlanOnly:
             {"end_date": "2099-01-01T00:00:00Z"},
             {"status": "active"},
             {"paypal_order_id": "ORDER-MINE"},
-            {"paypal_capture_id": "CAPTURE-MINE"},
+            {"approval_url": "https://checkout.invalid/pay"},
             {"user_id": 999},
             {"role": "admin"},
         ],
@@ -1374,10 +1834,12 @@ class TestRequestContractStaysPlanOnly:
     def test_the_callbacks_are_the_configured_ones(
         self, client, subscriber
     ):
-        """Both targets are built from the configured return base.
+        """Each target is the setting that configures it.
 
         The approving and the abandoning payer are returned to different
-        addresses, so the frontend can tell the two outcomes apart.
+        addresses, so the two outcomes stay distinguishable, and both
+        address the one ``/subscription`` path the frontend router
+        declares, so the payer always lands on a page that exists.
         """
         creator = AsyncMock(return_value=order_response())
         with patch(MODULE + ".create_order", new=creator):
@@ -1387,30 +1849,16 @@ class TestRequestContractStaysPlanOnly:
                 headers=bearer(subscriber),
             )
         arguments = creator.await_args.args
-        base = settings.PAYPAL_RETURN_BASE_URL
-        assert arguments[1] == (
-            base
-            + subscriptions_module.HOSTED_REDIRECT_PATH
-            + subscriptions_module.HOSTED_RETURN_PATH
-        )
-        assert arguments[2] == (
-            base
-            + subscriptions_module.HOSTED_REDIRECT_PATH
-            + subscriptions_module.HOSTED_CANCEL_PATH
-        )
+        assert arguments[1] == settings.PAYPAL_RETURN_URL
+        assert arguments[2] == settings.PAYPAL_CANCEL_URL
         assert arguments[1] != arguments[2]
+        for target in arguments[1:3]:
+            assert urlsplit(target).path == "/subscription"
 
-    def test_the_callbacks_are_not_the_first_cors_origin(self):
-        """The setting is independent of the origin list.
-
-        Deriving the callback from ALLOWED_ORIGINS is what let a
-        permissive development origin become a payment callback.
-        """
-        for continuation in (
-            subscriptions_module.HOSTED_RETURN_PATH,
-            subscriptions_module.HOSTED_CANCEL_PATH,
+    def test_the_callbacks_are_not_taken_from_the_origin_list(self):
+        """Neither address appears in the cross-origin allowlist."""
+        for target in (
+            settings.PAYPAL_RETURN_URL,
+            settings.PAYPAL_CANCEL_URL,
         ):
-            target = subscriptions_module._hosted_redirect_url(
-                continuation
-            )
             assert target not in settings.ALLOWED_ORIGINS

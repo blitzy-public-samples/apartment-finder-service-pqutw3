@@ -118,6 +118,62 @@ class TestDocumentationSurface:
         assert "/auth/login" in declared
 
 
+class TestShutdownDrainReporting:
+    """A log queue that will not empty is reported as the process stops.
+
+    The lifespan previously discarded the drain result, so records left
+    queued at shutdown were lost without a trace of their loss.
+    """
+
+    def _run_lifespan(self):
+        """Enters and leaves the application's lifespan once."""
+        with TestClient(main_module.app):
+            pass
+
+    def test_an_incomplete_drain_reaches_standard_error(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            main_module, "flush_log_queue", lambda: False
+        )
+        self._run_lifespan()
+
+        reported = capsys.readouterr().err
+        assert main_module.LOG_DRAIN_INCOMPLETE_MESSAGE in reported
+        assert str(main_module.QUEUE_DRAIN_TIMEOUT_SECONDS) in reported
+
+    def test_a_complete_drain_reports_nothing(self, monkeypatch, capsys):
+        monkeypatch.setattr(main_module, "flush_log_queue", lambda: True)
+        self._run_lifespan()
+
+        reported = capsys.readouterr().err
+        assert main_module.LOG_DRAIN_INCOMPLETE_MESSAGE not in reported
+
+    def test_the_drain_runs_after_the_outbound_client_is_closed(
+        self, monkeypatch
+    ):
+        order = []
+        closer = main_module.close_http_client
+
+        async def recording_close():
+            order.append("close")
+            await closer()
+
+        def recording_drain():
+            order.append("drain")
+            return True
+
+        monkeypatch.setattr(
+            main_module, "close_http_client", recording_close
+        )
+        monkeypatch.setattr(
+            main_module, "flush_log_queue", recording_drain
+        )
+        self._run_lifespan()
+
+        assert order == ["close", "drain"]
+
+
 class TestRequestBodyCaps:
     """Both the size and the chunk count of a body are bounded."""
 

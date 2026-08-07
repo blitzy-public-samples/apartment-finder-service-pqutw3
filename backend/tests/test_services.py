@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import json
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -333,22 +334,26 @@ class TestPayPalService(unittest.TestCase):
         The measurement is reported rather than raised, so the caller
         decides what to do with the row it holds.
         """
-        for label, payload in (
+        read_back = ('/v2/checkout/orders/' + ORDER_ID, 200,
+                     _order(captured=False))
+        for label, payload, extra in (
             (
                 'neither level reports completion',
                 _order(status='APPROVED'),
+                [],
             ),
             (
                 'the capture itself did not complete',
                 _order(capture_status='PENDING'),
+                [],
             ),
-            ('no capture present', _order(captured=False)),
-            ('amount below the plan', _order(value='0.01')),
-            ('foreign currency', _order(currency='EUR')),
+            ('no capture present', _order(captured=False), [read_back]),
+            ('amount below the plan', _order(value='0.01'), []),
+            ('foreign currency', _order(currency='EUR'), []),
         ):
             with self.subTest(label):
                 _recorder, transport = self._transport(
-                    [('/capture', 201, payload)]
+                    [('/capture', 201, payload)] + extra
                 )
                 with transport:
                     captured = _run(paypal_service.capture_order(
@@ -357,6 +362,66 @@ class TestPayPalService(unittest.TestCase):
                 outcome = self._settlement(captured)
                 self.assertFalse(outcome.completed)
                 self.assertTrue(outcome.reason)
+
+    def test_the_capture_asks_for_a_complete_representation(self):
+        """The capture call requests the full settled representation.
+
+        Without it PayPal answers with an identifier and a status alone,
+        which carries neither the amount nor the capture identifier the
+        settlement is measured by.
+        """
+        recorder, transport = self._transport(
+            [('/capture', 201, _order())]
+        )
+        with transport:
+            _run(paypal_service.capture_order(
+                self.db, ORDER_ID, self.owner
+            ))
+        sent = recorder.matching('/capture')[0]
+        self.assertEqual(
+            sent.headers[paypal_service.PREFER_HEADER],
+            paypal_service.PREFER_REPRESENTATION,
+        )
+
+    def test_a_minimal_capture_response_is_read_back_before_measuring(
+        self,
+    ):
+        """A charge is never reported as unsettled for want of a body.
+
+        PayPal may answer a capture with an identifier and a status only.
+        The order is read back so the settlement is measured against the
+        provider's own complete representation.
+        """
+        recorder, transport = self._transport([
+            ('/capture', 201, {'id': ORDER_ID, 'status': 'COMPLETED'}),
+            ('/v2/checkout/orders/' + ORDER_ID, 200, _order()),
+        ])
+        with transport:
+            captured = _run(paypal_service.capture_order(
+                self.db, ORDER_ID, self.owner
+            ))
+        plan = get_plan(PLAN_ID)
+        outcome = self._settlement(captured)
+        self.assertTrue(outcome.completed)
+        self.assertEqual(outcome.amount, format_amount(plan.amount))
+        self.assertEqual(outcome.currency, plan.currency)
+        self.assertEqual(outcome.capture_id, 'CAP-1')
+        self.assertEqual(
+            len(recorder.matching('/v2/checkout/orders/' + ORDER_ID)), 1
+        )
+
+    def test_a_complete_capture_response_is_not_read_back(self):
+        """A response already carrying the capture costs no extra call."""
+        recorder, transport = self._transport(
+            [('/capture', 201, _order())]
+        )
+        with transport:
+            _run(paypal_service.capture_order(
+                self.db, ORDER_ID, self.owner
+            ))
+        self.assertEqual(
+            recorder.matching('/v2/checkout/orders/' + ORDER_ID), []
+        )
 
     def test_a_settled_capture_is_reconciled_against_the_plan(self):
         recorder, transport = self._transport(
@@ -511,14 +576,22 @@ class TestPayPalService(unittest.TestCase):
             'PAYPAL-TRANSMISSION-SIG': 'sig',
             'PAYPAL-TRANSMISSION-TIME': '2026-01-01T00:00:00Z',
         }
+        raw = b'{"event_type": "PAYMENT.CAPTURE.COMPLETED"}'
         with transport:
             result = _run(paypal_service.verify_webhook_signature(
-                headers, {'event_type': 'PAYMENT.CAPTURE.COMPLETED'}
+                headers, raw
             ))
         self.assertTrue(result.verified)
         self.assertEqual(result.transmission_id, 'tx-2')
         self.assertEqual(
             result.event_type, 'PAYMENT.CAPTURE.COMPLETED'
+        )
+        # The bytes that arrived are what the verifier transmitted.
+        posted = _recorder.matching('/verify-webhook-signature')[0]
+        self.assertIn(raw, posted.content)
+        self.assertEqual(
+            json.loads(posted.content.decode('utf-8'))['webhook_event'],
+            {'event_type': 'PAYMENT.CAPTURE.COMPLETED'},
         )
 
 

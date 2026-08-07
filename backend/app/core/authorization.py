@@ -15,11 +15,24 @@ A paid entitlement is resolved by :func:`entitled_role`: a subscription
 row belonging to the principal, carrying the active status and not yet
 past its end date, grants the role its plan registers in
 :mod:`backend.app.core.plans`. Because the grant is derived from the row
-rather than stored on the user, it lapses when the row expires and
-nothing has to demote the account. The stored role is never lowered by
-it. :func:`require_role` resolves it only when the stored role does not
-already satisfy the minimum, so a route no entitlement can affect costs
-no extra query.
+rather than read off the user, it lapses when the row expires and
+nothing has to demote the account.
+
+The unexpired subscription is therefore the authority for every role a
+plan can grant, and the stored column alone never carries one. A stored
+value naming a member of :data:`SUBSCRIPTION_DERIVED_ROLES` is credited
+by :func:`stored_credit` as :data:`BASELINE_ROLE`, so a decision that
+turns on such a role always reads the subscription and a closed window
+admits nothing beyond that baseline. A stored role no plan grants --
+:data:`LOWEST_ROLE`, :data:`BASELINE_ROLE` and ``Role.ADMIN`` -- is
+never lowered, and :func:`require_role` resolves an entitlement only
+when the credited stored role does not already satisfy the minimum, so
+a route no entitlement can affect costs no extra query.
+
+A subscription that cannot be read grants nothing:
+:func:`entitled_role` records the failure and reports no entitlement, so
+the decision rests on the credited stored role alone rather than
+failing open.
 
 Resolution denies by default. A stored value is matched only when it
 equals a :class:`Role` member's value exactly: no whitespace is stripped
@@ -99,7 +112,7 @@ from typing import (
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import inspect as sqlalchemy_inspect
-from sqlalchemy.exc import NoInspectionAvailable
+from sqlalchemy.exc import NoInspectionAvailable, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from backend.app.core.logging import (
@@ -116,11 +129,13 @@ from backend.app.db.models import Subscription, User
 __all__ = [
     "AUDIT_FAILURE_MESSAGE",
     "AUDIT_SINK_FALLBACK",
+    "BASELINE_ROLE",
     "DECISION_OBJECT_MISSING",
     "DECISION_OWNERSHIP_DENIED",
     "DECISION_PRINCIPAL_MISSING",
     "DECISION_ROLE_DENIED",
     "DECISION_ROLE_INVALID",
+    "ENTITLEMENT_UNRESOLVED_MESSAGE",
     "FORBIDDEN_DETAIL",
     "LOOKUP_CANDIDATE_LIMIT",
     "LOWEST_ROLE",
@@ -130,6 +145,7 @@ __all__ = [
     "ROLE_ATTRIBUTE",
     "ROLE_ORDER",
     "ROLE_RANKS",
+    "SUBSCRIPTION_DERIVED_ROLES",
     "Role",
     "effective_role",
     "entitled_role",
@@ -140,6 +156,7 @@ __all__ = [
     "reset_audit_failure_count",
     "resolve_role",
     "role_satisfies",
+    "stored_credit",
 ]
 
 logger = get_logger(__name__)
@@ -177,6 +194,16 @@ ROLE_RANKS: Mapping[Role, int] = MappingProxyType(
 #: role at all rather than to this one, and satisfies no minimum.
 LOWEST_ROLE = Role.GUEST
 
+#: Roles a paid entitlement grants. A stored value naming one of these
+#: is credited as :data:`BASELINE_ROLE` on its own, and reaches its own
+#: rank only while :func:`entitled_role` resolves it from an unexpired
+#: active subscription.
+SUBSCRIPTION_DERIVED_ROLES: FrozenSet[Role] = frozenset({Role.PREMIUM})
+
+#: Role a stored subscription-derived value is credited as when no
+#: entitlement grants it.
+BASELINE_ROLE = Role.REGISTERED
+
 ROLE_ATTRIBUTE = "role"
 
 OWNER_ATTRIBUTE = "user_id"
@@ -195,6 +222,10 @@ REFUSAL_MESSAGE = "Authorization refused"
 #: Message of the fallback record written when the structured record
 #: could not be emitted.
 AUDIT_FAILURE_MESSAGE = "Authorization refused, primary audit sink failed"
+
+#: Message recorded when a paid entitlement could not be read. The
+#: decision then rests on the credited stored role alone.
+ENTITLEMENT_UNRESOLVED_MESSAGE = "Paid entitlement could not be resolved"
 
 #: Value recorded on the ``audit_sink`` field of a fallback record.
 AUDIT_SINK_FALLBACK = "stderr"
@@ -243,6 +274,23 @@ def parse_role(value: Any) -> Optional[Role]:
     return _ROLES_BY_VALUE.get(value)
 
 
+def stored_credit(value: Any) -> Optional[Role]:
+    """Returns the role a stored value carries without an entitlement.
+
+    A value naming a member of :data:`SUBSCRIPTION_DERIVED_ROLES` is
+    credited as :data:`BASELINE_ROLE`, so the column alone never carries
+    a rank a paid entitlement grants. Every other value
+    :func:`parse_role` recognises is returned unchanged, and a value
+    naming no member returns ``None``.
+    """
+    resolved = parse_role(value)
+    if resolved is None:
+        return None
+    if resolved in SUBSCRIPTION_DERIVED_ROLES:
+        return BASELINE_ROLE
+    return resolved
+
+
 def resolve_role(user: Any) -> Optional[Role]:
     """Returns the role the stored user row carries, or ``None``.
 
@@ -284,21 +332,32 @@ def entitled_role(
     ``None`` is returned when the principal carries no identifier, when
     no row qualifies, and when no qualifying row names a plan the
     catalog publishes.
+
+    ``None`` is also returned when the lookup itself fails, after one
+    record naming :data:`ENTITLEMENT_UNRESOLVED_MESSAGE`, so a
+    subscription that cannot be read grants nothing and the caller's
+    session is left exactly as it was found.
     """
     principal_id = _principal_id(user)
     if principal_id is None:
         return None
     if moment is None:
         moment = datetime.now(timezone.utc)
-    plan_ids = (
-        db.query(Subscription.plan_id)
-        .filter(
-            Subscription.user_id == principal_id,
-            Subscription.status == STATUS_ACTIVE,
-            Subscription.end_date > moment,
+    try:
+        plan_ids = (
+            db.query(Subscription.plan_id)
+            .filter(
+                Subscription.user_id == principal_id,
+                Subscription.status == STATUS_ACTIVE,
+                Subscription.end_date > moment,
+            )
+            .all()
         )
-        .all()
-    )
+    except SQLAlchemyError as error:
+        fields = {"principal_id": principal_id}
+        fields.update(exception_fields(error))
+        logger.error(ENTITLEMENT_UNRESOLVED_MESSAGE, extra=fields)
+        return None
     granted: Optional[Role] = None
     for (plan_id,) in plan_ids:
         try:
@@ -320,10 +379,18 @@ def effective_role(
 ) -> Optional[Role]:
     """Returns the role every decision about ``user`` is taken against.
 
-    The role stored on the row is resolved by :func:`resolve_role`, and
-    a paid entitlement resolved by :func:`entitled_role` raises it when
-    the entitlement ranks higher. The stored role is never lowered, so a
-    principal cannot lose privilege by holding a subscription.
+    The role stored on the row is resolved by :func:`resolve_role` and
+    credited by :func:`stored_credit`, and a paid entitlement resolved
+    by :func:`entitled_role` raises that credit when the entitlement
+    ranks higher.
+
+    A stored value naming a member of
+    :data:`SUBSCRIPTION_DERIVED_ROLES` is credited as
+    :data:`BASELINE_ROLE`, so such a role holds only while an unexpired
+    active subscription grants it and lapses with that subscription's
+    window. A stored role that no entitlement grants --
+    :data:`LOWEST_ROLE`, :data:`BASELINE_ROLE` and ``Role.ADMIN`` -- is
+    never lowered.
 
     Resolution still denies by default: a row whose stored role names no
     member resolves to ``None``, which satisfies no minimum, and an
@@ -335,10 +402,11 @@ def effective_role(
         # A stored role naming no member satisfies no minimum, and an
         # entitlement is never a substitute for it.
         return None
+    credited = stored_credit(stored)
     granted = entitled_role(db, user, moment)
-    if granted is not None and ROLE_RANKS[granted] > ROLE_RANKS[stored]:
+    if granted is not None and ROLE_RANKS[granted] > ROLE_RANKS[credited]:
         return granted
-    return stored
+    return credited
 
 
 def role_satisfies(role: Any, minimum: Any) -> bool:
@@ -522,11 +590,17 @@ def require_role(minimum: Any) -> Callable[..., User]:
     :func:`backend.app.core.security.get_current_user`, so an absent or
     invalid credential is answered ``401`` by that function before this
     check runs. The role stored on that row is read by
-    :func:`resolve_role` and compared with ``minimum`` by
-    :func:`role_satisfies`. Only when the stored role alone falls short
-    is :func:`effective_role` consulted, so a paid entitlement can raise
-    a principal to the declared minimum without a query being spent on
-    the principals the stored role already admits.
+    :func:`resolve_role`, credited by :func:`stored_credit` and compared
+    with ``minimum`` by :func:`role_satisfies`. Only when that credit
+    falls short is :func:`effective_role` consulted, so a paid
+    entitlement can raise a principal to the declared minimum without a
+    query being spent on the principals the stored role already admits.
+
+    Because :func:`stored_credit` credits a stored value naming a member
+    of :data:`SUBSCRIPTION_DERIVED_ROLES` as :data:`BASELINE_ROLE`, any
+    decision that turns on such a role reads the principal's unexpired
+    active subscription, and a stored value whose subscription window
+    has closed admits nothing beyond the baseline.
 
     The stored row is returned unchanged when the comparison passes, so
     a route may declare this dependency in place of
@@ -569,10 +643,10 @@ def require_role(minimum: Any) -> Callable[..., User]:
                 request,
             )
             raise _forbidden()
-        if role_satisfies(stored, required):
+        if role_satisfies(stored_credit(stored), required):
             return current_user
-        # The stored role alone does not satisfy the minimum, so the
-        # paid entitlement is resolved as well.
+        # The credit the stored role carries on its own does not satisfy
+        # the minimum, so the paid entitlement is resolved as well.
         effective = effective_role(db, current_user)
         if not role_satisfies(effective, required):
             _log_refusal(

@@ -100,11 +100,13 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from backend.app.core.config import LOCAL_ENVIRONMENT, settings
 from backend.app.core.logging import (
+    QUEUE_DRAIN_TIMEOUT_SECONDS,
     bind_request_id,
     current_request_id,
     flush_log_queue,
     get_logger,
     is_audited,
+    log_audit_fallback,
     log_exception,
     reset_request_id,
     unredacted_handler_names,
@@ -120,6 +122,7 @@ __all__ = [
     "DOCUMENTATION_ENABLED",
     "HEALTH_STATUS",
     "INVALID_REQUEST_DETAIL",
+    "LOG_DRAIN_INCOMPLETE_MESSAGE",
     "OPENAPI_PATH",
     "REDOC_PATH",
     "REQUEST_ID_FIELD",
@@ -227,6 +230,11 @@ REQUEST_ID_MAX_LENGTH = 64
 #: Message of the record emitted for a throttled request.
 THROTTLED_MESSAGE = "Request throttled"
 
+#: Message reported when the log queue still holds records after the
+#: shutdown drain timeout elapsed. It is written directly to standard
+#: error rather than through the queue.
+LOG_DRAIN_INCOMPLETE_MESSAGE = "Log queue did not drain before shutdown"
+
 # Characters an inbound request identifier may carry.
 _REQUEST_ID_ALPHABET = frozenset(
     "abcdefghijklmnopqrstuvwxyz"
@@ -284,7 +292,9 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
     before the first request is served and closed once the last one has
     completed. Any handler removed from a governed logging namespace is
     reported at startup, and the log queue is drained on the way out so
-    no record is lost when the process stops.
+    no record is lost when the process stops. A queue that still holds
+    records once the drain timeout elapses is reported on standard error,
+    which does not travel through the queue.
     """
     removed = unredacted_handler_names()
     if removed:
@@ -297,7 +307,11 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await close_http_client()
-        flush_log_queue()
+        if not flush_log_queue():
+            log_audit_fallback(
+                LOG_DRAIN_INCOMPLETE_MESSAGE,
+                {"timeout_seconds": QUEUE_DRAIN_TIMEOUT_SECONDS},
+            )
 
 
 app = FastAPI(

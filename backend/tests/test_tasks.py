@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +21,10 @@ TASK_MODULE = 'backend.app.tasks.listing_updater'
 ZIP_CODE = '12345'
 
 LISTING_URL = 'https://www.zillow.com/homedetails/1'
+
+# Longest a stand-in provider call waits to be released. It bounds the
+# case below so a pass that blocked the loop fails instead of hanging.
+BLOCKED_FETCH_TIMEOUT = 5.0
 
 
 @pytest.fixture
@@ -156,7 +162,7 @@ async def test_a_provider_listing_is_persisted_as_a_mapped_orm_row(
         ) as mock_fetch:
             await update_listings()
 
-    # The provider is called synchronously with the stored postal codes.
+    # The provider receives the stored postal codes.
     assert mock_fetch.call_args.args[0] == [ZIP_CODE]
 
     rows = db.query(Listing).all()
@@ -244,3 +250,53 @@ async def test_a_provider_field_outside_the_allowlist_is_ignored(
     assert row.id != 99
     assert not hasattr(row, 'owner_id')
     assert not hasattr(row, 'description')
+
+
+@pytest.mark.asyncio
+async def test_the_provider_call_runs_off_the_event_loop(
+    session_factory, saved_zip_code
+):
+    """The synchronous provider call is made on a worker thread."""
+    loop_thread = threading.get_ident()
+    calling_threads = []
+
+    def recording_fetch(zip_codes, filters):
+        calling_threads.append(threading.get_ident())
+        return []
+
+    with patch(TASK_MODULE + '.SessionLocal', session_factory):
+        with patch(TASK_MODULE + '.fetch_listings', new=recording_fetch):
+            await update_listings()
+
+    assert len(calling_threads) == 1
+    assert calling_threads[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_the_event_loop_runs_while_the_provider_is_waiting(
+    session_factory, saved_zip_code
+):
+    """A concurrent task progresses before the provider call returns.
+
+    The stand-in provider call blocks until the other task releases it,
+    so it can only return once the loop has run that task.
+    """
+    released = threading.Event()
+    release_observed = []
+
+    def blocked_fetch(zip_codes, filters):
+        release_observed.append(released.wait(BLOCKED_FETCH_TIMEOUT))
+        return []
+
+    async def release_after_yielding():
+        for _ in range(3):
+            await asyncio.sleep(0)
+        released.set()
+
+    with patch(TASK_MODULE + '.SessionLocal', session_factory):
+        with patch(TASK_MODULE + '.fetch_listings', new=blocked_fetch):
+            await asyncio.gather(
+                update_listings(), release_after_yielding()
+            )
+
+    assert release_observed == [True]

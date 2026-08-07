@@ -19,6 +19,7 @@ from unittest import mock
 
 import pytest
 
+from backend.app.core import logging as app_logging
 from backend.app.core.logging import (
     BASE_LOGGER_NAME,
     HANDLER_NAME,
@@ -410,48 +411,88 @@ class TestPaymentApiBase:
         assert_rejected(PAYPAL_MODE=mode, PAYPAL_API_BASE=base)
 
 
-class TestPaymentReturnBase:
-    """The payer-return base is its own validated setting."""
+class TestPaymentCallbackAddresses:
+    """The payer-return and cancel addresses are their own settings."""
 
-    def test_it_is_independent_of_the_origin_list(self):
+    def test_they_are_independent_of_the_origin_list(self):
         built = build_settings(
             ALLOWED_ORIGINS=[
                 "https://attacker.example.com",
                 "https://app.example.com",
             ],
-            PAYPAL_RETURN_BASE_URL="https://app.example.com",
+            PAYPAL_RETURN_URL="https://app.example.com/s/return",
+            PAYPAL_CANCEL_URL="https://app.example.com/s/cancel",
         )
-        assert built.PAYPAL_RETURN_BASE_URL == "https://app.example.com"
-        assert built.ALLOWED_ORIGINS[0] != built.PAYPAL_RETURN_BASE_URL
+        assert built.PAYPAL_RETURN_URL == (
+            "https://app.example.com/s/return"
+        )
+        assert built.PAYPAL_CANCEL_URL == (
+            "https://app.example.com/s/cancel"
+        )
+        assert built.ALLOWED_ORIGINS[0] not in built.PAYPAL_RETURN_URL
+
+    def test_the_two_addresses_are_configured_separately(self):
+        """Neither address is derived from the other."""
+        built = build_settings(
+            PAYPAL_RETURN_URL="https://app.example.com/paid",
+            PAYPAL_CANCEL_URL="https://other.example.com/gave-up",
+        )
+        assert built.PAYPAL_RETURN_URL == "https://app.example.com/paid"
+        assert built.PAYPAL_CANCEL_URL == (
+            "https://other.example.com/gave-up"
+        )
+
+    def test_an_equal_pair_is_rejected(self):
+        """An approving payer must be distinguishable from one who left."""
+        assert_rejected(
+            PAYPAL_RETURN_URL="https://app.example.com/s",
+            PAYPAL_CANCEL_URL="https://app.example.com/s",
+        )
 
     @pytest.mark.parametrize(
-        "base, expected",
+        "address, expected",
         [
-            ("https://App.Example.com/", "https://app.example.com"),
-            ("http://localhost:3000", "http://localhost:3000"),
+            (
+                "https://App.Example.com/Return/",
+                "https://app.example.com/Return",
+            ),
+            ("https://app.example.com", "https://app.example.com"),
+            (
+                "http://localhost:3000/subscription/return",
+                "http://localhost:3000/subscription/return",
+            ),
+            (
+                "http://localhost:3000/subscription?paypal=return",
+                "http://localhost:3000/subscription?paypal=return",
+            ),
+            (
+                "https://app.example.com/return/?next=1",
+                "https://app.example.com/return/?next=1",
+            ),
         ],
     )
-    def test_accepted_bases_are_canonicalized(self, base, expected):
-        built = build_settings(PAYPAL_RETURN_BASE_URL=base)
-        assert built.PAYPAL_RETURN_BASE_URL == expected
+    def test_accepted_addresses_are_canonicalized(
+        self, address, expected
+    ):
+        built = build_settings(PAYPAL_RETURN_URL=address)
+        assert built.PAYPAL_RETURN_URL == expected
 
     @pytest.mark.parametrize(
-        "base",
+        "address",
         [
             "",
             "   ",
             "*",
             "https://*.example.com",
-            "app.example.com",
-            "ftp://app.example.com",
-            "https://app.example.com/subscription",
-            "https://app.example.com?next=1",
-            "https://app.example.com#done",
-            "https://u:pw@app.example.com",
+            "app.example.com/return",
+            "ftp://app.example.com/return",
+            "https://app.example.com/return#done",
+            "https://u:pw@app.example.com/return",
         ],
     )
-    def test_malformed_bases_are_rejected(self, base):
-        assert_rejected(PAYPAL_RETURN_BASE_URL=base)
+    def test_malformed_addresses_are_rejected(self, address):
+        assert_rejected(PAYPAL_RETURN_URL=address)
+        assert_rejected(PAYPAL_CANCEL_URL=address)
 
     def test_production_refuses_sandbox_mode(self):
         assert_rejected(
@@ -472,7 +513,12 @@ class TestPaymentReturnBase:
             ),
             ALLOWED_ORIGINS=["https://apartment-finder.io"],
             ALLOWED_HOSTS=["apartment-finder.io"],
-            PAYPAL_RETURN_BASE_URL="https://apartment-finder.io",
+            PAYPAL_RETURN_URL=(
+                "https://apartment-finder.io/subscription/return"
+            ),
+            PAYPAL_CANCEL_URL=(
+                "https://apartment-finder.io/subscription/cancel"
+            ),
             RATE_LIMIT_STORAGE_URI=(
                 "redis://cache.apartment-finder.io:6379/0"
             ),
@@ -560,7 +606,12 @@ DEPLOYED_SETTINGS = {
     "FROM_EMAIL": "no-reply@corp-example.net",
     "ALLOWED_ORIGINS": ["https://app.corp-example.net"],
     "ALLOWED_HOSTS": ["app.corp-example.net"],
-    "PAYPAL_RETURN_BASE_URL": "https://app.corp-example.net",
+    "PAYPAL_RETURN_URL": (
+        "https://app.corp-example.net/subscription/return"
+    ),
+    "PAYPAL_CANCEL_URL": (
+        "https://app.corp-example.net/subscription/cancel"
+    ),
     "RATE_LIMIT_STORAGE_URI": "redis://cache.corp-example.net:6379/0",
 }
 
@@ -579,52 +630,58 @@ def assert_deployed_rejected(**overrides):
 
 
 class TestPaymentCallbackUrls:
-    """The hosted-redirect callbacks are configured, not derived.
+    """Each hosted-redirect callback is its own validated setting.
 
-    A permissive development CORS origin must not be reusable as a
-    production payment callback, so the base both callbacks are built
-    from is its own setting with its own environment-sensitive checks.
+    The checks below cover the deployed environment, where the scheme must
+    be TLS and the host must be publicly addressable.
     """
 
     def test_callbacks_are_not_taken_from_the_origin_list(self):
         built = build_settings(
             ALLOWED_ORIGINS=["http://localhost:3000"],
-            PAYPAL_RETURN_BASE_URL="http://localhost:8080",
+            PAYPAL_RETURN_URL="http://localhost:8080/return",
+            PAYPAL_CANCEL_URL="http://localhost:8080/cancel",
         )
-        assert built.PAYPAL_RETURN_BASE_URL == "http://localhost:8080"
-        assert built.PAYPAL_RETURN_BASE_URL not in built.ALLOWED_ORIGINS
+        assert built.PAYPAL_RETURN_URL == "http://localhost:8080/return"
+        assert built.PAYPAL_RETURN_URL not in built.ALLOWED_ORIGINS
+        assert built.PAYPAL_CANCEL_URL not in built.ALLOWED_ORIGINS
 
     @pytest.mark.parametrize(
-        "base",
+        "address",
         [
-            "http://localhost:3000",
-            "https://app.corp-example.net",
+            "http://localhost:3000/return",
+            "https://app.corp-example.net/return",
         ],
     )
-    def test_local_accepts_plaintext_and_loopback(self, base):
-        built = build_settings(PAYPAL_RETURN_BASE_URL=base)
-        assert built.PAYPAL_RETURN_BASE_URL == base
+    def test_local_accepts_plaintext_and_loopback(self, address):
+        built = build_settings(PAYPAL_RETURN_URL=address)
+        assert built.PAYPAL_RETURN_URL == address
 
     @pytest.mark.parametrize(
-        "base",
+        "address",
         [
-            "http://app.corp-example.net",
-            "https://localhost",
-            "https://127.0.0.1",
-            "https://10.0.0.7",
-            "https://service.internal",
+            "http://app.corp-example.net/return",
+            "https://localhost/return",
+            "https://127.0.0.1/return",
+            "https://10.0.0.7/return",
+            "https://service.internal/return",
         ],
     )
-    def test_deployed_rejects_plaintext_and_internal_hosts(self, base):
-        assert_deployed_rejected(PAYPAL_RETURN_BASE_URL=base)
+    def test_deployed_rejects_plaintext_and_internal_hosts(self, address):
+        assert_deployed_rejected(PAYPAL_RETURN_URL=address)
+        assert_deployed_rejected(PAYPAL_CANCEL_URL=address)
 
-    def test_deployed_accepts_a_public_https_base(self):
-        assert build_deployed().PAYPAL_RETURN_BASE_URL == (
-            "https://app.corp-example.net"
+    def test_deployed_accepts_public_https_callbacks(self):
+        deployed = build_deployed()
+        assert deployed.PAYPAL_RETURN_URL == (
+            "https://app.corp-example.net/subscription/return"
+        )
+        assert deployed.PAYPAL_CANCEL_URL == (
+            "https://app.corp-example.net/subscription/cancel"
         )
 
     @pytest.mark.parametrize(
-        "base",
+        "address",
         [
             "",
             "   ",
@@ -632,19 +689,21 @@ class TestPaymentCallbackUrls:
             "app.corp-example.net",
             "https://*.corp-example.net",
             "https://user:pw@app.corp-example.net",
-            "https://app.corp-example.net?token=1",
             "https://app.corp-example.net#frag",
             "ftp://app.corp-example.net",
         ],
     )
-    def test_malformed_callbacks_are_rejected(self, base):
-        assert_rejected(PAYPAL_RETURN_BASE_URL=base)
+    def test_malformed_callbacks_are_rejected(self, address):
+        assert_rejected(PAYPAL_RETURN_URL=address)
+        assert_rejected(PAYPAL_CANCEL_URL=address)
 
     def test_scheme_and_host_are_returned_lowercased(self):
         built = build_settings(
-            PAYPAL_RETURN_BASE_URL="HTTP://LocalHost:3000"
+            PAYPAL_RETURN_URL="HTTP://LocalHost:3000/Return"
         )
-        assert built.PAYPAL_RETURN_BASE_URL == "http://localhost:3000"
+        assert built.PAYPAL_RETURN_URL == (
+            "http://localhost:3000/Return"
+        )
 
 
 class TestRateLimitStorage:
@@ -1062,6 +1121,84 @@ class TestForeignHandlersOnGovernedLoggers:
         rendered = emit(lambda logger: logger.info("password=" + value))
         assert value not in rendered
         assert REDACTION_PLACEHOLDER in rendered
+
+
+class TestListenerShutdown:
+    """Stopping the listener drains its queue and ends its thread.
+
+    Before the fix the module reference was cleared before the running
+    check read it, so the check saw nothing, the queue was never drained
+    and the thread was never stopped: the records still queued were lost
+    and the thread outlived every replacement.
+    """
+
+    @pytest.fixture
+    def running_listener(self):
+        """Yields the live listener and rebuilds one afterwards."""
+        configure_logging()
+        listener = app_logging._listener
+        assert listener is not None
+        try:
+            yield listener
+        finally:
+            app_logging._stop_listener()
+            configure_logging()
+
+    def test_the_thread_is_stopped_not_merely_dereferenced(
+        self, running_listener
+    ):
+        thread = running_listener._thread
+        assert thread is not None
+        assert thread.is_alive()
+
+        app_logging._stop_listener()
+
+        assert app_logging._listener is None
+        assert not thread.is_alive()
+        assert running_listener._thread is None
+
+    def test_a_queued_record_is_written_before_the_thread_stops(
+        self, running_listener
+    ):
+        record_queue = app_logging._record_queue
+        handler = app_logging._stream_handler
+        written = io.StringIO()
+        replaced = handler.setStream(written)
+        try:
+            record_queue.put(
+                logging.LogRecord(
+                    BASE_LOGGER_NAME,
+                    logging.WARNING,
+                    __file__,
+                    0,
+                    "queued before shutdown",
+                    None,
+                    None,
+                )
+            )
+            app_logging._stop_listener()
+        finally:
+            handler.setStream(replaced)
+
+        assert "queued before shutdown" in written.getvalue()
+        assert record_queue.unfinished_tasks == 0
+
+    def test_stopping_twice_is_harmless(self, running_listener):
+        app_logging._stop_listener()
+        app_logging._stop_listener()
+        assert app_logging._listener is None
+
+    def test_a_replacement_leaves_no_second_listener_thread(
+        self, running_listener
+    ):
+        thread = running_listener._thread
+        app_logging._stop_listener()
+        configure_logging()
+        rebuilt = app_logging._listener
+
+        assert rebuilt is not running_listener
+        assert rebuilt._thread.is_alive()
+        assert not thread.is_alive()
 
 
 class TestRegistrationAddressContract:

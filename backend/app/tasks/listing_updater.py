@@ -3,7 +3,9 @@
 One pass reads the postal codes stored on saved filters, asks the
 provider for the listings covering them, maps each returned record onto
 the listing creation contract, and reconciles it against the stored
-corpus on :data:`IDENTITY_COLUMN`.
+corpus on :data:`IDENTITY_COLUMN`, which
+:class:`backend.app.db.models.Listing` constrains to be unique so that
+one provider address identifies at most one row.
 
 Every write goes through a mapped ORM instance and names its columns
 explicitly: a record is either constructed as a new
@@ -39,7 +41,9 @@ from backend.app.core.logging import get_logger, log_exception
 UPDATE_INTERVAL = timedelta(hours=1)
 
 #: Column a provider record is reconciled against. It is the only
-#: declared column carrying a value the provider assigns per listing.
+#: declared column carrying a value the provider assigns per listing, and
+#: :class:`backend.app.db.models.Listing` constrains it to be unique, so
+#: one value identifies at most one row.
 IDENTITY_COLUMN = "zillow_url"
 
 #: Provider query filters sent with every scheduled pass. The pass
@@ -139,6 +143,10 @@ async def update_listings():
     identifier -- copying the processed attributes onto an existing row
     or adding a new one -- and commits once at the end of the cycle.
 
+    The provider call is synchronous and is run on a worker thread, so
+    awaiting it yields the event loop for the duration of the provider
+    request rather than holding it until that request's timeout elapses.
+
     Any exception rolls the session back and is recorded through the
     redacting logger rather than propagated, so a failed cycle leaves no
     partial write behind and does not stop the caller. The session is
@@ -154,7 +162,9 @@ async def update_listings():
                 "names a postal code"
             )
             return
-        raw_listings = fetch_listings(zip_codes, PROVIDER_FILTERS)
+        raw_listings = await asyncio.to_thread(
+            fetch_listings, zip_codes, PROVIDER_FILTERS
+        )
         moment = datetime.now(timezone.utc)
         recorded = 0
         refreshed = 0
@@ -168,6 +178,8 @@ async def update_listings():
                 continue
             processed += 1
             identity = getattr(mapped, IDENTITY_COLUMN)
+            # The identity column is uniquely constrained, so this
+            # matches the one row carrying the value or none at all.
             existing_listing = db.query(Listing).filter(
                 getattr(Listing, IDENTITY_COLUMN) == identity
             ).first()

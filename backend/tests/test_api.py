@@ -1,9 +1,11 @@
 import asyncio
 import logging as stdlib_logging
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
+from itertools import count
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlsplit
 
 import bcrypt
 import pytest
@@ -72,10 +74,14 @@ from backend.app.main import (
     BodySizeLimitMiddleware,
     app,
 )
+from backend.app.schema import subscription as subscription_schema
+from backend.app.schema.subscription import SubscriptionCreate
 from backend.app.services import paypal_service as paypal_module
 from backend.app.services.paypal_service import (
+    CATEGORY_PROVIDER_CLIENT,
     CATEGORY_PROVIDER_SERVER,
     IDEMPOTENCY_HEADER,
+    CaptureOutcome,
     PayPalAPIError,
     PayPalError,
     WebhookVerification,
@@ -154,13 +160,65 @@ def approved_event(order_id=ORDER_ID):
     }
 
 
-def verified_approval():
+def verified_approval(transmission_id=None):
     """Returns the outcome of a passing check on an approval event."""
     return WebhookVerification(
         verified=True,
-        transmission_id=PAYPAL_HEADERS['PAYPAL-TRANSMISSION-ID'],
+        transmission_id=(
+            transmission_id or PAYPAL_HEADERS['PAYPAL-TRANSMISSION-ID']
+        ),
         event_type='CHECKOUT.ORDER.APPROVED',
     )
+
+
+#: Source of a distinct delivery identifier per notification, so a second
+#: delivery is a fresh event rather than a replay of the first.
+_deliveries = count(1)
+
+
+def verified_delivery(transmission_id=None, event_type=None):
+    """Returns a passing check carrying a distinct delivery identifier."""
+    return WebhookVerification(
+        verified=True,
+        transmission_id=(
+            transmission_id or 'transmission-%d' % next(_deliveries)
+        ),
+        event_type=event_type or 'CHECKOUT.ORDER.APPROVED',
+    )
+
+
+def deliver_approval(
+    client,
+    order_id=ORDER_ID,
+    capture=None,
+    transmission_id=None,
+    verification=None,
+):
+    """Delivers one signature-verified approval and settles the order.
+
+    The signature check and the capture call are both stood in for. The
+    delivery identifier is distinct per call unless one is supplied.
+    Returns the response together with the capture stand-in, so a caller
+    can assert how many times the provider was asked to settle.
+    """
+    checked = verification or verified_delivery(transmission_id)
+    settlement = (
+        capture
+        if capture is not None
+        else AsyncMock(return_value=capture_response())
+    )
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        new=AsyncMock(return_value=checked),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order', new=settlement
+    ):
+        response = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(order_id),
+            headers=PAYPAL_HEADERS,
+        )
+    return response, settlement
 
 
 @pytest.fixture
@@ -751,7 +809,7 @@ def test_subscription_creation_and_retrieval(
 
     The row it records entitles nothing until a settlement is proven, so
     the retrieval route reports nothing while it is pending and reports
-    the row once a capture has activated it.
+    the row once the verified approval has activated it.
     """
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
@@ -777,23 +835,16 @@ def test_subscription_creation_and_retrieval(
     assert pending.status_code == 200
     assert pending.json() is None
 
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=capture_response()),
-    ):
-        settled = client.post(
-            '/subscriptions/capture',
-            json={'order_id': ORDER_ID},
-            headers=bearer(registered_user),
-        )
+    settled, _ = deliver_approval(client)
     assert settled.status_code == 200
-    assert settled.json()['status'] == 'active'
+    assert settled.json() == {'status': 'processed'}
 
     fetched = client.get(
         '/subscriptions/', headers=bearer(registered_user)
     )
     assert fetched.status_code == 200
     assert fetched.json()['id'] == body['id']
+    assert fetched.json()['status'] == 'active'
 
 
 def test_subscription_creation_prices_from_the_catalog(
@@ -1012,8 +1063,8 @@ def test_the_ownership_row_is_durable_before_the_capture(
 ):
     """A settled charge can never be the first durable thing to happen.
 
-    Creation commits the pending row and captures nothing; the capture
-    continuation stands in for the remote call and reads the database
+    Creation commits the pending row and captures nothing; the verified
+    approval stands in for the remote capture call and reads the database
     from an independent session, so it only sees the row if that row was
     genuinely committed before the charge.
     """
@@ -1030,7 +1081,7 @@ def test_the_ownership_row_is_durable_before_the_capture(
             seen['end_date'] = row.end_date if row else None
             seen['user_id'] = row.user_id if row else None
             seen['request_id'] = (
-                row.paypal_request_id if row else None
+                paypal_module.order_request_id(row.id) if row else None
             )
         finally:
             independent.close()
@@ -1041,27 +1092,24 @@ def test_the_ownership_row_is_durable_before_the_capture(
     assert created.json()['status'] == STATUS_PENDING
     assert created.json()['end_date'] is None
 
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(side_effect=observing_capture),
-    ):
-        settled = client.post(
-            '/subscriptions/capture',
-            json={'order_id': ORDER_ID},
-            headers=bearer(registered_user),
-        )
+    settled, _ = deliver_approval(
+        client, capture=AsyncMock(side_effect=observing_capture)
+    )
 
     assert settled.status_code == 200
-    # Durable, owned, keyed, and granting nothing at the moment of the
-    # charge.
+    # Durable, owned, and granting nothing at the moment of the charge.
     assert seen['committed'] is True
     assert seen['status'] == STATUS_PENDING
     assert seen['end_date'] is None
     assert seen['user_id'] == registered_user.id
     assert seen['request_id']
+
     # Activated only after the charge settled.
-    assert settled.json()['status'] == STATUS_ACTIVE
-    assert settled.json()['end_date'] is not None
+    entitling = client.get(
+        '/subscriptions/', headers=bearer(registered_user)
+    ).json()
+    assert entitling['status'] == STATUS_ACTIVE
+    assert entitling['end_date'] is not None
 
 
 def test_a_failed_capture_leaves_a_failed_row_and_no_entitlement(
@@ -1074,15 +1122,12 @@ def test_a_failed_capture_leaves_a_failed_row_and_no_entitlement(
     """
     assert _open_subscription(client, registered_user).status_code == 200
 
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(side_effect=PayPalAPIError('capture declined')),
-    ):
-        refused = client.post(
-            '/subscriptions/capture',
-            json={'order_id': ORDER_ID},
-            headers=bearer(registered_user),
-        )
+    refused, _ = deliver_approval(
+        client,
+        capture=AsyncMock(
+            side_effect=PayPalAPIError('capture declined')
+        ),
+    )
 
     assert refused.status_code == 502
 
@@ -1097,6 +1142,9 @@ def test_a_failed_capture_leaves_a_failed_row_and_no_entitlement(
     assert client.get(
         '/subscriptions/', headers=bearer(registered_user)
     ).json() is None
+    # The delivery record went back with the transition, so PayPal's
+    # redelivery is processed rather than dismissed as a replay.
+    assert db.query(WebhookEvent).count() == 0
 
 
 def test_a_duplicate_order_identifier_is_not_captured_again(
@@ -1139,17 +1187,8 @@ def test_a_settled_charge_that_cannot_activate_reports_reconciliation(
     def fail_the_activation(self):
         raise SQLAlchemyError('activation could not be committed')
 
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=capture_response()),
-    ), patch.object(
-        SqlAlchemySession, 'commit', fail_the_activation
-    ):
-        response = client.post(
-            '/subscriptions/capture',
-            json={'order_id': ORDER_ID},
-            headers=bearer(registered_user),
-        )
+    with patch.object(SqlAlchemySession, 'commit', fail_the_activation):
+        response, _ = deliver_approval(client)
 
     assert response.status_code == 503
     assert response.json()['detail'] == RECONCILIATION_DETAIL
@@ -1161,15 +1200,7 @@ def test_a_successful_subscription_derives_the_premium_entitlement(
     """The paid role is derived from the settled row, end to end."""
     assert _open_subscription(client, registered_user).status_code == 200
 
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=capture_response()),
-    ):
-        settled = client.post(
-            '/subscriptions/capture',
-            json={'order_id': ORDER_ID},
-            headers=bearer(registered_user),
-        )
+    settled, _ = deliver_approval(client)
     assert settled.status_code == 200
 
     db.expire_all()
@@ -1606,9 +1637,19 @@ class FakeClient:
 
 @contextmanager
 def provider_transport(responses):
-    """Yields a fake transport installed on the provider module."""
+    """Yields a fake transport installed on the provider module.
+
+    The client is recorded against a loop, and only a call running on
+    that loop is given it, so the stand-in is installed through the same
+    context manager the provider functions acquire it from.
+    """
     fake = FakeClient(responses)
-    with patch.object(paypal_module, '_shared_client', fake):
+
+    @asynccontextmanager
+    async def lend_the_stand_in():
+        yield fake
+
+    with patch.object(paypal_module, '_client', lend_the_stand_in):
         with patch.object(
             paypal_module,
             '_bearer_credential',
@@ -1736,11 +1777,17 @@ def test_capture_proceeds_for_the_owning_principal(db, registered_user):
     assert len(fake.calls) == 1
 
 
-def test_route_paths_and_prefixes_are_unchanged():
+def _published_routes():
+    """Returns every (method, path) pair the application publishes."""
     pairs = set()
     for route in app.routes:
         for method in getattr(route, 'methods', None) or []:
             pairs.add((method, route.path))
+    return pairs
+
+
+def test_route_paths_and_prefixes_are_unchanged():
+    pairs = _published_routes()
     for expected in [
         ('POST', '/auth/register'),
         ('POST', '/auth/login'),
@@ -1752,6 +1799,31 @@ def test_route_paths_and_prefixes_are_unchanged():
         ('POST', '/subscriptions/'),
     ]:
         assert expected in pairs, expected
+
+
+def test_the_webhook_is_the_only_additive_subscription_route():
+    """The subscription surface is the two frozen routes plus the webhook.
+
+    A route that took a PayPal identifier from a client would be a fourth
+    one, so the set is asserted exactly rather than by membership.
+    """
+    published = {
+        pair
+        for pair in _published_routes()
+        if pair[1].startswith('/subscriptions')
+    }
+    assert published == {
+        ('GET', '/subscriptions/'),
+        ('POST', '/subscriptions/'),
+        ('POST', '/subscriptions/webhook'),
+    }
+    assert ('POST', '/subscriptions/capture') not in published
+
+
+def test_no_route_accepts_a_paypal_identifier_from_a_client():
+    """No request contract declares a provider identifier field."""
+    assert not hasattr(subscription_schema, 'SubscriptionCapture')
+    assert set(SubscriptionCreate.__fields__) == {'plan_id'}
 
 
 # ---------------------------------------------------------------
@@ -1767,8 +1839,8 @@ OVER_LIMIT_PASSWORD = 'Aa1!' + 'x' * 69
 API_PREFIXES = ('/auth', '/listings', '/filters', '/subscriptions')
 
 
-# The eight pre-existing routes plus the additive webhook listener and
-# the additive capture continuation, both mounted under /subscriptions.
+# The eight pre-existing routes plus the one additive route, the webhook
+# listener, mounted under the existing /subscriptions prefix.
 EXPECTED_API_ROUTES = {
     ('POST', '/auth/register'),
     ('POST', '/auth/login'),
@@ -1778,7 +1850,6 @@ EXPECTED_API_ROUTES = {
     ('POST', '/filters/'),
     ('GET', '/subscriptions/'),
     ('POST', '/subscriptions/'),
-    ('POST', '/subscriptions/capture'),
     ('POST', '/subscriptions/webhook'),
 }
 
@@ -2041,18 +2112,11 @@ def test_capture_activates_and_grants_the_plan_role(
 ):
     assert _open_order(client, registered_user).status_code == 200
 
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=_settled()),
-    ):
-        captured = client.post(
-            '/subscriptions/capture',
-            json={'order_id': ORDER_ID},
-            headers=bearer(registered_user),
-        )
+    captured, _ = deliver_approval(
+        client, capture=AsyncMock(return_value=_settled())
+    )
     assert captured.status_code == 200
-    assert captured.json()['status'] == 'active'
-    assert 'approval_url' not in captured.json()
+    assert captured.json() == {'status': 'processed'}
 
     db.expire_all()
     stored = db.query(SubscriptionModel).filter(
@@ -2078,16 +2142,12 @@ def test_an_unsettled_capture_changes_nothing(
 
     # A settlement that does not match the catalog is measured and
     # refused; the row is left as it was so a later attempt can settle it.
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=capture_response(value='0.01')),
-    ):
-        refused = client.post(
-            '/subscriptions/capture',
-            json={'order_id': ORDER_ID},
-            headers=bearer(registered_user),
-        )
-    assert refused.status_code == 400
+    refused, _ = deliver_approval(
+        client,
+        capture=AsyncMock(return_value=capture_response(value='0.01')),
+    )
+    assert refused.status_code == 200
+    assert refused.json() == {'status': 'ignored'}
 
     db.expire_all()
     stored = db.query(SubscriptionModel).filter(
@@ -2103,47 +2163,219 @@ def test_an_unsettled_capture_changes_nothing(
 def test_capture_is_repeatable_without_a_second_settlement(
     client, registered_user
 ):
+    """A second approval of a settled order captures nothing again."""
     assert _open_order(client, registered_user).status_code == 200
-    body = {'order_id': ORDER_ID}
-    headers = bearer(registered_user)
 
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=_settled()),
-    ) as first:
-        assert client.post(
-            '/subscriptions/capture', json=body, headers=headers
-        ).status_code == 200
-        assert first.await_count == 1
+    first_response, first = deliver_approval(
+        client, capture=AsyncMock(return_value=_settled())
+    )
+    assert first_response.status_code == 200
+    assert first.await_count == 1
 
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=_settled()),
-    ) as second:
-        repeated = client.post(
-            '/subscriptions/capture', json=body, headers=headers
-        )
+    # A second distinct delivery for the same order finds it already
+    # active and asks the provider for nothing.
+    repeated, second = deliver_approval(
+        client, capture=AsyncMock(return_value=_settled())
+    )
     assert repeated.status_code == 200
-    assert repeated.json()['status'] == 'active'
+    assert repeated.json() == {'status': 'processed'}
     assert second.await_count == 0
+    assert client.get(
+        '/subscriptions/', headers=bearer(registered_user)
+    ).json()['status'] == 'active'
 
 
-def test_capture_of_another_users_order_is_not_found(
+def test_the_order_idempotency_key_is_derived_from_the_stored_row(
+    client, db, registered_user
+):
+    """The key is a function of the committed row, stored nowhere.
+
+    Re-deriving it from the same row is what makes a repeat of an
+    uncertain call present the same ``PayPal-Request-Id``, so no column is
+    needed to remember it.
+    """
+    creator = AsyncMock(return_value=_created_order())
+    with patch(SUBSCRIPTIONS_MODULE + '.create_order', new=creator):
+        assert _post_plan(client, registered_user).status_code == 200
+
+    stored = db.query(SubscriptionModel).one()
+    sent = creator.await_args.kwargs['idempotency_key']
+    assert sent == paypal_module.order_request_id(stored.id)
+    assert sent == paypal_module.order_request_id(stored.id)
+    # Nothing on the row remembers it, and nothing needs to.
+    assert not hasattr(stored, 'paypal_request_id')
+
+
+def test_the_capture_identifier_is_carried_in_the_audit_record(
+    client, db, registered_user
+):
+    """A settled charge stays reconcilable through the activation record.
+
+    The provider's capture identifier is not a stored column, so the
+    activation record is where a reconciliation reads it from.
+    """
+    assert _open_order(client, registered_user).status_code == 200
+
+    with watching_audit_trail() as records:
+        settled, _ = deliver_approval(
+            client, capture=AsyncMock(return_value=_settled())
+        )
+    assert settled.status_code == 200
+
+    activations = [
+        record for record in records
+        if getattr(record, 'paypal_capture_id', None) is not None
+    ]
+    assert activations, messages(records)
+    record = activations[0]
+    assert record.paypal_capture_id == 'CAPTURE-1'
+    assert record.paypal_order_id == ORDER_ID
+    assert record.subscription_status == 'active'
+    assert db.query(SubscriptionModel).one().status == 'active'
+    assert not hasattr(
+        db.query(SubscriptionModel).one(), 'paypal_capture_id'
+    )
+
+
+def test_an_order_already_captured_is_read_back_and_activated(
+    client, db, registered_user
+):
+    """A settled order is measured, not charged again.
+
+    PayPal rejects a second capture of an order it has already settled, so
+    the approval continuation reads that order back and measures what it
+    settled against the catalog rather than refusing the entitlement the
+    payer has paid for.
+    """
+    assert _open_order(client, registered_user).status_code == 200
+
+    plan = get_plan(PREMIUM_MONTHLY)
+    already = PayPalAPIError(
+        'ORDER_ALREADY_CAPTURED',
+        category=CATEGORY_PROVIDER_CLIENT,
+        status_code=422,
+    )
+    read_back = AsyncMock(return_value=CaptureOutcome(
+        completed=True,
+        order_id=ORDER_ID,
+        status='COMPLETED',
+        amount=str(plan.amount),
+        currency=plan.currency,
+        capture_id='CAPTURE-READ-BACK',
+    ))
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_settled_order', new=read_back
+    ):
+        delivered, _ = deliver_approval(
+            client, capture=AsyncMock(side_effect=already)
+        )
+
+    assert delivered.status_code == 200
+    assert delivered.json() == {'status': 'processed'}
+    assert read_back.await_count == 1
+
+    db.expire_all()
+    stored = db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one()
+    assert stored.status == 'active'
+    assert stored.end_date is not None
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'premium'
+
+
+def test_a_provider_refusal_at_capture_is_not_read_back(
+    client, db, registered_user
+):
+    """Only an already-settled order is read back, never a refusal."""
+    assert _open_order(client, registered_user).status_code == 200
+
+    refused = PayPalAPIError(
+        'capture declined',
+        category=CATEGORY_PROVIDER_SERVER,
+        status_code=503,
+    )
+    read_back = AsyncMock()
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_settled_order', new=read_back
+    ):
+        delivered, _ = deliver_approval(
+            client, capture=AsyncMock(side_effect=refused)
+        )
+
+    assert delivered.status_code == 502
+    read_back.assert_not_awaited()
+
+    db.expire_all()
+    assert db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one().status == 'pending'
+    assert db.query(WebhookEvent).count() == 0
+
+
+def test_an_approval_naming_a_foreign_order_activates_nothing(
     client, db, registered_user, second_user
 ):
+    """A notification cannot move an order to a different account.
+
+    The account entitled is resolved from the stored order identifier, so
+    a second account gains nothing from the delivery and the row it does
+    not own stays exactly as it was.
+    """
     assert _open_order(client, registered_user).status_code == 200
 
+    delivered, _ = deliver_approval(
+        client, capture=AsyncMock(return_value=_settled())
+    )
+    assert delivered.status_code == 200
+
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == second_user.id
+    ).one().role == 'registered'
+    assert client.get(
+        '/subscriptions/', headers=bearer(second_user)
+    ).json() is None
+
+
+def test_an_approval_naming_an_unknown_order_activates_nothing(
+    client, db, registered_user
+):
+    """A notification for an order this service never opened is ignored."""
+    assert _open_order(client, registered_user).status_code == 200
+
+    attempted = AsyncMock(return_value=_settled())
     with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=_settled()),
-    ) as attempted:
-        refused = client.post(
-            '/subscriptions/capture',
-            json={'order_id': ORDER_ID},
-            headers=bearer(second_user),
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=verified_approval(),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order', new=attempted
+    ):
+        response = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(order_id='ORDER-DOES-NOT-EXIST'),
+            headers=PAYPAL_HEADERS,
         )
-    # Refused as not found, so the order's existence is not disclosed.
-    assert refused.status_code == 404
+    assert response.status_code == 200
+    assert response.json() == {'status': 'ignored'}
+
+
+def test_a_notification_naming_an_unopened_order_is_ignored(
+    client, db, registered_user, second_user
+):
+    """A notification is bound to the row that opened the order.
+
+    An order this service never opened resolves to no row, so nothing is
+    captured and no account is entitled.
+    """
+    assert _open_order(client, registered_user).status_code == 200
+
+    ignored, attempted = deliver_approval(
+        client, order_id='ORDER-DOES-NOT-EXIST'
+    )
+    assert ignored.status_code == 200
+    assert ignored.json() == {'status': 'ignored'}
     assert attempted.await_count == 0
 
     db.expire_all()
@@ -2155,40 +2387,13 @@ def test_capture_of_another_users_order_is_not_found(
     ).one().role == 'registered'
 
 
-def test_capture_of_an_unknown_order_is_refused(
-    client, registered_user
-):
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        new=AsyncMock(return_value=_settled()),
-    ) as attempted:
-        response = client.post(
-            '/subscriptions/capture',
-            json={'order_id': 'ORDER-DOES-NOT-EXIST'},
-            headers=bearer(registered_user),
-        )
-    assert response.status_code == 404
-    assert attempted.await_count == 0
-
-
-def test_the_capture_contract_rejects_extra_fields(
-    client, registered_user
-):
-    response = client.post(
-        '/subscriptions/capture',
-        json={'order_id': ORDER_ID, 'amount': '0.01'},
-        headers=bearer(registered_user),
-    )
-    assert response.status_code == 422
-
-
 def test_the_payer_return_target_is_not_the_first_cors_origin(
     client, registered_user, monkeypatch
 ):
-    """The hosted redirect comes from its own validated setting.
+    """Each hosted-redirect target is the setting that configures it.
 
-    The origin list is reordered around the call, so a target derived
-    from its first entry would change while the setting's does not.
+    The origin list is reordered around the call, and both targets stay
+    the configured addresses.
     """
     monkeypatch.setattr(
         settings,
@@ -2201,18 +2406,37 @@ def test_the_payer_return_target_is_not_the_first_cors_origin(
     ) as opened:
         assert _post_plan(client, registered_user).status_code == 200
     _plan_id, return_url, cancel_url = opened.await_args.args
-    base = (
-        settings.PAYPAL_RETURN_BASE_URL
-        + subscriptions_module.HOSTED_REDIRECT_PATH
-    )
-    assert return_url == (
-        base + subscriptions_module.HOSTED_RETURN_PATH
-    )
-    assert cancel_url == (
-        base + subscriptions_module.HOSTED_CANCEL_PATH
-    )
+    assert return_url == settings.PAYPAL_RETURN_URL
+    assert cancel_url == settings.PAYPAL_CANCEL_URL
     assert return_url != cancel_url
     assert settings.ALLOWED_ORIGINS[0] not in return_url
+
+
+def test_both_payer_return_targets_use_the_declared_frontend_path(
+    client, registered_user
+):
+    """A returning payer lands on a route the frontend actually declares.
+
+    The frontend router declares one subscription route, ``/subscription``.
+    Both targets address exactly that path and differ only by a query
+    string, so neither outcome sends the payer to a path that does not
+    exist.
+    """
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        new=AsyncMock(return_value=_created_order()),
+    ) as opened:
+        assert _post_plan(client, registered_user).status_code == 200
+    _plan_id, return_url, cancel_url = opened.await_args.args
+
+    declared = '/subscription'
+    assert urlsplit(settings.PAYPAL_RETURN_URL).path == declared
+    assert urlsplit(settings.PAYPAL_CANCEL_URL).path == declared
+    for target in (return_url, cancel_url):
+        parts = urlsplit(target)
+        assert parts.path == declared
+        assert parts.query
+    assert urlsplit(return_url).query != urlsplit(cancel_url).query
 
 
 def test_expired_entitlement_is_withdrawn_on_retrieval(
@@ -2275,6 +2499,11 @@ def test_every_router_prefix_is_still_mounted():
     assert mounted == {
         'auth', 'listings', 'filters', 'subscriptions'
     }
+
+
+def test_the_api_route_surface_is_exactly_the_expected_nine():
+    """The surface is the eight originals plus the webhook, and no more."""
+    assert _api_routes() == EXPECTED_API_ROUTES
 
 
 @pytest.mark.parametrize('prefix', [b'2a', b'2b'])
@@ -2529,18 +2758,13 @@ def open_order(client, user):
         )
 
 
-def settle_order(client, user, order_id=ORDER_ID):
-    """Capture an approved order with the PayPal call stood in for."""
-    with patch(
-        SUBSCRIPTIONS_MODULE + '.capture_order',
-        return_value=SETTLED_CAPTURE,
-    ) as capture:
-        response = client.post(
-            '/subscriptions/capture',
-            json={'order_id': order_id},
-            headers=bearer(user),
-        )
-    return response, capture
+def settle_order(client, order_id=ORDER_ID):
+    """Settle an approved order through the signature-verified webhook."""
+    return deliver_approval(
+        client,
+        order_id=order_id,
+        capture=AsyncMock(return_value=SETTLED_CAPTURE),
+    )
 
 
 def test_subscription_creation_captures_nothing(
@@ -2569,11 +2793,16 @@ def test_subscription_capture_activates_and_grants_the_plan_role(
     created = open_order(client, registered_user)
     assert created.status_code == 200
 
-    settled, capture = settle_order(client, registered_user)
+    settled, capture = settle_order(client)
     assert settled.status_code == 200
-    capture.assert_called_once()
-    assert settled.json()['status'] == 'active'
-    assert settled.json()['id'] == created.json()['id']
+    capture.assert_awaited_once()
+    assert settled.json() == {'status': 'processed'}
+
+    fetched = client.get(
+        '/subscriptions/', headers=bearer(registered_user)
+    )
+    assert fetched.json()['status'] == 'active'
+    assert fetched.json()['id'] == created.json()['id']
 
     db.expire_all()
     assert db.query(User).filter(
@@ -2585,7 +2814,7 @@ def test_subscription_retrieval_returns_the_settled_row(
     client, db, registered_user
 ):
     created = open_order(client, registered_user)
-    settle_order(client, registered_user)
+    settle_order(client)
 
     fetched = client.get(
         '/subscriptions/', headers=bearer(registered_user)
@@ -2610,17 +2839,21 @@ def test_repeating_the_capture_settles_nothing_twice(
     client, db, registered_user
 ):
     open_order(client, registered_user)
-    settle_order(client, registered_user)
+    settle_order(client)
 
-    repeated, capture = settle_order(client, registered_user)
+    repeated, capture = settle_order(client)
     assert repeated.status_code == 200
-    assert repeated.json()['status'] == 'active'
-    capture.assert_not_called()
+    assert repeated.json() == {'status': 'processed'}
+    capture.assert_not_awaited()
+    assert client.get(
+        '/subscriptions/', headers=bearer(registered_user)
+    ).json()['status'] == 'active'
 
 
-def test_capturing_another_accounts_order_is_not_found(
+def test_a_settlement_entitles_only_the_account_that_opened_it(
     client, db, registered_user
 ):
+    """The webhook entitles the row's own owner and nobody else."""
     open_order(client, registered_user)
     intruder = User(
         email='intruder@example.com',
@@ -2632,14 +2865,24 @@ def test_capturing_another_accounts_order_is_not_found(
     db.commit()
     db.refresh(intruder)
 
-    refused, capture = settle_order(client, intruder)
-    assert refused.status_code == 404
-    capture.assert_not_called()
-    assert db.query(SubscriptionModel).one().status == 'pending'
+    bound = {}
 
+    async def recording_capture(session, order_id, current_user, **kwargs):
+        bound['owner_id'] = current_user.id
+        return SETTLED_CAPTURE
 
-def test_subscription_capture_requires_authentication(client):
-    response = client.post(
-        '/subscriptions/capture', json={'order_id': ORDER_ID}
+    settled, capture = deliver_approval(
+        client, capture=AsyncMock(side_effect=recording_capture)
     )
-    assert response.status_code == 401
+    assert settled.status_code == 200
+    capture.assert_awaited_once()
+    # The capture was bound to the row's owner, not to the caller.
+    assert bound['owner_id'] == registered_user.id
+
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == intruder.id
+    ).one().role == 'registered'
+    assert client.get(
+        '/subscriptions/', headers=bearer(intruder)
+    ).json() is None

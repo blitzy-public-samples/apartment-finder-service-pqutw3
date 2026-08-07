@@ -4,10 +4,11 @@ Maps each plan identifier to its amount, currency, period and the role a
 subscriber holds. The catalog is fixed at import time and is published as
 a read-only mapping.
 
-This module also holds the values the ``subscriptions.status`` column
-takes. They live here, beside the catalog, because both the endpoint that
-writes the column and the authorization module that reads it need them,
-and this module imports nothing from the application.
+This module also holds every value the ``subscriptions.status`` column
+takes, published together as :data:`STATUS_VALUES`. They live here,
+beside the catalog, because both the endpoint that writes the column and
+the authorization module that reads it need them, and this module imports
+nothing from the application.
 """
 
 import decimal
@@ -21,8 +22,10 @@ __all__ = [
     "PREMIUM_ANNUAL",
     "PREMIUM_MONTHLY",
     "STATUS_ACTIVE",
+    "STATUS_CANCELLED",
     "STATUS_FAILED",
     "STATUS_PENDING",
+    "STATUS_REFUNDED",
     "STATUS_VALUES",
     "Plan",
     "ROLE_PREMIUM",
@@ -50,9 +53,24 @@ STATUS_ACTIVE = "active"
 #: entitlement and is retained for reconciliation.
 STATUS_FAILED = "failed"
 
-#: Every value the status column takes.
+#: Status of a row the provider reported as not settled. It grants no
+#: entitlement and is closed to a further attempt.
+STATUS_CANCELLED = "cancelled"
+
+#: Status of a row whose settled payment was returned. It grants no
+#: entitlement and is closed to a further attempt.
+STATUS_REFUNDED = "refunded"
+
+#: Every value the status column takes. :data:`STATUS_ACTIVE` is the
+#: only one that grants an entitlement.
 STATUS_VALUES: typing.FrozenSet[str] = frozenset(
-    {STATUS_PENDING, STATUS_ACTIVE, STATUS_FAILED}
+    {
+        STATUS_PENDING,
+        STATUS_ACTIVE,
+        STATUS_FAILED,
+        STATUS_CANCELLED,
+        STATUS_REFUNDED,
+    }
 )
 
 _AMOUNT_QUANTUM = decimal.Decimal("0.01")
@@ -82,12 +100,14 @@ class Plan(typing.NamedTuple):
     entitlement the plan buys.
 
     ``required_role`` is the role name a subscriber on the plan holds. It
-    is applied to ``User.role`` by
-    :func:`backend.app.api.endpoints.subscriptions.grant_plan_role`,
-    which runs only after a capture has settled for this amount and
-    currency, and it is withdrawn by
-    :func:`backend.app.api.endpoints.subscriptions.revoke_expired_entitlement`
-    once no active subscription remains.
+    is granted by
+    :func:`backend.app.core.authorization.entitled_role` for as long as
+    the subscriber holds a row carrying :data:`STATUS_ACTIVE` whose
+    entitlement window is still open, so it lapses with that row. The
+    endpoint that activates the row also records the name on
+    ``User.role``, which happens only after a capture has settled for
+    this amount and currency and which no authorization decision reads
+    as more than the baseline on its own.
     """
 
     plan_id: str

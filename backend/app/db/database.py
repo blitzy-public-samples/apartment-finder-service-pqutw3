@@ -12,7 +12,7 @@ metadata registry serves the models, the Alembic environment and the
 application.
 """
 
-from typing import Dict
+from typing import Any, Dict
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -28,16 +28,28 @@ POSTGRESQL_SCHEMES = ("postgresql://", "postgresql+")
 #: libpq runtime parameters applied to every PostgreSQL connection.
 POSTGRESQL_SESSION_OPTIONS = "-c timezone=utc"
 
+#: URL scheme prefixes served by the SQLite driver.
+SQLITE_SCHEMES = ("sqlite://", "sqlite+")
 
-def _connect_args(url: str) -> Dict[str, str]:
+#: Driver arguments applied to every SQLite connection. The pool hands a
+#: connection to one thread at a time, while a request-scoped session is
+#: opened and closed on whichever worker thread serves each step, so the
+#: driver's own single-thread check is lifted.
+SQLITE_CONNECT_ARGS: Dict[str, Any] = {"check_same_thread": False}
+
+
+def _connect_args(url: str) -> Dict[str, Any]:
     """Returns the driver arguments the configured backend accepts.
 
     A PostgreSQL URL receives :data:`POSTGRESQL_SESSION_OPTIONS` as its
-    libpq ``options`` parameter. Every other backend receives no
-    argument, so a SQLite URL stays usable.
+    libpq ``options`` parameter, and a SQLite URL receives
+    :data:`SQLITE_CONNECT_ARGS`. Every other backend receives no
+    argument.
     """
     if url.startswith(POSTGRESQL_SCHEMES):
         return {"options": POSTGRESQL_SESSION_OPTIONS}
+    if url.startswith(SQLITE_SCHEMES):
+        return dict(SQLITE_CONNECT_ARGS)
     return {}
 
 
