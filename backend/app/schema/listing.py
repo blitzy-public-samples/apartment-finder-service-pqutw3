@@ -4,19 +4,24 @@ from typing import Optional
 
 
 class Listing(BaseModel):
-    """Response contract for a listing record read from a ``listings`` row."""
+    """Response contract for a listing record read from a ``listings`` row.
+
+    Field optionality mirrors column nullability: ``id``, ``created_at``,
+    ``updated_at`` and ``rent`` are non-null columns and stay required;
+    every other column is nullable and projects as ``None``.
+    """
 
     id: int
     created_at: datetime
     updated_at: datetime
     rent: float
-    broker_fee: float
-    square_footage: float
-    bedrooms: int
-    bathrooms: int
-    available_date: datetime
-    street_address: str
-    zillow_url: str
+    broker_fee: Optional[float] = None
+    square_footage: Optional[float] = None
+    bedrooms: Optional[int] = None
+    bathrooms: Optional[int] = None
+    available_date: Optional[datetime] = None
+    street_address: Optional[str] = None
+    zillow_url: Optional[str] = None
 
     class Config:
         orm_mode = True

@@ -65,11 +65,13 @@ class Plan(typing.NamedTuple):
 
 
 def _to_amount(value: _AmountInput) -> decimal.Decimal:
-    """Return value as a Decimal carrying exactly two places.
+    """Return value quantized to two decimal places.
 
     Accepts Decimal, int and str. Raises TypeError for any other type,
     including bool and float, and ValueError when the value is not a
-    finite decimal number that fits two places.
+    finite decimal number that fits two places. A value carrying more
+    precision than two places is rejected rather than rounded, so the
+    returned amount is always equal to the value supplied.
     """
     if isinstance(value, decimal.Decimal):
         candidate = value
@@ -88,13 +90,18 @@ def _to_amount(value: _AmountInput) -> decimal.Decimal:
     if not candidate.is_finite():
         raise ValueError(f"Not a finite amount: {value!r}")
     try:
-        return candidate.quantize(
+        quantized = candidate.quantize(
             _AMOUNT_QUANTUM, rounding=_AMOUNT_ROUNDING
         )
     except decimal.InvalidOperation:
         raise ValueError(
             f"Amount exceeds two-place precision: {value!r}"
         ) from None
+    if quantized != candidate:
+        raise ValueError(
+            f"Amount exceeds two-place precision: {value!r}"
+        )
+    return quantized
 
 
 def _build_catalog() -> typing.Mapping[str, Plan]:

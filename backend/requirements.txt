@@ -1,5 +1,4 @@
-# apartment-finder-service - backend runtime dependencies (CPython 3.9).
-# Pin rationale is recorded in docs/security/DECISION_LOG.md.
+# Requires CPython 3.9.
 
 # Web framework and data validation
 fastapi==0.125.0

@@ -18,6 +18,15 @@ service-account*.json
 *-service-account*.json
 gcp-*.json
 
+# Generic credential directories and secret files
+credentials/
+**/credentials/
+.secrets/
+**/.secrets/
+secrets.json
+secret.json
+*.secrets.json
+
 # Private keys and certificates
 *.pem
 *.key
@@ -26,8 +35,18 @@ gcp-*.json
 *.jks
 *.keystore
 *.crt
+*.der
+*.ppk
+*.p8
+*.pk8
 id_rsa*
 id_ed25519*
+
+# Machine credential files read by command-line tools
+.netrc
+_netrc
+.pgpass
+.htpasswd
 
 # Kubernetes cluster credentials
 kubeconfig
@@ -50,6 +69,7 @@ ENV/
 
 # Test and coverage output
 .pytest_cache/
+.pytest-basetemp/
 .coverage
 .coverage.*
 coverage.xml
@@ -65,13 +85,29 @@ frontend/coverage/
 npm-debug.log*
 yarn-error.log*
 
-# Terraform state and variable files
+# Terraform state, variable files and saved plans
 .terraform/
+.terraform.tfstate.lock.info
 *.tfstate
 *.tfstate.*
+*.tfstate.backup
 *.tfvars
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+*.tfplan
+*.tfplan.*
+tfplan
+tfplan.*
+*.plan
+plan.out
+plan.json
 override.tf
 override.tf.json
+crash.log
+crash.*.log
+# The provider dependency lock file is tracked.
+!.terraform.lock.hcl
 
 # Logs
 *.log

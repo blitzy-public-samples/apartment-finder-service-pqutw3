@@ -11,6 +11,9 @@ FROM_EMAIL = settings.FROM_EMAIL
 def send_email(to_email: str, subject: str, content: str) -> bool:
     try:
         sg = SendGridAPIClient(SENDGRID_API_KEY)
+        # Bounds the underlying request; propagated to every chained
+        # sub-client the send call builds.
+        sg.client.timeout = settings.HTTP_TIMEOUT_SECONDS
         message = Mail(
             from_email=FROM_EMAIL,
             to_emails=to_email,

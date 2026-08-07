@@ -1,5 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, ForeignKey, Numeric, func,
+    text,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
@@ -16,7 +17,9 @@ class User(Base):
     last_login = Column(DateTime)
     role = Column(String, nullable=False, server_default="registered")
     failed_login_attempts = Column(Integer, nullable=False, server_default="0")
-    locked_until = Column(DateTime, nullable=True)
+    locked_until = Column(
+        DateTime, nullable=True, server_default=text("NULL")
+    )
 
     filters = relationship("Filter", back_populates="user")
     subscriptions = relationship("Subscription", back_populates="user")
@@ -77,12 +80,17 @@ class Subscription(Base):
     start_date = Column(DateTime, nullable=False)
     end_date = Column(DateTime)
     status = Column(String, nullable=False)
-    plan_id = Column(String, nullable=True)
-    amount = Column(Numeric(10, 2), nullable=True)
+    plan_id = Column(String, nullable=True, server_default=text("NULL"))
+    amount = Column(
+        Numeric(10, 2), nullable=True, server_default=text("NULL")
+    )
     currency = Column(String, nullable=False, server_default="USD")
-    paypal_order_id = Column(String, unique=True, nullable=True)
+    paypal_order_id = Column(
+        String, unique=True, nullable=True, server_default=text("NULL")
+    )
 
     user = relationship("User", back_populates="subscriptions")
+
 
 class WebhookEvent(Base):
     __tablename__ = 'webhook_events'

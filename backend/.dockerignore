@@ -1,7 +1,9 @@
 # Docker build context exclusions.
-# Effective when the build context is the repository root.
-# backend/.dockerignore covers a build whose context is the backend
-# directory, which is the context the backend image is built from.
+# Effective when the build context is this directory, which is the context
+# the backend image is built from:
+#   docker build -f infrastructure/docker/Dockerfile.backend backend/
+# The repository-root .dockerignore covers a build whose context is the
+# repository root.
 
 # Environment files
 .env
@@ -23,18 +25,6 @@ google-credentials.json
 gcp-*.json
 **/gcp-*.json
 
-# Generic credential directories and secret files
-credentials/
-**/credentials/
-.secrets/
-**/.secrets/
-secrets.json
-**/secrets.json
-secret.json
-**/secret.json
-*.secrets.json
-**/*.secrets.json
-
 # Private keys, certificates, and keystores
 *.pem
 **/*.pem
@@ -50,28 +40,10 @@ secret.json
 **/*.keystore
 *.crt
 **/*.crt
-*.der
-**/*.der
-*.ppk
-**/*.ppk
-*.p8
-**/*.p8
-*.pk8
-**/*.pk8
 id_rsa*
 **/id_rsa*
 id_ed25519*
 **/id_ed25519*
-
-# Machine credential files read by command-line tools
-.netrc
-**/.netrc
-_netrc
-**/_netrc
-.pgpass
-**/.pgpass
-.htpasswd
-**/.htpasswd
 
 # Kubernetes cluster credentials
 kubeconfig
@@ -135,25 +107,13 @@ ENV/
 **/npm-debug.log*
 **/yarn-error.log*
 
-# Terraform state, variable files and saved plans
+# Terraform state and variable files
 **/.terraform/
-**/.terraform.tfstate.lock.info
 **/*.tfstate
 **/*.tfstate.*
 **/*.tfvars
-**/*.tfvars.json
-**/*.auto.tfvars
-**/*.auto.tfvars.json
-**/*.tfplan
-**/*.tfplan.*
-**/tfplan
-**/tfplan.*
-**/plan.out
-**/plan.json
 **/override.tf
 **/override.tf.json
-**/crash.log
-**/crash.*.log
 
 # Logs
 **/*.log

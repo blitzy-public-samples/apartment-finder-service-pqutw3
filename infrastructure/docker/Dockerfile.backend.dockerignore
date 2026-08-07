@@ -1,7 +1,8 @@
-# Docker build context exclusions.
-# Effective when the build context is the repository root.
-# backend/.dockerignore covers a build whose context is the backend
-# directory, which is the context the backend image is built from.
+# Build-context exclusions for Dockerfile.backend.
+# Docker reads a <dockerfile>.dockerignore located beside the Dockerfile
+# named in the build command, in preference to the .dockerignore at the
+# build context root. The pattern set below matches the repository-root
+# .dockerignore.
 
 # Environment files
 .env

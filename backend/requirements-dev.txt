@@ -1,16 +1,35 @@
-# apartment-finder-service - backend development / CI dependencies
-# Target interpreter: CPython 3.9
-# Install together with the runtime manifest:
+# Requires CPython 3.9.
+# Install with:
 #   pip install -r backend/requirements.txt -r backend/requirements-dev.txt
-# Decision rationale: docs/security/DECISION_LOG.md
 
 # --- Test framework ----------------------------------------------------------
+# ACCEPTED RESIDUAL ADVISORY - pytest 8.4.2
+#   PYSEC-2026-1845 / GHSA-6w46-j5rx-g56g / CVE-2025-71176, CWE-377.
+#   Every release through 9.0.2 places its temporary directories under the
+#   predictable UNIX path /tmp/pytest-of-<user>, which lets a local user on a
+#   shared host cause a denial of service or escalate privileges.
+#   First fixed release: 9.0.3, which requires Python 3.10 or later. The
+#   interpreter is pinned at 3.9 in five places, so that release is not
+#   installable here and no backport is published.
+#   Compensating control: pytest.ini at the repository root sets
+#   --basetemp=.pytest-basetemp, so the run allocates its temporary
+#   directories inside the checkout it owns and never under the shared
+#   predictable root the advisory describes. .gitignore excludes that
+#   directory, and both .dockerignore files keep it out of images.
+#   This advisory is in addition to the seven residual advisories carried by
+#   the runtime manifest.
 pytest==8.4.2
 pytest-asyncio==1.2.0
 pytest-cov==7.1.0
 httpx==0.28.1
 
 # --- Security scanning -------------------------------------------------------
+# Auditing this manifest also resolves pip-audit's own dependency closure, so
+# the report includes advisories against msgpack, filelock, requests and
+# urllib3. Those packages are pulled in by the audit tool, are not imported by
+# backend/app, and are not installed by backend/requirements.txt; they are
+# recorded here so the extra report lines are not mistaken for application
+# exposure.
 pip-audit==2.9.0
 bandit==1.8.6
 

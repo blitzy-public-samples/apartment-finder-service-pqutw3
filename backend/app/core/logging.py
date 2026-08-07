@@ -1,4 +1,4 @@
-"""Structured JSON logging with credential redaction.
+﻿"""Structured JSON logging with credential redaction.
 
 This module is the application's single logging entry point. It emits one
 JSON object per record on standard output and rewrites credential-shaped
@@ -21,6 +21,22 @@ as are values nested inside fields supplied through ``extra={...}``.
 Every field passed through ``extra={...}`` is emitted under the
 ``context`` key of the JSON object.
 
+Redaction runs twice. Every part of a record -- message, interpolated
+arguments, formatted exception text and each ``extra`` value, walked
+recursively through mappings and sequences -- is rewritten before the
+JSON payload is serialised, and the serialised payload is rewritten once
+more before it leaves the process. A credential-shaped key name is
+matched after percent-decoding, and a mapping is matched whether its
+quotes are plain or backslash-escaped.
+
+The handler is installed on the ``backend`` logger and, at WARNING, on
+the third-party ``python_http_client`` and ``sendgrid`` loggers, whose
+records carry outbound request headers and bodies. Propagation is
+disabled on each, so no record reaches a handler installed elsewhere.
+Discovery and installation run under a lock, and a handler found under
+the reserved name whose type, formatter, filter or stream does not match
+is replaced.
+
 The module uses only the Python standard library and reads no
 configuration and no environment variable.
 
@@ -36,8 +52,10 @@ import json
 import logging
 import re
 import sys
+import threading
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from urllib.parse import unquote
 
 __all__ = [
     "BASE_LOGGER_NAME",
@@ -45,11 +63,14 @@ __all__ = [
     "DEFAULT_LOG_LEVEL",
     "HANDLER_NAME",
     "REDACTION_PLACEHOLDER",
+    "THIRD_PARTY_LOGGER_NAMES",
+    "THIRD_PARTY_LOG_LEVEL",
     "RedactingFilter",
     "RedactingJsonFormatter",
     "configure_logging",
     "get_logger",
     "redact",
+    "redact_structure",
 ]
 
 #: Name of the logger that owns the redacting handler.
@@ -57,6 +78,12 @@ BASE_LOGGER_NAME = "backend"
 
 #: Name assigned to the installed handler.
 HANDLER_NAME = "redacting-json-stream"
+
+#: Third-party logger namespaces placed under the redacting handler.
+THIRD_PARTY_LOGGER_NAMES = ("python_http_client", "sendgrid")
+
+#: Level applied to the third-party loggers named above.
+THIRD_PARTY_LOG_LEVEL = logging.WARNING
 
 #: JSON key that carries the fields supplied through ``extra={...}``.
 CONTEXT_FIELD = "context"
@@ -66,6 +93,12 @@ REDACTION_PLACEHOLDER = "[REDACTED]"
 
 #: Level applied to the base logger when the handler is installed.
 DEFAULT_LOG_LEVEL = logging.INFO
+
+# Deepest level of nesting walked when redacting a structured value.
+_MAX_REDACTION_DEPTH = 8
+
+# Serialises handler discovery and installation across threads.
+_CONFIGURE_LOCK = threading.RLock()
 
 # Key-name fragments that mark a value as credential-shaped. Matching is
 # case-insensitive and substring-based, and covers compound spellings
@@ -84,21 +117,34 @@ _SENSITIVE_KEY_STEMS = (
 # HTTP authentication scheme words that introduce a credential.
 _AUTH_SCHEMES = ("bearer", "basic", "digest", "token")
 
-# Captured values that are emitted unchanged.
-_SKIP_VALUES = frozenset(
-    (REDACTION_PLACEHOLDER.lower(),) + _AUTH_SCHEMES[:-1]
-)
+# Captured values that are emitted unchanged. Only an already
+# substituted placeholder qualifies, so a value that happens to spell an
+# authentication scheme word is still rewritten.
+_SKIP_VALUES = frozenset((REDACTION_PLACEHOLDER.lower(),))
 
-# Characters accepted inside a key name.
-_KEY_CHARS = r"[A-Za-z0-9_.\-]"
+# Characters accepted inside a key name. The percent sign is accepted so
+# a percent-encoded key name is captured and can be normalized before
+# the sensitivity test.
+_KEY_CHARS = r"[A-Za-z0-9_.\-%]"
 
-# A key name that contains one of the stems, with bounded affixes on
-# either side. Only a key matching this fragment is rewritten.
+# A key name that contains one of the stems literally, with bounded
+# affixes on either side.
 _SENSITIVE_KEY = (
     _KEY_CHARS + r"{0,32}?"
     r"(?:" + "|".join(_SENSITIVE_KEY_STEMS) + r")"
     + _KEY_CHARS + r"{0,32}"
 )
+
+# A key name carrying at least one percent escape. Such a key spells its
+# stem in encoded form, so :func:`_is_sensitive_key` decides it after
+# decoding rather than the pattern deciding it by shape.
+_ENCODED_KEY = _KEY_CHARS + r"{0,64}%" + _KEY_CHARS + r"{0,64}"
+
+# Largest number of percent-decoding passes applied to a key name.
+_MAX_KEY_DECODE_PASSES = 3
+
+# Characters removed from a key name before the stem test.
+_KEY_NOISE_RE = re.compile(r"[^a-z0-9]+")
 
 # Characters accepted inside an unquoted value. The class stops at
 # separators, at brackets, at quotes and at a backslash. A value
@@ -132,30 +178,78 @@ _URL_CREDENTIAL_RE = re.compile(
     r"(?P<at>@)",
 )
 
-# '"key": "value"', "'key': 'value'" and '"key": value' mappings.
-_MAPPING_RE = re.compile(
-    r"(?P<kq>[\"'])(?P<key>" + _SENSITIVE_KEY + r")(?P=kq)"
-    r"(?P<sep>\s*:\s*)"
-    r"(?:\"(?P<dq>(?:[^\"\\]|\\.)*)\""
-    r"|'(?P<sq>[^']*)'"
-    r"|(?P<bare>[^\s,}\[\]]+))",
-    re.IGNORECASE,
-)
 
-# "key=value" and "key: value" assignments with an unquoted key.
-_ASSIGNMENT_RE = re.compile(
-    r"(?<!" + _KEY_CHARS + r")"
-    r"(?P<key>" + _SENSITIVE_KEY + r")"
-    r"(?P<sep>\s*[:=]\s*)"
-    r"(?:\"(?P<dq>[^\"]*)\""
-    r"|'(?P<sq>[^']*)'"
-    r"|(?P<bare>" + _BARE_VALUE + r"))",
-    re.IGNORECASE,
-)
+def _mapping_pattern(key_pattern: str) -> "re.Pattern":
+    """Builds the '"key": "value"' mapping pattern for a key shape.
+
+    Each quote may be preceded by a backslash, so a mapping nested
+    inside an already serialised JSON string is matched as well.
+    """
+    return re.compile(
+        r"(?P<kopen>\\?[\"'])(?P<key>" + key_pattern + r")"
+        r"(?P<kclose>\\?[\"'])"
+        r"(?P<sep>\s*:\s*)"
+        r"(?:(?P<vopen>\\?[\"'])(?P<qval>(?:\\.|[^\"'\\]){0,4096})"
+        r"(?P<vclose>\\?[\"'])"
+        r"|(?P<bare>[^\s,}\[\]]+))",
+        re.IGNORECASE,
+    )
+
+
+def _assignment_pattern(key_pattern: str) -> "re.Pattern":
+    """Builds the "key=value" / "key: value" pattern for a key shape."""
+    return re.compile(
+        r"(?<!" + _KEY_CHARS + r")"
+        r"(?P<key>" + key_pattern + r")"
+        r"(?P<sep>\s*[:=]\s*)"
+        r"(?:\"(?P<dq>[^\"]*)\""
+        r"|'(?P<sq>[^']*)'"
+        r"|(?P<bare>" + _BARE_VALUE + r"))",
+        re.IGNORECASE,
+    )
+
+
+# Mappings and assignments whose key spells a stem literally.
+_MAPPING_RE = _mapping_pattern(_SENSITIVE_KEY)
+_ASSIGNMENT_RE = _assignment_pattern(_SENSITIVE_KEY)
+
+# Mappings and assignments whose key spells a stem in percent-encoded
+# form.
+_ENCODED_MAPPING_RE = _mapping_pattern(_ENCODED_KEY)
+_ENCODED_ASSIGNMENT_RE = _assignment_pattern(_ENCODED_KEY)
 
 # Value groups in match order, paired with the quote character that
 # surrounds the replacement.
 _VALUE_GROUPS = (("dq", '"'), ("sq", "'"), ("bare", ""))
+
+
+def _normalize_key(key: str) -> str:
+    """Returns a key name reduced to lower-case letters and digits.
+
+    Percent-encoding is decoded repeatedly, up to
+    :data:`_MAX_KEY_DECODE_PASSES` passes, so ``api%5Fkey`` and a fully
+    encoded spelling both reduce to the same form as ``api_key``.
+    """
+    candidate = key
+    for _ in range(_MAX_KEY_DECODE_PASSES):
+        if "%" not in candidate:
+            break
+        try:
+            decoded = unquote(candidate, errors="strict")
+        except Exception:
+            break
+        if decoded == candidate:
+            break
+        candidate = decoded
+    return _KEY_NOISE_RE.sub("", candidate.lower())
+
+
+def _is_sensitive_key(key: str) -> bool:
+    """Reports whether a key name marks its value as a credential."""
+    normalized = _normalize_key(key)
+    if not normalized:
+        return False
+    return any(stem in normalized for stem in _SENSITIVE_KEY_STEMS)
 
 
 def _is_skipped_value(value: str) -> bool:
@@ -177,15 +271,19 @@ def _replace_url_credential(match: "re.Match") -> str:
 
 
 def _replace_auth_header(match: "re.Match") -> str:
-    """Replaces the credential of an ``Authorization`` key/value pair."""
+    """Replaces the credential of an ``Authorization`` key/value pair.
+
+    The scheme word is replaced together with the credential, so the
+    substituted text carries no value the later assignment rule would
+    match again.
+    """
     value = match.group("value")
     if not value or _is_skipped_value(value):
         return match.group(0)
-    return "{0}{1}{2}{3}{4}".format(
+    return "{0}{1}{2}{3}".format(
         match.group("key"),
         match.group("sep"),
         match.group("open"),
-        match.group("scheme") or "",
         REDACTION_PLACEHOLDER,
     )
 
@@ -201,26 +299,35 @@ def _replace_bearer(match: "re.Match") -> str:
 def _replace_mapping(match: "re.Match") -> str:
     """Replaces the value of a quoted-key JSON or dict mapping."""
     key = match.group("key")
-    key_quote = match.group("kq")
-    for group, quote in _VALUE_GROUPS:
-        value = match.group(group)
-        if value is None:
-            continue
-        if not value or _is_skipped_value(value):
+    if not _is_sensitive_key(key):
+        return match.group(0)
+    prefix = "{0}{1}{2}{3}".format(
+        match.group("kopen"),
+        key,
+        match.group("kclose"),
+        match.group("sep"),
+    )
+    quoted = match.group("qval")
+    if quoted is not None:
+        if not quoted or _is_skipped_value(quoted):
             return match.group(0)
-        return "{0}{1}{0}{2}{3}{4}{3}".format(
-            key_quote,
-            key,
-            match.group("sep"),
-            quote,
+        return "{0}{1}{2}{3}".format(
+            prefix,
+            match.group("vopen"),
             REDACTION_PLACEHOLDER,
+            match.group("vclose"),
         )
-    return match.group(0)
+    bare = match.group("bare")
+    if not bare or _is_skipped_value(bare):
+        return match.group(0)
+    return prefix + REDACTION_PLACEHOLDER
 
 
 def _replace_assignment(match: "re.Match") -> str:
     """Replaces the value of an unquoted-key assignment."""
     key = match.group("key")
+    if not _is_sensitive_key(key):
+        return match.group(0)
     for group, quote in _VALUE_GROUPS:
         value = match.group(group)
         if value is None:
@@ -243,7 +350,9 @@ _REDACTION_RULES: Tuple[Tuple[Any, Callable[[Any], str]], ...] = (
     (_BEARER_RE, _replace_bearer),
     (_URL_CREDENTIAL_RE, _replace_url_credential),
     (_MAPPING_RE, _replace_mapping),
+    (_ENCODED_MAPPING_RE, _replace_mapping),
     (_ASSIGNMENT_RE, _replace_assignment),
+    (_ENCODED_ASSIGNMENT_RE, _replace_assignment),
 )
 
 
@@ -272,13 +381,83 @@ def _redact_value(value: Any) -> Any:
     return value
 
 
+def _redact_deep(value: Any, depth: int = 0, seen: Any = None) -> Any:
+    """Returns ``value`` with every nested credential replaced.
+
+    Strings are rewritten by :func:`redact` and byte strings are replaced
+    outright. Mappings and sequences are walked, and a mapping entry
+    whose key is credential-shaped has its whole value replaced by the
+    placeholder whatever that value's type is. Recursion stops at
+    :data:`_MAX_REDACTION_DEPTH`, past which a value is rendered with
+    :func:`str` and rewritten as text, and a container already visited on
+    the current path is not descended into again. A value of any other
+    type is returned unchanged, keeping the record's own formatting
+    intact; the pass over the serialised payload covers it.
+    """
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, (bytes, bytearray)):
+        return REDACTION_PLACEHOLDER
+    if depth >= _MAX_REDACTION_DEPTH:
+        return redact(value)
+    if isinstance(value, (dict, list, tuple, set, frozenset)):
+        visited = set() if seen is None else seen
+        marker = id(value)
+        if marker in visited:
+            return REDACTION_PLACEHOLDER
+        visited = visited | {marker}
+    else:
+        visited = seen
+    if isinstance(value, dict):
+        redacted: Dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and _is_sensitive_key(key):
+                redacted[key] = REDACTION_PLACEHOLDER
+            else:
+                redacted[key] = _redact_deep(item, depth + 1, visited)
+        return redacted
+    if isinstance(value, (list, tuple, set, frozenset)):
+        members = [
+            _redact_deep(item, depth + 1, visited) for item in value
+        ]
+        try:
+            return type(value)(members)
+        except Exception:
+            return members
+    return value
+
+
+def redact_structure(value: Any) -> Any:
+    """Returns ``value`` with credential-shaped entries replaced.
+
+    Any failure while walking yields the placeholder in place of the
+    offending value, so a record can never fail to be redacted.
+    """
+    try:
+        return _redact_deep(value)
+    except Exception:
+        return REDACTION_PLACEHOLDER
+
+
 def _redact_args(args: Any) -> Any:
-    """Redacts the string members of a log record's argument set."""
+    """Redacts the members of a log record's argument set.
+
+    A mapping argument set -- the form ``%(name)s`` interpolation uses --
+    is redacted by key as well as by value, so a credential named by its
+    key is replaced before interpolation renders it into the message.
+    """
     if isinstance(args, dict):
-        return {key: _redact_value(item) for key, item in args.items()}
+        return {
+            key: (
+                REDACTION_PLACEHOLDER
+                if isinstance(key, str) and _is_sensitive_key(key)
+                else _redact_deep(item)
+            )
+            for key, item in args.items()
+        }
     if isinstance(args, tuple):
-        return tuple(_redact_value(item) for item in args)
-    return _redact_value(args)
+        return tuple(_redact_deep(item) for item in args)
+    return _redact_deep(args)
 
 
 def _redact_format(template: str, has_args: bool) -> str:
@@ -349,12 +528,19 @@ _RESERVED_RECORD_ATTRS = frozenset(
 
 
 def _extract_context(record: logging.LogRecord) -> Dict[str, Any]:
-    """Collects the fields supplied through ``extra={...}``."""
+    """Collects the redacted fields supplied through ``extra={...}``.
+
+    A field whose name is credential-shaped is replaced outright; every
+    other field is walked by :func:`_redact_deep`.
+    """
     context: Dict[str, Any] = {}
     for name, value in vars(record).items():
         if name in _RESERVED_RECORD_ATTRS or name.startswith("_"):
             continue
-        context[name] = value
+        if _is_sensitive_key(name):
+            context[name] = REDACTION_PLACEHOLDER
+        else:
+            context[name] = _redact_deep(value)
     return context
 
 
@@ -362,10 +548,10 @@ class RedactingJsonFormatter(logging.Formatter):
     """Renders a record as a single redacted JSON object.
 
     The base implementation renders the message, the interpolated
-    arguments and the exception traceback. That rendered text is placed
-    in a JSON payload together with the timestamp, the level, the logger
-    name and the ``extra`` fields, and the redaction patterns are then
-    applied to the serialised payload.
+    arguments and the exception traceback. Every part of that rendered
+    text, and every ``extra`` field, is redacted before the JSON payload
+    is serialised, and the redaction patterns are applied once more to
+    the serialised payload.
     """
 
     def formatTime(
@@ -386,7 +572,12 @@ class RedactingJsonFormatter(logging.Formatter):
         record: logging.LogRecord,
         rendered: str,
     ) -> Dict[str, Any]:
-        """Assembles the JSON payload for a rendered record."""
+        """Assembles the redacted JSON payload for a rendered record.
+
+        The message and the exception detail are redacted here, before
+        serialisation, so a credential embedded in exception text cannot
+        reach the payload with its quotes escaped.
+        """
         message = record.getMessage()
         if rendered.startswith(message):
             detail = rendered[len(message):].strip("\n")
@@ -396,10 +587,10 @@ class RedactingJsonFormatter(logging.Formatter):
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "logger": record.name,
-            "message": message,
+            "message": redact(message),
         }
         if detail:
-            payload["exception"] = detail
+            payload["exception"] = redact(detail)
         context = _extract_context(record)
         if context:
             payload[CONTEXT_FIELD] = context
@@ -432,14 +623,35 @@ class RedactingJsonFormatter(logging.Formatter):
         return redact(serialized)
 
 
-def _find_redacting_handler(
-    logger: logging.Logger,
-) -> Optional[logging.Handler]:
-    """Returns the installed redacting handler, or ``None``."""
-    for handler in logger.handlers:
-        if getattr(handler, "name", None) == HANDLER_NAME:
-            return handler
-    return None
+def _find_named_handlers(logger: logging.Logger) -> List[logging.Handler]:
+    """Returns every handler on ``logger`` carrying the reserved name."""
+    return [
+        handler
+        for handler in list(logger.handlers)
+        if getattr(handler, "name", None) == HANDLER_NAME
+    ]
+
+
+def _is_redacting_handler(handler: Any) -> bool:
+    """Reports whether ``handler`` is configured as this module builds it.
+
+    A handler is accepted only when it is a stream handler carrying an
+    open stream, a :class:`RedactingJsonFormatter` and a
+    :class:`RedactingFilter`. Anything else occupying the reserved name is
+    treated as foreign.
+    """
+    if not isinstance(handler, logging.StreamHandler):
+        return False
+    if not isinstance(handler.formatter, RedactingJsonFormatter):
+        return False
+    if not any(
+        isinstance(entry, RedactingFilter) for entry in handler.filters
+    ):
+        return False
+    stream = getattr(handler, "stream", None)
+    if stream is None or getattr(stream, "closed", False):
+        return False
+    return True
 
 
 def _resolve_level(level: Optional[Union[int, str]]) -> int:
@@ -463,27 +675,67 @@ def _build_handler() -> logging.Handler:
     return handler
 
 
+def _install_handler(logger: logging.Logger) -> bool:
+    """Ensures ``logger`` carries exactly one valid redacting handler.
+
+    Every handler under the reserved name is inspected. One that matches
+    the expected configuration is kept and the rest are removed; a
+    non-matching handler is removed and replaced. Returns ``True`` when a
+    new handler was installed.
+    """
+    keep = None
+    for handler in _find_named_handlers(logger):
+        if keep is None and _is_redacting_handler(handler):
+            keep = handler
+        else:
+            logger.removeHandler(handler)
+    if keep is not None:
+        return False
+    logger.addHandler(_build_handler())
+    return True
+
+
+def _configure_third_party_loggers() -> None:
+    """Routes the third-party namespaces through the redacting handler.
+
+    Each logger named in :data:`THIRD_PARTY_LOGGER_NAMES` is held at
+    :data:`THIRD_PARTY_LOG_LEVEL`, given the redacting handler and stopped
+    from propagating, so its records cannot reach a handler installed
+    elsewhere.
+    """
+    for name in THIRD_PARTY_LOGGER_NAMES:
+        logger = logging.getLogger(name)
+        _install_handler(logger)
+        logger.setLevel(THIRD_PARTY_LOG_LEVEL)
+        logger.propagate = False
+
+
 def configure_logging(
     level: Optional[Union[int, str]] = None,
 ) -> logging.Logger:
-    """Installs the redacting handler on the base logger once.
+    """Installs the redacting handler on the governed loggers.
 
-    The handler is added only when it is not already present. Repeated
-    calls from different modules in one process leave a single handler
-    and produce no duplicated output. Passing ``level`` sets the base
-    logger's level; omitting it keeps the level already in effect, or
-    applies :data:`DEFAULT_LOG_LEVEL` on the first call.
+    Discovery and installation are performed under a lock, so repeated or
+    concurrent calls from different modules in one process leave exactly
+    one handler per logger and produce no duplicated output. A handler
+    found under the reserved name whose formatter, filter, type or stream
+    does not match is replaced.
+
+    Passing ``level`` sets the base logger's level; omitting it keeps the
+    level already in effect, or applies :data:`DEFAULT_LOG_LEVEL` on the
+    first call. The third-party loggers are always held at
+    :data:`THIRD_PARTY_LOG_LEVEL`.
 
     Returns the base logger.
     """
-    logger = logging.getLogger(BASE_LOGGER_NAME)
-    if _find_redacting_handler(logger) is None:
-        logger.addHandler(_build_handler())
+    with _CONFIGURE_LOCK:
+        logger = logging.getLogger(BASE_LOGGER_NAME)
+        installed = _install_handler(logger)
         logger.propagate = False
-        logger.setLevel(_resolve_level(level))
-    elif level is not None:
-        logger.setLevel(_resolve_level(level))
-    return logger
+        if installed or level is not None:
+            logger.setLevel(_resolve_level(level))
+        _configure_third_party_loggers()
+        return logger
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:

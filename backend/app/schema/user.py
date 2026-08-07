@@ -8,6 +8,10 @@ _EMAIL_MAX_LENGTH = 254
 _PASSWORD_MIN_LENGTH = 12
 _PASSWORD_MAX_BYTES = 72
 
+# Accepted address shape: a local part, a single "@", and a dotted
+# domain, with no whitespace in any part.
+_EMAIL_REGEX = r"^[^\s@]+@[^\s@]+\.[^\s@]+$"
+
 _UPPERCASE_PATTERN = re.compile(r"[A-Z]")
 _LOWERCASE_PATTERN = re.compile(r"[a-z]")
 _DIGIT_PATTERN = re.compile(r"\d")
@@ -15,11 +19,38 @@ _SPECIAL_CHARACTER_PATTERN = re.compile(
     r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?]"
 )
 
+# Address shape accepted by the client-side validator: a local part and a
+# domain separated by a single "@", with at least one dot in the domain
+# and no whitespace in either part.
+_EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+
+# Code points refused anywhere in an address: the C0 range, delete, and
+# the C1 range.
+_CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
 _EmailField = constr(
     strip_whitespace=True,
     min_length=_EMAIL_MIN_LENGTH,
     max_length=_EMAIL_MAX_LENGTH,
+    regex=_EMAIL_REGEX,
 )
+
+
+def _enforce_email_format(value: str) -> str:
+    """Reject an address that does not match the accepted shape.
+
+    Matching uses :func:`re.fullmatch`, so a trailing newline cannot
+    satisfy the pattern the way an end-of-string anchor would, and
+    control characters are refused before the shape is tested.
+    """
+    if _CONTROL_CHARACTER_PATTERN.search(value):
+        raise ValueError("email must not contain control characters")
+    if not _EMAIL_PATTERN.fullmatch(value):
+        raise ValueError(
+            "email must be a local part and a domain separated by '@', "
+            "with a dot in the domain and no whitespace"
+        )
+    return value
 
 
 def _enforce_password_byte_ceiling(value: str) -> str:
@@ -70,9 +101,13 @@ class UserCreate(BaseModel):
     class Config:
         extra = "forbid"
 
+    @validator("email")
+    def validate_email(cls, value: str) -> str:
+        """Apply the accepted address shape."""
+        return _enforce_email_format(value)
+
     @validator("password")
     def validate_password(cls, value: str) -> str:
-        """Apply the byte ceiling, then the full complexity policy."""
         return _enforce_password_complexity(
             _enforce_password_byte_ceiling(value)
         )
@@ -87,7 +122,11 @@ class UserLogin(BaseModel):
     class Config:
         extra = "forbid"
 
+    @validator("email")
+    def validate_email(cls, value: str) -> str:
+        """Apply the accepted address shape."""
+        return _enforce_email_format(value)
+
     @validator("password")
     def validate_password(cls, value: str) -> str:
-        """Apply the byte ceiling only."""
         return _enforce_password_byte_ceiling(value)
