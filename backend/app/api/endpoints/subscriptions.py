@@ -82,6 +82,18 @@ from the stored user row. ``POST /webhook`` declares no role dependency
 and is admitted on its signature alone; the account whose entitlement it
 grants is resolved from the stored order identifier, never from the
 notification.
+
+``POST /`` and ``POST /webhook`` are declared ``async`` because each
+awaits a provider call, and the session they hold is the synchronous one
+:func:`backend.app.db.database.get_db` yields. Every statement these two
+routes issue therefore runs through :func:`_in_session`, which hands it
+to a worker thread, so a statement waiting on a database lock never
+occupies the event loop and the completion of a provider call awaited by
+another request stays deliverable. The session is used by one thread at a
+time and never by two at once. The one read they do not issue themselves
+is the ownership resolution inside
+:mod:`backend.app.services.paypal_service`, which is a plain select
+holding no lock and waiting on none.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -89,7 +101,8 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from typing import Any, Dict, Optional, Tuple
+from starlette.concurrency import run_in_threadpool
+from typing import Any, Callable, Dict, Optional, Tuple, TypeVar
 
 from backend.app.api.endpoints.auth import limiter
 from backend.app.core.authorization import (
@@ -255,6 +268,26 @@ _OPEN_STATUSES = (PENDING_STATUS, FAILED_STATUS)
 # other category is a dependency failure.
 _CLIENT_STATE_CATEGORIES = (CATEGORY_PROVIDER_CLIENT,)
 
+# Return type of the operation :func:`_in_session` is handed.
+_Result = TypeVar("_Result")
+
+
+async def _in_session(
+    operation: "Callable[..., _Result]", *args: Any, **kwargs: Any
+) -> "_Result":
+    """Runs one synchronous session operation in a worker thread.
+
+    Used by the two ``async`` routes of this module for every call that
+    reaches the database, so no statement they issue runs on the event
+    loop. The exception the operation raises is raised here unchanged, so
+    a caller's ``except IntegrityError`` or ``except SQLAlchemyError``
+    reads exactly as it would around a direct call.
+
+    Successive calls run one after another and never overlap, so the
+    session is held by one thread at a time.
+    """
+    return await run_in_threadpool(operation, *args, **kwargs)
+
 
 def _provider_status(error: PayPalError) -> int:
     """Returns the status a provider failure is answered with.
@@ -407,7 +440,8 @@ async def create_subscription(
     No ORM attribute is read between the commit that makes the row
     durable and the provider call, so the transaction is closed and its
     connection is back in the pool for the duration of that call. The row
-    is read again afterwards.
+    is read again afterwards. Each statement runs through
+    :func:`_in_session`, so none of them occupies the event loop.
 
     The entitlement window is left empty until a settlement is proven, so
     the row that exists across the approval window entitles nothing by
@@ -449,11 +483,11 @@ async def create_subscription(
     # anything, reusing the open attempt already recorded for this
     # account and plan.
     try:
-        subscription_id, idempotency_key = _open_intent(
-            db, current_user, plan
+        subscription_id, idempotency_key = await _in_session(
+            _open_intent, db, current_user, plan
         )
     except SQLAlchemyError:
-        db.rollback()
+        await _in_session(db.rollback)
         _payment_failure(REASON_PENDING_NOT_RECORDED, current_user, plan)
         raise HTTPException(
             status_code=400, detail=PAYMENT_FAILED_DETAIL
@@ -467,7 +501,7 @@ async def create_subscription(
             idempotency_key=idempotency_key,
         )
     except PayPalError as error:
-        _mark_failed(db, subscription_id)
+        await _in_session(_mark_failed, db, subscription_id)
         raise _refuse_provider(
             error,
             "Could not open a PayPal order for a subscription",
@@ -482,7 +516,7 @@ async def create_subscription(
         # An order with no identifier cannot be captured, and one with no
         # allowlisted approval target cannot be approved, so neither is
         # handed back as an opened subscription.
-        _mark_failed(db, subscription_id)
+        await _in_session(_mark_failed, db, subscription_id)
         logger.error(
             "PayPal order carried no usable identifier or no allowlisted "
             "approval target",
@@ -502,7 +536,7 @@ async def create_subscription(
             )
         )
 
-    pending = _stored(db, subscription_id)
+    pending = await _in_session(_stored, db, subscription_id)
     if pending is None:
         raise _refuse_reconciliation(
             "Opened a PayPal order whose subscription row could no "
@@ -514,19 +548,19 @@ async def create_subscription(
 
     pending.paypal_order_id = order_id
     try:
-        db.commit()
+        await _in_session(db.commit)
     except IntegrityError:
         # The uniqueness constraint rejected the order identifier, so it
         # is already recorded against another row.
-        db.rollback()
-        _mark_failed(db, subscription_id)
+        await _in_session(db.rollback)
+        await _in_session(_mark_failed, db, subscription_id)
         _payment_failure(REASON_DUPLICATE_ORDER, current_user, plan)
         raise HTTPException(
             status_code=400, detail=PAYMENT_FAILED_DETAIL
         ) from None
     except SQLAlchemyError:
-        db.rollback()
-        _mark_failed(db, subscription_id)
+        await _in_session(db.rollback)
+        await _in_session(_mark_failed, db, subscription_id)
         raise _refuse_reconciliation(
             "Opened a PayPal order whose identifier could not be "
             "recorded",
@@ -534,7 +568,7 @@ async def create_subscription(
             plan_id=plan.plan_id,
             paypal_request_id=idempotency_key,
         ) from None
-    db.refresh(pending)
+    await _in_session(db.refresh, pending)
 
     logger.info(
         "Opened a PayPal order for a subscription",
@@ -786,6 +820,16 @@ async def receive_paypal_webhook(
     5. the notification is applied to the subscription it names
     6. the delivery record and the transition are committed together
 
+    Every statement of steps 4 to 6 runs through :func:`_in_session`, so
+    the flush that waits on the uniqueness constraint while a concurrent
+    delivery of the same identifier is still open waits in a worker
+    thread. That concurrent delivery is parked in the provider call of
+    step 5 with its own delivery row uncommitted, and its completion is
+    delivered by the event loop, which the wait therefore must not hold.
+    The wait resolves either way: a commit raises ``IntegrityError`` and
+    the repeat is acknowledged, a rollback lets the waiting insert succeed
+    and the notification is still settled.
+
     A notification that fails the check -- including one whose body does
     not decode to an object -- is answered ``400``. A notification that
     could not be checked at all is answered ``503``, so PayPal delivers it
@@ -844,9 +888,9 @@ async def receive_paypal_webhook(
         )
     )
     try:
-        db.flush()
+        await _in_session(db.flush)
     except IntegrityError:
-        db.rollback()
+        await _in_session(db.rollback)
         logger.warning(
             "Acknowledged a repeated PayPal delivery without "
             "processing it again",
@@ -865,20 +909,20 @@ async def receive_paypal_webhook(
             db, request, notification, event_type
         )
     except PayPalError as error:
-        db.rollback()
+        await _in_session(db.rollback)
         raise _refuse_provider(
             error,
             "Could not apply a verified PayPal notification",
             event_type=event_type,
         ) from None
     except Exception:
-        db.rollback()
+        await _in_session(db.rollback)
         raise
 
     try:
-        db.commit()
+        await _in_session(db.commit)
     except SQLAlchemyError:
-        db.rollback()
+        await _in_session(db.rollback)
         raise _refuse_reconciliation(
             "Applied a verified PayPal notification whose transition "
             "could not be recorded",
@@ -939,6 +983,9 @@ async def _apply_notification(
     event, no order identifier, or an order this service did not open.
     Nothing is committed here; the caller commits the transition and the
     delivery record together.
+
+    Each step that reaches the database runs through :func:`_in_session`,
+    so none of them occupies the event loop.
     """
     if event_type not in (
         EVENT_ORDER_APPROVED,
@@ -959,7 +1006,7 @@ async def _apply_notification(
         )
         return OUTCOME_IGNORED
 
-    subscription = _subscription_for(db, order_id)
+    subscription = await _in_session(_subscription_for, db, order_id)
     if subscription is None:
         logger.warning(
             "A verified PayPal notification named an order this "
@@ -972,7 +1019,7 @@ async def _apply_notification(
         return OUTCOME_IGNORED
 
     if event_type in REVOKING_EVENTS:
-        return _revoke(db, subscription, event_type)
+        return await _in_session(_revoke, db, subscription, event_type)
 
     if subscription.status == ACTIVE_STATUS:
         logger.info(
@@ -1023,7 +1070,9 @@ async def _apply_notification(
             plan.currency,
         )
 
-    return _activate(db, subscription, plan, outcome, event_type)
+    return await _in_session(
+        _activate, db, subscription, plan, outcome, event_type
+    )
 
 
 async def _settle(
@@ -1051,12 +1100,16 @@ async def _settle(
     settlement rather than to a second charge or a refusal, recovered
     from the provider's own representation rather than a reconstructed
     one. Every other provider failure is raised for the caller to answer.
+
+    The owning account is loaded through :func:`_in_session`, so the read
+    the relationship issues does not run on the event loop.
     """
+    owner = await _in_session(_owner_of, subscription)
     try:
         captured = await capture_order(
             db,
             order_id,
-            subscription.user,
+            owner,
             request=request,
             idempotency_key=capture_request_id(subscription.id),
         )
@@ -1077,7 +1130,7 @@ async def _settle(
         return await verify_settled_order(
             db,
             order_id,
-            subscription.user,
+            owner,
             plan.amount,
             plan.currency,
             request=request,
@@ -1085,6 +1138,11 @@ async def _settle(
     return read_capture(
         captured, order_id, plan.amount, plan.currency
     )
+
+
+def _owner_of(subscription: SubscriptionModel) -> Optional[User]:
+    """Returns the account a subscription belongs to."""
+    return subscription.user
 
 
 def _capture_envelope(order_id: str, resource: Any) -> Optional[Dict]:

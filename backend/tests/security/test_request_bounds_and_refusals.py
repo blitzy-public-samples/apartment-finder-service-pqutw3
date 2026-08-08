@@ -18,16 +18,19 @@ reintroduces any of the four fails here rather than at a later review.
 import base64
 import hashlib
 import re
+import sys
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.api.endpoints import filters as filters_module
 from backend.app.api.endpoints import listings as listings_module
+from backend.app.services import zillow_service
 from backend.app.core.config import MAX_PAGINATION_OFFSET, settings
 from backend.app.core.rate_limit import (
     RATE_LIMIT_HEADERS,
@@ -40,6 +43,7 @@ from backend.app.core.security import (
 )
 from backend.app.db import database as database_module
 from backend.app.db.models import Base, Criteria, Filter, User
+from backend.app.db.models import Listing as ListingModel
 from backend.app.main import (
     DOCS_PATH,
     DOCUMENTATION_ENABLED,
@@ -58,6 +62,11 @@ from backend.app.schema.filter import (
     MAX_CRITERIA,
     MAX_ZIP_CODES,
     MIN_CRITERIA,
+)
+from backend.app.schema.listing import (
+    MEASUREMENT_FIELDS,
+    Listing,
+    ListingCreate,
 )
 
 #: Password the fixtures hash and the login cases send.
@@ -89,6 +98,19 @@ documentation_published = pytest.mark.skipif(
     not DOCUMENTATION_ENABLED,
     reason="the documentation pages are published only in local runs",
 )
+
+# Smallest creation body the listing contract accepts, which each
+# measurement case replaces exactly one field of.
+BASE_LISTING = {"rent": 2400.0}
+
+# Smallest response body the listing contract accepts, built from the
+# non-null columns, which each measurement case replaces one field of.
+BASE_LISTING_RESPONSE = {
+    "id": 1,
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "updated_at": "2026-01-01T00:00:00+00:00",
+    "rent": 2400.0,
+}
 
 
 @pytest.fixture
@@ -133,6 +155,20 @@ def registered_user(db):
         hashed_password=get_password_hash(PASSWORD),
         created_at=datetime.now(timezone.utc),
         role="registered",
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@pytest.fixture
+def admin_user(db):
+    user = User(
+        email="bounds-admin@example.com",
+        hashed_password=get_password_hash(PASSWORD),
+        created_at=datetime.now(timezone.utc),
+        role="admin",
     )
     db.add(user)
     db.commit()
@@ -539,3 +575,173 @@ class TestDocumentationPolicyIsScopedToItsPages:
         response = client.get("/openapi.json")
         assert response.status_code == 200
         assert response.headers[CSP_HEADER] == API_POLICY
+
+
+class TestMeasurementsMustBeFiniteAndRepresentable:
+    """A measurement no response can carry is refused at the contract.
+
+    Every case here writes through the admin route and reads through the
+    public one, because the value that prompted them was accepted by the
+    contract, committed by the write, and then broke the read for every
+    caller until the row was deleted by hand.
+    """
+
+    @pytest.mark.parametrize("field", MEASUREMENT_FIELDS)
+    @pytest.mark.parametrize(
+        "value", [float("inf"), float("-inf"), float("nan")]
+    )
+    def test_the_contract_refuses_a_non_finite_measurement(
+        self, field, value
+    ):
+        body = dict(BASE_LISTING)
+        body[field] = value
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(**body)
+
+    @pytest.mark.parametrize("field", MEASUREMENT_FIELDS)
+    def test_the_contract_refuses_an_unrepresentable_whole_number(
+        self, field
+    ):
+        body = dict(BASE_LISTING)
+        body[field] = int("9" * 309)
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(**body)
+
+    @pytest.mark.parametrize("field", MEASUREMENT_FIELDS)
+    @pytest.mark.parametrize("value", ["inf", "Infinity", "1e400", "nan"])
+    def test_the_contract_refuses_a_non_finite_text_measurement(
+        self, field, value
+    ):
+        body = dict(BASE_LISTING)
+        body[field] = value
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(**body)
+
+    def test_a_finite_measurement_is_still_accepted(self):
+        accepted = ListingCreate(
+            rent=2400.5, broker_fee=0, square_footage=850
+        )
+        assert accepted.rent == 2400.5
+        assert accepted.broker_fee == 0
+        assert accepted.square_footage == 850
+
+    def test_the_largest_representable_measurement_is_accepted(self):
+        assert ListingCreate(rent=sys.float_info.max).rent == (
+            sys.float_info.max
+        )
+
+    def test_a_non_numeric_measurement_still_fails_on_its_type(self):
+        with pytest.raises(PydanticValidationError) as raised:
+            ListingCreate(rent="not a number")
+        assert any(
+            "float" in str(entry.get("type", ""))
+            or "float" in str(entry.get("msg", ""))
+            for entry in raised.value.errors()
+        )
+
+    @pytest.mark.parametrize("field", MEASUREMENT_FIELDS)
+    def test_the_response_contract_refuses_a_non_finite_measurement(
+        self, field
+    ):
+        body = dict(BASE_LISTING_RESPONSE)
+        body[field] = float("inf")
+        with pytest.raises(PydanticValidationError):
+            Listing(**body)
+
+    @pytest.mark.parametrize(
+        "literal",
+        [
+            '{"rent": 1e400}',
+            '{"rent": 1e999}',
+            '{"rent": Infinity}',
+            '{"rent": 1000, "broker_fee": 1e400}',
+            '{"rent": 1000, "square_footage": 1e400}',
+            '{"rent": %s}' % ("9" * 309),
+        ],
+    )
+    def test_the_write_route_refuses_the_literal_and_stores_nothing(
+        self, client, db, admin_user, literal
+    ):
+        response = client.post(
+            "/listings/",
+            content=literal,
+            headers=dict(
+                bearer(admin_user), **{"Content-Type": "application/json"}
+            ),
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+        assert db.query(ListingModel).count() == 0
+        assert client.get("/listings/").status_code == 200
+
+    def test_the_public_read_serves_a_page_around_an_unusable_row(
+        self, client, db, admin_user
+    ):
+        recorded = datetime.now(timezone.utc)
+        for rent in (1000.0, float("inf"), 3000.0):
+            db.add(
+                ListingModel(
+                    created_at=recorded,
+                    updated_at=recorded,
+                    rent=rent,
+                    street_address="row %r" % rent,
+                )
+            )
+        db.commit()
+        assert db.query(ListingModel).count() == 3
+
+        response = client.get("/listings/")
+        assert response.status_code == 200
+        served = response.json()
+        assert [row["rent"] for row in served] == [1000.0, 3000.0]
+
+        page = client.get("/listings/?skip=1&limit=1")
+        assert page.status_code == 200
+        assert page.json() == []
+
+    def test_the_write_route_still_accepts_every_allowed_field(
+        self, client, db, admin_user
+    ):
+        response = client.post(
+            "/listings/",
+            json={
+                "rent": 2400.0,
+                "broker_fee": 1200.0,
+                "square_footage": 850.0,
+                "bedrooms": 2,
+                "bathrooms": 1,
+                "available_date": "2026-09-01T00:00:00+00:00",
+                "street_address": "1 Finite Way",
+                "zillow_url": "https://www.zillow.com/homedetails/finite",
+            },
+            headers=bearer(admin_user),
+        )
+        assert response.status_code == 200
+        stored = db.query(ListingModel).one()
+        assert stored.rent == 2400.0
+        assert stored.broker_fee == 1200.0
+        assert stored.square_footage == 850.0
+
+    def test_the_provider_mapper_discards_a_non_finite_measurement(self):
+        with pytest.raises(zillow_service.ListingMappingError) as raised:
+            zillow_service.process_listing(
+                {
+                    "price": float("inf"),
+                    "square_feet": 900.0,
+                    "address": "1 Ingest Way",
+                    "listing_url": "https://www.zillow.com/homedetails/x",
+                }
+            )
+        assert "rent" in raised.value.fields
+
+    def test_the_provider_mapper_still_accepts_a_finite_measurement(self):
+        mapped = zillow_service.process_listing(
+            {
+                "price": 2400.0,
+                "square_feet": 900.0,
+                "address": "1 Ingest Way",
+                "listing_url": "https://www.zillow.com/homedetails/x",
+            }
+        )
+        assert mapped.rent == 2400.0
+        assert mapped.square_footage == 900.0

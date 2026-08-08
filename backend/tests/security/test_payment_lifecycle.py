@@ -9,7 +9,9 @@ forever, and an entitlement that no notification could ever grant or
 withdraw.
 """
 
+import inspect
 import json
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -19,12 +21,18 @@ from urllib.parse import urlsplit
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.api.endpoints import subscriptions as subscriptions_module
 from backend.app.api.endpoints.auth import limiter
 from backend.app.core.config import settings
+from backend.app.core.logging import (
+    bind_request_id,
+    current_request_id,
+    reset_request_id,
+)
 from backend.app.core.plans import PREMIUM_MONTHLY, format_amount, get_plan
 from backend.app.core.security import (
     create_access_token,
@@ -1862,3 +1870,220 @@ class TestRequestContractStaysPlanOnly:
             settings.PAYPAL_CANCEL_URL,
         ):
             assert target not in settings.ALLOWED_ORIGINS
+
+
+class TestSessionWorkRunsOffTheEventLoop:
+    """Neither async route issues a statement on the event loop.
+
+    Two simultaneous deliveries of one notification previously stopped
+    the whole service: the second delivery's insert waited on the first
+    delivery's uncommitted row while occupying the event loop, so the
+    completion of the first delivery's provider call could never be
+    delivered, neither request ever finished and nothing recovered
+    without restarting the process.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_operation_runs_on_another_thread(self):
+        caller = threading.get_ident()
+        observed = {}
+
+        def operation(marker):
+            observed["thread"] = threading.get_ident()
+            return marker
+
+        assert await subscriptions_module._in_session(
+            operation, "settled"
+        ) == "settled"
+        assert observed["thread"] != caller
+
+    @pytest.mark.asyncio
+    async def test_a_constraint_violation_is_raised_unchanged(self):
+        def operation():
+            raise IntegrityError("INSERT", {}, Exception("duplicate key"))
+
+        with pytest.raises(IntegrityError):
+            await subscriptions_module._in_session(operation)
+
+    @pytest.mark.asyncio
+    async def test_any_other_database_error_is_raised_unchanged(self):
+        def operation():
+            raise SQLAlchemyError("connection lost")
+
+        with pytest.raises(SQLAlchemyError):
+            await subscriptions_module._in_session(operation)
+
+    @pytest.mark.asyncio
+    async def test_keyword_arguments_reach_the_operation(self):
+        def operation(first, second=None):
+            return (first, second)
+
+        assert await subscriptions_module._in_session(
+            operation, "a", second="b"
+        ) == ("a", "b")
+
+    @pytest.mark.asyncio
+    async def test_the_bound_request_identifier_reaches_the_thread(self):
+        token = bind_request_id("d34db33f")
+        try:
+            observed = await subscriptions_module._in_session(
+                current_request_id
+            )
+        finally:
+            reset_request_id(token)
+        assert observed == "d34db33f"
+
+    @pytest.mark.parametrize(
+        "route",
+        [
+            "create_subscription",
+            "receive_paypal_webhook",
+            "_apply_notification",
+            "_settle",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "statement",
+        ["db.commit()", "db.flush()", "db.rollback()", "db.refresh("],
+    )
+    def test_no_async_route_issues_a_bare_statement(
+        self, route, statement
+    ):
+        source = inspect.getsource(
+            getattr(subscriptions_module, route)
+        )
+        assert statement not in source
+
+    @pytest.mark.parametrize(
+        "route",
+        [
+            "create_subscription",
+            "receive_paypal_webhook",
+            "_apply_notification",
+            "_settle",
+        ],
+    )
+    def test_every_such_route_is_a_coroutine_function(self, route):
+        assert inspect.iscoroutinefunction(
+            getattr(subscriptions_module, route)
+        )
+
+    def test_a_repeated_delivery_is_still_acknowledged(
+        self, client, subscriber, db
+    ):
+        """The duplicate answer is unchanged by where the flush runs."""
+        subscription = Subscription(
+            user_id=subscriber.id,
+            plan_id=PREMIUM_MONTHLY,
+            amount=get_plan(PREMIUM_MONTHLY).amount,
+            currency=get_plan(PREMIUM_MONTHLY).currency,
+            status="pending",
+            start_date=datetime.now(timezone.utc),
+            paypal_order_id=ORDER_ID,
+        )
+        db.add(subscription)
+        db.add(
+            WebhookEvent(
+                transmission_id=TRANSMISSION_ID,
+                event_type="CHECKOUT.ORDER.APPROVED",
+            )
+        )
+        db.commit()
+
+        capture = AsyncMock()
+        with patch(MODULE + ".capture_order", new=capture):
+            response = deliver(
+                client,
+                {
+                    "event_type": "CHECKOUT.ORDER.APPROVED",
+                    "resource": {"id": ORDER_ID},
+                },
+            )
+        assert response.status_code == 200
+        assert response.json() == {"status": "duplicate"}
+        capture.assert_not_awaited()
+        assert db.query(WebhookEvent).count() == 1
+        db.refresh(subscription)
+        assert subscription.status == "pending"
+
+    def test_a_first_delivery_still_settles_and_activates(
+        self, client, subscriber, db
+    ):
+        """The processed answer is unchanged by where the flush runs."""
+        subscription = Subscription(
+            user_id=subscriber.id,
+            plan_id=PREMIUM_MONTHLY,
+            amount=get_plan(PREMIUM_MONTHLY).amount,
+            currency=get_plan(PREMIUM_MONTHLY).currency,
+            status="pending",
+            start_date=datetime.now(timezone.utc),
+            paypal_order_id=ORDER_ID,
+        )
+        db.add(subscription)
+        db.commit()
+
+        capture = AsyncMock(return_value=capture_response())
+        with patch(MODULE + ".capture_order", new=capture):
+            response = deliver(
+                client,
+                {
+                    "event_type": "CHECKOUT.ORDER.APPROVED",
+                    "resource": {"id": ORDER_ID},
+                },
+            )
+        assert response.status_code == 200
+        assert response.json() == {"status": "processed"}
+        capture.assert_awaited_once()
+        assert db.query(WebhookEvent).count() == 1
+        db.refresh(subscription)
+        assert subscription.status == "active"
+
+    def test_a_failed_capture_still_rolls_the_delivery_record_back(
+        self, client, subscriber, db
+    ):
+        """A redelivery can still settle a row whose capture failed."""
+        subscription = Subscription(
+            user_id=subscriber.id,
+            plan_id=PREMIUM_MONTHLY,
+            amount=get_plan(PREMIUM_MONTHLY).amount,
+            currency=get_plan(PREMIUM_MONTHLY).currency,
+            status="pending",
+            start_date=datetime.now(timezone.utc),
+            paypal_order_id=ORDER_ID,
+        )
+        db.add(subscription)
+        db.commit()
+
+        failing = AsyncMock(
+            side_effect=paypal_service.PayPalAPIError(
+                "capture failed",
+                category=paypal_service.CATEGORY_TIMEOUT,
+            )
+        )
+        with patch(MODULE + ".capture_order", new=failing):
+            response = deliver(
+                client,
+                {
+                    "event_type": "CHECKOUT.ORDER.APPROVED",
+                    "resource": {"id": ORDER_ID},
+                },
+            )
+        assert response.status_code == 504
+        assert db.query(WebhookEvent).count() == 0
+        db.refresh(subscription)
+        assert subscription.status == "pending"
+
+        capture = AsyncMock(return_value=capture_response())
+        with patch(MODULE + ".capture_order", new=capture):
+            redelivery = deliver(
+                client,
+                {
+                    "event_type": "CHECKOUT.ORDER.APPROVED",
+                    "resource": {"id": ORDER_ID},
+                },
+            )
+        assert redelivery.status_code == 200
+        assert redelivery.json() == {"status": "processed"}
+        assert db.query(WebhookEvent).count() == 1
+        db.refresh(subscription)
+        assert subscription.status == "active"

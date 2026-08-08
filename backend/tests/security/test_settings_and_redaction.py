@@ -707,7 +707,7 @@ class TestPaymentCallbackUrls:
 
 
 class TestRateLimitStorage:
-    """Credential-endpoint counters must be shared once deployed."""
+    """Credential-endpoint counters must be bounded once deployed."""
 
     def test_local_accepts_process_local_memory(self):
         assert build_settings(
@@ -717,8 +717,26 @@ class TestRateLimitStorage:
     @pytest.mark.parametrize(
         "uri", ["memory://", "async+memory://"]
     )
-    def test_deployed_rejects_process_local_memory(self, uri):
+    def test_deployed_rejects_unbounded_process_local_memory(self, uri):
         assert_deployed_rejected(RATE_LIMIT_STORAGE_URI=uri)
+
+    def test_deployed_accepts_the_bounded_in_process_store(self):
+        assert build_deployed(
+            RATE_LIMIT_STORAGE_URI=(
+                CONFIG.BOUNDED_MEMORY_SCHEME + "://"
+            )
+        ).RATE_LIMIT_STORAGE_URI == CONFIG.BOUNDED_MEMORY_SCHEME + "://"
+
+    def test_deployed_accepts_the_declared_default(self):
+        values = dict(DEPLOYED_SETTINGS)
+        values.pop("RATE_LIMIT_STORAGE_URI", None)
+        with _environment_without_settings():
+            built = Settings(
+                _env_file=None, **dict(BASELINE_SETTINGS, **values)
+            )
+        assert built.RATE_LIMIT_STORAGE_URI == (
+            Settings.__fields__["RATE_LIMIT_STORAGE_URI"].default
+        )
 
     @pytest.mark.parametrize(
         "uri",
@@ -738,6 +756,54 @@ class TestRateLimitStorage:
     )
     def test_unknown_storage_schemes_are_rejected(self, uri):
         assert_rejected(RATE_LIMIT_STORAGE_URI=uri)
+
+    def test_the_deployable_set_is_the_shared_set_plus_the_bounded_one(
+        self,
+    ):
+        assert CONFIG.DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES == (
+            CONFIG.SHARED_RATE_LIMIT_STORAGE_SCHEMES
+            | {CONFIG.BOUNDED_MEMORY_SCHEME}
+        )
+        assert CONFIG.UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES == (
+            CONFIG.IN_PROCESS_RATE_LIMIT_SCHEMES
+            - {CONFIG.BOUNDED_MEMORY_SCHEME}
+        )
+        assert not (
+            CONFIG.DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES
+            & CONFIG.UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES
+        )
+
+    def test_a_deployed_in_process_store_is_recorded_once(self):
+        from backend.app.core import rate_limit
+
+        built = build_deployed(
+            RATE_LIMIT_STORAGE_URI=(
+                CONFIG.BOUNDED_MEMORY_SCHEME + "://"
+            )
+        )
+        records = []
+        with mock.patch.object(
+            rate_limit.settings,
+            "RATE_LIMIT_STORAGE_URI",
+            built.RATE_LIMIT_STORAGE_URI,
+        ), mock.patch.object(
+            rate_limit.settings, "ENVIRONMENT", built.ENVIRONMENT
+        ), mock.patch.object(
+            rate_limit.logger,
+            "warning",
+            lambda message, **kwargs: records.append((message, kwargs)),
+        ):
+            limiter = rate_limit.build_limiter()
+        assert limiter is not None
+        assert [message for message, _ in records] == [
+            rate_limit.IN_PROCESS_STORE_MESSAGE
+        ]
+        assert records[0][1]["extra"]["setting"] == (
+            "RATE_LIMIT_STORAGE_URI"
+        )
+        assert records[0][1]["extra"]["scheme"] == (
+            CONFIG.BOUNDED_MEMORY_SCHEME
+        )
 
     def test_webhook_rate_limit_uses_the_same_expression_check(self):
         assert build_settings(

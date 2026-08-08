@@ -48,6 +48,9 @@ The checks applied here are:
   :data:`RATE_LIMIT_STORAGE_SCHEMES`, and a scheme outside
   :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` must carry the address of the
   store it names
+* outside :data:`LOCAL_ENVIRONMENT` the rate-limit storage URI must name
+  a scheme in :data:`DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES`, which
+  excludes the in-process schemes whose tracked-key count is unbounded
 * placeholder values and reserved example domains are refused outside
   :data:`LOCAL_ENVIRONMENT`
 * when ``SECRET_BACKEND`` names :data:`MANAGED_BACKEND_NAME`, every
@@ -81,6 +84,7 @@ from pydantic import BaseSettings, Field, root_validator, validator
 __all__ = [
     "ALLOWED_JWT_ALGORITHMS",
     "BOUNDED_MEMORY_SCHEME",
+    "DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES",
     "ENVIRONMENT_BACKEND_NAME",
     "ENVIRONMENT_NAMES",
     "IN_PROCESS_RATE_LIMIT_SCHEMES",
@@ -103,6 +107,7 @@ __all__ = [
     "SHARED_RATE_LIMIT_STORAGE_SCHEMES",
     "Settings",
     "TLS_SCHEME",
+    "UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES",
     "ZILLOW_API_DOMAINS",
     "is_allowed_listing_provider_url",
     "required_signing_key_bytes",
@@ -218,6 +223,25 @@ SHARED_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
     scheme
     for scheme in RATE_LIMIT_STORAGE_SCHEMES
     if scheme not in IN_PROCESS_RATE_LIMIT_SCHEMES
+)
+
+#: The in-process schemes whose number of tracked keys has no ceiling.
+#: :data:`BOUNDED_MEMORY_SCHEME` is absent because
+#: :mod:`backend.app.core.rate_limit` caps it at
+#: ``Settings.RATE_LIMIT_MAX_TRACKED_KEYS``.
+UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
+    scheme
+    for scheme in IN_PROCESS_RATE_LIMIT_SCHEMES
+    if scheme != BOUNDED_MEMORY_SCHEME
+)
+
+#: Rate-limit storage schemes accepted outside :data:`LOCAL_ENVIRONMENT`:
+#: every shared scheme, plus the bounded in-process scheme. A scheme in
+#: this set that is also in :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` counts
+#: inside one process, which :func:`backend.app.core.rate_limit.
+#: build_limiter` records once against the setting that named it.
+DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
+    SHARED_RATE_LIMIT_STORAGE_SCHEMES | {BOUNDED_MEMORY_SCHEME}
 )
 
 #: Largest row offset a paged read may name. It is the ceiling of the
@@ -1194,14 +1218,20 @@ class Settings(BaseSettings):
     def _check_rate_limit_sharing(
         cls, values: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Require shared rate-limit storage outside local runs.
+        """Require deployable rate-limit storage outside local runs.
 
-        A scheme outside
-        :data:`SHARED_RATE_LIMIT_STORAGE_SCHEMES` counts requests in the
-        memory of one process, so a deployment running more than one
-        process enforces its credential-endpoint limits once per process
-        rather than once per caller. Such a scheme is accepted only while
-        ``ENVIRONMENT`` names :data:`LOCAL_ENVIRONMENT`.
+        Outside :data:`LOCAL_ENVIRONMENT` the scheme must appear in
+        :data:`DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES`: every shared
+        scheme, plus :data:`BOUNDED_MEMORY_SCHEME`, whose tracked-key
+        count is capped by ``RATE_LIMIT_MAX_TRACKED_KEYS``. A scheme in
+        :data:`UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES` is refused, because
+        it holds one counter per caller address with no ceiling.
+
+        A scheme that counts inside one process is recorded once by
+        :func:`backend.app.core.rate_limit.build_limiter`, which names
+        this setting, the scheme and the environment, so a deployment
+        running more than one process can see that its
+        credential-endpoint limits are enforced per process.
         """
         uri = values.get("RATE_LIMIT_STORAGE_URI")
         if not isinstance(uri, str):
@@ -1209,13 +1239,13 @@ class Settings(BaseSettings):
         if values.get("ENVIRONMENT") == LOCAL_ENVIRONMENT:
             return values
         if _rate_limit_storage_scheme(uri) not in (
-            SHARED_RATE_LIMIT_STORAGE_SCHEMES
+            DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES
         ):
             raise ValueError(
-                "RATE_LIMIT_STORAGE_URI must name storage shared by "
-                "every process, one of "
-                f"{sorted(SHARED_RATE_LIMIT_STORAGE_SCHEMES)}, unless "
-                f"ENVIRONMENT is {LOCAL_ENVIRONMENT}"
+                "RATE_LIMIT_STORAGE_URI must name storage whose tracked "
+                "keys are bounded, one of "
+                f"{sorted(DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES)}, "
+                f"unless ENVIRONMENT is {LOCAL_ENVIRONMENT}"
             )
         return values
 

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from typing import List
@@ -21,6 +22,9 @@ DEFAULT_PAGE_SIZE = min(100, settings.MAX_PAGE_SIZE)
 #: Detail returned when a listing cannot be persisted.
 LISTING_NOT_STORED_DETAIL = "Listing could not be stored"
 
+#: Reason recorded for a stored row the response contract cannot carry.
+REASON_UNPROJECTABLE_ROW = "listing_not_projectable"
+
 
 @router.get("/")
 def get_listings(
@@ -30,8 +34,19 @@ def get_listings(
         DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE
     ),
 ) -> List[Listing]:
-    # Ordered by the primary key so a row keeps its position across
-    # pages while the corpus is being written to.
+    """Returns one page of the listing corpus, reachable without a token.
+
+    Ordered by the primary key, so a row keeps its position across pages
+    while the corpus is being written to.
+
+    Each row is projected on its own. A row carrying a value the response
+    contract cannot represent -- which
+    :class:`backend.app.schema.listing.ListingCreate` refuses at every
+    write path, so only a row written outside this contract can carry one
+    -- is recorded against its identifier and left out of the page,
+    because a page is more useful than a refusal and the endpoint is
+    reachable without a credential.
+    """
     listings = (
         db.query(ListingModel)
         .order_by(ListingModel.id)
@@ -39,7 +54,37 @@ def get_listings(
         .limit(limit)
         .all()
     )
-    return [Listing.from_orm(listing) for listing in listings]
+    page = []
+    for listing in listings:
+        try:
+            page.append(Listing.from_orm(listing))
+        except ValidationError as error:
+            logger.error(
+                "Left a stored listing out of a page because the "
+                "response contract cannot carry it",
+                extra={
+                    "listing_id": listing.id,
+                    "reason": REASON_UNPROJECTABLE_ROW,
+                    "failed_fields": _failed_fields(error),
+                },
+            )
+    return page
+
+
+def _failed_fields(error: ValidationError) -> List[str]:
+    """Returns the contract fields ``error`` reports, sorted and unique.
+
+    A location part is kept only when it names a field :class:`Listing`
+    declares, so the result carries contract names and never a stored
+    value.
+    """
+    declared = set(Listing.__fields__)
+    names = set()
+    for entry in error.errors():
+        for part in entry.get("loc", ()):
+            if isinstance(part, str) and part in declared:
+                names.add(part)
+    return sorted(names)
 
 
 @router.post("/")
