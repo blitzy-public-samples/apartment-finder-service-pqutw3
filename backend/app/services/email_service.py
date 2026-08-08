@@ -12,6 +12,7 @@ FROM_EMAIL = settings.FROM_EMAIL
 # is removed from text that names no key -- provider error prose included.
 register_secret_values(SENDGRID_API_KEY)
 
+
 def send_email(to_email: str, subject: str, content: str) -> bool:
     try:
         sg = SendGridAPIClient(SENDGRID_API_KEY)
