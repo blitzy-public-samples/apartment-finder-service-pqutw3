@@ -7,10 +7,13 @@ factor of the stored hash, and a refusal branch whose attempt-counting
 statements made it slower than the branch that found no account.
 
 The timing cases measure the elapsed time of complete requests and
-compare the median of each refusal branch against the others.
+compare each refusal branch against the others. Because every refusal is
+padded out to one budget, the time a branch takes is a floor that the
+machine can only add to, so the branches are sampled round-robin and each
+is read at its shortest -- the reading that carries the least noise and
+therefore the clearest view of the work the branch does.
 """
 
-import statistics
 import time
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -41,11 +44,13 @@ LEGACY_ROUNDS = 4
 # A cost factor above the supported ceiling.
 UNSUPPORTED_ROUNDS = security.MAX_SUPPORTED_BCRYPT_COST + 1
 
-# Requests measured per refusal branch. The median of each branch is
-# compared, so one scheduling delay does not decide a case.
-TIMING_SAMPLES = 3
+# Rounds measured. Each round issues one request per refusal branch, so a
+# slowdown lasting part of the measurement reaches every branch rather
+# than whichever one was being sampled at the time, and each branch has
+# this many chances at an unhindered reading.
+TIMING_SAMPLES = 7
 
-# Seconds two branch medians may differ by. It is below the cost of one
+# Seconds two branch readings may differ by. It is below the cost of one
 # comparison at the supported ceiling, so an extra or missing comparison
 # fails the case.
 TIMING_TOLERANCE_SECONDS = max(
@@ -504,16 +509,48 @@ class TestRefusalBranchesTakeTheSameTime:
     """Every login refusal is held to one budget, measured end to end."""
 
     @staticmethod
-    def _median_elapsed(client, address, password):
-        measured = []
-        for _ in range(TIMING_SAMPLES):
-            started = time.monotonic()
-            response = login(client, address, password)
-            measured.append(time.monotonic() - started)
-            assert response.status_code == 401
-        return statistics.median(measured)
+    def _measure_branches(client, branches, before_round=None):
+        """Returns the shortest complete request each branch answered in.
 
-    def test_the_branch_medians_agree_and_reach_the_budget(
+        ``branches`` maps a name to the address and password that reach
+        that refusal branch. One request per branch is issued per round,
+        in the same order each time, so a slowdown lasting part of the
+        measurement is shared by every branch instead of falling entirely
+        on whichever one was being sampled when it occurred.
+
+        ``before_round`` is called once at the start of each round, outside
+        the measured window, and is where a case restores state its own
+        requests consume -- keeping the number of rounds independent of any
+        threshold the endpoint enforces against repeated attempts.
+
+        The reading kept for each branch is the **shortest** of its
+        requests rather than the median. Each refusal is padded out to
+        :data:`backend.app.core.security.MIN_LOGIN_REFUSAL_SECONDS`, so
+        the time a branch takes is a floor that the machine can only add
+        to: scheduling, garbage collection and input-output make a request
+        longer and never shorter. The shortest reading is therefore the
+        closest estimate of the work the branch actually does, and the
+        difference between two branches' shortest readings is the
+        difference in that work rather than in the noise around it.
+
+        Every response is asserted to be a refusal as it is measured, so a
+        branch that stopped refusing cannot be read as a fast one.
+        """
+        readings = dict((name, []) for name in branches)
+        for _ in range(TIMING_SAMPLES):
+            if before_round is not None:
+                before_round()
+            for name, (address, password) in branches.items():
+                started = time.monotonic()
+                response = login(client, address, password)
+                elapsed = time.monotonic() - started
+                assert response.status_code == 401, (name, response.text)
+                readings[name].append(elapsed)
+        return dict(
+            (name, min(measured)) for name, measured in readings.items()
+        )
+
+    def test_the_branch_timings_agree_and_reach_the_budget(
         self, db, client
     ):
         """The four refusals are indistinguishable in elapsed time.
@@ -544,26 +581,62 @@ class TestRefusalBranchesTakeTheSameTime:
         )
         db.commit()
 
-        medians = {
-            "unknown": self._median_elapsed(
-                client, "absent@example.com", WRONG_PASSWORD
-            ),
-            "wrong_password": self._median_elapsed(
-                client, "current@example.com", WRONG_PASSWORD
-            ),
-            "locked": self._median_elapsed(
-                client, "locked@example.com", PASSWORD
-            ),
-            "unsupported_cost": self._median_elapsed(
-                client, "expensive@example.com", WRONG_PASSWORD
-            ),
-        }
+        def clear_the_counted_attempts():
+            """Returns the counting branch to an unlocked row each round.
+
+            The wrong-password branch counts one failed attempt per
+            request, and ``settings.LOGIN_MAX_ATTEMPTS`` of them lock the
+            account -- which would carry that branch onto the locked path
+            partway through the measurement and quietly stop measuring the
+            branch this case names. Clearing the count keeps every round on
+            that branch whatever the configured threshold is and however
+            many rounds are taken. The write is issued between rounds, not
+            inside a measured request.
+            """
+            db.query(User).filter(
+                User.email == "current@example.com"
+            ).update(
+                {"failed_login_attempts": 0, "locked_until": None},
+                synchronize_session=False,
+            )
+            db.commit()
+
+        readings = self._measure_branches(
+            client,
+            {
+                "unknown": ("absent@example.com", WRONG_PASSWORD),
+                "wrong_password": (
+                    "current@example.com",
+                    WRONG_PASSWORD,
+                ),
+                "locked": ("locked@example.com", PASSWORD),
+                "unsupported_cost": (
+                    "expensive@example.com",
+                    WRONG_PASSWORD,
+                ),
+            },
+            before_round=clear_the_counted_attempts,
+        )
 
         budget = security.MIN_LOGIN_REFUSAL_SECONDS
-        for name, measured in medians.items():
+        for name, measured in readings.items():
             assert measured >= budget * 0.9, (name, measured, budget)
-        spread = max(medians.values()) - min(medians.values())
-        assert spread <= TIMING_TOLERANCE_SECONDS, medians
+        spread = max(readings.values()) - min(readings.values())
+        assert spread <= TIMING_TOLERANCE_SECONDS, readings
+
+        # The counting branch is the one that could have drifted onto
+        # another path during the measurement, so the row it counts
+        # against is read back: one attempt stands from the final round
+        # and no lock was reached, which holds only if every round was
+        # answered by the branch this case names.
+        db.expire_all()
+        counting = db.query(User).filter(
+            User.email == "current@example.com"
+        ).one()
+        assert counting.failed_login_attempts == 1, (
+            counting.failed_login_attempts
+        )
+        assert counting.locked_until is None, counting.locked_until
 
     def test_the_refusal_budget_covers_the_credential_budget(self):
         assert security.MIN_LOGIN_REFUSAL_SECONDS > (

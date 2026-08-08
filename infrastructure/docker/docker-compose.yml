@@ -6,13 +6,19 @@
 # or from an uncommitted `.env` beside this file. Copy the repository's
 # `.env.example`, fill it in, and export it or place it here.
 #
-# Required by both profiles: COMPOSE_DATABASE_URL, SECRET_KEY,
-# ZILLOW_API_KEY, PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET,
-# PAYPAL_WEBHOOK_ID and SENDGRID_API_KEY. The local profile also requires
-# POSTGRES_PASSWORD; the gcp profile also requires
-# CLOUD_SQL_INSTANCE_CONNECTION_NAME. Everything else carries the code
-# default, so an absent optional value never blocks a start.
-version: '3.8'
+# Every substitution in this document is resolved before the profile
+# filter is applied, so each required name below carries a value on every
+# invocation whichever profile is selected: COMPOSE_DATABASE_URL,
+# SECRET_KEY, ZILLOW_API_KEY, PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET,
+# PAYPAL_WEBHOOK_ID, SENDGRID_API_KEY and POSTGRES_PASSWORD. A gcp stack
+# additionally sets CLOUD_SQL_INSTANCE_CONNECTION_NAME to a real
+# project:region:instance value; the proxy refuses the unset marker this
+# file defaults to. Everything else carries the code default, so an
+# absent optional value never blocks a start.
+#
+# The project name is fixed below so the containers, the network and the
+# db-data volume are named for this service.
+name: apartment-finder
 
 # The local stack runs against the PostgreSQL service defined below:
 #   docker compose --profile local up -d
@@ -119,12 +125,14 @@ services:
     environment:
       <<: *backend-environment
     healthcheck:
-      # python:3.9-slim carries python and no curl.
+      # python:3.9-slim carries python and no curl. The readiness path
+      # answers 503 while the database is unreachable, so a container
+      # whose database is unusable is not reported healthy.
       test:
         - "CMD"
         - "python"
         - "-c"
-        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).getcode() == 200 else 1)"
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).getcode() == 200 else 1)"
       interval: 30s
       timeout: 10s
       retries: 3
@@ -176,13 +184,18 @@ services:
   # PostgreSQL service answers to. The proxy authenticates with the
   # ambient credentials of the host it runs on; no credential file is
   # mounted into this service and none is read from this repository.
+  #
+  # The instance name defaults to a marker that carries no colon, so it
+  # is not a well-formed project:region:instance value and the proxy
+  # exits naming it. Only this service consumes the value, and this
+  # service starts only under the gcp profile.
   cloud-sql-proxy:
     image: gcr.io/cloudsql-docker/gce-proxy:1.19.1
     profiles:
       - gcp
     command:
       - "/cloud_sql_proxy"
-      - "-instances=${CLOUD_SQL_INSTANCE_CONNECTION_NAME:?CLOUD_SQL_INSTANCE_CONNECTION_NAME must be set}=tcp:0.0.0.0:5432"
+      - "-instances=${CLOUD_SQL_INSTANCE_CONNECTION_NAME:-cloud-sql-instance-connection-name-unset}=tcp:0.0.0.0:5432"
     networks:
       default:
         aliases:

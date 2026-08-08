@@ -34,7 +34,14 @@ from backend.app.core.logging import (
     current_request_id,
     reset_request_id,
 )
-from backend.app.core.plans import PREMIUM_MONTHLY, format_amount, get_plan
+from backend.app.core.plans import (
+    PLAN_IDS,
+    PREMIUM_MONTHLY,
+    STATUS_VALUES,
+    UnknownPlanError,
+    format_amount,
+    get_plan,
+)
 from backend.app.core.security import (
     create_access_token,
     get_password_hash,
@@ -2798,3 +2805,383 @@ class TestSessionWorkRunsOffTheEventLoop:
         assert db.query(WebhookEvent).count() == 1
         db.refresh(subscription)
         assert subscription.status == "active"
+
+
+class TestTheAmountContractRefusesWhatItCannotPrice:
+    """The catalog prices in exact decimals or refuses the value.
+
+    Every amount this service charges comes from the catalog and is
+    rendered by :func:`backend.app.core.plans.format_amount`, so that
+    renderer is the last point at which a value that cannot be expressed
+    as an exact two-place decimal can be stopped. A value it accepted
+    loosely -- a float, a value rounded to fit, a non-finite decimal --
+    would be sent to the provider as the amount to charge.
+    """
+
+    @pytest.mark.parametrize(
+        "value, rendered",
+        [
+            pytest.param(Decimal("9.99"), "9.99", id="decimal"),
+            pytest.param(Decimal("9.9"), "9.90", id="one_place"),
+            pytest.param(Decimal("10"), "10.00", id="whole_decimal"),
+            pytest.param(10, "10.00", id="whole_number"),
+            pytest.param(0, "0.00", id="zero"),
+            pytest.param("99.99", "99.99", id="text"),
+            pytest.param(" 99.99 ", "99.99", id="padded_text"),
+        ],
+    )
+    def test_an_exact_amount_is_rendered_to_two_places(
+        self, value, rendered
+    ):
+        assert format_amount(value) == rendered
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("nine ninety nine", id="words"),
+            pytest.param("", id="empty"),
+            pytest.param("9,99", id="comma_separator"),
+            pytest.param("$9.99", id="currency_symbol"),
+        ],
+    )
+    def test_text_that_is_not_a_decimal_is_refused(self, value):
+        with pytest.raises(ValueError):
+            format_amount(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(9.99, id="float"),
+            pytest.param(True, id="boolean"),
+            pytest.param(None, id="none"),
+            pytest.param(Decimal, id="type_object"),
+        ],
+    )
+    def test_a_type_the_catalog_does_not_price_in_is_refused(
+        self, value
+    ):
+        with pytest.raises(TypeError):
+            format_amount(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(Decimal("NaN"), id="not_a_number"),
+            pytest.param(Decimal("Infinity"), id="infinity"),
+            pytest.param(Decimal("-Infinity"), id="negative_infinity"),
+            pytest.param("NaN", id="text_not_a_number"),
+        ],
+    )
+    def test_an_amount_that_is_not_finite_is_refused(self, value):
+        with pytest.raises(ValueError):
+            format_amount(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("9.999", id="three_places"),
+            pytest.param(Decimal("0.001"), id="below_a_cent"),
+            pytest.param("1.005", id="halfway_below_a_cent"),
+        ],
+    )
+    def test_an_amount_finer_than_a_cent_is_refused(self, value):
+        """Refused rather than rounded: a rounded charge is a wrong one."""
+        with pytest.raises(ValueError):
+            format_amount(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(Decimal("1E+30"), id="beyond_the_precision"),
+            pytest.param("1E+40", id="text_beyond_the_precision"),
+        ],
+    )
+    def test_an_amount_beyond_the_representable_range_is_refused(
+        self, value
+    ):
+        with pytest.raises(ValueError):
+            format_amount(value)
+
+    @pytest.mark.parametrize(
+        "plan_id",
+        [
+            pytest.param("premium_weekly", id="never_published"),
+            pytest.param("", id="empty"),
+            pytest.param("PREMIUM_MONTHLY", id="wrong_case"),
+            pytest.param(None, id="none"),
+            pytest.param(17, id="not_text"),
+            pytest.param(["premium_monthly"], id="unhashable"),
+        ],
+    )
+    def test_an_identifier_the_catalog_does_not_publish_is_refused(
+        self, plan_id
+    ):
+        with pytest.raises(UnknownPlanError) as refused:
+            get_plan(plan_id)
+        assert refused.value.plan_id == plan_id
+
+    def test_every_published_plan_prices_exactly(self):
+        """No catalog entry carries an amount the renderer refuses."""
+        for plan_id in PLAN_IDS:
+            plan = get_plan(plan_id)
+            assert format_amount(plan.amount) == str(plan.amount)
+            assert plan.period_days >= 1
+            assert plan.currency == plan.currency.upper()
+
+
+class TestANotificationThatCannotBeAppliedChangesNothing:
+    """A verified notification the service cannot act on is acknowledged.
+
+    Each case here is a delivery PayPal signed and this service could not
+    apply: it named no order, it named an order whose row is closed, or it
+    named a row priced by a plan the catalog no longer publishes. Every
+    one of them is acknowledged so PayPal stops retrying, records why, and
+    leaves the stored row and the subscriber's role exactly as they were.
+    """
+
+    @staticmethod
+    def _row(subscriber, status="pending", plan_id=PREMIUM_MONTHLY):
+        """Returns a stored subscription naming the order under test."""
+        return Subscription(
+            user_id=subscriber.id,
+            plan_id=plan_id,
+            amount=PLAN.amount,
+            currency=PLAN.currency,
+            status=status,
+            start_date=datetime.now(timezone.utc),
+            paypal_order_id=ORDER_ID,
+        )
+
+    @staticmethod
+    def _settled(capture_id=CAPTURE_ID):
+        """Returns the outcome a complete capture of the plan reports."""
+        return paypal_service.CaptureOutcome(
+            completed=True,
+            order_id=ORDER_ID,
+            status="COMPLETED",
+            amount=format_amount(PLAN.amount),
+            currency=PLAN.currency,
+            capture_id=capture_id,
+        )
+
+    @staticmethod
+    def _record(session_factory, status):
+        """Records ``status`` against the order from another session."""
+        session = session_factory()
+        try:
+            row = (
+                session.query(Subscription)
+                .filter(Subscription.paypal_order_id == ORDER_ID)
+                .one()
+            )
+            row.status = status
+            session.commit()
+        finally:
+            session.close()
+
+    def test_a_notification_naming_no_order_is_acknowledged(
+        self, client, db, subscriber
+    ):
+        db.add(self._row(subscriber))
+        db.commit()
+
+        response = deliver(
+            client,
+            {
+                "id": "WH-NO-ORDER",
+                "event_type": "PAYMENT.CAPTURE.COMPLETED",
+                "resource": {"status": "COMPLETED"},
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": subscriptions_module.OUTCOME_IGNORED
+        }
+        db.expire_all()
+        assert db.query(Subscription).one().status == "pending"
+        assert db.query(WebhookEvent).count() == 1
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            subscriptions_module.CANCELLED_STATUS,
+            subscriptions_module.REFUNDED_STATUS,
+        ],
+    )
+    def test_an_order_already_closed_is_left_closed(
+        self, client, db, subscriber, status
+    ):
+        db.add(self._row(subscriber, status=status))
+        db.commit()
+
+        response = deliver(client, capture_completed_event())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": subscriptions_module.OUTCOME_IGNORED
+        }
+        db.expire_all()
+        assert db.query(Subscription).one().status == status
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    def test_an_order_priced_by_an_unpublished_plan_is_acknowledged(
+        self, client, db, subscriber
+    ):
+        """A row the catalog can no longer price grants nothing."""
+        db.add(self._row(subscriber, plan_id="premium_retired"))
+        db.commit()
+
+        response = deliver(client, capture_completed_event())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": subscriptions_module.OUTCOME_IGNORED
+        }
+        db.expire_all()
+        assert db.query(Subscription).one().status == "pending"
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    def test_the_refusal_names_why_the_plan_could_not_be_read(
+        self, client, db, subscriber
+    ):
+        db.add(self._row(subscriber, plan_id="premium_retired"))
+        db.commit()
+
+        with patch.object(
+            subscriptions_module.logger, "error"
+        ) as recorded:
+            deliver(client, capture_completed_event())
+
+        reasons = [
+            call.kwargs["extra"].get("reason")
+            for call in recorded.call_args_list
+            if "extra" in call.kwargs
+        ]
+        assert (
+            subscriptions_module.REASON_PLAN_UNAVAILABLE in reasons
+        )
+
+    def test_a_settled_capture_carrying_no_identifier_activates_nothing(
+        self, db, subscriber
+    ):
+        """A settlement that cannot be reconciled grants no entitlement.
+
+        Every outcome the provider reader builds carries the provider's
+        capture identifier, so this is the guard behind that contract: an
+        outcome reporting a complete capture with no identifier is refused
+        rather than activated, because the row it produced could never be
+        reconciled against the provider afterwards.
+        """
+        db.add(self._row(subscriber))
+        db.commit()
+        stored = db.query(Subscription).one()
+
+        outcome = subscriptions_module._activate(
+            db,
+            stored,
+            PLAN,
+            self._settled(capture_id=None),
+            "PAYMENT.CAPTURE.COMPLETED",
+        )
+
+        assert outcome == subscriptions_module.OUTCOME_IGNORED
+        db.rollback()
+        db.expire_all()
+        assert db.query(Subscription).one().status == "pending"
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    def test_the_unreconcilable_capture_is_recorded_with_its_reason(
+        self, db, subscriber
+    ):
+        db.add(self._row(subscriber))
+        db.commit()
+        stored = db.query(Subscription).one()
+
+        with patch.object(
+            subscriptions_module.logger, "error"
+        ) as recorded:
+            subscriptions_module._activate(
+                db,
+                stored,
+                PLAN,
+                self._settled(capture_id=""),
+                "PAYMENT.CAPTURE.COMPLETED",
+            )
+
+        reasons = [
+            call.kwargs["extra"].get("reason")
+            for call in recorded.call_args_list
+            if "extra" in call.kwargs
+        ]
+        assert (
+            subscriptions_module.REASON_UNRECONCILABLE_CAPTURE in reasons
+        )
+
+    def test_a_row_activated_while_the_capture_was_in_flight_is_left(
+        self, db, subscriber, session_factory
+    ):
+        """A second settlement of one order writes the row once."""
+        db.add(self._row(subscriber))
+        db.commit()
+        stale = db.query(Subscription).one()
+        self._record(session_factory, subscriptions_module.ACTIVE_STATUS)
+
+        outcome = subscriptions_module._activate(
+            db,
+            stale,
+            PLAN,
+            self._settled(),
+            "PAYMENT.CAPTURE.COMPLETED",
+        )
+
+        assert outcome == subscriptions_module.OUTCOME_PROCESSED
+        db.rollback()
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == subscriptions_module.ACTIVE_STATUS
+        assert stored.end_date is None
+
+    def test_a_row_in_a_status_no_transition_covers_is_left_alone(
+        self, db, subscriber, session_factory
+    ):
+        """A status outside the published set is not written over.
+
+        Every status the application writes is one of five, and each is
+        covered by a transition. This is the guard for a row carrying
+        something else -- a value only a later revision or a manual edit
+        could store -- which is refused rather than treated as open.
+        """
+        unpublished = "suspended"
+        assert unpublished not in STATUS_VALUES
+        db.add(self._row(subscriber))
+        db.commit()
+        stale = db.query(Subscription).one()
+        self._record(session_factory, unpublished)
+
+        outcome = subscriptions_module._activate(
+            db,
+            stale,
+            PLAN,
+            self._settled(),
+            "PAYMENT.CAPTURE.COMPLETED",
+        )
+
+        assert outcome == subscriptions_module.OUTCOME_IGNORED
+        db.rollback()
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == unpublished
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )

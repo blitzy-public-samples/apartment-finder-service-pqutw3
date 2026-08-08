@@ -176,25 +176,47 @@ MOUNTED_PREFIXES = (
     "/subscriptions/",
 )
 
-#: Path of the readiness route the application mounts directly rather
+#: Path of the liveness route the application mounts directly rather
 #: than through the router. It sits under none of
 #: :data:`MOUNTED_PREFIXES`.
 HEALTH_PATH = "/health"
 
-#: The readiness route, as ``app.routes`` reports it.
+#: The liveness route, as ``app.routes`` reports it.
 HEALTH_ROUTE = ("GET", HEALTH_PATH)
 
-#: Slug the readiness cases report under. It is deliberately outside the
+#: Slug the liveness cases report under. It is deliberately outside the
 #: numbered sequence :data:`ROUTE_MATRIX` uses, because the route is
 #: governed by no role.
 HEALTH_ROUTE_SLUG = "health"
 
-#: Body the readiness route answers. Written out here rather than read
+#: Body the liveness route answers. Written out here rather than read
 #: from :data:`backend.app.main.HEALTH_STATUS`, so the assertion states
 #: an independent expectation instead of comparing the application with
 #: itself; a route that merely answers ``200`` cannot pass for a
-#: readiness report.
+#: liveness report.
 HEALTH_BODY = {"status": "ok"}
+
+#: Path of the readiness route, mounted directly like the liveness route
+#: and likewise governed by no role.
+READINESS_PATH = "/health/ready"
+
+#: The readiness route, as ``app.routes`` reports it.
+READINESS_ROUTE = ("GET", READINESS_PATH)
+
+#: Slug the readiness cases report under.
+READINESS_ROUTE_SLUG = "readiness"
+
+#: Body the readiness route answers while the database answers. Written
+#: out here for the same reason :data:`HEALTH_BODY` is.
+READINESS_BODY = {"status": "ready"}
+
+#: Body the readiness route answers while the database does not.
+NOT_READY_BODY = {"status": "unavailable"}
+
+#: The routes the application mounts outside the router. Neither is
+#: governed by a role, so neither contributes a cell to the matrix and
+#: the matrix stays at :data:`EXPECTED_CELL_COUNT` exactly.
+OPERATIONAL_ROUTES = frozenset((HEALTH_ROUTE, READINESS_ROUTE))
 
 #: Paths the framework mounts for its own documentation. Each is
 #: registered with ``include_in_schema`` cleared, which is the property
@@ -616,11 +638,11 @@ def test_the_matrix_covers_every_route_the_application_publishes():
     The comparison is against ``app.routes``, so the grid can no longer
     agree only with itself: a route the application gains without a row
     here fails, and a row here naming a route the application does not
-    serve fails too. :data:`HEALTH_ROUTE` is accounted for explicitly
-    because it is deliberately outside the grid — no role governs it —
-    and the framework's documentation routes are excluded deliberately
-    too, by the ``include_in_schema`` flag each carries, with the paths
-    that exclusion covers asserted by name.
+    serve fails too. :data:`OPERATIONAL_ROUTES` is accounted for
+    explicitly because those routes are deliberately outside the grid —
+    no role governs either — and the framework's documentation routes
+    are excluded deliberately too, by the ``include_in_schema`` flag
+    each carries, with the paths that exclusion covers asserted by name.
     """
     recorded = set(
         (method, path) for _slug, method, path, _cells in ROUTE_MATRIX
@@ -628,9 +650,9 @@ def test_the_matrix_covers_every_route_the_application_publishes():
     published = published_routes()
 
     assert len(recorded) == EXPECTED_ROUTE_COUNT
-    assert HEALTH_ROUTE not in recorded
-    assert HEALTH_ROUTE in published
-    assert recorded | {HEALTH_ROUTE} == published
+    assert recorded.isdisjoint(OPERATIONAL_ROUTES)
+    assert OPERATIONAL_ROUTES <= published
+    assert recorded | OPERATIONAL_ROUTES == published
 
     excluded = documentation_routes()
     assert excluded
@@ -645,7 +667,7 @@ def test_the_matrix_covers_every_route_the_application_publishes():
 def test_the_health_route_answers_every_principal(
     principal, client, seeded_users, auth_header_factory
 ):
-    """Asserts the readiness route is public, deliberately and for all.
+    """Asserts the liveness route is public, deliberately and for all.
 
     It carries no role dependency by design: it reports whether the
     process is serving, which a deployment probe reads before any
@@ -662,6 +684,27 @@ def test_the_health_route_answers_every_principal(
         HEALTH_ROUTE_SLUG, principal, ALLOWED, response
     )
     assert response.json() == HEALTH_BODY
+
+
+@pytest.mark.parametrize("principal", PRINCIPALS)
+def test_the_readiness_route_answers_every_principal(
+    principal, client, seeded_users, auth_header_factory
+):
+    """Asserts the readiness route is public, deliberately and for all.
+
+    It is governed by no role for the same reason the liveness route is
+    not, and it is likewise recorded here rather than as a tenth grid
+    row so the grid stays the nine routes the role model governs.
+    """
+    headers = headers_for(principal, seeded_users, auth_header_factory)
+    method, path = READINESS_ROUTE
+
+    response = _send(client, method, path, headers, None)
+
+    assert response.status_code == ALLOWED, _report(
+        READINESS_ROUTE_SLUG, principal, ALLOWED, response
+    )
+    assert response.json() == READINESS_BODY
 
 
 def test_the_matrix_is_nine_routes_by_five_principals():

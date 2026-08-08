@@ -12,15 +12,17 @@ import logging
 import uuid
 
 import pytest
+from conftest import CLIENT_BASE_URL
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.app import main as main_module
 from backend.app.core.config import LOCAL_ENVIRONMENT, settings
 from backend.app.core.logging import BASE_LOGGER_NAME, configure_logging
-from backend.app.db.database import engine
+from backend.app.db.database import engine, get_db
 
 # Imported here rather than inside the test that uses it: the first
 # ``get_logger`` call a module makes settles handler governance, which
@@ -102,9 +104,10 @@ class TestDocumentationSurface:
     def test_the_anonymous_surface_is_the_authorized_one(self):
         """Only the routes the plan admits anonymously are reachable.
 
-        Health, registration, login, the public listings read and the
-        signature-checked webhook are the admitted set; when publication
-        is off the documentation routes are not part of it.
+        Liveness, readiness, registration, login, the public listings
+        read and the signature-checked webhook are the admitted set;
+        when publication is off the documentation routes are not part of
+        it.
         """
         declared = set()
         for route in main_module.app.routes:
@@ -115,7 +118,127 @@ class TestDocumentationSurface:
             for path in self.DOC_PATHS:
                 assert path not in declared
         assert "/health" in declared
+        assert main_module.READINESS_PATH in declared
         assert "/auth/login" in declared
+
+
+@pytest.fixture
+def unreachable_client():
+    """Yields a client whose readiness session reaches no database.
+
+    The engine addresses a port nothing listens on, so the probe
+    statement raises the same class of error a stopped database raises.
+    No credential is written into the URL.
+    """
+    down = create_engine("postgresql://127.0.0.1:1/unreachable")
+
+    def override_get_db():
+        session = Session(bind=down)
+        try:
+            yield session
+        finally:
+            session.close()
+
+    main_module.app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(
+            main_module.app,
+            base_url=CLIENT_BASE_URL,
+            raise_server_exceptions=False,
+        ) as opened:
+            yield opened
+    finally:
+        main_module.app.dependency_overrides.clear()
+        down.dispose()
+
+
+class TestReadinessProbe:
+    """The readiness route reports whether the database can be read.
+
+    The liveness route answers unconditionally, so on its own it cannot
+    distinguish a process that is serving from one whose database is
+    unusable. These cases cover that distinction in both directions and
+    assert the refusal gives nothing away.
+    """
+
+    def test_a_reachable_database_answers_ready(self, client):
+        response = client.get(main_module.READINESS_PATH)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": main_module.READINESS_STATUS
+        }
+
+    def test_an_unreachable_database_is_answered_unavailable(
+        self, unreachable_client
+    ):
+        response = unreachable_client.get(main_module.READINESS_PATH)
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "status": main_module.NOT_READY_STATUS
+        }
+
+    def test_liveness_still_answers_while_readiness_refuses(
+        self, unreachable_client
+    ):
+        """One process, two probes, two different reports."""
+        liveness = unreachable_client.get("/health")
+        readiness = unreachable_client.get(main_module.READINESS_PATH)
+
+        assert liveness.status_code == 200
+        assert liveness.json() == {"status": main_module.HEALTH_STATUS}
+        assert readiness.status_code == 503
+
+    def test_the_refusal_names_no_internal_detail(
+        self, unreachable_client
+    ):
+        """The body carries the outcome and nothing about the cause."""
+        response = unreachable_client.get(main_module.READINESS_PATH)
+
+        assert set(response.json()) == {"status"}
+
+        body = response.text.lower()
+        for leaked in (
+            "select",
+            "psycopg2",
+            "sqlalchemy",
+            "traceback",
+            "operationalerror",
+            "127.0.0.1",
+            "unreachable",
+            "backend",
+        ):
+            assert leaked not in body, leaked
+
+    def test_the_refusal_carries_the_protective_headers(
+        self, unreachable_client
+    ):
+        """A refused probe is still a governed response."""
+        response = unreachable_client.get(main_module.READINESS_PATH)
+
+        for header, value in main_module.SECURITY_HEADERS.items():
+            assert response.headers.get(header) == value
+
+    def test_the_refusal_is_recorded_through_the_logger(
+        self, unreachable_client, records
+    ):
+        """The cause is recorded rather than returned."""
+        response = unreachable_client.get(main_module.READINESS_PATH)
+        assert response.status_code == 503
+
+        matching = [
+            record
+            for record in records
+            if record.getMessage()
+            == main_module.READINESS_FAILURE_MESSAGE
+        ]
+
+        assert matching, [record.getMessage() for record in records]
+        recorded = matching[0]
+        assert recorded.levelno == logging.ERROR
+        assert getattr(recorded, "exception_type", "")
+        assert not recorded.exc_info
 
 
 class TestShutdownDrainReporting:

@@ -99,6 +99,19 @@ REFUSED_OFFSETS = (
     "9" * 200,
 )
 
+# Page sizes a paged read must refuse: the first value above the
+# configured cap, a value far above it, the first value the database could
+# not bind, a page of nothing, a negative page, and a value that is not a
+# number at all.
+REFUSED_PAGE_SIZES = (
+    str(settings.MAX_PAGE_SIZE + 1),
+    str(settings.MAX_PAGE_SIZE * 1000),
+    str(2 ** 63),
+    "0",
+    "-1",
+    "all",
+)
+
 # Script elements carrying their own content rather than a source.
 INLINE_SCRIPT = re.compile(
     r"<script(?![^>]*\bsrc\b)[^>]*>(.*?)</script>",
@@ -332,6 +345,112 @@ class TestPagedOffsetIsBounded:
     )
     def test_neither_read_declares_a_ceiling_of_its_own(self, module):
         assert not hasattr(module, "MAX_PAGINATION_OFFSET")
+
+
+class TestPagedSizeIsBounded:
+    """A paged read refuses a page size above the configured cap.
+
+    The cap is what keeps one anonymous request from making the database
+    walk the whole corpus, so it is asserted through the application on
+    both paged reads rather than only in the published schema: a change
+    that kept the schema's ``maximum`` annotation while reading the value
+    somewhere the annotation does not govern would satisfy a document
+    assertion and still serve an unbounded page.
+
+    The values refused are derived from ``settings.MAX_PAGE_SIZE``, so a
+    deployment that raises the cap does not have to edit these cases.
+    """
+
+    def test_the_bound_is_a_positive_operational_cap(self):
+        assert settings.MAX_PAGE_SIZE >= 1
+
+    def test_the_default_page_never_exceeds_the_cap(self):
+        """Each read's default is admitted by its own bound."""
+        for module in (listings_module, filters_module):
+            assert module.DEFAULT_PAGE_SIZE <= settings.MAX_PAGE_SIZE
+            assert module.DEFAULT_PAGE_SIZE >= 1
+
+    @pytest.mark.parametrize("limit", REFUSED_PAGE_SIZES)
+    def test_the_public_read_refuses_a_limit_above_the_cap(
+        self, client, limit
+    ):
+        response = client.get("/listings/", params={"limit": limit})
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+
+    @pytest.mark.parametrize("limit", REFUSED_PAGE_SIZES)
+    def test_the_owned_read_refuses_a_limit_above_the_cap(
+        self, client, registered_user, limit
+    ):
+        response = client.get(
+            "/filters/",
+            params={"limit": limit},
+            headers=bearer(registered_user),
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+
+    def test_the_public_read_still_serves_the_cap_itself(self, client):
+        response = client.get(
+            "/listings/", params={"limit": str(settings.MAX_PAGE_SIZE)}
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_the_owned_read_still_serves_the_cap_itself(
+        self, client, registered_user
+    ):
+        response = client.get(
+            "/filters/",
+            params={"limit": str(settings.MAX_PAGE_SIZE)},
+            headers=bearer(registered_user),
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_the_public_read_serves_a_page_of_one(self, client, db):
+        """The smallest admitted page is honoured, not just accepted."""
+        for rent in (2100.0, 2200.0, 2300.0):
+            recorded = datetime.now(timezone.utc)
+            db.add(
+                ListingModel(
+                    created_at=recorded,
+                    updated_at=recorded,
+                    rent=rent,
+                )
+            )
+        db.commit()
+
+        response = client.get("/listings/", params={"limit": "1"})
+
+        assert response.status_code == 200
+        assert len(response.json()) == 1
+
+    def test_the_cap_bounds_the_page_the_corpus_can_return(
+        self, client, db
+    ):
+        """A corpus larger than the cap is served the cap, not itself."""
+        for index in range(settings.MAX_PAGE_SIZE + 5):
+            recorded = datetime.now(timezone.utc)
+            db.add(
+                ListingModel(
+                    created_at=recorded,
+                    updated_at=recorded,
+                    rent=1000.0 + index,
+                )
+            )
+        db.commit()
+
+        served = client.get(
+            "/listings/", params={"limit": str(settings.MAX_PAGE_SIZE)}
+        )
+        refused = client.get(
+            "/listings/", params={"limit": str(settings.MAX_PAGE_SIZE + 1)}
+        )
+
+        assert served.status_code == 200
+        assert len(served.json()) == settings.MAX_PAGE_SIZE
+        assert refused.status_code == 422
 
 
 class TestSavedFilterHoldsSeveralPredicates:

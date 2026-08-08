@@ -82,13 +82,15 @@ from typing import (
     Tuple,
 )
 
-from fastapi import FastAPI, status
+from fastapi import Depends, FastAPI, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.utils import is_body_allowed_for_status_code
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import (
@@ -134,8 +136,13 @@ __all__ = [
     "INVALID_HOST_DETAIL",
     "INVALID_REQUEST_DETAIL",
     "LOG_DRAIN_INCOMPLETE_MESSAGE",
+    "NOT_READY_STATUS",
     "OAUTH2_REDIRECT_PATH",
     "OPENAPI_PATH",
+    "READINESS_FAILURE_MESSAGE",
+    "READINESS_PATH",
+    "READINESS_STATEMENT",
+    "READINESS_STATUS",
     "REDOC_PATH",
     "REQUEST_ID_FIELD",
     "REQUEST_ID_HEADER",
@@ -159,6 +166,7 @@ __all__ = [
     "http_exception_handler",
     "limiter",
     "rate_limit_exceeded_handler",
+    "readiness_check",
     "unhandled_exception_handler",
     "validation_exception_handler",
 ]
@@ -224,6 +232,21 @@ TOO_MANY_REQUESTS_DETAIL = "Too many requests"
 INVALID_HOST_DETAIL = "Invalid host header"
 
 HEALTH_STATUS = "ok"
+
+#: Path the readiness probe is published at.
+READINESS_PATH = "/health/ready"
+
+#: Status reported when every dependency the probe reads answered.
+READINESS_STATUS = "ready"
+
+#: Status reported when a dependency the probe reads did not answer.
+NOT_READY_STATUS = "unavailable"
+
+#: Statement the readiness probe reads the database with.
+READINESS_STATEMENT = text("SELECT 1")
+
+#: Message recorded when the readiness probe cannot read the database.
+READINESS_FAILURE_MESSAGE = "readiness probe could not read the database"
 
 #: Path the interactive documentation is published at.
 DOCS_PATH = "/docs"
@@ -353,6 +376,7 @@ _RESPONSE_START_MESSAGE = "http.response.start"
 # ``app.state.limiter`` below.
 from backend.app.api.endpoints.auth import limiter  # noqa: E402
 from backend.app.api.router import api_router  # noqa: E402
+from backend.app.db.database import get_db  # noqa: E402
 from backend.app.services.paypal_service import (  # noqa: E402
     close_http_client,
     open_http_client,
@@ -1098,3 +1122,24 @@ app.include_router(api_router)
 def health_check() -> Dict[str, str]:
     """Reports that the process is able to serve requests."""
     return {"status": HEALTH_STATUS}
+
+
+@app.get(READINESS_PATH)
+def readiness_check(
+    response: Response,
+    db: Session = Depends(get_db),
+) -> Dict[str, str]:
+    """Reports whether the database this process reads is reachable.
+
+    Reads one statement through the session dependency and answers
+    ``503`` when it does not complete. The body names the outcome and
+    nothing else, and a failure is recorded through the redacting
+    logger.
+    """
+    try:
+        db.execute(READINESS_STATEMENT)
+    except Exception as error:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        log_exception(logger, READINESS_FAILURE_MESSAGE, error)
+        return {"status": NOT_READY_STATUS}
+    return {"status": READINESS_STATUS}

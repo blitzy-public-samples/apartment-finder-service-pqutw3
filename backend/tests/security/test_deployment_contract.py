@@ -56,6 +56,7 @@ import yaml
 from conftest import REPO_ROOT
 
 from backend.app.core.config import Settings
+from backend.app.main import READINESS_PATH
 
 #: Compose file under test.
 COMPOSE_PATH = REPO_ROOT / "infrastructure" / "docker" / "docker-compose.yml"
@@ -112,6 +113,14 @@ PROXY_SERVICE = "cloud-sql-proxy"
 
 #: Variable naming the instance the proxy connects to.
 PROXY_INSTANCE_VARIABLE = "CLOUD_SQL_INSTANCE_CONNECTION_NAME"
+
+#: Project name the stack declares. It prefixes every container, the
+#: network and the db-data volume the stack creates.
+EXPECTED_PROJECT_NAME = "apartment-finder"
+
+#: Top-level key Compose no longer reads and warns about on every
+#: invocation while it is present.
+OBSOLETE_TOP_LEVEL_KEY = "version"
 
 #: Text fragments that mark a value a human is expected to edit in place.
 FORBIDDEN_MARKERS = (
@@ -295,6 +304,29 @@ def _documented_variables():
             r"^([A-Z][A-Z0-9_]*)=",
             ENVIRONMENT_EXAMPLE.read_text(encoding="utf-8"),
             re.MULTILINE,
+        )
+    )
+
+
+def _documented_values():
+    """Returns the value ``.env.example`` ships for each variable."""
+    return dict(
+        (match.group(1), match.group(2))
+        for match in re.finditer(
+            r"^([A-Z][A-Z0-9_]*)=(.*)$",
+            ENVIRONMENT_EXAMPLE.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+    )
+
+
+def _compose_required_variables():
+    """Returns the variables the Compose file marks required."""
+    return set(
+        match.group(1)
+        for match in re.finditer(
+            r"\$\{([A-Z][A-Z0-9_]*)" + re.escape(REQUIRED_OPERATOR),
+            _compose_text(),
         )
     )
 
@@ -562,17 +594,63 @@ def test_the_database_password_is_required_rather_than_defaulted():
     assert SUBSTITUTION.match(value).group("operator") == REQUIRED_OPERATOR
 
 
-def test_the_proxy_service_requires_its_instance_name():
-    """Asserts the proxy target is substituted and reachable.
+def test_the_proxy_target_is_substituted_and_defaulted():
+    """Asserts the proxy target renders under every profile.
 
-    The instance name is required rather than defaulted, and the proxy
-    is declared to listen on every interface so the backend service can
-    reach it across the Compose network.
+    The instance name carries a default, so the document interpolates
+    whichever profile is selected. The default carries no colon, so it
+    is not a well-formed ``project:region:instance`` value and the proxy
+    exits naming it. The proxy is declared to listen on every interface
+    so the backend service can reach it across the Compose network.
     """
     command = " ".join(_service(PROXY_SERVICE)["command"])
+    defaulted = "${" + PROXY_INSTANCE_VARIABLE + DEFAULT_OPERATOR
+    demanded = "${" + PROXY_INSTANCE_VARIABLE + REQUIRED_OPERATOR
 
-    assert "${" + PROXY_INSTANCE_VARIABLE + ":?" in command
+    assert defaulted in command
+    assert demanded not in command
     assert "tcp:0.0.0.0:5432" in command
+
+    start = command.index(defaulted) + len(defaulted)
+    fallback = command[start:command.index("}", start)]
+
+    assert fallback.strip()
+    assert ":" not in fallback
+
+
+def test_every_required_variable_is_shipped_with_a_value():
+    """Asserts a verbatim copy of the template renders the document.
+
+    Compose resolves every substitution before it applies the profile
+    filter, so a name marked required stops an invocation under any
+    profile while the template ships that name empty. A variable only
+    one profile's service consumes is defaulted rather than required.
+    """
+    shipped = _documented_values()
+    required = _compose_required_variables()
+
+    assert required, "the file marks a variable required"
+
+    for name in sorted(required):
+        assert name in shipped, name
+        assert shipped[name].strip(), name
+
+
+def test_the_file_declares_no_obsolete_version_element():
+    """Asserts the document carries no top-level version key.
+
+    Compose ignores the key and warns about it on every invocation.
+    """
+    assert OBSOLETE_TOP_LEVEL_KEY not in _compose_document()
+
+
+def test_the_file_names_the_project_it_starts():
+    """Asserts the stack declares its own project name.
+
+    The name prefixes every container, the network and the db-data
+    volume, rather than being taken from the parent directory.
+    """
+    assert _compose_document().get("name") == EXPECTED_PROJECT_NAME
 
 
 def test_the_proxy_answers_to_the_name_the_local_database_answers_to():
@@ -758,12 +836,18 @@ def test_every_service_that_declares_a_probe_is_covered_here():
     )
 
 
-def test_the_backend_probe_reads_the_health_route_the_application_serves():
-    """Asserts the probe addresses the served route on the served port."""
+def test_the_backend_probe_reads_the_readiness_route_it_serves():
+    """Asserts the probe addresses the served route on the served port.
+
+    The path asserted is the readiness route the application publishes,
+    named in full rather than by prefix: the liveness path is a prefix
+    of it, so a prefix match would accept either one.
+    """
     probe = " ".join(_service("backend")["healthcheck"]["test"])
     exposed = _exposed_port(BACKEND_DOCKERFILE)
+    served = "http://127.0.0.1:" + str(exposed) + READINESS_PATH
 
-    assert "http://127.0.0.1:" + str(exposed) + "/health" in probe
+    assert served in probe
 
 
 def test_every_frontend_argument_the_build_discards_is_recorded():

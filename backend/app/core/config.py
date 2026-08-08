@@ -111,6 +111,7 @@ __all__ = [
     "PAYPAL_MODES",
     "PRODUCTION_ENVIRONMENT",
     "RATE_LIMIT_STORAGE_SCHEMES",
+    "REPOSITORY_ROOT",
     "SANDBOX_MODE",
     "SECRET_BACKENDS",
     "SHARED_RATE_LIMIT_STORAGE_SCHEMES",
@@ -147,9 +148,19 @@ SANDBOX_MODE = "sandbox"
 #: the only source.
 ENV_FILE_VARIABLE = "ENV_FILE"
 
+#: Directory the repository is checked out at: four levels above this
+#: module, which lives at ``backend/app/core/config.py``.
+REPOSITORY_ROOT = os.path.dirname(
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+)
+
 #: File settings are also read from when :data:`ENV_FILE_VARIABLE` is
-#: absent from the process environment.
-DEFAULT_ENV_FILE = ".env"
+#: absent from the process environment. It is an absolute path under
+#: :data:`REPOSITORY_ROOT`, so the same file is read whichever directory
+#: the process was started in.
+DEFAULT_ENV_FILE = os.path.join(REPOSITORY_ROOT, ".env")
 
 #: PayPal environment name that identifies live credentials.
 LIVE_MODE = "live"
@@ -728,6 +739,11 @@ def _configured_env_file() -> Optional[str]:
     :data:`ENV_FILE_VARIABLE` is absent from the process environment,
     and ``None`` when it is present and names nothing. A process that
     supplies every setting itself therefore reads no file.
+
+    The default is an absolute path under :data:`REPOSITORY_ROOT`, so the
+    file a process reads does not depend on the directory it was started
+    in. A value supplied through :data:`ENV_FILE_VARIABLE` is used as
+    given, so a relative one is still resolved against that directory.
     """
     declared = os.environ.get(ENV_FILE_VARIABLE)
     if declared is None:

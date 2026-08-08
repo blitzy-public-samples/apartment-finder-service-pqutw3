@@ -216,3 +216,8 @@ scripts/
 # Test suites
 tests/
 **/tests/
+
+# Development dependency manifest. The runtime manifest requirements.txt is
+# copied by the image definition and is not matched by either pattern below.
+requirements-dev.txt
+**/requirements-dev.txt

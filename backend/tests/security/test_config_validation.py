@@ -66,6 +66,8 @@ from backend.app.core.config import (
     ENV_FILE_VARIABLE,
     IN_PROCESS_RATE_LIMIT_SCHEMES,
     LIVE_MODE,
+    MANAGED_BACKEND_NAME,
+    MANAGED_SECRET_SETTINGS,
     MAX_PAGINATION_OFFSET_CEILING,
     MIN_PROVIDER_SECRET_LENGTH,
     MIN_SIGNING_KEY_BYTES,
@@ -272,6 +274,11 @@ def _child_environment(overrides: Dict[str, Any]) -> Dict[str, str]:
     root as the import path, the complete valid baseline, and
     ``overrides`` applied over that baseline. A value of ``None`` removes
     the name instead of setting it.
+
+    :data:`ENV_FILE_VARIABLE` is set to an empty value, so the child
+    reads no environment file at all and its whole configuration is the
+    baseline plus ``overrides``. That is asserted rather than assumed by
+    :func:`test_a_child_interpreter_reads_no_environment_file`.
     """
     environment = dict(
         (name, os.environ[name])
@@ -280,6 +287,7 @@ def _child_environment(overrides: Dict[str, Any]) -> Dict[str, str]:
     )
     environment["PYTHONPATH"] = str(REPO_ROOT)
     environment["PYTHONIOENCODING"] = "utf-8"
+    environment[ENV_FILE_VARIABLE] = ""
     for name, value in valid_settings().items():
         environment[name] = _as_environment_value(value)
     for name, value in overrides.items():
@@ -331,10 +339,10 @@ def start_interpreter(
 ) -> StartupOutcome:
     """Returns what a fresh interpreter did importing ``module``.
 
-    The child runs in a directory of its own, so the repository's
-    environment file is not on the relative path
-    ``Settings.Config.env_file`` names, and its whole configuration is
-    the baseline plus ``overrides``. It writes :data:`STARTUP_MARKER` to
+    The child is handed :data:`ENV_FILE_VARIABLE` empty, so it reads no
+    environment file and its whole configuration is the baseline plus
+    ``overrides``. It also runs in a directory of its own, so nothing it
+    writes touches the repository. It writes :data:`STARTUP_MARKER` to
     standard output once the import has returned, and is abandoned after
     :data:`STARTUP_TIMEOUT_SECONDS`.
     """
@@ -968,6 +976,139 @@ class TestEnvironmentFileSelection:
         monkeypatch.setenv(ENV_FILE_VARIABLE, " local.env ")
 
         assert _configured_env_file() == "local.env"
+
+    def test_the_default_file_is_addressed_absolutely(self):
+        """The default names one file, whatever the working directory.
+
+        A relative default is resolved against the directory the process
+        was started in, so the same command reads a different file -- or
+        no file -- depending on where it was run. The default is anchored
+        on the repository root instead, which is what makes the
+        documented startup command work from any directory.
+        """
+        assert os.path.isabs(DEFAULT_ENV_FILE)
+        assert os.path.dirname(DEFAULT_ENV_FILE) == str(REPO_ROOT)
+        assert os.path.basename(DEFAULT_ENV_FILE) == ".env"
+
+    def test_the_default_file_does_not_follow_the_working_directory(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv(ENV_FILE_VARIABLE, raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        assert _configured_env_file() == DEFAULT_ENV_FILE
+
+
+class TestAManagedSecretBackendRequiresTheEnvironment:
+    """Managed secrets must arrive as variables, not from a file.
+
+    ``SECRET_BACKEND`` naming the managed backend is a statement that the
+    deployment's secrets come from a secret manager, delivered to the
+    process as environment variables. The check exists so that such a
+    deployment cannot silently fall back on a file committed or copied
+    into the image: a value that is only in a file is treated as absent.
+
+    The autouse fixture above removes every setting name from the process
+    environment, so each case here places back exactly what it means to
+    supply.
+    """
+
+    @staticmethod
+    def _supply(monkeypatch, values):
+        """Places ``values`` in the process environment."""
+        for name, value in values.items():
+            monkeypatch.setenv(name, value)
+
+    def _managed(self, monkeypatch, **overrides):
+        """Supplies every managed setting, then applies ``overrides``."""
+        supplied = dict(
+            (name, str(valid_settings()[name]))
+            for name in MANAGED_SECRET_SETTINGS
+        )
+        supplied.update(overrides)
+        self._supply(monkeypatch, supplied)
+        return build_settings(SECRET_BACKEND=MANAGED_BACKEND_NAME)
+
+    def test_the_default_backend_requires_nothing_of_the_environment(
+        self,
+    ):
+        """The check applies to the managed backend only."""
+        assert build_settings().SECRET_BACKEND == "env"
+
+    def test_every_managed_value_supplied_is_accepted(self, monkeypatch):
+        built = self._managed(monkeypatch)
+
+        assert built.SECRET_BACKEND == MANAGED_BACKEND_NAME
+
+    @pytest.mark.parametrize("absent", list(MANAGED_SECRET_SETTINGS))
+    def test_a_managed_value_missing_from_the_environment_is_refused(
+        self, monkeypatch, absent
+    ):
+        supplied = dict(
+            (name, str(valid_settings()[name]))
+            for name in MANAGED_SECRET_SETTINGS
+            if name != absent
+        )
+        self._supply(monkeypatch, supplied)
+
+        message = rejection_message(SECRET_BACKEND=MANAGED_BACKEND_NAME)
+
+        assert absent in message
+        assert MANAGED_BACKEND_NAME in message
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_a_managed_value_present_but_blank_counts_as_absent(
+        self, monkeypatch, blank
+    ):
+        supplied = dict(
+            (name, str(valid_settings()[name]))
+            for name in MANAGED_SECRET_SETTINGS
+        )
+        supplied["SENDGRID_API_KEY"] = blank
+        self._supply(monkeypatch, supplied)
+
+        message = rejection_message(SECRET_BACKEND=MANAGED_BACKEND_NAME)
+
+        assert "SENDGRID_API_KEY" in message
+
+    def test_the_refusal_names_every_value_that_is_missing(
+        self, monkeypatch
+    ):
+        message = rejection_message(SECRET_BACKEND=MANAGED_BACKEND_NAME)
+
+        for name in MANAGED_SECRET_SETTINGS:
+            assert name in message
+
+    def test_a_lower_case_variable_name_still_supplies_the_value(
+        self, monkeypatch
+    ):
+        """The environment is read case-insensitively, as pydantic does."""
+        supplied = dict(
+            (name.lower(), str(valid_settings()[name]))
+            for name in MANAGED_SECRET_SETTINGS
+        )
+        self._supply(monkeypatch, supplied)
+
+        built = build_settings(SECRET_BACKEND=MANAGED_BACKEND_NAME)
+
+        assert built.SECRET_BACKEND == MANAGED_BACKEND_NAME
+
+    def test_every_managed_setting_is_one_the_class_declares(self):
+        for name in MANAGED_SECRET_SETTINGS:
+            assert name in Settings.__fields__
+
+
+def test_a_child_interpreter_reads_no_environment_file():
+    """The startup harness supplies settings and reads no file.
+
+    Every startup case here decides what a fresh interpreter was handed,
+    so a file contributing a value would make an absent setting look
+    present. The harness switches file loading off explicitly rather than
+    relying on the child's working directory.
+    """
+    environment = _child_environment({})
+
+    assert environment[ENV_FILE_VARIABLE] == ""
 
 
 class TestTheSuiteRunsOnIsolatedConfiguration:

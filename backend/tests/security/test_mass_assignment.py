@@ -74,6 +74,7 @@ from sqlalchemy import text
 from backend.app.core.authorization import Role
 from backend.app.core.security import verify_password
 from backend.app.db.models import Listing as ListingModel, User
+from backend.app.schema.user import User as UserResponse
 from backend.tests.support import VALID_TEST_PASSWORD
 
 #: Route the listing contract is exercised on. The trailing slash is
@@ -110,6 +111,14 @@ AUDIT_LOGGER_NAME = "alembic.runtime.migration"
 
 #: Members ``POST /auth/register`` nests under ``user``.
 REGISTERED_USER_MEMBERS = frozenset({"id", "email"})
+
+#: Every field :class:`backend.app.schema.user.User` declares. The
+#: response model is the contract a user record is published under, and
+#: the set is asserted exactly, so a column of ``users`` added to it --
+#: the stored credential above all -- fails rather than reaching a body.
+USER_RESPONSE_FIELDS = frozenset(
+    {"id", "email", "created_at", "last_login"}
+)
 
 #: Members ``POST /auth/login`` returns.
 LOGIN_MEMBERS = frozenset({"access_token", "token_type"})
@@ -653,6 +662,38 @@ def test_no_credential_response_carries_a_stored_password_hash(
     stored = stored_user(db, ORDINARY_EMAIL)
     assert stored is not None
     assert stored.hashed_password.startswith(BCRYPT_PREFIXES)
+
+
+def test_the_user_response_contract_declares_no_credential_field():
+    """Assert the user response model cannot carry a stored credential.
+
+    The endpoints build their credential responses as explicit
+    dictionaries, so the cases above cover what those routes actually
+    return. This case covers the declared contract itself, which no route
+    currently returns: it is the model a later response would be built
+    from, and a hash field added to it would otherwise reach a body with
+    nothing failing.
+
+    The assertion is on the exact declared field set rather than on the
+    absence of one name, so a credential added under any name -- and any
+    other column of ``users`` added by accident -- fails here.
+    """
+    assert set(UserResponse.__fields__) == USER_RESPONSE_FIELDS
+    assert HASH_FIELD_NAME not in UserResponse.__fields__
+    for name in UserResponse.__fields__:
+        assert "password" not in name
+        assert "secret" not in name
+    assert UserResponse.Config.orm_mode is True
+
+
+def test_the_user_response_contract_covers_the_credential_responses():
+    """Assert the declared contract carries what the routes return.
+
+    ``POST /auth/register`` nests :data:`REGISTERED_USER_MEMBERS` under
+    ``user``. Those members are declared by the model, so the model is
+    the wider contract and the routes disclose a subset of it.
+    """
+    assert REGISTERED_USER_MEMBERS <= set(UserResponse.__fields__)
 
 
 def test_no_listing_response_carries_a_stored_password_hash(
