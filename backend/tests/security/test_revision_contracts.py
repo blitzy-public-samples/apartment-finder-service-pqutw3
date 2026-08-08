@@ -25,6 +25,8 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
+from backend.tests.support import enforce_sqlite_foreign_keys
+
 #: Directory holding the revision modules.
 VERSIONS_DIR = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -223,8 +225,12 @@ def _administrator_count(connection):
 
 @pytest.fixture
 def connection():
-    """Yields a connection to an empty temporary SQLite database."""
-    engine = sa.create_engine("sqlite://")
+    """Yields a connection to an empty temporary SQLite database.
+
+    Foreign keys are enforced on the connection, and a row naming a
+    parent that is not stored is refused.
+    """
+    engine = enforce_sqlite_foreign_keys(sa.create_engine("sqlite://"))
     conn = engine.connect()
     try:
         yield conn

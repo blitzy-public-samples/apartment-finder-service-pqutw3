@@ -21,6 +21,8 @@ It publishes:
   a configured one
 * :data:`CLIENT_BASE_URL` -- the base URL every test client is opened on
 * :func:`bearer_header` -- the ``Authorization`` header carrying a token
+* :func:`enforce_sqlite_foreign_keys` -- the registration that makes a
+  SQLite engine enforce the foreign keys the models declare
 
 Usage::
 
@@ -29,7 +31,9 @@ Usage::
 
 import os
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
+
+from sqlalchemy import event
 
 #: Absolute path of the repository root, two directories above this
 #: file.
@@ -146,3 +150,25 @@ def apply_test_settings() -> Dict[str, str]:
 def bearer_header(token: str) -> Dict[str, str]:
     """Return the ``Authorization`` header mapping carrying ``token``."""
     return {"Authorization": "Bearer {0}".format(token)}
+
+
+def enforce_sqlite_foreign_keys(engine: Any) -> Any:
+    """Enforce foreign keys on every connection ``engine`` opens.
+
+    SQLite accepts a foreign key in a table definition but does not
+    enforce it until ``PRAGMA foreign_keys`` is set, and the setting is
+    per connection. Registering it on connect leaves every foreign key
+    the models and the revisions declare enforced for the whole test, so
+    a row naming a parent that is not stored is refused. Returns
+    ``engine`` itself, unchanged apart from the registration.
+    """
+
+    @event.listens_for(engine, "connect")
+    def _set_pragma(dbapi_connection: Any, connection_record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
+
+    return engine

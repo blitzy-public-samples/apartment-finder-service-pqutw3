@@ -13,6 +13,15 @@ RUN npm ci
 # Copy the rest of the application code
 COPY . .
 
+# Build-time configuration the bundle carries. Create React App inlines
+# every REACT_APP_* variable present in the build environment, so each
+# name docker-compose.yml passes as a build argument is declared here and
+# exported into the environment before the build command below runs.
+ARG REACT_APP_API_BASE_URL
+ARG REACT_APP_PAYPAL_CLIENT_ID
+ENV REACT_APP_API_BASE_URL=$REACT_APP_API_BASE_URL \
+    REACT_APP_PAYPAL_CLIENT_ID=$REACT_APP_PAYPAL_CLIENT_ID
+
 # Build the React app
 RUN npm run build
 

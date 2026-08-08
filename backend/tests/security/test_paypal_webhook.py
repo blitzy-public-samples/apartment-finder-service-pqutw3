@@ -55,7 +55,12 @@ import httpx
 import pytest
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from conftest import assert_paypal_request
+from conftest import (
+    PayPalContractError,
+    assert_paypal_request,
+    assert_verifier_embeds_event,
+    embedded_event_bytes,
+)
 
 from backend.app.api.endpoints import subscriptions as subscriptions_module
 from backend.app.core.config import settings
@@ -206,6 +211,29 @@ HOSTILE_CERT_URLS = (
 )
 
 
+#: Notification bodies that are valid JSON objects but are not the
+#: compact serialisation this suite's other cases send. Each is
+#: delivered as-is so the postback document can be proved to carry the
+#: arrived bytes rather than a re-serialisation of their value.
+NON_CANONICAL_EVENT_BODIES = (
+    pytest.param(
+        b'{\n  "event_type" : "PAYMENT.CAPTURE.COMPLETED" ,\n'
+        b'  "id": "WH-H4-CAPTURE"\n}',
+        id="indented_with_spaced_separators",
+    ),
+    pytest.param(
+        b'{"id":"WH-H4-CAPTURE","event_type":'
+        b'"PAYMENT.CAPTURE.COMPLETED","note":"caf\\u00e9"}',
+        id="escaped_non_ascii_that_would_re_encode",
+    ),
+    pytest.param(
+        b'{"event_type":"PAYMENT.CAPTURE.COMPLETED","amount":1.50,'
+        b'"note":"caf\xc3\xa9"}',
+        id="literal_non_ascii_and_a_trailing_zero_number",
+    ),
+)
+
+
 class RecordedCall(object):
     """One outbound request as the stand-in transport received it."""
 
@@ -236,22 +264,40 @@ class RecordedCall(object):
         """Returns the decoded body this call transmitted."""
         return json.loads(self.content.decode("utf-8"))
 
+    def event_bytes(self):
+        """Returns the event field of this call as transmitted bytes."""
+        return embedded_event_bytes(self.content)
+
 
 class VerifierTransport(object):
     """Answers PayPal's endpoints and records every call it is handed.
 
     ``status`` is the ``verification_status`` the verify endpoint
-    reports. ``unreachable`` makes the verify call fail as a transport
-    error instead. No request leaves the process.
+    reports, and ``UNSET_STATUS`` makes it report no status field at all.
+    ``unreachable`` makes the verify call fail as a transport error.
+    ``verify_status_code`` is the HTTP status the verify endpoint answers
+    with, and ``verify_text`` replaces its JSON body with raw content, so
+    a body that is not an object can be served. ``token_status_code``
+    is the HTTP status the credential exchange answers with, so a grant
+    the provider refuses can be served. No request leaves the process.
     """
+
+    #: ``status`` value that omits the status field from the answer.
+    UNSET_STATUS = object()
 
     def __init__(
         self,
         status=paypal_service.VERIFICATION_SUCCESS,
         unreachable=False,
+        verify_status_code=200,
+        verify_text=None,
+        token_status_code=200,
     ):
         self.status = status
         self.unreachable = unreachable
+        self.verify_status_code = verify_status_code
+        self.verify_text = verify_text
+        self.token_status_code = token_status_code
         self.calls = []
 
         @asynccontextmanager
@@ -276,6 +322,11 @@ class VerifierTransport(object):
         call.route = assert_paypal_request(outbound)
         self.calls.append(call)
         if call.path == TOKEN_PATH:
+            if self.token_status_code != 200:
+                return httpx.Response(
+                    self.token_status_code,
+                    json={"error": "invalid_client"},
+                )
             return httpx.Response(
                 200,
                 json={
@@ -285,8 +336,17 @@ class VerifierTransport(object):
             )
         if self.unreachable:
             raise httpx.ConnectError("verifier unreachable")
+        if self.verify_text is not None:
+            return httpx.Response(
+                self.verify_status_code,
+                content=self.verify_text,
+                headers={"Content-Type": "application/json"},
+            )
+        if self.status is self.UNSET_STATUS:
+            return httpx.Response(self.verify_status_code, json={})
         return httpx.Response(
-            200, json={"verification_status": self.status}
+            self.verify_status_code,
+            json={"verification_status": self.status},
         )
 
     @property
@@ -484,6 +544,46 @@ LEFT_BY_COMMIT = "commit"
 
 #: Outcome recorded when the first delivery rolled its transaction back.
 LEFT_BY_ROLLBACK = "rollback"
+
+
+#: Every stand-in configuration under which the check cannot complete,
+#: as the keyword that produces it. Each must be reported as the
+#: verifier being unavailable and never as a rejected signature.
+UNCHECKABLE_ANSWERS = (
+    pytest.param("unreachable", True, id="verifier_unreachable"),
+    pytest.param(
+        "token_status_code", 401, id="grant_refused_401"
+    ),
+    pytest.param(
+        "token_status_code", 403, id="grant_refused_403"
+    ),
+    pytest.param(
+        "verify_status_code", 400, id="verifier_client_error_400"
+    ),
+    pytest.param(
+        "verify_status_code", 422, id="verifier_client_error_422"
+    ),
+    pytest.param(
+        "verify_status_code", 500, id="verifier_server_error_500"
+    ),
+    pytest.param(
+        "verify_status_code", 503, id="verifier_server_error_503"
+    ),
+    pytest.param(
+        "verify_text", b"not-json-at-all", id="body_is_not_json"
+    ),
+    pytest.param(
+        "verify_text", b'"SUCCESS"', id="body_is_not_an_object"
+    ),
+    pytest.param(
+        "status", VerifierTransport.UNSET_STATUS, id="status_absent"
+    ),
+    pytest.param("status", None, id="status_is_null"),
+    pytest.param("status", 1, id="status_is_a_number"),
+    pytest.param("status", "", id="status_is_empty"),
+    pytest.param("status", "PENDING", id="status_is_unrecognised"),
+    pytest.param("status", "success", id="status_is_lower_case"),
+)
 
 
 class ConcurrentDeliveryBarrier(object):
@@ -795,6 +895,61 @@ async def test_a_verified_notification_posts_the_documented_fields(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("body", NON_CANONICAL_EVENT_BODIES)
+async def test_the_posted_document_carries_the_arrived_bytes_verbatim(
+    recorder, body
+):
+    """The event field is the byte sequence that arrived, not its value.
+
+    Each body is a valid JSON object whose serialisation differs from the
+    compact one this service would produce -- indented, with spaced
+    separators, with escaped or literal non-ASCII, or with a number
+    carrying a trailing zero. The assertion is on bytes, so a document
+    that decoded the notification and re-encoded it fails even though the
+    decoded values would compare equal.
+    """
+    outcome = await paypal_service.verify_webhook_signature(
+        webhook_headers(), body
+    )
+
+    assert outcome.verified is True
+    posted = recorder.verify_calls()
+    assert len(posted) == 1
+    assert_verifier_embeds_event(posted[0].content, body)
+    assert posted[0].event_bytes() == body
+    assert body in posted[0].content
+
+
+@pytest.mark.asyncio
+async def test_a_re_serialised_document_fails_the_byte_assertion(
+    recorder,
+):
+    """The byte assertion refuses a document rebuilt from parsed values.
+
+    This is the control for the case above: it proves the assertion is
+    not satisfied by any document carrying an equivalent value.
+    """
+    body = b'{\n  "event_type" : "PAYMENT.CAPTURE.COMPLETED"\n}'
+    rebuilt = json.dumps(json.loads(body.decode("utf-8"))).encode(
+        "utf-8"
+    )
+    document = (
+        b'{"webhook_id":"W","'
+        + paypal_service.WEBHOOK_EVENT_FIELD.encode("utf-8")
+        + b'":'
+        + rebuilt
+        + b"}"
+    )
+
+    assert rebuilt != body
+    assert json.loads(rebuilt.decode("utf-8")) == json.loads(
+        body.decode("utf-8")
+    )
+    with pytest.raises(PayPalContractError):
+        assert_verifier_embeds_event(document, body)
+
+
+@pytest.mark.asyncio
 async def test_a_tampered_signature_is_rejected(failing_recorder):
     outcome = await paypal_service.verify_webhook_signature(
         webhook_headers(signature=TAMPERED_SIG),
@@ -827,6 +982,78 @@ async def test_an_unreachable_verifier_is_reported_as_retryable():
     )
     assert outcome.retryable is True
     assert outcome.transmission_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyword, value", UNCHECKABLE_ANSWERS)
+async def test_an_answer_that_settles_nothing_is_reported_unavailable(
+    keyword, value
+):
+    """Only an explicit FAILURE is a signature rejection.
+
+    Every answer that leaves the check incomplete -- a refused grant, a
+    verifier status outside 2xx, a body that is not an object, an absent
+    status field, a status of another type and an unrecognised status --
+    is reported as the verifier being unavailable and as retryable, so
+    the route answers it 503 and PayPal delivers the notification again.
+    """
+    stand_in = VerifierTransport(**{keyword: value})
+
+    with patch(SERVICE + "._client", new=stand_in.open_client):
+        outcome = await paypal_service.verify_webhook_signature(
+            webhook_headers(),
+            notification_bytes(capture_completed_event()),
+        )
+
+    assert outcome.verified is False
+    assert outcome.reason == (
+        paypal_service.REASON_VERIFIER_UNAVAILABLE
+    )
+    assert outcome.retryable is True
+    assert outcome.transmission_id is None
+    assert outcome.event_type is None
+
+
+@pytest.mark.asyncio
+async def test_only_an_explicit_failure_is_a_signature_rejection():
+    """The reported FAILURE is the one value that rejects a signature."""
+    stand_in = VerifierTransport(
+        status=paypal_service.VERIFICATION_FAILURE
+    )
+
+    with patch(SERVICE + "._client", new=stand_in.open_client):
+        outcome = await paypal_service.verify_webhook_signature(
+            webhook_headers(),
+            notification_bytes(capture_completed_event()),
+        )
+
+    assert outcome.verified is False
+    assert outcome.reason == paypal_service.REASON_SIGNATURE
+    assert outcome.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_a_client_error_from_the_verifier_is_not_a_rejection(
+):
+    """A 4xx from the verifier is a check that did not complete.
+
+    The failure category underneath it is one the service does not
+    retry, so this case is what proves the outcome is decided by the
+    verification classification rather than by that category.
+    """
+    stand_in = VerifierTransport(verify_status_code=400)
+
+    with patch(SERVICE + "._client", new=stand_in.open_client):
+        outcome = await paypal_service.verify_webhook_signature(
+            webhook_headers(),
+            notification_bytes(capture_completed_event()),
+        )
+
+    assert outcome.reason != paypal_service.REASON_SIGNATURE
+    assert outcome.reason == (
+        paypal_service.REASON_VERIFIER_UNAVAILABLE
+    )
+    assert outcome.retryable is True
 
 
 @pytest.mark.asyncio
@@ -970,6 +1197,68 @@ def test_an_unverifiable_notification_changes_no_database_state(
         db.query(Subscription).one().status
         == subscriptions_module.PENDING_STATUS
     )
+
+
+@pytest.mark.parametrize("keyword, value", UNCHECKABLE_ANSWERS)
+def test_an_answer_that_settles_nothing_is_answered_503(
+    client, db, pending_subscription, keyword, value
+):
+    """Every could-not-check answer is 503 and changes no state.
+
+    Each case is driven through the route with the real verification
+    function and the real transport in place, so the status the route
+    returns is the one the classification produces rather than one a
+    stand-in asserted.
+    """
+    stand_in = VerifierTransport(**{keyword: value})
+    before = stored_state(db)
+
+    with patch(SERVICE + "._client", new=stand_in.open_client):
+        response = deliver(
+            client,
+            notification_bytes(capture_completed_event()),
+            webhook_headers(),
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        subscriptions_module.WEBHOOK_UNVERIFIABLE_DETAIL
+    )
+    assert stored_state(db) == before
+    assert db.query(WebhookEvent).count() == 0
+    assert (
+        db.query(Subscription).one().status
+        == subscriptions_module.PENDING_STATUS
+    )
+    assert db.query(Subscription).one().end_date is None
+
+
+def test_only_a_reported_failure_is_answered_400(
+    client, db, pending_subscription
+):
+    """The reported FAILURE is the one answer the route refuses as 400.
+
+    Paired with the case above, this proves the route separates a
+    notification the verifier rejected from one it could not check.
+    """
+    stand_in = VerifierTransport(
+        status=paypal_service.VERIFICATION_FAILURE
+    )
+    before = stored_state(db)
+
+    with patch(SERVICE + "._client", new=stand_in.open_client):
+        response = deliver(
+            client,
+            notification_bytes(capture_completed_event()),
+            webhook_headers(signature=TAMPERED_SIG),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        subscriptions_module.WEBHOOK_REJECTED_DETAIL
+    )
+    assert stored_state(db) == before
+    assert db.query(WebhookEvent).count() == 0
 
 
 def test_a_failed_verification_is_logged_without_the_signature(

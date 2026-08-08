@@ -42,7 +42,11 @@ class Listing(Base):
     available_date = Column(DateTime)
     street_address = Column(String)
     # Provider address a scheduled ingestion pass reconciles a record
-    # against.
+    # against. No uniqueness is declared over it, and revision 0001
+    # declares none either, so the mapped table and the migrated table
+    # agree: two rows may carry one address, and reconciliation is the
+    # query-then-write in
+    # backend/app/tasks/listing_updater.py rather than a constraint.
     zillow_url = Column(String)
 
 

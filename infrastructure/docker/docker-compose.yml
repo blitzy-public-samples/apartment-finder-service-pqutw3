@@ -81,9 +81,12 @@ services:
       dockerfile: ../infrastructure/docker/Dockerfile.frontend
       args:
         # The bundle is produced at build time and cannot read a runtime
-        # variable, so these are build arguments. The frontend image must
-        # declare a matching `ARG` for each before `npm run build` for the
-        # value to reach the bundle.
+        # variable, so these are build arguments. Dockerfile.frontend
+        # declares an `ARG` of each name and exports it ahead of
+        # `npm run build`, so both values are inlined into the built
+        # bundle. Both are read by the browser, so neither may carry a
+        # secret. The API origin is the published backend port, which the
+        # browser resolves itself rather than over the compose network.
         REACT_APP_API_BASE_URL: ${REACT_APP_API_BASE_URL:-http://localhost:8000}
         REACT_APP_PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:?PAYPAL_CLIENT_ID must be set}
     profiles:

@@ -571,6 +571,106 @@ def test_h2_an_unknown_plan_is_refused_before_any_row_or_payment_call(
     assert stored_rows(db) == []
 
 
+#: Order identifiers the provider must not be believed about. Each one
+#: either cannot address a provider path or cannot be told apart from a
+#: different identifier once stored, so none of them may reach the column.
+UNUSABLE_ORDER_IDENTIFIERS = (
+    pytest.param(None, id="identifier_absent"),
+    pytest.param(17, id="identifier_is_a_number"),
+    pytest.param(["ORDER-1"], id="identifier_is_a_list"),
+    pytest.param({"value": "ORDER-1"}, id="identifier_is_an_object"),
+    pytest.param("", id="identifier_is_empty"),
+    pytest.param("   ", id="identifier_is_whitespace_only"),
+    pytest.param("\t\n", id="identifier_is_a_tab_and_a_newline"),
+    pytest.param("A" * 65, id="identifier_is_over_the_ceiling"),
+    pytest.param("ORDER 1", id="identifier_carries_a_space"),
+    pytest.param("ORDER/../etc", id="identifier_traverses_the_path"),
+    pytest.param("ORDER%2F1", id="identifier_carries_an_escape"),
+    pytest.param("ORDER?query=1", id="identifier_carries_a_query"),
+    pytest.param("ORDER#fragment", id="identifier_carries_a_fragment"),
+    pytest.param("ORDER\n1", id="identifier_carries_a_newline"),
+    pytest.param("-ORDER-1", id="identifier_opens_with_a_separator"),
+)
+
+
+def order_reply_identified_by(identifier):
+    """Returns a created-order reply carrying ``identifier`` as its id.
+
+    ``None`` produces a reply carrying no identifier at all, which is how
+    an absent field is served rather than a null one.
+    """
+    body = {
+        'status': 'PAYER_ACTION_REQUIRED',
+        'links': [{'rel': 'payer-action', 'href': APPROVAL_URL}],
+    }
+    if identifier is not None:
+        body['id'] = identifier
+    return StandInResponse(200, body)
+
+
+@pytest.mark.parametrize("identifier", UNUSABLE_ORDER_IDENTIFIERS)
+def test_h3_an_unusable_provider_order_identifier_is_never_stored(
+    client, db, registered_user, auth_header_factory, identifier
+):
+    """A created order the provider cannot be addressed by is refused.
+
+    The value is served in the created-order response, so it is refused
+    on the way in from the provider rather than on the way in from a
+    client. The subscription is left failed carrying no order identifier,
+    so nothing is later interpolated into a provider path.
+    """
+    plan = get_plan(PREMIUM_MONTHLY)
+    reply = order_reply_identified_by(identifier)
+
+    with provider_transport([reply]):
+        response = open_subscription(
+            client,
+            auth_header_factory(registered_user),
+            {'plan_id': plan.plan_id},
+        )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    rows = stored_rows(db)
+    assert len(rows) == 1
+    assert rows[0].paypal_order_id is None
+    assert rows[0].status == subscriptions_module.FAILED_STATUS
+    assert rows[0].end_date is None
+
+
+def test_h3_a_padded_provider_order_identifier_is_stored_stripped(
+    client, db, registered_user, auth_header_factory
+):
+    """A padded identifier is stored as the value the path will carry."""
+    plan = get_plan(PREMIUM_MONTHLY)
+    reply = order_reply_identified_by('  ' + ORDER_ID + '\t')
+
+    with provider_transport([reply]):
+        response = open_subscription(
+            client,
+            auth_header_factory(registered_user),
+            {'plan_id': plan.plan_id},
+        )
+
+    assert response.status_code == 200
+    rows = stored_rows(db)
+    assert len(rows) == 1
+    assert rows[0].paypal_order_id == ORDER_ID
+    assert rows[0].status == subscriptions_module.PENDING_STATUS
+
+
+def test_h3_the_accepted_identifier_shape_is_a_bounded_path_segment():
+    """The reader accepts only a bounded URL-safe path segment."""
+    read = subscriptions_module._provider_order_id
+    ceiling = subscriptions_module.MAX_PROVIDER_ORDER_ID_LENGTH
+
+    assert read({'id': '5C1-2X_a.b~c'}) == '5C1-2X_a.b~c'
+    assert read({'id': 'A' * ceiling}) == 'A' * ceiling
+    assert read({'id': 'A' * (ceiling + 1)}) is None
+    assert read({}) is None
+    assert read(None) is None
+    assert read('not-a-mapping') is None
+
+
 def test_h2_the_catalog_is_the_only_source_of_plan_identifiers():
     assert PLAN_IDS == frozenset({PREMIUM_MONTHLY, PREMIUM_ANNUAL})
     assert set(CATALOG_PLAN_IDS) == set(PLAN_IDS)

@@ -48,6 +48,7 @@ from backend.app.core.security import (
 from backend.app.db import database as database_module
 from backend.app.db.models import Base, Criteria, Filter, User
 from backend.app.db.models import Listing as ListingModel
+from backend.tests.support import enforce_sqlite_foreign_keys
 from backend.app.main import (
     DOCS_PATH,
     DOCUMENTATION_ENABLED,
@@ -125,10 +126,12 @@ BASE_LISTING_RESPONSE = {
 
 @pytest.fixture
 def session_factory():
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
     )
     Base.metadata.create_all(bind=engine)
     yield sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -815,15 +818,14 @@ class TestListingUrlMustAddressTheProvider:
         assert projected.zillow_url == "https://legacy.example.net/1"
 
 
-class TestAListingIntegrityConflictIsNotAServerError:
-    """An integrity violation on the write path answers as 409.
+class TestAListingRefusedByTheDatabaseIsOneFixedError:
+    """Every database refusal on the write path answers the same way.
 
-    Revision 0001 adds no uniqueness over the address column, so a
-    repeated address is stored rather than refused. The conflict
-    branch still exists for any integrity violation the database
-    does raise, and the point of it is that such a violation is
-    reported as a deterministic outcome of the request rather than
-    as a database failure that leaks internals.
+    Revision 0001 adds no uniqueness over the address column, and a
+    repeated address is stored rather than refused. Whatever the
+    database does refuse -- an integrity violation included -- is rolled
+    back and answered with the one recorded detail, and the response
+    names neither the constraint nor the statement.
     """
 
     #: Address both write attempts carry.
@@ -853,7 +855,7 @@ class TestAListingIntegrityConflictIsNotAServerError:
         ]
         assert {row.zillow_url for row in stored} == {self.ADDRESS}
 
-    def test_an_integrity_violation_is_refused_as_a_conflict(
+    def test_an_integrity_violation_is_refused_as_a_server_error(
         self, client, db, admin_user, monkeypatch
     ):
         def refuse(self_, *args, **kwargs):
@@ -861,23 +863,30 @@ class TestAListingIntegrityConflictIsNotAServerError:
 
         monkeypatch.setattr(Session, "commit", refuse)
         response = self._create(client, admin_user)
-        assert response.status_code == 409
+        assert response.status_code == 500
         assert response.json() == {
-            "detail": listings_module.LISTING_DUPLICATE_DETAIL
+            "detail": listings_module.LISTING_NOT_STORED_DETAIL
         }
 
-    def test_the_conflict_is_not_reported_as_a_database_failure(
+    def test_no_refusal_names_the_constraint_the_database_refused(
         self, client, db, admin_user, monkeypatch
     ):
         def refuse(self_, *args, **kwargs):
-            raise IntegrityError("insert", {}, Exception("unique"))
+            raise IntegrityError(
+                "insert", {}, Exception("uq_listings_zillow_url")
+            )
 
         monkeypatch.setattr(Session, "commit", refuse)
         response = self._create(client, admin_user)
-        assert response.status_code != 500
-        assert response.json()["detail"] != (
-            listings_module.LISTING_NOT_STORED_DETAIL
-        )
+        body = response.text
+        assert "uq_listings_zillow_url" not in body
+        assert "insert" not in body
+        assert response.json() == {
+            "detail": listings_module.LISTING_NOT_STORED_DETAIL
+        }
+
+    def test_the_module_publishes_no_duplicate_specific_refusal(self):
+        assert not hasattr(listings_module, "LISTING_DUPLICATE_DETAIL")
 
     def test_a_distinct_address_is_still_accepted(
         self, client, db, admin_user

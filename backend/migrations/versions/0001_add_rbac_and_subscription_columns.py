@@ -30,6 +30,15 @@ holding the six tables that precede it. Offline, no database is present
 to inspect, so ``--sql`` emits the additive statements unconditionally,
 for a database already holding those six tables.
 
+``listings`` is one of the tables created only when absent, and it is
+created with no uniqueness over ``zillow_url``. The mapped
+:class:`backend.app.db.models.Listing` declares none either, so the two
+agree: a repeated provider address is stored rather than refused, a
+database already holding repeated addresses applies this revision
+unchanged, and ``backend/app/tasks/listing_updater.py`` reconciles by
+reading the earliest row carrying the value rather than by relying on a
+constraint.
+
 Revision ID: 0001
 Revises:
 Create Date: 2026-08-08 09:14:22.517394
@@ -219,7 +228,11 @@ def _create_users():
 
 
 def _create_listings():
-    """Create ``listings`` as the schema preceding this revision has it."""
+    """Create ``listings`` as the schema preceding this revision has it.
+
+    No uniqueness is declared over ``zillow_url``, matching both the
+    preceding schema and the mapped table.
+    """
     op.create_table(
         LISTINGS,
         sa.Column("id", sa.Integer(), nullable=False),

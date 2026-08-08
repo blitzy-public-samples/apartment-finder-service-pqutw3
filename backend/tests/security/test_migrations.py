@@ -27,6 +27,8 @@ What is asserted:
 * the seeded account's stored password verifies against no candidate
 * an upgrade finding a second administrative account raises and writes
   nothing
+* the schema the revisions leave behind refuses an ownership row naming
+  an account that is not stored, on both lineages
 
 Usage::
 
@@ -43,6 +45,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.core.security import verify_credential, verify_password
 from conftest import ALEMBIC_INI
@@ -394,6 +397,57 @@ def test_the_upgrade_installs_the_two_uniqueness_constraints(
     assert ("zillow_url",) not in _unique_columns(
         migration_connection, "listings"
     )
+
+
+@pytest.mark.parametrize("preceding", [False, True])
+def test_the_migrated_schema_refuses_an_orphan_ownership_row(
+    migration_connection, alembic_config, pre_revision_schema, preceding
+):
+    """Assert the schema the revisions leave enforces the owner keys.
+
+    A ``filters`` row and a ``subscriptions`` row are each inserted
+    naming an account identifier that is not stored, and each is
+    refused. Both lineages are covered: the tables the revision builds
+    from nothing, and the tables it migrated in place. The deployed
+    PostgreSQL database enforces these keys unconditionally, and this
+    harness now refuses the same rows it refuses.
+    """
+    if preceding:
+        pre_revision_schema(migration_connection)
+
+    command.upgrade(alembic_config(migration_connection), "head")
+
+    absent = 10_000
+    assert (
+        migration_connection.execute(
+            text("SELECT COUNT(*) FROM users WHERE id = :id"),
+            {"id": absent},
+        ).scalar()
+        == 0
+    )
+
+    for statement, parameters in (
+        (
+            "INSERT INTO filters (user_id, name, created_at)"
+            " VALUES (:user_id, :name, :created_at)",
+            {
+                "user_id": absent,
+                "name": "names an account that is not stored",
+                "created_at": STORED_CREATED_AT,
+            },
+        ),
+        (
+            "INSERT INTO subscriptions (user_id, start_date, status)"
+            " VALUES (:user_id, :start_date, :status)",
+            {
+                "user_id": absent,
+                "start_date": STORED_CREATED_AT,
+                "status": "pending",
+            },
+        ),
+    ):
+        with pytest.raises(IntegrityError):
+            migration_connection.execute(text(statement), parameters)
 
 
 def test_a_repeated_upgrade_changes_nothing(

@@ -53,6 +53,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from conftest import REPO_ROOT, VALID_TEST_PASSWORD
+from backend.tests.support import enforce_sqlite_foreign_keys
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
@@ -150,10 +151,12 @@ def migration_connection():
     The schema is built from ``Base.metadata`` on an in-memory database
     held open by a single connection, and is dropped when the case ends.
     """
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
     )
     Base.metadata.create_all(bind=engine)
     connection = engine.connect()

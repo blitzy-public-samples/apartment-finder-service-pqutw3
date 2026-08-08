@@ -38,10 +38,17 @@ readonly COMPOSE_DB_HOST="db"
 # Account the schema revisions promote, and the role they promote it to.
 # Both values are fixed in
 # backend/migrations/versions/0002_seed_single_admin.py and must match it.
+# The same address is carried by the ADMIN_SEED_EMAIL entry of the
+# environment file.
 readonly ADMIN_EMAIL="test@blitzy.com"
 readonly ADMIN_ROLE="admin"
 
-# Revision carrying the schema, and the revision carrying the grant
+# Length of the generated administrator seed password, in characters
+readonly ADMIN_PASSWORD_LENGTH=24
+
+# Revision carrying the schema, and the revision carrying the grant. The
+# administrator seed account is stored under the schema revision, and the
+# grant revision is applied over it.
 readonly SCHEMA_REVISION="0001"
 readonly SEED_REVISION="0002"
 
@@ -55,17 +62,6 @@ readonly MAX_SIGNING_KEY_SEQUENCE_RUN=4
 
 # Keys generate_signing_key produces before it gives up
 readonly SIGNING_KEY_ATTEMPTS=10
-
-# Address the administrator seed revision promotes. The same address is
-# written into the ADMIN_SEED_EMAIL entry of the environment file.
-readonly ADMIN_SEED_EMAIL="test@blitzy.com"
-
-# Length of the generated administrator seed password, in characters
-readonly ADMIN_PASSWORD_LENGTH=24
-
-# Revision applying the schema, which the administrator seed account is
-# stored under before the revision that grants the role is applied.
-readonly SCHEMA_REVISION="0001"
 
 # Interpreter found by check_software
 PYTHON_BIN=""
@@ -717,7 +713,7 @@ seed_admin_account() {
     fi
 
     (cd "${REPO_ROOT}" \
-        && ADMIN_SEED_EMAIL="${ADMIN_SEED_EMAIL}" \
+        && ADMIN_SEED_EMAIL="${ADMIN_EMAIL}" \
            ADMIN_SEED_PASSWORD="${admin_password}" \
            "${VENV_PYTHON}" -c '
 import os
@@ -778,7 +774,7 @@ run_migrations() {
     verify_single_administrator
 
     echo "Initial data migrations completed."
-    echo "The administrator role is held by ${ADMIN_SEED_EMAIL} alone."
+    echo "The administrator role is held by ${ADMIN_EMAIL} alone."
 }
 
 main() {

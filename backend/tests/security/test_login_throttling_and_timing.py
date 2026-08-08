@@ -28,6 +28,7 @@ from backend.app.core.config import settings
 from backend.app.db import database as database_module
 from backend.app.db.models import Base, User
 from backend.app.main import app
+from backend.tests.support import enforce_sqlite_foreign_keys
 
 PASSWORD = "Str0ng-Passphrase-9"
 
@@ -80,10 +81,12 @@ def fresh_rate_limit_counters():
 
 @pytest.fixture
 def session_factory():
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
     )
     Base.metadata.create_all(bind=engine)
     yield sessionmaker(autocommit=False, autoflush=False, bind=engine)

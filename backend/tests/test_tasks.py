@@ -7,11 +7,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.core.logging import flush_log_queue
+from backend.tests.support import enforce_sqlite_foreign_keys
 from backend.app.db.models import Base, Filter, Listing, User, ZipCode
 from backend.app.tasks import listing_updater
 from backend.app.tasks.listing_updater import (
@@ -80,10 +82,12 @@ def mock_db_session():
 
 @pytest.fixture
 def session_factory():
-    engine = create_engine(
-        'sqlite://',
-        connect_args={'check_same_thread': False},
-        poolclass=StaticPool,
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            'sqlite://',
+            connect_args={'check_same_thread': False},
+            poolclass=StaticPool,
+        )
     )
     Base.metadata.create_all(bind=engine)
     yield sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -345,6 +349,99 @@ async def test_a_second_pass_refreshes_rather_than_duplicates(
     rows = db.query(Listing).all()
     assert len(rows) == 1
     assert rows[0].rent == 2500
+
+
+def _unique_column_sets(session, table):
+    """Returns each set of columns ``table`` constrains to be unique.
+
+    Both a uniqueness constraint and a unique index are reported, so the
+    result covers however the running schema records one.
+    """
+    inspector = sa_inspect(session.get_bind())
+    sets = set()
+    for constraint in inspector.get_unique_constraints(table):
+        sets.add(tuple(constraint.get('column_names') or []))
+    for index in inspector.get_indexes(table):
+        if index.get('unique'):
+            sets.add(tuple(index.get('column_names') or []))
+    return sets
+
+
+def test_the_mapped_corpus_declares_no_provider_address_uniqueness(db):
+    """The mapped table constrains no set of columns on the address.
+
+    Revision 0001 declares none either, and
+    ``backend/tests/security/test_revision_contracts.py`` asserts that
+    directly, so the mapped table and the migrated table agree and the
+    reconciliation below has no database backstop by design rather than
+    by omission.
+    """
+    assert (IDENTITY_COLUMN,) not in _unique_column_sets(db, 'listings')
+    assert Listing.__table__.columns[IDENTITY_COLUMN].unique in (
+        None, False
+    )
+    assert not any(
+        set(constraint.columns.keys()) == {IDENTITY_COLUMN}
+        for constraint in Listing.__table__.constraints
+    )
+
+
+def _seed_listing(session, url, rent):
+    """Stores one listing carrying ``url`` and returns its identifier."""
+    moment = datetime.now(timezone.utc)
+    row = Listing(
+        created_at=moment,
+        updated_at=moment,
+        rent=rent,
+        zillow_url=url,
+    )
+    session.add(row)
+    session.commit()
+    return row.id
+
+
+def test_two_rows_may_carry_one_provider_address(db):
+    """The corpus stores a repeated address rather than refusing it."""
+    first = _seed_listing(db, LISTING_URL, 2400)
+    second = _seed_listing(db, LISTING_URL, 2500)
+
+    assert first != second
+    assert db.query(Listing).count() == 2
+
+
+@pytest.mark.asyncio
+async def test_a_pass_reconciles_the_earliest_of_two_matching_rows(
+    session_factory, db, saved_zip_code
+):
+    """Interleaved inserts leave duplicates; a pass stays deterministic.
+
+    Two rows carrying one provider address are stored, which is the state
+    two passes inserting at once can leave behind now that no uniqueness
+    refuses the second insert. Every later pass then updates the earliest
+    of them, adds nothing, and leaves the other exactly as it was -- so
+    the corpus stops growing and the outcome does not depend on the order
+    the database returns rows in.
+    """
+    earliest = _seed_listing(db, LISTING_URL, 2400)
+    later = _seed_listing(db, LISTING_URL, 2500)
+    untouched = db.query(Listing).filter(
+        Listing.id == later
+    ).one().updated_at
+
+    for rent in (3000, 3100):
+        with patch(TASK_MODULE + '.SessionLocal', session_factory):
+            with patch(
+                TASK_MODULE + '.fetch_listings',
+                return_value=[_provider_listing(price=rent)],
+            ):
+                await update_listings()
+
+    db.expire_all()
+    rows = db.query(Listing).order_by(Listing.id).all()
+    assert [row.id for row in rows] == [earliest, later]
+    assert rows[0].rent == 3100
+    assert rows[1].rent == 2500
+    assert rows[1].updated_at == untouched
 
 
 @pytest.mark.asyncio

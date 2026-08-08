@@ -1,8 +1,8 @@
-"""Static checks over the Compose definition that starts the service.
+"""Checks over the definitions that start the service and set it up.
 
 The container stack cannot be built or started from this test process, so
-every property below is asserted against the declaration itself. What is
-asserted:
+every Compose property below is asserted against the declaration itself.
+What is asserted:
 
 * each ``build`` stanza names a context directory that exists and a
   Dockerfile that exists once resolved from that context
@@ -16,6 +16,9 @@ asserted:
   documented in ``.env.example``
 * the frontend's API target names the port the backend image exposes,
   publishes and listens on, under the variable name the bundle reads
+* each frontend build argument either matches an ``ARG`` the frontend
+  image declares, and so reaches the built bundle, or is recorded here
+  and noted in the Compose file as an argument the build discards
 * each health probe invokes an executable its own base image provides
 
 The Settings class is the authority for the environment contract, the
@@ -30,9 +33,23 @@ profile runs the PostgreSQL service declared in the file; the ``gcp``
 profile runs the Cloud SQL proxy, which answers to the same ``db``
 network alias. Both profiles run ``migrate`` to completion before the
 backend starts, so the schema is never behind the code that serves it.
+
+The developer setup script is covered by the last two cases, which are
+the only ones here that run anything. They assert that no name it
+declares ``readonly`` is declared twice, and that its declarations,
+function definitions and traps all execute cleanly with its entry point
+removed. A shell refuses a second ``readonly`` declaration of one name
+and returns non-zero, and the script runs under ``set -Eeuo pipefail``,
+so such a declaration ends the run on that line with no step of the
+setup having happened -- and ``bash -n`` parses it without complaint,
+which is why the bootstrap is executed here rather than only read.
 """
 
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import pytest
 import yaml
@@ -60,6 +77,9 @@ ENVIRONMENT_EXAMPLE = REPO_ROOT / ".env.example"
 FRONTEND_API_MODULE = (
     REPO_ROOT / "frontend" / "src" / "services" / "api.ts"
 )
+
+#: Script that prepares a local development environment.
+SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_dev_environment.sh"
 
 #: Services the file is required to declare, in order.
 EXPECTED_SERVICES = (
@@ -152,6 +172,49 @@ FORBIDDEN_PROBE_EXECUTABLE = "curl"
 
 #: Build argument the frontend carries the backend's address in.
 FRONTEND_TARGET_NAME = "REACT_APP_API_BASE_URL"
+
+#: Frontend build arguments the frontend image declares no ``ARG`` for.
+#: The build discards each of them, so the built bundle carries no value
+#: for any name listed here. The record is empty: the frontend image
+#: declares an ``ARG`` for every argument the Compose file supplies it,
+#: and exports each one before the build command runs.
+DISCARDED_FRONTEND_ARGUMENTS = ()
+
+#: Wording the Compose file carries while it supplies an argument the
+#: build discards. It is matched literally and on one line, so a comment
+#: rewrapped across it fails the case that reads it.
+DISCARDED_ARGUMENT_NOTE = "the build discards"
+
+#: Shape of one ``ARG`` declaration in an image definition.
+IMAGE_ARGUMENT = re.compile(
+    r"^ARG\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE
+)
+
+#: Shape of one ``readonly`` declaration in a shell script.
+READONLY_DECLARATION = re.compile(
+    r"^\s*readonly\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE
+)
+
+#: The setup script's entry point: the single line that runs it.
+SETUP_ENTRY_POINT = re.compile(r'^main\s+"\$@"\s*$', re.MULTILINE)
+
+#: Seconds the bootstrap shell is allowed before it is abandoned.
+BOOTSTRAP_TIMEOUT_SECONDS = 120.0
+
+#: Prefix every name the frontend bundle inlines at build time carries.
+FRONTEND_VARIABLE_PREFIX = "REACT_APP_"
+
+#: Command each image definition builds its artifact with. An ``ARG``
+#: declared after it cannot reach it.
+BUILD_COMMAND = "npm run build"
+
+#: Frontend modules that read a build-time value out of the bundle. The
+#: frontend source is read-only here and is the authority for the names.
+FRONTEND_CONFIGURED_MODULES = (
+    REPO_ROOT / "frontend" / "src" / "services" / "api.ts",
+    REPO_ROOT / "frontend" / "src" / "services" / "paypal.ts",
+    REPO_ROOT / "frontend" / "src" / "index.tsx",
+)
 
 
 def _compose_document():
@@ -259,6 +322,33 @@ def _exposed_port(dockerfile):
     )
     assert len(ports) == 1, dockerfile.name
     return int(ports[0])
+
+
+def _declared_image_arguments(dockerfile):
+    """Returns the ``ARG`` names one image definition declares."""
+    return set(
+        IMAGE_ARGUMENT.findall(dockerfile.read_text(encoding="utf-8"))
+    )
+
+
+def _setup_script_text():
+    """Returns the developer setup script as text."""
+    return SETUP_SCRIPT.read_text(encoding="utf-8")
+
+
+def _setup_script_bootstrap():
+    """Returns the setup script with its entry point removed.
+
+    What is left declares every constant, defines every function and
+    installs both traps, and runs no step of the setup. Line endings are
+    normalised, so the text handed to a shell is the text the repository
+    carries however the checkout translated it.
+    """
+    text = _setup_script_text().replace("\r\n", "\n")
+    bootstrap, removed = SETUP_ENTRY_POINT.subn("", text)
+
+    assert removed == 1, removed
+    return bootstrap
 
 
 def test_the_compose_file_parses_and_declares_every_service():
@@ -520,6 +610,101 @@ def test_the_frontend_target_names_the_variable_the_bundle_reads():
     assert FRONTEND_TARGET_NAME in dict(_build_arguments("frontend"))
 
 
+def _dockerfile_of(service):
+    """Returns the image definition one service builds from."""
+    build = _service(service)["build"]
+    context = (COMPOSE_PATH.parent / build["context"]).resolve()
+    return (context / build["dockerfile"]).resolve()
+
+
+def _declared_arguments_before_build(dockerfile):
+    """Returns the arguments an image declares before it builds.
+
+    Only the ``ARG`` names appearing before the first ``RUN`` that builds
+    are returned, because a declaration after the build command cannot
+    reach it. The scan stops at the first ``FROM`` following one, so a
+    later stage's declarations are not credited to the build stage.
+    """
+    declared = []
+    for line in dockerfile.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ARG "):
+            declared.append(stripped[4:].split("=")[0].strip())
+        elif BUILD_COMMAND in stripped and stripped.startswith("RUN "):
+            break
+    return declared
+
+
+def _exported_names(dockerfile):
+    """Returns the names an image assigns with ``ENV``."""
+    return re.findall(
+        r"^\s*ENV\s+([A-Z][A-Z0-9_]*)=",
+        dockerfile.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    ) + re.findall(
+        r"^\s+([A-Z][A-Z0-9_]*)=",
+        dockerfile.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+
+
+@pytest.mark.parametrize("service", BUILD_SERVICES)
+def test_every_build_argument_is_declared_by_the_image_it_is_passed_to(
+    service,
+):
+    """Asserts no build argument is passed to an image that ignores one.
+
+    Compose drops a ``args`` entry the image never declares, silently, so
+    a value passed under a name the image does not declare as an ``ARG``
+    never reaches the build. Every name each service passes is therefore
+    required to be declared in that service's own Dockerfile, before the
+    command that builds.
+    """
+    passed = [name for name, _ in _build_arguments(service)]
+    if not passed:
+        return
+    declared = _declared_arguments_before_build(_dockerfile_of(service))
+
+    missing = [name for name in passed if name not in declared]
+    assert missing == [], missing
+
+
+def test_the_frontend_build_arguments_reach_the_bundle():
+    """Asserts each argument is declared and exported before the build.
+
+    Create React App reads its configuration from the build environment,
+    so a declared argument additionally has to be exported for the build
+    command to see it. Both names Compose passes are asserted through
+    both steps.
+    """
+    dockerfile = _dockerfile_of("frontend")
+    declared = _declared_arguments_before_build(dockerfile)
+    exported = _exported_names(dockerfile)
+    passed = [name for name, _ in _build_arguments("frontend")]
+
+    assert passed
+    for name in passed:
+        assert name.startswith(FRONTEND_VARIABLE_PREFIX), name
+        assert name in declared, name
+        assert name in exported, name
+
+
+def test_the_frontend_bundle_reads_every_argument_it_is_passed():
+    """Asserts no build argument is passed that no source reads.
+
+    The frontend source is read-only here and is the authority for the
+    names the bundle reads, so an argument naming nothing the source
+    reads is a value with no destination.
+    """
+    read = "".join(
+        path.read_text(encoding="utf-8")
+        for path in FRONTEND_CONFIGURED_MODULES
+    )
+
+    for name, _ in _build_arguments("frontend"):
+        assert "process.env." + name in read, name
+
+
 def test_the_frontend_targets_the_port_the_backend_listens_on():
     """Asserts one port runs through the image, the mapping and the URL.
 
@@ -579,3 +764,81 @@ def test_the_backend_probe_reads_the_health_route_the_application_serves():
     exposed = _exposed_port(BACKEND_DOCKERFILE)
 
     assert "http://127.0.0.1:" + str(exposed) + "/health" in probe
+
+
+def test_every_frontend_argument_the_build_discards_is_recorded():
+    """Asserts the discarded-argument record matches both files.
+
+    A build argument no ``ARG`` declares is dropped by the build, so the
+    bundle carries no value for it and the browser falls back on the
+    source default. The set the frontend image drops is asserted to equal
+    :data:`DISCARDED_FRONTEND_ARGUMENTS` exactly, in both directions: an
+    argument added to the Compose file with no ``ARG`` to receive it
+    fails here, and so does a name left in the record after the image
+    began declaring it. While the set is non-empty the Compose file is
+    asserted to say so beside the arguments themselves, which is what
+    stops its build stanza reading as a delivery the build does not make.
+    """
+    supplied = set(name for name, _ in _build_arguments("frontend"))
+    discarded = supplied - _declared_image_arguments(FRONTEND_DOCKERFILE)
+
+    assert discarded == set(DISCARDED_FRONTEND_ARGUMENTS), sorted(discarded)
+    if discarded:
+        assert DISCARDED_ARGUMENT_NOTE in _compose_text()
+
+
+def test_the_setup_script_declares_each_readonly_name_once():
+    """Asserts no name is declared ``readonly`` twice.
+
+    The second declaration of one name returns non-zero under every
+    shell, and the script's own options end the run at that line, so a
+    duplicate leaves the whole setup unperformed.
+    """
+    declared = READONLY_DECLARATION.findall(_setup_script_text())
+    assert declared, SETUP_SCRIPT.name
+
+    repeated = sorted(
+        name for name in set(declared) if declared.count(name) > 1
+    )
+
+    assert repeated == []
+
+
+def test_the_setup_script_bootstrap_runs_without_failing():
+    """Runs the setup script's declarations, definitions and traps.
+
+    The entry point is removed first, so nothing is installed, written,
+    created or migrated. An empty standard output is asserted alongside
+    the exit status: every step of the setup announces itself, so silence
+    is the evidence that none of them ran. The shell is abandoned after
+    :data:`BOOTSTRAP_TIMEOUT_SECONDS`.
+    """
+    shell = shutil.which("bash")
+    if shell is None:
+        pytest.skip("no POSIX shell is available to run the bootstrap")
+
+    with tempfile.TemporaryDirectory() as directory:
+        bootstrap = Path(directory) / SETUP_SCRIPT.name
+        bootstrap.write_bytes(_setup_script_bootstrap().encode("utf-8"))
+        try:
+            completed = subprocess.run(
+                [shell, str(bootstrap)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=BOOTSTRAP_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as expired:
+            raise AssertionError(
+                "{0} did not finish its bootstrap within {1} seconds; "
+                "stdout={2!r} stderr={3!r}".format(
+                    SETUP_SCRIPT.name,
+                    BOOTSTRAP_TIMEOUT_SECONDS,
+                    expired.stdout,
+                    expired.stderr,
+                )
+            ) from None
+
+    assert completed.returncode == 0, completed.stderr.decode(
+        "utf-8", "replace"
+    )
+    assert completed.stdout == b""

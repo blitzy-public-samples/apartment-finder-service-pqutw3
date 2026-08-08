@@ -106,6 +106,7 @@ from backend.tests.support import (  # noqa: E402
     VALID_TEST_PASSWORD,
     apply_test_settings,
     bearer_header,
+    enforce_sqlite_foreign_keys,
 )
 
 #: Environment variable :mod:`backend.app.core.config` reads the
@@ -136,6 +137,7 @@ import base64  # noqa: E402
 import importlib.util  # noqa: E402
 import json  # noqa: E402
 import uuid  # noqa: E402
+from urllib.parse import urlsplit  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 from typing import (  # noqa: E402
     Any,
@@ -153,7 +155,7 @@ from alembic.config import Config  # noqa: E402
 from alembic.operations import Operations  # noqa: E402
 from alembic.runtime.migration import MigrationContext  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import create_engine, event, text  # noqa: E402
+from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
@@ -164,8 +166,10 @@ from backend.app.core.config import (  # noqa: E402
     settings,
 )
 from backend.app.core.plans import (  # noqa: E402
+    PLAN_IDS,
     PREMIUM_MONTHLY,
     STATUS_ACTIVE,
+    format_amount,
     get_plan,
 )
 from backend.app.core.security import (  # noqa: E402
@@ -404,6 +408,58 @@ PAYPAL_GRANT_TYPE = "client_credentials"
 #: Header the settle call carries its representation preference in.
 PAYPAL_PREFER_HEADER = "Prefer"
 
+#: Field of the verifier document that carries the notification, which
+#: the document must carry as its final member so the notification can be
+#: taken back out of the transmitted bytes without decoding them.
+PAYPAL_VERIFY_EVENT_FIELD = "webhook_event"
+
+#: Intent the created order declares, and no other.
+PAYPAL_ORDER_INTENT = "CAPTURE"
+
+#: Description the created order's single purchase unit carries.
+PAYPAL_ORDER_DESCRIPTION = "Subscription Payment"
+
+#: Fields the created order carries at its top level, and no others.
+PAYPAL_ORDER_FIELDS = frozenset(
+    {"intent", "purchase_units", "payment_source"}
+)
+
+#: Fields the single purchase unit carries, and no others.
+PAYPAL_PURCHASE_UNIT_FIELDS = frozenset({"amount", "description"})
+
+#: Fields the purchase unit's amount carries, and no others.
+PAYPAL_AMOUNT_FIELDS = frozenset({"currency_code", "value"})
+
+#: Payer experience context values the created order must carry.
+PAYPAL_EXPERIENCE_VALUES = {
+    "user_action": "PAY_NOW",
+    "shipping_preference": "NO_SHIPPING",
+    "payment_method_preference": "IMMEDIATE_PAYMENT_REQUIRED",
+}
+
+#: Redirect targets the experience context carries. Their values are the
+#: caller's, so they are required to be absolute targets rather than
+#: compared against a fixed value.
+PAYPAL_REDIRECT_FIELDS = ("return_url", "cancel_url")
+
+#: Fields the experience context carries, and no others.
+PAYPAL_EXPERIENCE_FIELDS = frozenset(
+    set(PAYPAL_EXPERIENCE_VALUES) | set(PAYPAL_REDIRECT_FIELDS)
+)
+
+#: Every amount and currency pair the plan catalog publishes. A created
+#: order carrying any other pair is a price this service does not sell.
+PAYPAL_CATALOG_PRICES = frozenset(
+    (
+        format_amount(get_plan(plan_id).amount),
+        get_plan(plan_id).currency,
+    )
+    for plan_id in PLAN_IDS
+)
+
+#: Body the settle call sends, and no other.
+PAYPAL_CAPTURE_BODY = {}
+
 #: Fields the verifier document carries, and no others.
 PAYPAL_VERIFY_FIELDS = frozenset(
     {
@@ -490,6 +546,266 @@ def _paypal_route(path: str, method: str, url: Any) -> str:
     raise AssertionError("unreachable")
 
 
+def _decoded_body(
+    json_body: Any, content: Any, method: Any, url: Any
+) -> Any:
+    """Returns the body one call sent, decoded.
+
+    A caller that handed over a decoded body supplies it directly; one
+    that handed over raw content has those bytes decoded here, so both
+    call shapes reach the same assertions.
+    """
+    if json_body is not None:
+        return json_body
+    if not content:
+        return None
+    try:
+        return json.loads(bytes(content).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        _refuse("body is not readable JSON", method, url)
+        return None
+
+
+def _assert_absolute_target(
+    value: Any, field: str, method: Any, url: Any
+) -> None:
+    """Assert one redirect target is an absolute address."""
+    if not isinstance(value, str) or not value.strip():
+        _refuse(
+            "experience context {0} is {1!r}".format(field, value),
+            method,
+            url,
+        )
+        return
+    parts = urlsplit(value.strip())
+    if not parts.scheme or not parts.netloc:
+        _refuse(
+            "experience context {0} is not absolute".format(field),
+            method,
+            url,
+        )
+
+
+def _assert_experience_context(
+    context: Any, method: Any, url: Any
+) -> None:
+    """Assert the payer experience context field by field."""
+    if not isinstance(context, dict):
+        _refuse("order carries no experience context", method, url)
+        return
+    if set(context) != set(PAYPAL_EXPERIENCE_FIELDS):
+        _refuse(
+            "experience context fields are {0}".format(
+                sorted(context)
+            ),
+            method,
+            url,
+        )
+    for field, expected in PAYPAL_EXPERIENCE_VALUES.items():
+        if context.get(field) != expected:
+            _refuse(
+                "experience context {0} is {1!r}".format(
+                    field, context.get(field)
+                ),
+                method,
+                url,
+            )
+    for field in PAYPAL_REDIRECT_FIELDS:
+        _assert_absolute_target(context.get(field), field, method, url)
+
+
+def _assert_purchase_unit(unit: Any, method: Any, url: Any) -> None:
+    """Assert the single purchase unit, including its catalog price."""
+    if not isinstance(unit, dict):
+        _refuse("purchase unit is not an object", method, url)
+        return
+    if set(unit) != set(PAYPAL_PURCHASE_UNIT_FIELDS):
+        _refuse(
+            "purchase unit fields are {0}".format(sorted(unit)),
+            method,
+            url,
+        )
+    if unit.get("description") != PAYPAL_ORDER_DESCRIPTION:
+        _refuse(
+            "purchase unit description is {0!r}".format(
+                unit.get("description")
+            ),
+            method,
+            url,
+        )
+    amount = unit.get("amount")
+    if not isinstance(amount, dict):
+        _refuse("purchase unit carries no amount", method, url)
+        return
+    if set(amount) != set(PAYPAL_AMOUNT_FIELDS):
+        _refuse(
+            "amount fields are {0}".format(sorted(amount)),
+            method,
+            url,
+        )
+    priced = (amount.get("value"), amount.get("currency_code"))
+    if priced not in PAYPAL_CATALOG_PRICES:
+        _refuse(
+            "order prices {0[0]!r} {0[1]!r}, which no plan "
+            "publishes".format(priced),
+            method,
+            url,
+        )
+
+
+def assert_create_order_body(
+    document: Any, method: Any = "POST", url: Any = PAYPAL_ORDERS_PATH
+) -> None:
+    """Assert one created order carries the complete documented body.
+
+    Every field is checked and no field is optional: the intent, exactly
+    one purchase unit carrying exactly an amount and a description, an
+    amount naming a price the plan catalog publishes, and a payer
+    experience context carrying exactly the two absolute redirect targets
+    and the three fixed values. A field outside any of those sets fails,
+    so a field added to the outbound document cannot pass unasserted.
+    """
+    if not isinstance(document, dict):
+        _refuse("order body is not an object", method, url)
+        return
+    if set(document) != set(PAYPAL_ORDER_FIELDS):
+        _refuse(
+            "order body fields are {0}".format(sorted(document)),
+            method,
+            url,
+        )
+    if document.get("intent") != PAYPAL_ORDER_INTENT:
+        _refuse(
+            "order intent is {0!r}".format(document.get("intent")),
+            method,
+            url,
+        )
+    units = document.get("purchase_units")
+    if not isinstance(units, list) or len(units) != 1:
+        _refuse("order carries no single purchase unit", method, url)
+        return
+    _assert_purchase_unit(units[0], method, url)
+    source = document.get("payment_source")
+    if not isinstance(source, dict) or set(source) != {"paypal"}:
+        _refuse("order payment source is not the wallet", method, url)
+        return
+    wallet = source["paypal"]
+    if not isinstance(wallet, dict) or set(wallet) != {
+        "experience_context"
+    }:
+        _refuse("order wallet carries no single context", method, url)
+        return
+    _assert_experience_context(
+        wallet["experience_context"], method, url
+    )
+
+
+def assert_capture_body(
+    document: Any, method: Any = "POST", url: Any = PAYPAL_ORDERS_PATH
+) -> None:
+    """Assert the settle call's body is exactly the documented one.
+
+    The call carries its idempotency key and its representation
+    preference as headers, so the body carries nothing at all. A body
+    holding any member fails.
+    """
+    if document != PAYPAL_CAPTURE_BODY:
+        _refuse(
+            "settle body is {0!r} rather than {1!r}".format(
+                document, PAYPAL_CAPTURE_BODY
+            ),
+            method,
+            url,
+        )
+
+
+def embedded_event_bytes(document: Any) -> bytes:
+    """Return the bytes a verifier document carries under the event field.
+
+    ``document`` is the **raw postback body as it was transmitted**. The
+    value is taken as a byte slice: the bytes between the event field's
+    key and the closing brace of the document are returned exactly as
+    they were sent, with no decode and no re-encode anywhere in the path.
+    A caller can therefore compare them with the notification bytes that
+    arrived and prove the two are identical rather than merely
+    equivalent.
+
+    Raises :class:`PayPalContractError` when the document does not carry
+    the event field as its final member.
+    """
+    try:
+        raw = bytes(document)
+    except (TypeError, ValueError):
+        raise PayPalContractError(
+            "verifier document is not raw bytes"
+        )
+    key = b'"' + PAYPAL_VERIFY_EVENT_FIELD.encode("utf-8") + b'":'
+    marker = raw.find(key)
+    if marker < 0:
+        raise PayPalContractError(
+            "verifier document carries no {0} field".format(
+                PAYPAL_VERIFY_EVENT_FIELD
+            )
+        )
+    if not raw.rstrip().endswith(b"}"):
+        raise PayPalContractError(
+            "verifier document does not close with an object brace"
+        )
+    return raw[marker + len(key):raw.rstrip().rfind(b"}")]
+
+
+def assert_verifier_embeds_event(
+    document: Any, event: Any
+) -> None:
+    """Assert a verifier document carries ``event`` byte for byte.
+
+    ``document`` is the raw postback body and ``event`` is the raw
+    notification body that arrived. The comparison is on bytes, so a
+    document that parsed the notification and re-serialised it fails even
+    when the re-serialisation is an equivalent JSON value.
+    """
+    embedded = embedded_event_bytes(document)
+    expected = bytes(event)
+    if embedded != expected:
+        raise PayPalContractError(
+            "verifier document embedded {0!r} rather than the "
+            "{1!r} that arrived".format(embedded, expected)
+        )
+
+
+def _assert_embedded_event(
+    document: bytes, method: Any, url: Any
+) -> None:
+    """Assert the transmitted event field is a verbatim byte slice.
+
+    The slice is required to be non-empty and to be a JSON object in its
+    own right, so a document whose event field was rebuilt from parsed
+    values still carries a notification, and a caller holding the
+    notification bytes can compare them with
+    :func:`assert_verifier_embeds_event`.
+    """
+    try:
+        embedded = embedded_event_bytes(document)
+    except PayPalContractError as failure:
+        _refuse(str(failure), method, url)
+        return
+    if not embedded.strip():
+        _refuse("verifier document embedded no event", method, url)
+    try:
+        notification = json.loads(embedded.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        _refuse(
+            "verifier document embedded an unreadable event",
+            method,
+            url,
+        )
+        return
+    if not isinstance(notification, dict):
+        _refuse(
+            "verifier document embedded a non-object event", method, url
+        )
+
+
 def assert_paypal_contract(
     method: str,
     url: str,
@@ -499,6 +815,7 @@ def assert_paypal_contract(
     data: Any = None,
     auth: Any = None,
     timeout: Any = None,
+    raw_body: Any = None,
 ) -> str:
     """Assert one outbound provider request and return its route.
 
@@ -512,8 +829,15 @@ def assert_paypal_contract(
     ``Content-Type: application/json`` and a body; the settle call omits
     its representation preference; the verifier document does not carry
     exactly the documented fields with the configured webhook identifier;
-    or the call carries no timeout, or one other than
-    ``settings.HTTP_TIMEOUT_SECONDS``.
+    the verifier document does not carry the notification as a verbatim
+    byte slice under its event field; or the call carries no timeout, or
+    one other than ``settings.HTTP_TIMEOUT_SECONDS``.
+
+    ``raw_body`` is the request body exactly as it was transmitted, which
+    a caller supplies when it also supplies a decoded ``json_body``. The
+    verifier document's event field is checked against those bytes, so
+    the check cannot be satisfied by a document that was parsed and
+    rebuilt.
     """
     target = str(url)
     base = settings.PAYPAL_API_BASE
@@ -576,6 +900,11 @@ def assert_paypal_contract(
         if json_body is None and not content:
             _refuse("write call sent no body", method, url)
 
+    if route == PAYPAL_ROUTE_CREATE_ORDER:
+        assert_create_order_body(
+            _decoded_body(json_body, content, method, url), method, url
+        )
+
     if route == PAYPAL_ROUTE_CAPTURE_ORDER:
         if not _header(headers, PAYPAL_PREFER_HEADER):
             _refuse(
@@ -583,6 +912,9 @@ def assert_paypal_contract(
                 method,
                 url,
             )
+        assert_capture_body(
+            _decoded_body(json_body, content, method, url), method, url
+        )
 
     if route == PAYPAL_ROUTE_VERIFY:
         document = json_body
@@ -602,6 +934,9 @@ def assert_paypal_contract(
             _refuse(
                 "verifier document names another webhook", method, url
             )
+        transmitted = raw_body if raw_body else content
+        if transmitted:
+            _assert_embedded_event(bytes(transmitted), method, url)
 
     _assert_paypal_timeout(timeout, method, url)
     return route
@@ -623,6 +958,7 @@ def assert_paypal_call(method: str, url: str, **kwargs: Any) -> str:
         data=kwargs.get("data"),
         auth=kwargs.get("auth"),
         timeout=kwargs.get("timeout"),
+        raw_body=kwargs.get("content"),
     )
 
 
@@ -632,7 +968,9 @@ def assert_paypal_request(outbound: Any) -> str:
     The request's own method, target, headers, body and recorded timeout
     are handed to :func:`assert_paypal_contract`, so a stand-in installed
     as a transport asserts the same contract as one installed as a
-    client.
+    client. The body is handed over twice: decoded, and as the bytes that
+    were transmitted, so the verifier document's event field is checked
+    against those bytes rather than against a decoded copy of them.
     """
     try:
         body = bytes(outbound.content)
@@ -674,6 +1012,7 @@ def assert_paypal_request(outbound: Any) -> str:
         data=form,
         auth=credentials,
         timeout=dict(outbound.extensions.get("timeout") or {}),
+        raw_body=body,
     )
 
 
@@ -734,24 +1073,6 @@ def unlisted_algorithm() -> str:
     raise AssertionError(
         "every candidate algorithm is accepted, so none is unlisted"
     )
-
-
-def _enforce_sqlite_foreign_keys(engine):
-    """Enforce foreign keys on every connection ``engine`` opens.
-
-    SQLite accepts a foreign key in a table definition but does not
-    enforce it until ``PRAGMA foreign_keys`` is set, and the setting is
-    per connection. Registering it on connect is what makes the four
-    foreign keys the models declare hold in a test.
-    """
-
-    @event.listens_for(engine, "connect")
-    def _set_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        try:
-            cursor.execute("PRAGMA foreign_keys=ON")
-        finally:
-            cursor.close()
 
 
 @pytest.fixture(autouse=True)
@@ -844,12 +1165,13 @@ def session_factory():
     yielded and dropped afterwards. No row outlives one test. Foreign
     keys are enforced on every connection the engine opens.
     """
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
     )
-    _enforce_sqlite_foreign_keys(engine)
     Base.metadata.create_all(bind=engine)
     try:
         yield sessionmaker(
@@ -1319,13 +1641,17 @@ def migration_connection():
 
     The database carries no table, so a revision applied through
     :func:`alembic_config` runs against the state a first deployment
-    presents. The connection is held open for the whole test and is
-    closed with the engine afterwards.
+    presents. Foreign keys are enforced on every connection the engine
+    opens, and the schema a revision leaves behind refuses a row naming a
+    parent that is not stored. The connection is held open for the whole
+    test and is closed with the engine afterwards.
     """
-    engine = create_engine(
-        MIGRATION_DATABASE_URL,
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            MIGRATION_DATABASE_URL,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
     )
     connection = engine.connect()
     try:

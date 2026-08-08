@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime, timezone
@@ -19,12 +19,9 @@ logger = get_logger(__name__)
 #: Page size applied when a request names none.
 DEFAULT_PAGE_SIZE = min(100, settings.MAX_PAGE_SIZE)
 
-#: Detail returned when a listing cannot be persisted.
+#: Detail returned when a listing cannot be persisted, whatever the
+#: database refused it for.
 LISTING_NOT_STORED_DETAIL = "Listing could not be stored"
-
-#: Detail returned when a listing address is already stored against
-#: another row, which the uniqueness over that column refuses.
-LISTING_DUPLICATE_DETAIL = "Listing address is already stored"
 
 #: Detail returned for a page carrying a stored row the response contract
 #: cannot represent.
@@ -113,6 +110,21 @@ def create_listing(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(Role.ADMIN)),
 ) -> Listing:
+    """Stores one listing for an administrator and returns it.
+
+    The row is built from named columns, so no field outside
+    :class:`backend.app.schema.listing.ListingCreate` reaches it.
+
+    The provider address column carries no uniqueness, in the mapped
+    table and in revision ``0001`` alike, so a listing repeating an
+    address already stored is **stored** rather than refused, and two
+    rows may carry one address.
+
+    Every refusal the database raises -- an integrity violation included
+    -- rolls the write back and is answered with one fixed detail, so no
+    response distinguishes which constraint the database refused or
+    otherwise discloses its internals.
+    """
     recorded_at = datetime.now(timezone.utc)
     db_listing = ListingModel(
         created_at=recorded_at,
@@ -127,19 +139,10 @@ def create_listing(
         zillow_url=listing.zillow_url,
     )
     db.add(db_listing)
-    # A conflict on the uniqueness over the address column is answered
-    # separately from a database failure, and both roll back first.
+    # Any refusal from the database rolls the session back, is recorded
+    # against the caller, and is answered with one fixed detail.
     try:
         db.commit()
-    except IntegrityError:
-        db.rollback()
-        logger.warning(
-            "Refused a listing whose address is already stored",
-            extra={"user_id": current_user.id},
-        )
-        raise HTTPException(
-            status_code=409, detail=LISTING_DUPLICATE_DETAIL
-        ) from None
     except SQLAlchemyError:
         db.rollback()
         logger.exception(

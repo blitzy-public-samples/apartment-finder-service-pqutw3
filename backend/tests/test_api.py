@@ -32,8 +32,14 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import urlsplit
 
+import httpx
 import pytest
-from conftest import assert_paypal_call
+from conftest import (
+    assert_capture_body,
+    assert_create_order_body,
+    assert_paypal_call,
+    assert_paypal_request,
+)
 from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -75,6 +81,7 @@ from backend.app.core.plans import (
     STATUS_ACTIVE,
     STATUS_FAILED,
     STATUS_PENDING,
+    format_amount,
     get_plan,
 )
 from backend.app.core.security import (
@@ -103,6 +110,7 @@ from backend.app.services.paypal_service import (
     CATEGORY_PROVIDER_CLIENT,
     CATEGORY_PROVIDER_SERVER,
     IDEMPOTENCY_HEADER,
+    ISSUE_ORDER_ALREADY_CAPTURED,
     CaptureOutcome,
     PayPalAPIError,
     PayPalError,
@@ -1744,6 +1752,69 @@ def test_order_creation_uses_the_current_experience_context():
     assert 'application_context' not in body
 
 
+def test_order_creation_sends_the_complete_documented_document():
+    """The outbound create-order body is asserted in full.
+
+    The document is compared member by member against the plan catalog
+    and the fixed payer experience values, and it is additionally handed
+    to the shared contract guard, which refuses any field outside the
+    documented sets. A field added to the outbound document therefore
+    fails this case rather than travelling unasserted.
+    """
+    plan = get_plan(PREMIUM_MONTHLY)
+    with provider_transport([FakeResponse(200, order_response())]) as fake:
+        asyncio.run(paypal_module.create_order(
+            PREMIUM_MONTHLY,
+            'https://example.test/return',
+            'https://example.test/cancel',
+        ))
+    _, kwargs = fake.calls[0]
+
+    assert kwargs['json'] == {
+        'intent': 'CAPTURE',
+        'purchase_units': [
+            {
+                'amount': {
+                    'currency_code': plan.currency,
+                    'value': format_amount(plan.amount),
+                },
+                'description': 'Subscription Payment',
+            }
+        ],
+        'payment_source': {
+            'paypal': {
+                'experience_context': {
+                    'return_url': 'https://example.test/return',
+                    'cancel_url': 'https://example.test/cancel',
+                    'user_action': 'PAY_NOW',
+                    'shipping_preference': 'NO_SHIPPING',
+                    'payment_method_preference': (
+                        'IMMEDIATE_PAYMENT_REQUIRED'
+                    ),
+                }
+            }
+        },
+    }
+    assert_create_order_body(kwargs['json'])
+    assert fake.routes == ['create_order']
+
+
+def test_the_settle_call_sends_an_empty_body(db, registered_user):
+    """The outbound capture body is exactly the empty object."""
+    owned_order(db, registered_user)
+    with provider_transport(
+        [FakeResponse(200, capture_response())]
+    ) as fake:
+        asyncio.run(paypal_module.capture_order(
+            db, ORDER_ID, registered_user
+        ))
+    _, kwargs = fake.calls[0]
+
+    assert kwargs['json'] == {}
+    assert_capture_body(kwargs['json'])
+    assert fake.routes == ['capture_order']
+
+
 def test_a_rejected_token_is_refreshed_once():
     """A stale grant is discarded and the call repeated once."""
     responses = [
@@ -2317,6 +2388,7 @@ def test_an_order_already_captured_is_read_back_and_activated(
         'ORDER_ALREADY_CAPTURED',
         category=CATEGORY_PROVIDER_CLIENT,
         status_code=422,
+        issue=ISSUE_ORDER_ALREADY_CAPTURED,
     )
     read_back = AsyncMock(return_value=CaptureOutcome(
         completed=True,
@@ -2346,6 +2418,149 @@ def test_an_order_already_captured_is_read_back_and_activated(
     assert db.query(User).filter(
         User.id == registered_user.id
     ).one().role == 'premium'
+
+
+#: Provider issue code carried by a refusal that is not a settlement.
+OTHER_PROVIDER_ISSUE = 'INSTRUMENT_DECLINED'
+
+
+@contextmanager
+def provider_mock_transport(handler):
+    """Lends the provider a real client over a stand-in transport.
+
+    ``handler`` is given each outbound request and returns the response
+    for it, so the service's own status handling and error
+    classification -- including the provider issue code it reads out of
+    an error body -- run end to end rather than being stood in for. The
+    client is lent through the funnel the provider functions acquire one
+    from, so no request reaches a socket.
+    """
+
+    @asynccontextmanager
+    async def lend_the_stand_in():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as stand_in:
+            yield stand_in
+
+    paypal_module.reset_access_token_cache()
+    try:
+        with patch.object(paypal_module, '_client', lend_the_stand_in):
+            yield
+    finally:
+        paypal_module.reset_access_token_cache()
+
+
+def _refusing_capture_handler(issue, status_code=422):
+    """Returns a handler answering the capture call with ``issue``."""
+
+    def handle(outbound):
+        assert_paypal_request(outbound)
+        if outbound.url.path.endswith('/v1/oauth2/token'):
+            return httpx.Response(
+                200,
+                json={'access_token': 'grant', 'expires_in': 3600},
+            )
+        return httpx.Response(
+            status_code,
+            json={
+                'name': 'UNPROCESSABLE_ENTITY',
+                'details': [{'issue': issue}],
+            },
+        )
+
+    return handle
+
+
+def test_a_non_settlement_refusal_is_not_read_back_or_consumed(
+    client, db, registered_user, auth_header_factory
+):
+    """A 4xx that is not an already-settled order consumes nothing.
+
+    The refusal is served by a real transport carrying a provider issue
+    code that is not the already-captured one, so the service reads that
+    code out of the error body and the endpoint's discriminator sees it.
+    Nothing is read back, the delivery record is discarded, the
+    subscription is untouched and the response is not a success -- so
+    PayPal delivers the notification again.
+    """
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    read_back = AsyncMock()
+    with provider_mock_transport(
+        _refusing_capture_handler(OTHER_PROVIDER_ISSUE)
+    ):
+        with patch(
+            SUBSCRIPTIONS_MODULE + '.verify_settled_order', new=read_back
+        ), patch(
+            SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+            new=AsyncMock(return_value=verified_delivery()),
+        ):
+            delivered = client.post(
+                '/subscriptions/webhook',
+                json=approved_event(),
+                headers=PAYPAL_HEADERS,
+            )
+
+    assert delivered.status_code // 100 != 2
+    read_back.assert_not_awaited()
+
+    db.expire_all()
+    stored = db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one()
+    assert stored.status == 'pending'
+    assert stored.end_date is None
+    assert db.query(WebhookEvent).count() == 0
+
+
+def test_the_already_captured_issue_is_the_only_recovered_refusal(
+    client, db, registered_user, auth_header_factory
+):
+    """The recovered refusal is the one the provider names as settled.
+
+    Paired with the case above, which serves the same status under a
+    different issue code, this proves the discriminator is the issue code
+    rather than the status or the failure category.
+    """
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    plan = get_plan(PREMIUM_MONTHLY)
+    read_back = AsyncMock(return_value=CaptureOutcome(
+        completed=True,
+        order_id=ORDER_ID,
+        status='COMPLETED',
+        amount=str(plan.amount),
+        currency=plan.currency,
+        capture_id='CAPTURE-READ-BACK',
+    ))
+    with provider_mock_transport(
+        _refusing_capture_handler(ISSUE_ORDER_ALREADY_CAPTURED)
+    ):
+        with patch(
+            SUBSCRIPTIONS_MODULE + '.verify_settled_order', new=read_back
+        ), patch(
+            SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+            new=AsyncMock(return_value=verified_delivery()),
+        ):
+            delivered = client.post(
+                '/subscriptions/webhook',
+                json=approved_event(),
+                headers=PAYPAL_HEADERS,
+            )
+
+    assert delivered.status_code == 200
+    assert delivered.json() == {'status': 'processed'}
+    assert read_back.await_count == 1
+
+    db.expire_all()
+    assert db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one().status == 'active'
 
 
 def test_a_provider_refusal_at_capture_is_not_read_back(

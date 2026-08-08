@@ -24,10 +24,14 @@ The properties covered are:
 * ``0001`` adds ``plan_id``, ``amount``, ``currency`` and
   ``paypal_order_id`` to ``subscriptions``, and every row already stored
   reads the currency ``USD``
-* ``0001`` adds the uniqueness over ``subscriptions.paypal_order_id``,
-  the uniqueness over ``listings.zillow_url``, and the
-  ``webhook_events`` table whose ``transmission_id`` is unique, each
-  proven by a rejected duplicate insert
+* ``0001`` adds the uniqueness over ``subscriptions.paypal_order_id``
+  and the ``webhook_events`` table whose ``transmission_id`` is unique,
+  each proven by a rejected duplicate insert, and adds no uniqueness
+  over ``listings.zillow_url``, proven by an accepted duplicate insert
+* the ``listings`` table ``0001`` leaves behind is the same table
+  whichever lineage produced it -- the schema that precedes the
+  revision, either database the revision migrated, and the mapped
+  metadata all agree on its columns and on its uniqueness
 * ``0001`` grants no administrator, applies to a database holding no
   table, and re-applies over its own shape without changing it
 * ``0002`` promotes the single address the revision names and no other,
@@ -56,10 +60,14 @@ from pathlib import Path  # noqa: F401
 from typing import Any
 
 from alembic.config import Config
-from sqlalchemy import create_engine
+from sqlalchemy import UniqueConstraint, create_engine
 
 from backend.app.db import database as database_module
-from backend.tests.support import REPO_ROOT
+from backend.app.db.models import Listing
+from backend.tests.support import (
+    REPO_ROOT,
+    enforce_sqlite_foreign_keys,
+)
 
 
 #: Revision identifier of the additive schema change.
@@ -131,7 +139,8 @@ DUPLICATE_ORDER_ID = "ORDER-MIGRATION-DUPLICATE"
 #: Delivery identifier the uniqueness cases submit twice.
 DUPLICATE_TRANSMISSION_ID = "TRANSMISSION-MIGRATION-DUPLICATE"
 
-#: Listing target the uniqueness cases submit twice.
+#: Listing target the case covering the absent listing uniqueness
+#: submits twice.
 DUPLICATE_LISTING_URL = "https://www.zillow.com/homedetails/duplicate"
 
 
@@ -246,6 +255,53 @@ def carries_uniqueness_over(engine, table, columns):
     return False
 
 
+def uniqueness_column_sets(engine, table):
+    """Return every column set ``table`` holds a uniqueness over.
+
+    Both the uniqueness constraints and the unique indexes reported for
+    ``table`` are collected: a backend may record either.
+    """
+    covered = set()
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        for constraint in inspector.get_unique_constraints(table):
+            covered.add(tuple(constraint.get("column_names") or []))
+        for index in inspector.get_indexes(table):
+            if index.get("unique"):
+                covered.add(tuple(index.get("column_names") or []))
+    return covered
+
+
+def listing_shape(engine, table):
+    """Return the stored shape of ``table`` as columns and uniqueness."""
+    return (
+        tuple(sorted(column_names(engine, table))),
+        frozenset(uniqueness_column_sets(engine, table)),
+    )
+
+
+def mapped_listing_shape():
+    """Return the same shape for the table the application declares."""
+    mapped = Listing.__table__
+    covered = set(
+        tuple(column.name for column in constraint.columns)
+        for constraint in mapped.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
+    covered.update(
+        tuple(column.name for column in index.columns)
+        for index in mapped.indexes
+        if index.unique
+    )
+    covered.update(
+        (column.name,) for column in mapped.columns if column.unique
+    )
+    return (
+        tuple(sorted(column.name for column in mapped.columns)),
+        frozenset(covered),
+    )
+
+
 def roles_by_email(engine):
     """Return the stored role of every account, keyed by address."""
     return dict(
@@ -345,13 +401,16 @@ def pre_revision_database(tmp_path):
     It carries no ``alembic_version`` table, no ``webhook_events`` table,
     and none of the columns either revision adds, so a revision applied
     to it performs the work it would perform against a deployment that
-    predates it.
+    predates it. Foreign keys are enforced on every connection, and a
+    row naming a parent that is not stored is refused.
     """
-    engine = create_engine(
-        "sqlite+pysqlite:///{0}".format(
-            (tmp_path / "pre_revision.db").as_posix()
-        ),
-        connect_args={"check_same_thread": False},
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            "sqlite+pysqlite:///{0}".format(
+                (tmp_path / "pre_revision.db").as_posix()
+            ),
+            connect_args={"check_same_thread": False},
+        )
     )
     try:
         with engine.begin() as connection:
@@ -364,12 +423,19 @@ def pre_revision_database(tmp_path):
 
 @pytest.fixture
 def empty_migration_database(tmp_path):
-    """Yield an engine on a database holding no table at all."""
-    engine = create_engine(
-        "sqlite+pysqlite:///{0}".format(
-            (tmp_path / "empty.db").as_posix()
-        ),
-        connect_args={"check_same_thread": False},
+    """Yield an engine on a database holding no table at all.
+
+    Foreign keys are enforced on every connection, and the tables the
+    revision builds from nothing refuse a row naming a parent that is
+    not stored.
+    """
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            "sqlite+pysqlite:///{0}".format(
+                (tmp_path / "empty.db").as_posix()
+            ),
+            connect_args={"check_same_thread": False},
+        )
     )
     try:
         yield engine
@@ -636,6 +702,40 @@ def test_0001_adds_no_uniqueness_over_the_listing_target(
         seeded_pre_revision, schema.LISTINGS, ["zillow_url"]
     )
     seed_listing(seeded_pre_revision, DUPLICATE_LISTING_URL)
+
+
+def test_the_listing_table_is_the_same_whichever_lineage_built_it(
+    seeded_pre_revision,
+    empty_migration_database,
+    alembic_config,
+    migration_target,
+):
+    """One listing shape, across every route a database can arrive by.
+
+    Four shapes are compared: the schema that precedes the revision, that
+    same database after the revision migrated it, a database the revision
+    built from nothing, and the mapped metadata the application declares.
+    Each is read as its column names and the sets of columns a uniqueness
+    covers, and the four readings are required to be equal. An addition
+    or a removal on any one route fails this case.
+    """
+    schema = revision_module(alembic_config, SCHEMA_REVISION)
+
+    preceding = listing_shape(seeded_pre_revision, schema.LISTINGS)
+
+    migration_target(seeded_pre_revision)
+    command.upgrade(alembic_config, "head")
+    migrated_in_place = listing_shape(seeded_pre_revision, schema.LISTINGS)
+
+    migration_target(empty_migration_database)
+    command.upgrade(alembic_config, "head")
+    built_from_nothing = listing_shape(
+        empty_migration_database, schema.LISTINGS
+    )
+
+    assert migrated_in_place == preceding
+    assert built_from_nothing == preceding
+    assert mapped_listing_shape() == preceding
 
 
 def test_0001_applies_to_a_database_holding_no_table(

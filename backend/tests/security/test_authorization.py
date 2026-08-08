@@ -40,6 +40,7 @@ from backend.app.core.security import (
     get_password_hash,
 )
 from backend.app.db.models import Base, Filter, User
+from backend.tests.support import enforce_sqlite_foreign_keys
 
 PASSWORD = "Str0ng-Passphrase-9"
 
@@ -292,10 +293,12 @@ class TestClaimedRoleIsAuditable:
 
 @pytest.fixture
 def session_factory():
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
     )
     Base.metadata.create_all(bind=engine)
     yield sessionmaker(autocommit=False, autoflush=False, bind=engine)

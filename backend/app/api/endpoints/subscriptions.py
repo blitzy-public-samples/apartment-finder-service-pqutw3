@@ -103,6 +103,7 @@ capture was still in flight when a refund or a cancellation was recorded
 leaves that outcome in place.
 """
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -146,7 +147,9 @@ from backend.app.services.paypal_service import (
     CATEGORY_PROVIDER_CLIENT,
     CATEGORY_RATE_LIMITED,
     CATEGORY_TIMEOUT,
+    ISSUE_ORDER_ALREADY_CAPTURED,
     REASON_MALFORMED_BODY,
+    REASON_VERIFIER_UNAVAILABLE,
     CaptureOutcome,
     PayPalAPIError,
     PayPalError,
@@ -234,6 +237,19 @@ REASON_UNRECONCILABLE_CAPTURE = "capture_identifier_missing"
 
 ORDER_ID_KEY = "id"
 
+#: Longest provider order identifier accepted. A longer value is refused
+#: rather than stored, so what one provider response can place in a
+#: column and in an outbound path is bounded.
+MAX_PROVIDER_ORDER_ID_LENGTH = 64
+
+#: Shape a provider order identifier must have to be stored and used. It
+#: admits only characters that need no escaping in a URL path segment, so
+#: the stored value is the value the provider path carries.
+PROVIDER_ORDER_ID_PATTERN = re.compile(
+    r"\A[A-Za-z0-9][A-Za-z0-9._~-]{0,%d}\Z"
+    % (MAX_PROVIDER_ORDER_ID_LENGTH - 1)
+)
+
 #: Key carrying the object a notification reports on.
 RESOURCE_KEY = "resource"
 
@@ -284,6 +300,11 @@ REASON_TERMINAL_STATUS = "subscription_already_terminal"
 # other category is a dependency failure.
 _CLIENT_STATE_CATEGORIES = (CATEGORY_PROVIDER_CLIENT,)
 
+# Verification reasons that report a check which could not be completed
+# rather than a notification the check rejected. Each is answered
+# HTTP_503_SERVICE_UNAVAILABLE.
+_UNCHECKED_REASONS = (REASON_VERIFIER_UNAVAILABLE,)
+
 # Return type of the operation :func:`_in_session` is handed.
 _Result = TypeVar("_Result")
 
@@ -327,6 +348,61 @@ def _provider_detail(response_status: int) -> str:
     if response_status == status.HTTP_400_BAD_REQUEST:
         return PAYMENT_FAILED_DETAIL
     return PAYMENT_UNAVAILABLE_DETAIL
+
+
+def _provider_order_id(order: Any) -> Optional[str]:
+    """Returns the identifier an opened order carries, or ``None``.
+
+    The value is read from :data:`ORDER_ID_KEY`, stripped of surrounding
+    whitespace, and returned only when the result is non-empty and
+    matches :data:`PROVIDER_ORDER_ID_PATTERN`. A value that is not a
+    string, one that is blank or whitespace only, one longer than
+    :data:`MAX_PROVIDER_ORDER_ID_LENGTH` and one carrying a character
+    outside that shape each return ``None``.
+
+    The returned value is what is persisted, logged and appended to the
+    provider path, so no other form of the identifier reaches a column or
+    an outbound request.
+    """
+    if not isinstance(order, dict):
+        return None
+    value = order.get(ORDER_ID_KEY)
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not PROVIDER_ORDER_ID_PATTERN.match(candidate):
+        return None
+    return candidate
+
+
+def _is_already_captured(error: PayPalError) -> bool:
+    """Reports whether a provider refusal names an order already settled.
+
+    True only when the failure sits in :data:`_CLIENT_STATE_CATEGORIES`
+    **and** carries the issue code
+    :data:`backend.app.services.paypal_service.ISSUE_ORDER_ALREADY_CAPTURED`.
+    A refusal the provider answered with the same status under any other
+    issue code, and one carrying no issue code at all, are both False.
+    """
+    if getattr(error, "category", None) not in _CLIENT_STATE_CATEGORIES:
+        return False
+    return getattr(error, "issue", None) == ISSUE_ORDER_ALREADY_CAPTURED
+
+
+def _could_not_be_checked(verification: Any) -> bool:
+    """Reports whether a notification's check did not complete.
+
+    True when the outcome names a reason in :data:`_UNCHECKED_REASONS`,
+    and also when it reports itself retryable. The reason is read first
+    and on its own, so an outcome the verification function classified as
+    unavailable is answered as unavailable whatever the retryability of
+    the provider failure underneath it, and a rejected signature is the
+    only outcome answered ``400``.
+    """
+    reason = getattr(verification, "reason", None)
+    if reason in _UNCHECKED_REASONS:
+        return True
+    return bool(getattr(verification, "retryable", False))
 
 
 def _provider_fields(error: PayPalError) -> Dict[str, Any]:
@@ -526,12 +602,12 @@ async def create_subscription(
             paypal_request_id=idempotency_key,
         ) from None
 
-    order_id = order.get(ORDER_ID_KEY) if isinstance(order, dict) else None
+    order_id = _provider_order_id(order)
     target = approval_url(order)
-    if not isinstance(order_id, str) or not order_id or target is None:
-        # An order with no identifier cannot be captured, and one with no
-        # allowlisted approval target cannot be approved, so neither is
-        # handed back as an opened subscription.
+    if order_id is None or target is None:
+        # An order with no acceptable identifier cannot be captured, and
+        # one with no allowlisted approval target cannot be approved, so
+        # neither is handed back as an opened subscription.
         await _in_session(_mark_failed, db, subscription_id)
         logger.error(
             "PayPal order carried no usable identifier or no allowlisted "
@@ -541,7 +617,7 @@ async def create_subscription(
                 "plan_id": plan.plan_id,
                 "paypal_request_id": idempotency_key,
                 "reason": REASON_UNUSABLE_ORDER,
-                "order_identifier_present": bool(order_id),
+                "order_identifier_present": order_id is not None,
                 "approval_target_present": target is not None,
             },
         )
@@ -846,13 +922,20 @@ async def receive_paypal_webhook(
     acknowledged, a rollback lets the waiting insert succeed and the
     notification is still settled.
 
-    A notification that fails the check -- including one whose body does
-    not decode to an object -- is answered ``400``. A notification that
-    could not be checked at all is answered ``503``, and PayPal delivers
-    it again, as it redelivers every notification it is not answered
-    ``2xx`` for. A delivery identifier already recorded is answered
-    ``200`` and is **not** processed again. Nothing is written on any
-    rejected path.
+    A notification the check *rejects* -- a certificate host outside the
+    allowlist, an absent header, a body that does not decode to an
+    object, or an explicit
+    :data:`backend.app.services.paypal_service.VERIFICATION_FAILURE`
+    from PayPal -- is answered ``400``. A notification that could not be
+    checked at all is answered ``503``: that covers a verifier which
+    could not be reached or did not answer, and a verifier answer that
+    carries no recognised status, and it is decided by
+    :func:`_could_not_be_checked` from the reason itself rather than from
+    the retryability of any provider failure beneath it. PayPal delivers
+    a ``503`` again, as it redelivers every notification it is not
+    answered ``2xx`` for. A delivery identifier already recorded is
+    answered ``200`` and is **not** processed again. Nothing is written on
+    any rejected path.
 
     A transition that cannot be committed is answered ``503`` carrying
     :data:`RECONCILIATION_DETAIL` after one record naming
@@ -873,7 +956,7 @@ async def receive_paypal_webhook(
         request.headers, raw_body
     )
     if not verification.verified:
-        if verification.retryable:
+        if _could_not_be_checked(verification):
             raise _reject_webhook(
                 request,
                 verification.reason,
@@ -1124,7 +1207,16 @@ async def _settle(
     approval PayPal has already settled therefore resolves to that
     settlement rather than to a second charge or a refusal, recovered
     from the provider's own representation rather than a reconstructed
-    one. Every other provider failure is raised for the caller to answer.
+    one.
+
+    That recovery is entered only for a refusal the provider identifies
+    as :data:`ISSUE_ORDER_ALREADY_CAPTURED`, which
+    :func:`_is_already_captured` decides from the failure's issue code
+    rather than from its category. Every other provider failure --
+    including every other refusal answered with the same status -- is
+    raised for the caller to answer, and the caller discards the
+    delivery record it had claimed, so the notification is delivered
+    again rather than consumed as one nothing applied to.
 
     The owning account is loaded through :func:`_in_session`, so the read
     the relationship issues does not run on the event loop.
@@ -1139,7 +1231,7 @@ async def _settle(
             idempotency_key=capture_request_id(subscription.id),
         )
     except PayPalAPIError as error:
-        if error.category not in _CLIENT_STATE_CATEGORIES:
+        if not _is_already_captured(error):
             raise
         logger.warning(
             "Reading back an order the provider reported as already "
@@ -1149,6 +1241,7 @@ async def _settle(
                 "plan_id": plan.plan_id,
                 "provider_category": error.category,
                 "provider_status": error.status_code,
+                "provider_issue": error.issue,
                 "paypal_debug_id": error.debug_id,
             },
         )

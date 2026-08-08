@@ -48,6 +48,7 @@ from backend.app.db.models import (
 )
 from backend.app.main import app
 from backend.app.services import paypal_service
+from backend.tests.support import enforce_sqlite_foreign_keys
 
 PASSWORD = "Str0ng-Passphrase-9"
 
@@ -277,10 +278,12 @@ def fresh_rate_limit_counters():
 
 @pytest.fixture
 def session_factory():
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    engine = enforce_sqlite_foreign_keys(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
     )
     Base.metadata.create_all(bind=engine)
     yield sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -1226,6 +1229,7 @@ class TestWebhookReplay:
             "already captured",
             category=paypal_service.CATEGORY_PROVIDER_CLIENT,
             status_code=422,
+            issue=paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
         )
         settled = paypal_service.CaptureOutcome(
             completed=True,
@@ -1262,6 +1266,7 @@ class TestWebhookReplay:
             "already captured",
             category=paypal_service.CATEGORY_PROVIDER_CLIENT,
             status_code=422,
+            issue=paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
         )
         short = paypal_service.CaptureOutcome(
             completed=False,
@@ -1872,14 +1877,14 @@ class TestOrderOwnershipBinding:
             )
 
     def test_an_unknown_order_is_refused_the_same_way(
-        self, db, subscriber
+        self, db, subscriber, other_user
     ):
         with pytest.raises(paypal_service.OrderOwnershipError) as first:
             paypal_service._resolve_owned_order(
                 db, "ORDER-ABSENT", subscriber, None
             )
         row = Subscription(
-            user_id=999999,
+            user_id=other_user.id,
             plan_id=PREMIUM_MONTHLY,
             amount=Decimal("9.99"),
             currency="USD",

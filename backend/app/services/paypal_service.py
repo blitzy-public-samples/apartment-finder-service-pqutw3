@@ -47,7 +47,13 @@ Four operations are published:
   record of its own, and returns a :class:`WebhookVerification`; its
   caller records the outcome once and records the returned
   ``transmission_id`` under the uniqueness constraint that rejects a
-  replay.
+  replay. A rejected signature is reported only for an explicit
+  :data:`VERIFICATION_FAILURE`; every answer that leaves the check
+  incomplete -- an unanswered postback, a body that is not an object, an
+  absent or non-string status, and a status outside
+  :data:`VERIFICATION_STATUSES` -- is reported as
+  :data:`REASON_VERIFIER_UNAVAILABLE` with ``retryable`` True, which the
+  caller answers ``503`` so PayPal delivers the notification again.
 
 Order creation and capture both carry the ``PayPal-Request-Id`` header
 their caller supplies, and a repeat of an uncertain call resolves to the
@@ -55,9 +61,14 @@ same order and the same capture rather than to a second charge.
 
 Every failure is raised as a :class:`PayPalAPIError` carrying a
 :data:`ERROR_CATEGORIES` category, the provider status, the provider's
-``PayPal-Debug-Id`` and whether the failure is worth retrying, from which
-a caller can answer a dependency failure differently from a rejected
-request. No response body, URL or credential reaches the message.
+``PayPal-Debug-Id``, the provider's own issue code and whether the
+failure is worth retrying, from which a caller can answer a dependency
+failure differently from a rejected request, and can distinguish
+:data:`ISSUE_ORDER_ALREADY_CAPTURED` from every other refusal the
+provider answers with the same status. The issue code is read only from
+:data:`PROVIDER_ISSUE_FIELDS` and only in the shape
+:data:`PROVIDER_ISSUE_PATTERN` accepts. No response body, URL or
+credential reaches the message.
 
 Every call is issued through one shared HTTP client, whose pooled
 connections and TLS sessions serve all four operations. The pool is
@@ -95,6 +106,7 @@ Usage::
 import asyncio
 import json
 import math
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -141,12 +153,16 @@ __all__ = [
     "ERROR_CATEGORIES",
     "EXPIRY_MARGIN_SECONDS",
     "IDEMPOTENCY_HEADER",
+    "ISSUE_ORDER_ALREADY_CAPTURED",
     "REASON_AMOUNT_MISMATCH",
     "FAILURE_BACKOFF_SECONDS",
     "KEEPALIVE_EXPIRY_SECONDS",
     "MAX_CONNECTIONS",
     "MAX_KEEPALIVE_CONNECTIONS",
+    "MAX_PROVIDER_ISSUE_DETAILS",
     "MAX_RESPONSE_BYTES",
+    "PROVIDER_ISSUE_FIELDS",
+    "PROVIDER_ISSUE_PATTERN",
     "PREFER_HEADER",
     "PREFER_REPRESENTATION",
     "REASON_CERTIFICATE_HOST",
@@ -164,7 +180,10 @@ __all__ = [
     "TRANSMISSION_ID_HEADER",
     "TRANSMISSION_SIG_HEADER",
     "TRANSMISSION_TIME_HEADER",
+    "VERIFICATION_FAILURE",
+    "VERIFICATION_STATUSES",
     "VERIFICATION_SUCCESS",
+    "VERIFICATION_STATUS_FIELD",
     "WEBHOOK_EVENT_FIELD",
     "CaptureOutcome",
     "OrderOwnershipError",
@@ -240,6 +259,14 @@ REQUIRED_WEBHOOK_HEADERS = (
 #: The only ``verification_status`` treated as a passing check.
 VERIFICATION_SUCCESS = "SUCCESS"
 
+#: The only ``verification_status`` treated as a rejected signature.
+VERIFICATION_FAILURE = "FAILURE"
+
+#: Every ``verification_status`` the verifier is understood to report.
+#: A value outside this set, a value of another type and an absent value
+#: are each treated as a check that could not be completed.
+VERIFICATION_STATUSES = (VERIFICATION_SUCCESS, VERIFICATION_FAILURE)
+
 #: Rejection reason: the certificate host is outside the allowlist.
 REASON_CERTIFICATE_HOST = "certificate_host_not_allowlisted"
 
@@ -252,10 +279,15 @@ REASON_MALFORMED_BODY = "malformed_body"
 #: Field of the postback document that carries the notification.
 WEBHOOK_EVENT_FIELD = "webhook_event"
 
-#: Rejection reason: PayPal did not report a passing check.
+#: Field of the verifier's response that carries its outcome.
+VERIFICATION_STATUS_FIELD = "verification_status"
+
+#: Rejection reason: PayPal reported :data:`VERIFICATION_FAILURE`.
 REASON_SIGNATURE = "signature_not_verified"
 
-#: Rejection reason: the check could not be completed.
+#: Rejection reason: the check could not be completed. Covers a verifier
+#: that could not be reached or did not answer, and a verifier answer
+#: that does not carry a :data:`VERIFICATION_STATUSES` value.
 REASON_VERIFIER_UNAVAILABLE = "verifier_unavailable"
 
 #: Response header carrying the provider's support correlation handle.
@@ -323,6 +355,27 @@ REASON_CURRENCY_MISMATCH = "captured_currency_mismatch"
 
 #: Capture rejection: the response could not be read.
 REASON_MALFORMED_CAPTURE = "capture_response_malformed"
+
+#: Provider issue reporting that the order named by a capture call has
+#: already been settled. It is the one issue a caller may treat as a
+#: settlement to be read back rather than as a failed call.
+ISSUE_ORDER_ALREADY_CAPTURED = "ORDER_ALREADY_CAPTURED"
+
+#: Fields of a provider error body the issue code is read from, in the
+#: order they are consulted. ``details`` is a list whose entries carry
+#: ``issue``; ``name`` is the error's own identifier. No other field of
+#: the body is read, and no value from any other field is retained.
+PROVIDER_ISSUE_FIELDS = ("details", "name")
+
+#: Entries of ``details`` this many deep are examined; a longer list is
+#: read no further, so the work one error body can cause is bounded.
+MAX_PROVIDER_ISSUE_DETAILS = 16
+
+#: Shape an issue code must have to be carried. A value that is not an
+#: upper-case identifier of at most 64 characters is discarded rather
+#: than retained, so nothing a provider body carries reaches a caller or
+#: a log record except a code of this shape.
+PROVIDER_ISSUE_PATTERN = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
 
 #: Prefix of the idempotency key sent when an order is opened.
 _ORDER_KEY_PREFIX = "sub-order-"
@@ -572,8 +625,13 @@ class PayPalAPIError(PayPalError):
     went wrong without naming the request. ``status_code`` is the status
     the provider answered, or ``None`` when no response arrived.
     ``debug_id`` is the provider's ``PayPal-Debug-Id``, which support
-    correlates a call by. ``retryable`` reports whether a later attempt
-    may succeed.
+    correlates a call by. ``issue`` is the provider's own issue code for
+    the failure, read from the allowlisted fields
+    :data:`PROVIDER_ISSUE_FIELDS` and carried only in the shape
+    :data:`PROVIDER_ISSUE_PATTERN` accepts, or ``None`` when the body
+    named none; it is what a caller distinguishes
+    :data:`ISSUE_ORDER_ALREADY_CAPTURED` from every other refusal by.
+    ``retryable`` reports whether a later attempt may succeed.
 
     The message carries no response body, no URL and no credential, so
     the exception is safe to translate into a client-facing error.
@@ -587,12 +645,14 @@ class PayPalAPIError(PayPalError):
         debug_id: Optional[str] = None,
         retryable: Optional[bool] = None,
         operation: Optional[str] = None,
+        issue: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
         self.debug_id = debug_id
         self.operation = operation
+        self.issue = issue
         if retryable is None:
             self.retryable = category in RETRYABLE_CATEGORIES
         else:
@@ -605,6 +665,7 @@ class PayPalAPIError(PayPalError):
             "provider_status": self.status_code,
             "paypal_debug_id": self.debug_id,
             "provider_operation": self.operation,
+            "provider_issue": self.issue,
             "provider_retryable": self.retryable,
         }
 
@@ -755,6 +816,56 @@ def _status_category(status_code: int) -> str:
     return CATEGORY_PROVIDER_CLIENT
 
 
+def _issue_code(value: Any) -> Optional[str]:
+    """Returns ``value`` as an issue code, or ``None``.
+
+    A value is returned only when it is a string whose stripped form
+    matches :data:`PROVIDER_ISSUE_PATTERN`, so a code is either an
+    upper-case identifier of bounded length or nothing at all.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not PROVIDER_ISSUE_PATTERN.match(candidate):
+        return None
+    return candidate
+
+
+def _provider_issue(
+    response: Any, operation: Optional[str] = None
+) -> Optional[str]:
+    """Returns the provider's issue code for a failed call, or ``None``.
+
+    The body is decoded only when it is within
+    :data:`MAX_RESPONSE_BYTES`, and only the fields named by
+    :data:`PROVIDER_ISSUE_FIELDS` are consulted: the first
+    :data:`MAX_PROVIDER_ISSUE_DETAILS` entries of ``details`` for their
+    ``issue``, then the body's own ``name``. Every candidate is passed
+    through :func:`_issue_code`, so no other field, and no value of any
+    other shape, is retained or returned. Any failure to read the body
+    returns ``None``.
+    """
+    if response is None:
+        return None
+    try:
+        if _oversized(response, operation):
+            return None
+        payload = response.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    details = payload.get("details")
+    if isinstance(details, list):
+        for entry in details[:MAX_PROVIDER_ISSUE_DETAILS]:
+            if not isinstance(entry, dict):
+                continue
+            code = _issue_code(entry.get("issue"))
+            if code is not None:
+                return code
+    return _issue_code(payload.get("name"))
+
+
 def _api_error(
     error: Exception,
     path: str,
@@ -763,17 +874,20 @@ def _api_error(
     """Classifies ``error`` and records it as one structured failure.
 
     The record carries the path, the operation, the failure category, the
-    provider status and the provider's debug identifier. No response
-    body, no URL and no credential is recorded, and the returned
-    exception carries the same fields for its caller to translate.
+    provider status, the provider's debug identifier and the provider's
+    issue code. No response body, no URL and no credential is recorded,
+    and the returned exception carries the same fields for its caller to
+    translate.
     """
     status_code = None  # type: Optional[int]
     debug_id = None  # type: Optional[str]
+    issue = None  # type: Optional[str]
     if isinstance(error, httpx.TimeoutException):
         category = CATEGORY_TIMEOUT
     elif isinstance(error, httpx.HTTPStatusError):
         status_code = error.response.status_code
         debug_id = _debug_id(error.response)
+        issue = _provider_issue(error.response, operation)
         category = _status_category(status_code)
     elif isinstance(error, ValueError):
         category = CATEGORY_MALFORMED_RESPONSE
@@ -785,6 +899,7 @@ def _api_error(
         status_code=status_code,
         debug_id=debug_id,
         operation=operation,
+        issue=issue,
     )
     fields = failure.audit_fields()
     fields["path"] = path
@@ -1834,8 +1949,8 @@ async def verify_webhook_signature(
        rejected as :data:`REASON_MALFORMED_BODY` and no request is sent
     4. the document assembled by :func:`_postback_document`, carrying
        ``body`` verbatim under ``webhook_event``, is posted to PayPal's
-       verify-webhook-signature endpoint, and only
-       :data:`VERIFICATION_SUCCESS` is treated as a passing check
+       verify-webhook-signature endpoint, and its answer is classified
+       by the three-way rule below
 
     The bytes that arrived are what the verifier is sent, so PayPal
     checks the signature against the notification as it was signed rather
@@ -1843,14 +1958,27 @@ async def verify_webhook_signature(
     read until step 4 has passed, and the only one read then is the event
     type.
 
+    The verifier's answer resolves to exactly one of three outcomes, and
+    a rejected signature is one of them rather than the default:
+
+    * :data:`VERIFICATION_SUCCESS` -- the check passed.
+    * :data:`VERIFICATION_FAILURE` -- the check rejected the signature,
+      returned as :data:`REASON_SIGNATURE` with ``retryable`` False.
+    * anything else -- a postback the provider could not answer, a
+      response body that is not an object, an absent
+      :data:`VERIFICATION_STATUS_FIELD`, a value of another type, and a
+      value outside :data:`VERIFICATION_STATUSES` are each a check that
+      could not be completed, returned as
+      :data:`REASON_VERIFIER_UNAVAILABLE` with ``retryable`` True.
+
     Reads and writes no database state on any path and emits no record of
     its own. Every failed check is *returned* rather than raised, as a
     :class:`WebhookVerification` whose ``verified`` is False, whose
     ``reason`` names the failed check and whose ``retryable`` reports
-    whether the check itself could not be completed -- including a
-    postback the provider could not answer, which is returned as
-    :data:`REASON_VERIFIER_UNAVAILABLE` rather than propagating the
-    :class:`PayPalError`.
+    whether the check itself could not be completed. A
+    :class:`PayPalError` from the postback is returned as
+    :data:`REASON_VERIFIER_UNAVAILABLE` rather than propagating, and its
+    own retryability does not narrow that outcome.
     ``transmission_id`` is returned only on a passing check, and the
     caller records it under the uniqueness constraint that rejects a
     replayed notification.
@@ -1884,17 +2012,38 @@ async def verify_webhook_signature(
             operation=_OPERATION_VERIFY,
             document=document,
         )
-    except PayPalError as error:
-        return _rejected(
-            REASON_VERIFIER_UNAVAILABLE,
-            retryable=bool(getattr(error, "retryable", True)),
+    except PayPalError:
+        return _rejected(REASON_VERIFIER_UNAVAILABLE, retryable=True)
+
+    reported = _verification_status(payload)
+    if reported == VERIFICATION_SUCCESS:
+        return WebhookVerification(
+            verified=True,
+            transmission_id=transmission_id,
+            event_type=_event_type(notification),
         )
-
-    if payload.get("verification_status") != VERIFICATION_SUCCESS:
+    if reported == VERIFICATION_FAILURE:
         return _rejected(REASON_SIGNATURE)
+    return _rejected(REASON_VERIFIER_UNAVAILABLE, retryable=True)
 
-    return WebhookVerification(
-        verified=True,
-        transmission_id=transmission_id,
-        event_type=_event_type(notification),
-    )
+
+def _verification_status(payload: Any) -> Optional[str]:
+    """Returns the outcome the verifier reported, or ``None``.
+
+    ``None`` is returned unless ``payload`` is an object carrying
+    :data:`VERIFICATION_STATUS_FIELD` as a string naming one of
+    :data:`VERIFICATION_STATUSES`. An absent field, a field of another
+    type and a value outside that set therefore all read as an outcome
+    this service does not have, which is distinct from a reported
+    rejection. Only the field named above is read; no other field of the
+    response is examined and none is recorded.
+    """
+    if not isinstance(payload, dict):
+        return None
+    reported = payload.get(VERIFICATION_STATUS_FIELD)
+    if not isinstance(reported, str):
+        return None
+    candidate = reported.strip()
+    if candidate not in VERIFICATION_STATUSES:
+        return None
+    return candidate

@@ -6,6 +6,14 @@ the listing creation contract, and reconciles it against the stored
 corpus on :data:`IDENTITY_COLUMN`: a record whose value already names a
 stored row updates that row rather than adding another.
 
+That reconciliation is a read followed by a write, and the column it
+matches on carries no uniqueness in the mapped table or in revision
+``0001``, so the database refuses nothing on the strength of it. Two
+passes running at once may therefore each read no row and each insert
+one, leaving two rows carrying one value. The read is ordered by primary
+key and takes the first row, so once that has happened every later pass
+reconciles the same one of them and the corpus does not keep growing.
+
 Every write goes through a mapped ORM instance and names its columns
 explicitly: a record is either constructed as a new
 :class:`backend.app.db.models.Listing` or assigned onto the declared
@@ -56,8 +64,15 @@ UPDATE_INTERVAL = timedelta(hours=1)
 
 #: Column a provider record is reconciled against. It is the only
 #: declared column carrying a value the provider assigns per listing. A
-#: record whose value already names a row updates that row, so one value
-#: reaches at most one row.
+#: record whose value already names a row updates that row, so one pass
+#: writes one value to one row.
+#:
+#: The column carries no uniqueness, in the mapped table and in revision
+#: ``0001`` alike, so two rows may carry one value. The read is ordered
+#: by primary key and takes the first row, which is the earliest row
+#: carrying the value: two rows carrying one value resolve to the same
+#: one on every pass, rather than to whichever row the database returns
+#: first.
 IDENTITY_COLUMN = "zillow_url"
 
 #: Provider query filters sent with every scheduled pass. The pass
@@ -290,10 +305,16 @@ async def update_listings():
             identity = getattr(mapped, IDENTITY_COLUMN)
             # Each record is flushed as it is written, so this matches a
             # row carrying the value -- including one written earlier in
-            # this same pass -- or none at all.
-            existing_listing = db.query(Listing).filter(
-                getattr(Listing, IDENTITY_COLUMN) == identity
-            ).first()
+            # this same pass -- or none at all. The order is by primary
+            # key, so where the corpus holds more than one row carrying
+            # the value the earliest of them is the one reconciled, on
+            # this pass and on every later one.
+            existing_listing = (
+                db.query(Listing)
+                .filter(getattr(Listing, IDENTITY_COLUMN) == identity)
+                .order_by(Listing.id)
+                .first()
+            )
             if not _write(db, existing_listing, mapped, moment):
                 refused += 1
             elif existing_listing is None:

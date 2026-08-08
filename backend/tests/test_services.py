@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import copy
 import functools
 import inspect
 import io
@@ -23,6 +24,8 @@ from conftest import (
     PAYPAL_VERIFY_FIELDS,
     PAYPAL_VERIFY_PATH,
     PayPalContractError,
+    assert_capture_body,
+    assert_create_order_body,
     assert_paypal_contract,
     assert_paypal_request,
 )
@@ -45,7 +48,10 @@ from backend.app.core.logging import (
     reset_request_id,
     flush_log_queue,
 )
-from backend.app.core.plans import format_amount, get_plan
+from backend.app.api.endpoints import (
+    subscriptions as subscriptions_module,
+)
+from backend.app.core.plans import PLAN_IDS, format_amount, get_plan
 from backend.app.db.models import Base, Subscription, User
 from backend.app.services import email_service as email_service_module
 from backend.app.services import paypal_service
@@ -59,6 +65,7 @@ from backend.app.services.zillow_service import (
 from backend.app.tasks import (
     listing_updater as listing_updater_module,
 )
+from backend.tests.support import enforce_sqlite_foreign_keys
 
 ZILLOW_MODULE = 'backend.app.services.zillow_service'
 EMAIL_MODULE = 'backend.app.services.email_service'
@@ -1096,10 +1103,12 @@ class TestPayPalService(unittest.TestCase):
 
     def setUp(self):
         paypal_service.reset_access_token_cache()
-        self.engine = create_engine(
-            'sqlite://',
-            connect_args={'check_same_thread': False},
-            poolclass=StaticPool,
+        self.engine = enforce_sqlite_foreign_keys(
+            create_engine(
+                'sqlite://',
+                connect_args={'check_same_thread': False},
+                poolclass=StaticPool,
+            )
         )
         Base.metadata.create_all(bind=self.engine)
         self.Session = sessionmaker(bind=self.engine)
@@ -1339,6 +1348,21 @@ class TestPayPalService(unittest.TestCase):
                 refused.exception.category,
                 paypal_service.CATEGORY_PROVIDER_CLIENT,
             )
+            # The decisive field: the provider's own issue code, which is
+            # what the endpoint discriminates the recovery on.
+            self.assertEqual(
+                refused.exception.issue,
+                paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
+            )
+            self.assertTrue(
+                subscriptions_module._is_already_captured(
+                    refused.exception
+                )
+            )
+            self.assertEqual(
+                refused.exception.audit_fields()["provider_issue"],
+                paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
+            )
             outcome = _run(paypal_service.verify_settled_order(
                 self.db, ORDER_ID, self.owner, plan.amount, plan.currency
             ))
@@ -1351,6 +1375,116 @@ class TestPayPalService(unittest.TestCase):
             path.endswith('/v2/checkout/orders/' + ORDER_ID)
             for path in recorder.paths()
         ))
+
+    def test_another_refusal_carries_its_own_issue_code(self):
+        """A refusal under the same status carries a different code.
+
+        The status and the failure category are identical to the
+        already-captured case above, so the issue code is the only field
+        that separates the two, and the endpoint's discriminator refuses
+        this one.
+        """
+        _recorder, transport = self._transport([
+            ('/capture', 422, {
+                'name': 'UNPROCESSABLE_ENTITY',
+                'details': [{'issue': 'INSTRUMENT_DECLINED'}],
+            }),
+        ])
+        with transport:
+            with self.assertRaises(
+                paypal_service.PayPalAPIError
+            ) as refused:
+                _run(paypal_service.capture_order(
+                    self.db, ORDER_ID, self.owner
+                ))
+        self.assertEqual(
+            refused.exception.category,
+            paypal_service.CATEGORY_PROVIDER_CLIENT,
+        )
+        self.assertEqual(refused.exception.issue, 'INSTRUMENT_DECLINED')
+        self.assertFalse(
+            subscriptions_module._is_already_captured(refused.exception)
+        )
+
+    def test_an_error_body_naming_no_issue_carries_no_code(self):
+        """A body with no allowlisted field yields no issue code."""
+        _recorder, transport = self._transport([
+            ('/capture', 422, {'message': 'the order was not settled'}),
+        ])
+        with transport:
+            with self.assertRaises(
+                paypal_service.PayPalAPIError
+            ) as refused:
+                _run(paypal_service.capture_order(
+                    self.db, ORDER_ID, self.owner
+                ))
+        self.assertIsNone(refused.exception.issue)
+        self.assertFalse(
+            subscriptions_module._is_already_captured(refused.exception)
+        )
+
+    def test_the_error_name_is_read_when_no_detail_names_an_issue(self):
+        """The body's own name supplies the code when details do not."""
+        _recorder, transport = self._transport([
+            ('/capture', 422, {
+                'name': paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
+                'details': [{'description': 'no issue field here'}],
+            }),
+        ])
+        with transport:
+            with self.assertRaises(
+                paypal_service.PayPalAPIError
+            ) as refused:
+                _run(paypal_service.capture_order(
+                    self.db, ORDER_ID, self.owner
+                ))
+        self.assertEqual(
+            refused.exception.issue,
+            paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
+        )
+
+    def test_only_an_allowlisted_field_of_the_error_body_is_read(self):
+        """No field outside the allowlist reaches the issue code."""
+        _recorder, transport = self._transport([
+            ('/capture', 422, {
+                'issue': paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
+                'error_description': (
+                    paypal_service.ISSUE_ORDER_ALREADY_CAPTURED
+                ),
+                'debug_id': paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
+            }),
+        ])
+        with transport:
+            with self.assertRaises(
+                paypal_service.PayPalAPIError
+            ) as refused:
+                _run(paypal_service.capture_order(
+                    self.db, ORDER_ID, self.owner
+                ))
+        self.assertIsNone(refused.exception.issue)
+
+    def test_an_issue_value_outside_the_accepted_shape_is_discarded(self):
+        """A code of another shape is dropped rather than carried."""
+        for label, value in (
+            ('lower case', 'order_already_captured'),
+            ('punctuated', 'ORDER-ALREADY-CAPTURED'),
+            ('spaced prose', 'ORDER ALREADY CAPTURED'),
+            ('over the ceiling', 'A' * 65),
+            ('not a string', 17),
+            ('empty', ''),
+        ):
+            with self.subTest(label):
+                _recorder, transport = self._transport([
+                    ('/capture', 422, {'details': [{'issue': value}]}),
+                ])
+                with transport:
+                    with self.assertRaises(
+                        paypal_service.PayPalAPIError
+                    ) as refused:
+                        _run(paypal_service.capture_order(
+                            self.db, ORDER_ID, self.owner
+                        ))
+                self.assertIsNone(refused.exception.issue)
 
     def test_the_access_token_is_exchanged_once_per_lifetime(self):
         recorder, transport = self._transport(
@@ -1662,6 +1796,315 @@ class TestProviderContractGuard(unittest.TestCase):
                 url=settings.PAYPAL_API_BASE + PAYPAL_VERIFY_PATH,
                 json_body=document,
             ))
+
+
+def _created_order_body(plan_id=PLAN_ID):
+    """Returns the complete create-order document for ``plan_id``."""
+    plan = get_plan(plan_id)
+    return {
+        'intent': 'CAPTURE',
+        'purchase_units': [
+            {
+                'amount': {
+                    'currency_code': plan.currency,
+                    'value': format_amount(plan.amount),
+                },
+                'description': 'Subscription Payment',
+            }
+        ],
+        'payment_source': {
+            'paypal': {
+                'experience_context': {
+                    'return_url': 'https://app.example/r',
+                    'cancel_url': 'https://app.example/c',
+                    'user_action': 'PAY_NOW',
+                    'shipping_preference': 'NO_SHIPPING',
+                    'payment_method_preference': (
+                        'IMMEDIATE_PAYMENT_REQUIRED'
+                    ),
+                }
+            }
+        },
+    }
+
+
+def _without(mapping, *path):
+    """Returns ``mapping`` with the member at ``path`` removed."""
+    altered = copy.deepcopy(mapping)
+    target = altered
+    for key in path[:-1]:
+        target = target[key]
+    del target[path[-1]]
+    return altered
+
+
+def _replacing(mapping, path, value):
+    """Returns ``mapping`` with the member at ``path`` set to ``value``."""
+    altered = copy.deepcopy(mapping)
+    target = altered
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    return altered
+
+
+#: Path of the payer experience context inside the created order.
+_CONTEXT = ('payment_source', 'paypal', 'experience_context')
+
+#: Path of the single purchase unit's amount.
+_AMOUNT = ('purchase_units', 0, 'amount')
+
+
+class TestTheCreateOrderBodyContract(unittest.TestCase):
+    """One departure per required create-order field is refused.
+
+    The positive control asserts the complete document is accepted, and
+    every case below alters exactly one required field or value and
+    asserts the guard refuses it, so no field of the outbound document is
+    asserted only by its presence.
+    """
+
+    def _assert_refused(self, document):
+        """Assert the guard refuses ``document`` as a created order."""
+        with self.assertRaises(PayPalContractError):
+            assert_create_order_body(document)
+
+    def test_the_complete_document_is_accepted(self):
+        assert_create_order_body(_created_order_body())
+
+    def test_every_catalog_plan_prices_an_acceptable_order(self):
+        for plan_id in sorted(PLAN_IDS):
+            with self.subTest(plan_id):
+                assert_create_order_body(_created_order_body(plan_id))
+
+    def test_a_body_that_is_not_an_object_is_refused(self):
+        for label, document in (
+            ('a list', [_created_order_body()]),
+            ('a string', 'intent=CAPTURE'),
+            ('nothing', None),
+        ):
+            with self.subTest(label):
+                self._assert_refused(document)
+
+    def test_an_added_top_level_field_is_refused(self):
+        self._assert_refused(
+            _replacing(_created_order_body(), ('payer',), {'x': 1})
+        )
+
+    def test_a_missing_intent_is_refused(self):
+        self._assert_refused(_without(_created_order_body(), 'intent'))
+
+    def test_another_intent_is_refused(self):
+        self._assert_refused(
+            _replacing(_created_order_body(), ('intent',), 'AUTHORIZE')
+        )
+
+    def test_missing_purchase_units_are_refused(self):
+        self._assert_refused(
+            _without(_created_order_body(), 'purchase_units')
+        )
+
+    def test_more_than_one_purchase_unit_is_refused(self):
+        document = _created_order_body()
+        document['purchase_units'].append(
+            copy.deepcopy(document['purchase_units'][0])
+        )
+        self._assert_refused(document)
+
+    def test_an_added_purchase_unit_field_is_refused(self):
+        self._assert_refused(
+            _replacing(
+                _created_order_body(),
+                ('purchase_units', 0, 'reference_id'),
+                'unit-1',
+            )
+        )
+
+    def test_a_missing_description_is_refused(self):
+        self._assert_refused(
+            _without(_created_order_body(), 'purchase_units', 0,
+                     'description')
+        )
+
+    def test_another_description_is_refused(self):
+        self._assert_refused(
+            _replacing(
+                _created_order_body(),
+                ('purchase_units', 0, 'description'),
+                'Donation',
+            )
+        )
+
+    def test_a_missing_amount_is_refused(self):
+        self._assert_refused(
+            _without(_created_order_body(), 'purchase_units', 0, 'amount')
+        )
+
+    def test_an_added_amount_field_is_refused(self):
+        self._assert_refused(
+            _replacing(
+                _created_order_body(),
+                _AMOUNT + ('breakdown',),
+                {},
+            )
+        )
+
+    def test_a_price_outside_the_catalog_is_refused(self):
+        for label, value in (
+            ('a cent below', '9.98'),
+            ('a cent above', '10.00'),
+            ('nothing at all', '0.00'),
+            ('unformatted', '9.9'),
+        ):
+            with self.subTest(label):
+                self._assert_refused(
+                    _replacing(
+                        _created_order_body(),
+                        _AMOUNT + ('value',),
+                        value,
+                    )
+                )
+
+    def test_another_currency_is_refused(self):
+        self._assert_refused(
+            _replacing(
+                _created_order_body(),
+                _AMOUNT + ('currency_code',),
+                'EUR',
+            )
+        )
+
+    def test_a_missing_payment_source_is_refused(self):
+        self._assert_refused(
+            _without(_created_order_body(), 'payment_source')
+        )
+
+    def test_another_payment_source_is_refused(self):
+        self._assert_refused(
+            _replacing(
+                _created_order_body(),
+                ('payment_source',),
+                {'card': {'number': '4111111111111111'}},
+            )
+        )
+
+    def test_a_missing_experience_context_is_refused(self):
+        self._assert_refused(
+            _without(
+                _created_order_body(),
+                'payment_source',
+                'paypal',
+                'experience_context',
+            )
+        )
+
+    def test_an_added_experience_context_field_is_refused(self):
+        self._assert_refused(
+            _replacing(
+                _created_order_body(),
+                _CONTEXT + ('brand_name',),
+                'Apartment Finder',
+            )
+        )
+
+    def test_each_fixed_experience_value_is_required(self):
+        for field, value in (
+            ('user_action', 'CONTINUE'),
+            ('shipping_preference', 'GET_FROM_FILE'),
+            ('payment_method_preference', 'UNRESTRICTED'),
+        ):
+            with self.subTest(field + ' altered'):
+                self._assert_refused(
+                    _replacing(
+                        _created_order_body(),
+                        _CONTEXT + (field,),
+                        value,
+                    )
+                )
+            with self.subTest(field + ' absent'):
+                self._assert_refused(
+                    _without(
+                        _created_order_body(),
+                        'payment_source',
+                        'paypal',
+                        'experience_context',
+                        field,
+                    )
+                )
+
+    def test_each_redirect_target_must_be_absolute(self):
+        for field in ('return_url', 'cancel_url'):
+            for label, value in (
+                ('absent', None),
+                ('blank', '   '),
+                ('relative', '/subscription'),
+                ('not text', 17),
+            ):
+                with self.subTest(field + ' is ' + label):
+                    self._assert_refused(
+                        _replacing(
+                            _created_order_body(),
+                            _CONTEXT + (field,),
+                            value,
+                        )
+                    )
+
+
+class TestTheCaptureBodyContract(unittest.TestCase):
+    """The settle call's body is the empty object and nothing else."""
+
+    def test_the_empty_object_is_accepted(self):
+        assert_capture_body({})
+
+    def test_any_member_is_refused(self):
+        for label, document in (
+            ('a payer identifier', {'payer_id': 'PAYER-1'}),
+            ('an amount', {'amount': {'value': '9.99'}}),
+            ('a note', {'note_to_payer': 'thanks'}),
+            ('nothing at all', None),
+            ('a list', []),
+            ('a string', ''),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(PayPalContractError):
+                    assert_capture_body(document)
+
+    def test_the_guard_refuses_a_settle_call_carrying_a_body(self):
+        """The refusal reaches the shared guard, not only the helper."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(
+                method='POST',
+                url=(
+                    settings.PAYPAL_API_BASE + ORDER_PATH + '/capture'
+                ),
+                headers={
+                    'Authorization': 'Bearer ' + STAND_IN_GRANT,
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=representation',
+                },
+                json_body={'payer_id': 'PAYER-1'},
+                timeout=settings.HTTP_TIMEOUT_SECONDS,
+            )
+
+    def test_the_guard_refuses_a_created_order_priced_elsewhere(self):
+        """The create-order refusal reaches the shared guard too."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(
+                method='POST',
+                url=settings.PAYPAL_API_BASE + PAYPAL_ORDERS_PATH,
+                headers={
+                    'Authorization': 'Bearer ' + STAND_IN_GRANT,
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                },
+                json_body=_replacing(
+                    _created_order_body(),
+                    _AMOUNT + ('value',),
+                    '0.01',
+                ),
+                timeout=settings.HTTP_TIMEOUT_SECONDS,
+            )
 
 
 class TestProviderCredentialRegistration(unittest.TestCase):
