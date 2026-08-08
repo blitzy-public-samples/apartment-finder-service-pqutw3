@@ -5,10 +5,9 @@ subscriber holds. The catalog is fixed at import time and is published as
 a read-only mapping.
 
 This module also holds every value the ``subscriptions.status`` column
-takes, published together as :data:`STATUS_VALUES`. They live here,
-beside the catalog, because both the endpoint that writes the column and
-the authorization module that reads it need them, and this module imports
-nothing from the application.
+takes, published together as :data:`STATUS_VALUES`. They are read by the
+endpoint that writes the column and by the authorization module that
+reads it. This module imports nothing from the application.
 """
 
 import decimal

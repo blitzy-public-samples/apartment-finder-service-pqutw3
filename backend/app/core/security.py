@@ -14,19 +14,31 @@ shorter lifetime, and a longer or non-positive one is refused.
 The subject of a token is the user's integer identifier. The role claim
 a token carries is descriptive only: :func:`get_current_user` resolves
 the user from the stored row and copies no claim onto it. The claim is
-recorded on ``request.state`` under :data:`CLAIMED_ROLE_ATTRIBUTE` so
-that a refusal can name the role the caller asserted alongside the role
-the row actually carries. Nothing reads it to decide anything, and
+recorded on ``request.state`` under :data:`CLAIMED_ROLE_ATTRIBUTE`, where
+a refusal reads it to name the role the caller asserted alongside the
+role the row carries. Nothing reads it to decide anything, and
 :func:`claimed_role` is the only accessor.
 
 Passwords are hashed with bcrypt at the configured cost factor, in the
 format bcrypt already stores, and verification reports a mismatch
 rather than raising when a stored hash cannot be parsed.
 
+The stored cost factors this module compares against run from
+:data:`MIN_SUPPORTED_BCRYPT_COST` to :data:`MAX_SUPPORTED_BCRYPT_COST`.
+A stored hash declaring a cost outside that range is reported as a
+mismatch without being compared, and one record naming the cost is
+emitted.
+
 :func:`verify_credential` is the entry point every login path takes. It
-performs the same work whatever it is given, so the time a login takes
-reveals neither whether an address holds an account nor what cost factor
-that account's stored hash carries.
+performs the same work whatever it is given, bounded by
+:data:`MIN_CREDENTIAL_CHECK_SECONDS`, which is measured against a decoy
+hash carried at :data:`MAX_SUPPORTED_BCRYPT_COST`.
+:data:`MIN_LOGIN_REFUSAL_SECONDS` extends that bound over the database
+work a login performs after the comparison, and
+:func:`equalize_login_refusal` applies it. Together they mean the time a
+refused login takes reveals neither whether an address holds an account,
+nor what cost factor that account's stored hash carries, nor which
+refusal branch answered it.
 
 Usage::
 
@@ -46,6 +58,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from backend.app.core.config import settings
+from backend.app.core.logging import get_logger
 from backend.app.db.database import get_db
 from backend.app.db.models import User
 
@@ -53,16 +66,22 @@ __all__ = [
     "CLAIMED_ROLE_ATTRIBUTE",
     "DECOY_HASH",
     "JWT_ALGORITHMS",
+    "MAX_SUPPORTED_BCRYPT_COST",
     "MAX_TOKEN_LIFETIME",
     "MIN_CREDENTIAL_CHECK_SECONDS",
+    "MIN_LOGIN_REFUSAL_SECONDS",
+    "MIN_SUPPORTED_BCRYPT_COST",
     "REQUIRED_CLAIMS",
     "ROLE_CLAIM",
     "SIGNING_ALGORITHM",
+    "UNSUPPORTED_COST_MESSAGE",
     "claimed_role",
     "create_access_token",
+    "equalize_login_refusal",
     "get_current_user",
     "get_password_hash",
     "oauth2_scheme",
+    "stored_bcrypt_cost",
     "verify_credential",
     "verify_password",
 ]
@@ -93,8 +112,42 @@ ROLE_CLAIM = "role"
 #: asserted and takes part in no decision.
 CLAIMED_ROLE_ATTRIBUTE = "claimed_role"
 
+#: Lowest stored bcrypt cost factor a credential check will compare
+#: against. It is bcrypt's own lowest accepted cost.
+MIN_SUPPORTED_BCRYPT_COST = 4
+
+#: Cost factor the password hashes this schema arrived with were written
+#: at. It is the floor of :data:`MAX_SUPPORTED_BCRYPT_COST`, so lowering
+#: ``BCRYPT_ROUNDS`` never makes a stored hash unverifiable.
+INHERITED_BCRYPT_COST = 12
+
+#: Highest stored bcrypt cost factor a credential check will compare
+#: against: the configured cost, or the inherited one when that is
+#: higher. A stored hash above it is reported as a mismatch without being
+#: compared, so no comparison exceeds the measured budget.
+MAX_SUPPORTED_BCRYPT_COST = max(
+    settings.BCRYPT_ROUNDS, INHERITED_BCRYPT_COST
+)
+
+#: Message of the record emitted for a stored hash whose cost factor lies
+#: outside the supported range.
+UNSUPPORTED_COST_MESSAGE = (
+    "Refused a stored password hash whose bcrypt cost factor is outside "
+    "the supported range"
+)
+
+#: Fraction of :data:`MIN_CREDENTIAL_CHECK_SECONDS` added to reach
+#: :data:`MIN_LOGIN_REFUSAL_SECONDS`. It covers the statements a refusal
+#: branch issues after the comparison.
+REFUSAL_WORK_ALLOWANCE = 0.25
+
 # Byte length of the random value :data:`DECOY_HASH` is built from.
 _DECOY_INPUT_BYTES = 32
+
+# Number of fields a bcrypt hash carries before its salt and digest.
+_COST_FIELD_INDEX = 2
+
+logger = get_logger(__name__)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl='token')
 
@@ -114,14 +167,61 @@ def _credentials_exception() -> HTTPException:
     )
 
 
+def stored_bcrypt_cost(hashed_password: object) -> Optional[int]:
+    """Return the cost factor a stored bcrypt hash declares.
+
+    ``None`` is returned for a value that is not a string, does not carry
+    the ``$<identifier>$<cost>$`` prefix bcrypt writes, or names a cost
+    that is not a number.
+    """
+    if not isinstance(hashed_password, str):
+        return None
+    fields = hashed_password.split("$")
+    if len(fields) <= _COST_FIELD_INDEX:
+        return None
+    try:
+        return int(fields[_COST_FIELD_INDEX])
+    except ValueError:
+        return None
+
+
+def _cost_is_supported(hashed_password: object) -> bool:
+    """Report whether a stored hash's cost factor may be compared.
+
+    A cost outside :data:`MIN_SUPPORTED_BCRYPT_COST` to
+    :data:`MAX_SUPPORTED_BCRYPT_COST` is refused and recorded, naming the
+    cost and the supported range and never the hash itself. A value
+    carrying no readable cost is left to :func:`verify_password`, which
+    reports it as a mismatch.
+    """
+    cost = stored_bcrypt_cost(hashed_password)
+    if cost is None:
+        return True
+    if MIN_SUPPORTED_BCRYPT_COST <= cost <= MAX_SUPPORTED_BCRYPT_COST:
+        return True
+    logger.error(
+        UNSUPPORTED_COST_MESSAGE,
+        extra={
+            "stored_cost": cost,
+            "min_supported_cost": MIN_SUPPORTED_BCRYPT_COST,
+            "max_supported_cost": MAX_SUPPORTED_BCRYPT_COST,
+        },
+    )
+    return False
+
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Return whether the candidate matches the stored bcrypt hash.
 
     Accepts any hash format bcrypt reads, including ``$2a$`` and
-    ``$2b$``. Returns ``False`` rather than raising when the stored hash
-    cannot be parsed, or when either argument is a value bcrypt does not
-    accept, such as an over-long candidate or a non-string.
+    ``$2b$``, whose cost factor lies within the supported range. Returns
+    ``False`` rather than raising when the stored hash cannot be parsed,
+    when its cost factor is outside that range, or when either argument
+    is a value bcrypt does not accept, such as an over-long candidate or
+    a non-string.
     """
+    if not _cost_is_supported(hashed_password):
+        return False
     try:
         return bcrypt.checkpw(
             plain_password.encode("utf-8"),
@@ -131,20 +231,31 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 
+def _hash_at(password: str, cost: int) -> str:
+    """Return a bcrypt hash of the password at ``cost``."""
+    hashed = bcrypt.hashpw(
+        password.encode("utf-8"),
+        bcrypt.gensalt(rounds=cost),
+    )
+    return hashed.decode("utf-8")
+
+
 def get_password_hash(password: str) -> str:
     """Return a bcrypt hash of the password at the configured cost.
 
     The password is hashed as supplied, and bcrypt refuses an input
     longer than 72 bytes.
     """
-    hashed = bcrypt.hashpw(
-        password.encode("utf-8"),
-        bcrypt.gensalt(rounds=settings.BCRYPT_ROUNDS),
-    )
-    return hashed.decode("utf-8")
+    return _hash_at(password, settings.BCRYPT_ROUNDS)
 
 
-DECOY_HASH = get_password_hash(secrets.token_urlsafe(_DECOY_INPUT_BYTES))
+#: Hash every credential check compares against in addition to the stored
+#: one. It carries :data:`MAX_SUPPORTED_BCRYPT_COST`, so one comparison
+#: against it costs at least as much as one against any hash the check
+#: will run.
+DECOY_HASH = _hash_at(
+    secrets.token_urlsafe(_DECOY_INPUT_BYTES), MAX_SUPPORTED_BCRYPT_COST
+)
 
 
 def _measure_decoy_comparison() -> float:
@@ -156,9 +267,38 @@ def _measure_decoy_comparison() -> float:
 
 #: Seconds every credential check is padded out to, measured once when
 #: this module is imported. The value is the cost of one comparison
-#: against :data:`DECOY_HASH` multiplied by the two comparisons
+#: against :data:`DECOY_HASH`, which carries
+#: :data:`MAX_SUPPORTED_BCRYPT_COST`, multiplied by the two comparisons
 #: :func:`verify_credential` performs.
 MIN_CREDENTIAL_CHECK_SECONDS = _measure_decoy_comparison() * 2
+
+#: Seconds a refused login is padded out to, measured from the moment the
+#: handler was entered. It is :data:`MIN_CREDENTIAL_CHECK_SECONDS` plus
+#: :data:`REFUSAL_WORK_ALLOWANCE` of it, which covers the statements one
+#: refusal branch issues and another does not.
+MIN_LOGIN_REFUSAL_SECONDS = MIN_CREDENTIAL_CHECK_SECONDS * (
+    1.0 + REFUSAL_WORK_ALLOWANCE
+)
+
+
+def _pad_until(started: float, budget: float) -> None:
+    """Wait until ``budget`` seconds have elapsed since ``started``."""
+    remaining = budget - (time.monotonic() - started)
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def equalize_login_refusal(started: float) -> None:
+    """Hold a refused login until its budget has elapsed.
+
+    ``started`` is the ``time.monotonic()`` reading taken when the login
+    handler was entered. The call returns once
+    :data:`MIN_LOGIN_REFUSAL_SECONDS` have elapsed since then, and returns
+    at once when they already have. Every refusal branch calls it, so the
+    account lookup, the credential comparison and the attempt-counting
+    statements one branch issues are all covered by one budget.
+    """
+    _pad_until(started, MIN_LOGIN_REFUSAL_SECONDS)
 
 
 def verify_credential(
@@ -174,12 +314,13 @@ def verify_credential(
 
     Every call performs the same work: one comparison against the stored
     or stand-in hash, then one comparison against :data:`DECOY_HASH` at
-    the configured cost factor, and finally a wait until
+    :data:`MAX_SUPPORTED_BCRYPT_COST`, and finally a wait until
     :data:`MIN_CREDENTIAL_CHECK_SECONDS` have elapsed. A stored hash
-    carrying a cost factor below the configured one therefore does not
-    complete sooner than one that matched no account, so the elapsed time
-    reveals neither whether an address holds an account nor whether that
-    account is locked.
+    carrying a cost factor below the supported ceiling does not complete
+    sooner than one that matched no account, and one carrying a cost above
+    it is refused without being compared rather than taking longer, so the
+    elapsed time reveals neither whether an address holds an account, nor
+    what cost that account's hash carries, nor whether it is locked.
     """
     started = time.monotonic()
     candidate = hashed_password if hashed_password else DECOY_HASH
@@ -187,11 +328,7 @@ def verify_credential(
     verify_password(plain_password, DECOY_HASH)
     if hashed_password is None or not hashed_password:
         matched = False
-    remaining = MIN_CREDENTIAL_CHECK_SECONDS - (
-        time.monotonic() - started
-    )
-    if remaining > 0:
-        time.sleep(remaining)
+    _pad_until(started, MIN_CREDENTIAL_CHECK_SECONDS)
     return matched
 
 

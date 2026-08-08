@@ -128,6 +128,30 @@ ENV/
 **/htmlcov/
 **/coverage/
 
+# Local and generated database files
+*.db
+**/*.db
+*.db-journal
+**/*.db-journal
+*.db-shm
+**/*.db-shm
+*.db-wal
+**/*.db-wal
+*.sqlite
+**/*.sqlite
+*.sqlite3
+**/*.sqlite3
+apartment_finder_test
+**/apartment_finder_test
+apartment_finder_test.*
+**/apartment_finder_test.*
+test.db
+**/test.db
+test.sqlite
+**/test.sqlite
+test.sqlite3
+**/test.sqlite3
+
 # Node dependencies and build output
 **/node_modules/
 **/build/

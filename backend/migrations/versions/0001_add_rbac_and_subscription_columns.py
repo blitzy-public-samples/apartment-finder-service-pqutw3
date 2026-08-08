@@ -3,9 +3,9 @@
 Adds ``role``, ``failed_login_attempts`` and ``locked_until`` to
 ``users``. Adds ``plan_id``, ``amount``, ``currency`` and
 ``paypal_order_id`` to ``subscriptions``, the last under a uniqueness
-constraint. Adds a uniqueness constraint over ``listings.zillow_url``.
-Creates the ``webhook_events`` table, whose ``transmission_id`` is
-unique.
+constraint. Creates the ``webhook_events`` table, whose
+``transmission_id`` is unique. No column or constraint of any other
+table is added, altered or removed.
 
 Every column added to a table that precedes this revision carries a
 server default. An account already stored reads the role ``registered``
@@ -13,17 +13,29 @@ and a zero failed-attempt count, and a subscription row already stored
 reads the currency ``USD``. This revision writes no other role and
 promotes no account.
 
-Every operation is guarded by a schema inspection. The revision applies
-to a database holding the six tables that precede it, to an empty
-database, and to one already carrying the final shape. ``downgrade``
-removes only what this revision adds, and never a table or column that
-precedes it.
+``upgrade`` first checks that none of the objects listed above is
+already present, and raises when one is: a database already carrying
+this revision's shape is stamped rather than migrated. Every object this
+revision then adds is therefore an object it created, and ``downgrade``
+reverses exactly that set -- the three ``users`` columns, the four
+``subscriptions`` columns with their uniqueness constraint, and the
+``webhook_events`` table. It removes no table or column that precedes
+this revision. The uniqueness over ``paypal_order_id`` is removed with
+the column it covers, on a backend that drops a constraint in place and
+on one that only recreates the table.
+
+A table this revision adds columns to is created in full when it is
+absent, so the revision applies to an empty database as well as to one
+holding the six tables that precede it. Offline, no database is present
+to inspect, so ``--sql`` emits the additive statements unconditionally,
+for a database already holding those six tables.
 
 Revision ID: 0001
 Revises:
 Create Date: 2026-08-08 09:14:22.517394
 
 """
+from alembic import context
 from alembic import op
 import sqlalchemy as sa
 
@@ -51,11 +63,31 @@ CRITERIA = "criteria"
 SUBSCRIPTIONS = "subscriptions"
 WEBHOOK_EVENTS = "webhook_events"
 
-#: Names this revision gives the uniqueness constraints it adds. Each is
-#: dropped under the same name.
-LISTINGS_URL_UNIQUE = "uq_listings_zillow_url"
+#: Column of ``subscriptions`` this revision constrains to be unique.
+ORDER_COLUMN = "paypal_order_id"
+
+#: Names this revision gives the uniqueness constraints it adds. Each
+#: matches the name the mapped table declares, and each is dropped under
+#: that name.
 SUBSCRIPTIONS_ORDER_UNIQUE = "uq_subscriptions_paypal_order_id"
 WEBHOOK_TRANSMISSION_UNIQUE = "uq_webhook_events_transmission_id"
+
+#: Kinds of uniqueness a schema inspection reports over a column.
+CONSTRAINT_UNIQUENESS = "constraint"
+INDEX_UNIQUENESS = "index"
+
+#: Backend on which a uniqueness is removed only by recreating the
+#: table. ``batch_alter_table`` performs that recreation, which carries
+#: the uniqueness away with the column it covers.
+RECREATING_DIALECT = "sqlite"
+
+#: Message of the failure raised when this revision's shape is already
+#: present.
+ALREADY_PRESENT_MESSAGE = (
+    "Revision 0001 cannot run: the database already carries {objects}. "
+    "Stamp this revision instead of applying it, so its reversal "
+    "removes only objects it created."
+)
 
 
 def _users_added_columns():
@@ -112,6 +144,19 @@ def _subscriptions_added_columns():
     ]
 
 
+def _emitting_statements() -> bool:
+    """Report whether this run emits SQL rather than executing it.
+
+    ``alembic upgrade --sql`` configures an environment context that
+    answers this. A revision driven directly against a connection
+    configures the operations proxy alone, and executes.
+    """
+    try:
+        return bool(context.is_offline_mode())
+    except (AttributeError, NameError):
+        return False
+
+
 def _inspector():
     """Reflect the bind this revision is running against."""
     return sa.inspect(op.get_bind())
@@ -129,35 +174,33 @@ def _column_names(table):
     )
 
 
-def _unique_over(table, columns):
-    """Report whether a uniqueness already covers exactly ``columns``.
+def _uniqueness_over(table, columns):
+    """Return the uniqueness covering exactly ``columns``, or ``None``.
 
-    Both the uniqueness constraints and the unique indexes reported for
-    ``table`` are examined. A uniqueness recorded either way counts.
+    The lookup is by covered column, so it finds a uniqueness the
+    running schema carries whatever that uniqueness is called and
+    whether the schema records it as a constraint or as a unique index.
+    The result is the pair ``(kind, name)``, where ``kind`` is
+    :data:`CONSTRAINT_UNIQUENESS` or :data:`INDEX_UNIQUENESS` and
+    ``name`` is the name the schema reports, which is ``None`` for a
+    constraint the schema left unnamed.
     """
     wanted = list(columns)
     inspector = _inspector()
     for constraint in inspector.get_unique_constraints(table):
         if list(constraint.get("column_names") or []) == wanted:
-            return True
+            return (CONSTRAINT_UNIQUENESS, constraint.get("name"))
     for index in inspector.get_indexes(table):
         if not index.get("unique"):
             continue
         if list(index.get("column_names") or []) == wanted:
-            return True
-    return False
+            return (INDEX_UNIQUENESS, index.get("name"))
+    return None
 
 
-def _named_unique_present(table, name):
-    """Report whether ``table`` carries a uniqueness called ``name``."""
-    inspector = _inspector()
-    for constraint in inspector.get_unique_constraints(table):
-        if constraint.get("name") == name:
-            return True
-    for index in inspector.get_indexes(table):
-        if index.get("unique") and index.get("name") == name:
-            return True
-    return False
+def _recreates_tables():
+    """Report whether the bind removes a uniqueness by recreation."""
+    return op.get_bind().dialect.name == RECREATING_DIALECT
 
 
 def _create_users():
@@ -176,7 +219,7 @@ def _create_users():
 
 
 def _create_listings():
-    """Create ``listings`` carrying this revision's uniqueness."""
+    """Create ``listings`` as the schema preceding this revision has it."""
     op.create_table(
         LISTINGS,
         sa.Column("id", sa.Integer(), nullable=False),
@@ -191,7 +234,6 @@ def _create_listings():
         sa.Column("street_address", sa.String(), nullable=True),
         sa.Column("zillow_url", sa.String(), nullable=True),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("zillow_url", name=LISTINGS_URL_UNIQUE),
     )
 
 
@@ -235,21 +277,42 @@ def _create_criteria():
     )
 
 
-def _create_subscriptions():
-    """Create ``subscriptions`` carrying this revision's columns."""
-    op.create_table(
-        SUBSCRIPTIONS,
+def _subscriptions_definition():
+    """Build ``subscriptions`` as this revision leaves it.
+
+    The columns that precede this revision come first, then the columns
+    it adds, then the keys and the uniqueness over the order column.
+    """
+    return [
         sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("user_id", sa.Integer(), nullable=False),
         sa.Column("start_date", sa.DateTime(), nullable=False),
         sa.Column("end_date", sa.DateTime(), nullable=True),
         sa.Column("status", sa.String(), nullable=False),
-        *_subscriptions_added_columns(),
+    ] + _subscriptions_added_columns() + [
         sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
-            "paypal_order_id", name=SUBSCRIPTIONS_ORDER_UNIQUE
+            ORDER_COLUMN, name=SUBSCRIPTIONS_ORDER_UNIQUE
         ),
+    ]
+
+
+def _create_subscriptions():
+    """Create ``subscriptions`` carrying this revision's columns."""
+    op.create_table(SUBSCRIPTIONS, *_subscriptions_definition())
+
+
+def _subscriptions_table():
+    """Return the table this revision leaves ``subscriptions`` as.
+
+    ``batch_alter_table`` is given this definition, so a backend that
+    reverses a column by recreating the table reproduces the remaining
+    columns and keys from this declaration, and the uniqueness it
+    removes carries a name.
+    """
+    return sa.Table(
+        SUBSCRIPTIONS, sa.MetaData(), *_subscriptions_definition()
     )
 
 
@@ -273,28 +336,57 @@ def _create_webhook_events():
     )
 
 
+def _present_objects():
+    """Returns the names of this revision's objects already in place.
+
+    Each name is reported as ``<table>.<column>`` for a column, as the
+    constraint name for a uniqueness, and as the table name for a table.
+    An empty list means the database carries none of them.
+    """
+    present = []
+    if _table_present(USERS):
+        existing = _column_names(USERS)
+        present.extend(
+            USERS + "." + column.name
+            for column in _users_added_columns()
+            if column.name in existing
+        )
+    if _table_present(SUBSCRIPTIONS):
+        existing = _column_names(SUBSCRIPTIONS)
+        present.extend(
+            SUBSCRIPTIONS + "." + column.name
+            for column in _subscriptions_added_columns()
+            if column.name in existing
+        )
+        if _uniqueness_over(SUBSCRIPTIONS, [ORDER_COLUMN]) is not None:
+            present.append(SUBSCRIPTIONS_ORDER_UNIQUE)
+    if _table_present(WEBHOOK_EVENTS):
+        present.append(WEBHOOK_EVENTS)
+    return present
+
+
+def _refuse_present_shape():
+    """Raise when any object this revision adds is already in place."""
+    present = _present_objects()
+    if present:
+        raise RuntimeError(
+            ALREADY_PRESENT_MESSAGE.format(objects=", ".join(present))
+        )
+
+
 def _upgrade_users():
     """Bring ``users`` to this revision's shape."""
     if not _table_present(USERS):
         _create_users()
         return
-    existing = _column_names(USERS)
     for column in _users_added_columns():
-        if column.name not in existing:
-            op.add_column(USERS, column)
+        op.add_column(USERS, column)
 
 
 def _upgrade_listings():
-    """Bring the uniqueness over ``listings.zillow_url`` into place."""
+    """Ensure ``listings`` exists; this revision alters no column of it."""
     if not _table_present(LISTINGS):
         _create_listings()
-        return
-    if _unique_over(LISTINGS, ["zillow_url"]):
-        return
-    with op.batch_alter_table(LISTINGS) as batch_op:
-        batch_op.create_unique_constraint(
-            LISTINGS_URL_UNIQUE, ["zillow_url"]
-        )
 
 
 def _upgrade_filters():
@@ -324,11 +416,11 @@ def _upgrade_subscriptions():
     for column in _subscriptions_added_columns():
         if column.name not in existing:
             op.add_column(SUBSCRIPTIONS, column)
-    if _unique_over(SUBSCRIPTIONS, ["paypal_order_id"]):
+    if _uniqueness_over(SUBSCRIPTIONS, [ORDER_COLUMN]) is not None:
         return
     with op.batch_alter_table(SUBSCRIPTIONS) as batch_op:
         batch_op.create_unique_constraint(
-            SUBSCRIPTIONS_ORDER_UNIQUE, ["paypal_order_id"]
+            SUBSCRIPTIONS_ORDER_UNIQUE, [ORDER_COLUMN]
         )
 
 
@@ -338,12 +430,33 @@ def _upgrade_webhook_events():
         _create_webhook_events()
 
 
+def _upgrade_offline():
+    """Emit this revision's additive statements unconditionally.
+
+    The statements assume the six tables that precede this revision are
+    present, which is the schema a statement stream is applied to.
+    """
+    for column in _users_added_columns():
+        op.add_column(USERS, column)
+    for column in _subscriptions_added_columns():
+        op.add_column(SUBSCRIPTIONS, column)
+    op.create_unique_constraint(
+        SUBSCRIPTIONS_ORDER_UNIQUE, SUBSCRIPTIONS, [ORDER_COLUMN]
+    )
+    _create_webhook_events()
+
+
 def upgrade() -> None:
     """Apply this revision.
 
-    The tables are visited in an order that satisfies their foreign
-    keys.
+    Raises ``RuntimeError`` when any object this revision adds is already
+    present. The tables are visited in an order that satisfies their
+    foreign keys.
     """
+    if _emitting_statements():
+        _upgrade_offline()
+        return
+    _refuse_present_shape()
     _upgrade_users()
     _upgrade_listings()
     _upgrade_filters()
@@ -359,29 +472,51 @@ def _downgrade_webhook_events():
         op.drop_table(WEBHOOK_EVENTS)
 
 
+def _drop_order_uniqueness(batch_op, uniqueness):
+    """Drop the uniqueness over the order column within ``batch_op``.
+
+    ``uniqueness`` is the pair :func:`_uniqueness_over` reported, or
+    ``None`` when the running schema carries no uniqueness over the
+    column. A backend that recreates the table has no statement emitted
+    for it: on that backend the recreation is what removes the
+    uniqueness, and it does so whether the running schema named the
+    uniqueness or left it unnamed.
+    """
+    if uniqueness is None or _recreates_tables():
+        return
+    kind, name = uniqueness
+    if name is None:
+        name = SUBSCRIPTIONS_ORDER_UNIQUE
+    if kind == INDEX_UNIQUENESS:
+        batch_op.drop_index(name)
+    else:
+        batch_op.drop_constraint(name, type_="unique")
+
+
 def _downgrade_subscriptions():
-    """Remove this revision's ``subscriptions`` additions."""
+    """Remove this revision's ``subscriptions`` additions.
+
+    The uniqueness over the order column is dropped before the column,
+    and both are removed inside one batch operation so that a backend
+    which reverses a column only by recreating the table does so once.
+    """
     if not _table_present(SUBSCRIPTIONS):
         return
-    if _named_unique_present(SUBSCRIPTIONS, SUBSCRIPTIONS_ORDER_UNIQUE):
-        with op.batch_alter_table(SUBSCRIPTIONS) as batch_op:
-            batch_op.drop_constraint(
-                SUBSCRIPTIONS_ORDER_UNIQUE, type_="unique"
-            )
     existing = _column_names(SUBSCRIPTIONS)
-    for column in reversed(_subscriptions_added_columns()):
-        if column.name in existing:
-            op.drop_column(SUBSCRIPTIONS, column.name)
-
-
-def _downgrade_listings():
-    """Remove this revision's uniqueness over ``listings.zillow_url``."""
-    if not _table_present(LISTINGS):
+    added = [
+        column.name
+        for column in reversed(_subscriptions_added_columns())
+        if column.name in existing
+    ]
+    uniqueness = _uniqueness_over(SUBSCRIPTIONS, [ORDER_COLUMN])
+    if not added and uniqueness is None:
         return
-    if not _named_unique_present(LISTINGS, LISTINGS_URL_UNIQUE):
-        return
-    with op.batch_alter_table(LISTINGS) as batch_op:
-        batch_op.drop_constraint(LISTINGS_URL_UNIQUE, type_="unique")
+    with op.batch_alter_table(
+        SUBSCRIPTIONS, copy_from=_subscriptions_table()
+    ) as batch_op:
+        _drop_order_uniqueness(batch_op, uniqueness)
+        for name in added:
+            batch_op.drop_column(name)
 
 
 def _downgrade_users():
@@ -394,12 +529,31 @@ def _downgrade_users():
             op.drop_column(USERS, column.name)
 
 
+def _downgrade_offline():
+    """Emit the reverse of this revision's statements unconditionally.
+
+    The statements assume the shape ``upgrade`` leaves behind, which is
+    the schema a statement stream is applied to. The uniqueness over the
+    order column is dropped before the column it covers.
+    """
+    op.drop_table(WEBHOOK_EVENTS)
+    op.drop_constraint(
+        SUBSCRIPTIONS_ORDER_UNIQUE, SUBSCRIPTIONS, type_="unique"
+    )
+    for column in reversed(_subscriptions_added_columns()):
+        op.drop_column(SUBSCRIPTIONS, column.name)
+    for column in reversed(_users_added_columns()):
+        op.drop_column(USERS, column.name)
+
+
 def downgrade() -> None:
     """Reverse this revision.
 
-    Each uniqueness constraint is dropped before the column it covers.
+    The uniqueness constraint is dropped before the column it covers.
     """
+    if _emitting_statements():
+        _downgrade_offline()
+        return
     _downgrade_webhook_events()
     _downgrade_subscriptions()
-    _downgrade_listings()
     _downgrade_users()

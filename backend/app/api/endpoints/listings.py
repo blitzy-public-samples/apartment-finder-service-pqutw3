@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime, timezone
 
 from backend.app.core.authorization import Role, require_role
-from backend.app.core.config import MAX_PAGINATION_OFFSET, settings
+from backend.app.core.config import settings
 from backend.app.core.logging import get_logger
 from backend.app.db.database import get_db
 from backend.app.schema.listing import ListingCreate, Listing
@@ -22,6 +22,14 @@ DEFAULT_PAGE_SIZE = min(100, settings.MAX_PAGE_SIZE)
 #: Detail returned when a listing cannot be persisted.
 LISTING_NOT_STORED_DETAIL = "Listing could not be stored"
 
+#: Detail returned when a listing address is already stored against
+#: another row, which the uniqueness over that column refuses.
+LISTING_DUPLICATE_DETAIL = "Listing address is already stored"
+
+#: Detail returned for a page carrying a stored row the response contract
+#: cannot represent.
+LISTING_NOT_PROJECTABLE_DETAIL = "Listing page could not be served"
+
 #: Reason recorded for a stored row the response contract cannot carry.
 REASON_UNPROJECTABLE_ROW = "listing_not_projectable"
 
@@ -29,7 +37,7 @@ REASON_UNPROJECTABLE_ROW = "listing_not_projectable"
 @router.get("/")
 def get_listings(
     db: Session = Depends(get_db),
-    skip: int = Query(0, ge=0, le=MAX_PAGINATION_OFFSET),
+    skip: int = Query(0, ge=0, le=settings.MAX_PAGINATION_OFFSET),
     limit: int = Query(
         DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE
     ),
@@ -37,15 +45,23 @@ def get_listings(
     """Returns one page of the listing corpus, reachable without a token.
 
     Ordered by the primary key, so a row keeps its position across pages
-    while the corpus is being written to.
+    while the corpus is being written to. The page carries every row the
+    named window selects, in that order, so a page shorter than ``limit``
+    means the window reached the end of the corpus and nothing else.
+
+    ``limit`` is bounded by ``settings.MAX_PAGE_SIZE`` and ``skip`` by
+    ``settings.MAX_PAGINATION_OFFSET``, so the rows one anonymous request
+    can make the database walk are bounded by configuration rather than
+    by the range of the column type. An offset above the cap is refused
+    by request validation.
 
     Each row is projected on its own. A row carrying a value the response
     contract cannot represent -- which
     :class:`backend.app.schema.listing.ListingCreate` refuses at every
     write path, so only a row written outside this contract can carry one
-    -- is recorded against its identifier and left out of the page,
-    because a page is more useful than a refusal and the endpoint is
-    reachable without a credential.
+    -- fails the page it appears on. The row is recorded against its
+    identifier and the failing contract fields, and the response is an
+    error rather than a page with that row removed.
     """
     listings = (
         db.query(ListingModel)
@@ -60,14 +76,18 @@ def get_listings(
             page.append(Listing.from_orm(listing))
         except ValidationError as error:
             logger.error(
-                "Left a stored listing out of a page because the "
-                "response contract cannot carry it",
+                "Refused a listing page because the response contract "
+                "cannot carry a stored row",
                 extra={
                     "listing_id": listing.id,
                     "reason": REASON_UNPROJECTABLE_ROW,
                     "failed_fields": _failed_fields(error),
                 },
             )
+            raise HTTPException(
+                status_code=500,
+                detail=LISTING_NOT_PROJECTABLE_DETAIL,
+            ) from None
     return page
 
 
@@ -107,8 +127,19 @@ def create_listing(
         zillow_url=listing.zillow_url,
     )
     db.add(db_listing)
+    # A conflict on the uniqueness over the address column is answered
+    # separately from a database failure, and both roll back first.
     try:
         db.commit()
+    except IntegrityError:
+        db.rollback()
+        logger.warning(
+            "Refused a listing whose address is already stored",
+            extra={"user_id": current_user.id},
+        )
+        raise HTTPException(
+            status_code=409, detail=LISTING_DUPLICATE_DETAIL
+        ) from None
     except SQLAlchemyError:
         db.rollback()
         logger.exception(

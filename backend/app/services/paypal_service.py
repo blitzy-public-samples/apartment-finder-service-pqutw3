@@ -7,13 +7,12 @@ OAuth2 client-credentials grant, and applies the timeout named by
 read from validated settings, and no environment name or host is written
 here.
 
-Every call is issued through an asynchronous client, so no request here
-blocks the event loop the API handlers run on. The client is opened by
+Every call is issued through an asynchronous client and blocks no event
+loop the API handlers run on. The client is opened by
 :func:`open_http_client` while the application starts and released by
 :func:`close_http_client` while it stops. It is recorded against the
-event loop it was opened on and is issued only from that loop, since a
-connection pool belongs to the loop that created it; a call made outside
-that lifetime, or on another loop, gets a client of its own.
+event loop it was opened on and is issued only from that loop; a call
+made outside that lifetime, or on another loop, gets a client of its own.
 
 Four operations are published:
 
@@ -25,13 +24,13 @@ Four operations are published:
   to; the order is not captured here.
 * :func:`capture_order` captures an order the payer has approved. The
   stored order identifier is resolved to its ``subscriptions`` row
-  through :func:`backend.app.core.authorization.load_owned`, so the
-  decision, the route and the object are recorded by the one centralized
-  authorization path, and an order that does not resolve to a row owned
-  by the principal is refused before any request leaves the process. The
-  capture asks for a complete representation and reads the order back
-  when the response carries no settled capture, so what it returns always
-  states the amount, the currency and the capture identifier.
+  through :func:`backend.app.core.authorization.load_owned`, which
+  records the decision, the route and the object; an order that does not
+  resolve to a row owned by the principal is refused before any request
+  leaves the process. The capture asks for a complete representation and
+  reads the order back when the response carries no settled capture, and
+  what it returns always states the amount, the currency and the capture
+  identifier.
 * :func:`read_capture` reads a capture response and reports whether the
   provider completed it for the expected order, amount and currency. A
   response that does not satisfy every one of those is not a completed
@@ -39,8 +38,8 @@ Four operations are published:
 * :func:`verify_webhook_signature` checks an inbound notification
   against PayPal's verify-webhook-signature endpoint. It takes the **raw
   request bytes** and transmits them verbatim as the postback's
-  ``webhook_event``, so PayPal checks the signature against the
-  notification as it arrived rather than against a re-encoded copy of it.
+  ``webhook_event``, and PayPal therefore checks the signature against
+  the notification as it arrived and not against a re-encoded copy of it.
   The host named by the ``PAYPAL-CERT-URL`` header is checked against
   ``settings.PAYPAL_CERT_HOST_ALLOWLIST`` before that value is used,
   transmitted or logged, and all five ``PAYPAL-*`` headers are required.
@@ -51,22 +50,23 @@ Four operations are published:
   replay.
 
 Order creation and capture both carry the ``PayPal-Request-Id`` header
-their caller supplies, so a repeat of an uncertain call resolves to the
+their caller supplies, and a repeat of an uncertain call resolves to the
 same order and the same capture rather than to a second charge.
 
 Every failure is raised as a :class:`PayPalAPIError` carrying a
 :data:`ERROR_CATEGORIES` category, the provider status, the provider's
-``PayPal-Debug-Id`` and whether the failure is worth retrying, so a
-caller can answer a dependency failure differently from a rejected
+``PayPal-Debug-Id`` and whether the failure is worth retrying, from which
+a caller can answer a dependency failure differently from a rejected
 request. No response body, URL or credential reaches the message.
 
-Every call is issued through one shared HTTP client, so the connections
-and TLS sessions it pools serve all four operations. The pool is bounded
-by :data:`MAX_CONNECTIONS` and :data:`MAX_KEEPALIVE_CONNECTIONS`, and
-:func:`close_http_client` releases it when the application stops.
+Every call is issued through one shared HTTP client, whose pooled
+connections and TLS sessions serve all four operations. The pool is
+bounded by :data:`MAX_CONNECTIONS` and
+:data:`MAX_KEEPALIVE_CONNECTIONS`, and :func:`close_http_client` releases
+it when the application stops.
 
 No function here writes, flushes, commits or discards database state on
-any path, so a caller's own transaction is exactly as it left it when a
+any path, and a caller's own transaction is exactly as it left it when a
 call returns.
 
 The access token is held in a process-wide cache for the lifetime the
@@ -112,13 +112,14 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from backend.app.core.authorization import load_owned
 from backend.app.core.config import TLS_SCHEME, settings
 from backend.app.core.logging import (
     exception_fields,
     get_logger,
-    register_secret_values,
+    register_required_secret_values,
 )
 from backend.app.core.plans import format_amount, get_plan
 from backend.app.db.models import Subscription
@@ -145,11 +146,13 @@ __all__ = [
     "KEEPALIVE_EXPIRY_SECONDS",
     "MAX_CONNECTIONS",
     "MAX_KEEPALIVE_CONNECTIONS",
+    "MAX_RESPONSE_BYTES",
     "PREFER_HEADER",
     "PREFER_REPRESENTATION",
     "REASON_CERTIFICATE_HOST",
     "REASON_CURRENCY_MISMATCH",
     "REASON_MALFORMED_BODY",
+    "REASON_RESPONSE_TOO_LARGE",
     "REASON_MALFORMED_CAPTURE",
     "REASON_MISSING_HEADER",
     "REASON_NOT_COMPLETED",
@@ -188,10 +191,9 @@ PAYPAL_CLIENT_SECRET = settings.PAYPAL_CLIENT_SECRET
 
 logger = get_logger(__name__)
 
-# Replaces the provider credentials wherever they appear in a record, so
-# they are removed from text that names no key -- provider error prose
-# included.
-register_secret_values(
+# Replaces the provider credentials wherever they appear in a record,
+# including in text that names no key such as provider error prose.
+register_required_secret_values(
     PAYPAL_CLIENT_SECRET, settings.PAYPAL_WEBHOOK_ID
 )
 
@@ -334,6 +336,17 @@ EXPIRY_MARGIN_SECONDS = 60.0
 #: Seconds a failed credential exchange is not repeated for.
 FAILURE_BACKOFF_SECONDS = 5.0
 
+#: Bytes of a provider response body that are decoded. A body declaring
+#: or carrying more is refused before it is decoded, so the memory one
+#: response can be made to occupy is bounded whatever the provider sends.
+MAX_RESPONSE_BYTES = 1048576
+
+#: Rejection reason: the response body exceeds :data:`MAX_RESPONSE_BYTES`.
+REASON_RESPONSE_TOO_LARGE = "response_body_too_large"
+
+#: Response header declaring the body length.
+CONTENT_LENGTH_HEADER = "Content-Length"
+
 #: Connections the shared client keeps open at once.
 MAX_CONNECTIONS = 20
 
@@ -423,6 +436,12 @@ _cached_deadline = 0.0
 _backoff_deadline = 0.0
 
 _backoff_failure = None  # type: Optional[Tuple[str, Optional[int], bool]]
+
+# Generation of the token cache. reset_access_token_cache advances it, and
+# an exchange started under an earlier generation stores neither its token
+# nor its failure, so a rotation is never undone by a call already in
+# flight when it happened.
+_cache_generation = 0
 
 # Client shared by every call issued on the event loop that opened it,
 # with the loop it belongs to, or None when the application has not
@@ -613,10 +632,12 @@ class CaptureOutcome(NamedTuple):
     ``completed`` is True only when the response names the expected
     order, reports :data:`CAPTURE_COMPLETED_STATUS`, carries the
     expected amount and currency, and carries a provider identifier for
-    the settlement. ``capture_id`` is that identifier, recorded on the
-    row so a charge can be reconciled against the provider afterwards;
-    it is populated on every completed outcome. ``reason`` names the
-    first check that failed and is ``None`` on a completed capture.
+    the settlement. ``capture_id`` is that identifier and is populated on
+    every completed outcome. No column holds it: the caller writes it to
+    the activation audit record, under ``paypal_capture_id``, and the
+    ``subscriptions`` row retains only ``paypal_order_id``. ``reason``
+    names the first check that failed and is ``None`` on a completed
+    capture.
     """
 
     completed: bool
@@ -626,6 +647,90 @@ class CaptureOutcome(NamedTuple):
     currency: Optional[str] = None
     capture_id: Optional[str] = None
     reason: Optional[str] = None
+
+
+def _declared_length(response: Any) -> Optional[int]:
+    """Returns the body length a response declares, or ``None``."""
+    try:
+        value = response.headers.get(CONTENT_LENGTH_HEADER)
+    except Exception:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _oversized(response: Any, operation: Optional[str]) -> bool:
+    """Report whether a response body is past :data:`MAX_RESPONSE_BYTES`.
+
+    The declared length is read first, so a body that announces itself as
+    oversized is refused without its bytes being examined. The bytes
+    actually received are measured next, which covers a body that declares
+    no length or under-declares one.
+    """
+    for measured in (_declared_length(response), _body_length(response)):
+        if measured is not None and measured > MAX_RESPONSE_BYTES:
+            logger.error(
+                "PayPal REST call returned a body past the accepted size",
+                extra={
+                    "provider_operation": operation,
+                    "reason": REASON_RESPONSE_TOO_LARGE,
+                    "response_bytes": measured,
+                    "max_response_bytes": MAX_RESPONSE_BYTES,
+                    "paypal_debug_id": _debug_id(response),
+                },
+            )
+            return True
+    return False
+
+
+def _body_length(response: Any) -> Optional[int]:
+    """Returns the number of bytes a response carries, or ``None``."""
+    body = getattr(response, "content", None)
+    if isinstance(body, (bytes, bytearray)):
+        return len(body)
+    return None
+
+
+def _decoded_object(
+    response: Any, operation: Optional[str]
+) -> Dict[str, Any]:
+    """Returns the decoded object a response carries.
+
+    The body is measured against :data:`MAX_RESPONSE_BYTES` before it is
+    decoded, and a body past that size raises
+    :class:`PayPalAPIError` carrying
+    :data:`CATEGORY_MALFORMED_RESPONSE` rather than being parsed. A body
+    that decodes to anything other than an object raises the same error.
+    """
+    if _oversized(response, operation):
+        raise PayPalAPIError(
+            _CALL_FAILED,
+            category=CATEGORY_MALFORMED_RESPONSE,
+            status_code=getattr(response, "status_code", None),
+            debug_id=_debug_id(response),
+            operation=operation,
+        )
+    payload = response.json()
+    if not isinstance(payload, dict):
+        logger.error(
+            "PayPal REST call returned a body that is not an object",
+            extra={
+                "provider_operation": operation,
+                "provider_status": getattr(response, "status_code", None),
+                "paypal_debug_id": _debug_id(response),
+                "body_type": type(payload).__name__,
+            },
+        )
+        raise PayPalAPIError(
+            _CALL_FAILED,
+            category=CATEGORY_MALFORMED_RESPONSE,
+            status_code=getattr(response, "status_code", None),
+            debug_id=_debug_id(response),
+            operation=operation,
+        )
+    return payload
 
 
 def _debug_id(response: Any) -> Optional[str]:
@@ -743,13 +848,13 @@ async def _exchange_credentials() -> Tuple[str, float]:
                 timeout=settings.HTTP_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
-            payload = response.json()
+            payload = _decoded_object(response, _OPERATION_TOKEN)
+    except PayPalAPIError:
+        raise
     except _TRANSPORT_ERRORS as error:
         raise _api_error(error, _OAUTH_PATH, _OPERATION_TOKEN) from None
 
-    granted = None
-    if isinstance(payload, dict):
-        granted = payload.get("access_token")
+    granted = payload.get("access_token")
     if not isinstance(granted, str) or not granted:
         logger.error(
             "PayPal credential exchange returned no usable grant",
@@ -779,8 +884,21 @@ def _read_cached_token() -> Optional[str]:
     return None
 
 
-def _store_cached_token(granted: str, lifetime: float) -> None:
-    """Holds ``granted`` for ``lifetime`` seconds, or holds nothing.
+def _current_generation() -> int:
+    """Returns the generation the token cache is currently on."""
+    with _CACHE_STATE:
+        return _cache_generation
+
+
+def _store_cached_token(
+    granted: str, lifetime: float, generation: int
+) -> bool:
+    """Holds ``granted`` for ``lifetime`` seconds. Reports whether it did.
+
+    The token is held only while ``generation`` is still the current
+    generation of the cache. A token exchanged under an earlier generation
+    is discarded and ``False`` is returned, so a credential rotation that
+    ran while the exchange was in flight is not undone by its result.
 
     Any recorded exchange failure is cleared, so a successful exchange
     ends the backoff immediately.
@@ -788,27 +906,40 @@ def _store_cached_token(granted: str, lifetime: float) -> None:
     global _cached_access, _cached_deadline
     global _backoff_deadline, _backoff_failure
     with _CACHE_STATE:
+        if generation != _cache_generation:
+            return False
         _cached_access = granted if lifetime > 0.0 else None
         _cached_deadline = time.monotonic() + lifetime
         _backoff_deadline = 0.0
         _backoff_failure = None
+    return True
 
 
-def _record_exchange_failure(error: PayPalAPIError) -> None:
+def _record_exchange_failure(
+    error: PayPalAPIError, generation: int
+) -> bool:
     """Holds ``error`` back for :data:`FAILURE_BACKOFF_SECONDS`.
 
     The category, provider status and retryability are held with the
     deadline, so a caller refused during the window is answered as the
     failure that caused it rather than as a different kind of failure.
+
+    The failure is held only while ``generation`` is still the current
+    generation of the cache, so a failure from an exchange that used
+    credentials since rotated does not hold back a caller that would now
+    use the new ones. Reports whether it was held.
     """
     global _backoff_deadline, _backoff_failure
     with _CACHE_STATE:
+        if generation != _cache_generation:
+            return False
         _backoff_deadline = time.monotonic() + FAILURE_BACKOFF_SECONDS
         _backoff_failure = (
             getattr(error, "category", CATEGORY_TRANSPORT),
             getattr(error, "status_code", None),
             bool(getattr(error, "retryable", True)),
         )
+    return True
 
 
 def _held_back_failure() -> Optional[PayPalAPIError]:
@@ -848,6 +979,13 @@ async def _bearer_credential() -> str:
     A failed exchange is held back for :data:`FAILURE_BACKOFF_SECONDS`,
     during which callers are refused with that same failure and no
     request is sent. A successful exchange ends the window.
+
+    The generation of the cache is read before the exchange begins and
+    passed to whichever of :func:`_store_cached_token` and
+    :func:`_record_exchange_failure` follows it, so neither writes over a
+    :func:`reset_access_token_cache` that ran while the exchange was in
+    flight. The grant itself is still returned to the caller that asked
+    for it.
     """
     cached = _read_cached_token()
     if cached is not None:
@@ -862,12 +1000,13 @@ async def _bearer_credential() -> str:
         held_back = _held_back_failure()
         if held_back is not None:
             raise held_back
+        generation = _current_generation()
         try:
             granted, lifetime = await _exchange_credentials()
         except PayPalAPIError as error:
-            _record_exchange_failure(error)
+            _record_exchange_failure(error, generation)
             raise
-        _store_cached_token(granted, lifetime)
+        _store_cached_token(granted, lifetime, generation)
         return granted
 
 
@@ -875,16 +1014,18 @@ def reset_access_token_cache() -> None:
     """Discard the cached access token and any recorded failure.
 
     The next call performs a fresh credential exchange. Called after the
-    grant credentials are rotated. A refresh already in flight is left to
-    finish; its result is discarded by the caller that observes the reset.
+    grant credentials are rotated. The generation of the cache is advanced,
+    so a refresh already in flight finishes and returns its grant to its
+    own caller without storing it here.
     """
     global _cached_access, _cached_deadline
-    global _backoff_deadline, _backoff_failure
+    global _backoff_deadline, _backoff_failure, _cache_generation
     with _CACHE_STATE:
         _cached_access = None
         _cached_deadline = 0.0
         _backoff_deadline = 0.0
         _backoff_failure = None
+        _cache_generation += 1
         _CACHE_STATE.notify_all()
 
 
@@ -967,32 +1108,13 @@ async def _post_json(
                 document=document,
             )
         response.raise_for_status()
-        payload = response.json()
+        payload = _decoded_object(response, operation)
     except PayPalAPIError:
         raise
     except _TRANSPORT_ERRORS as error:
         raise _api_error(error, path, operation) from None
 
     debug_id = _debug_id(response)
-    if not isinstance(payload, dict):
-        logger.error(
-            "PayPal REST call returned a body that is not an object",
-            extra={
-                "path": path,
-                "provider_operation": operation,
-                "provider_status": response.status_code,
-                "paypal_debug_id": debug_id,
-                "paypal_request_id": idempotency_key,
-                "body_type": type(payload).__name__,
-            },
-        )
-        raise PayPalAPIError(
-            _CALL_FAILED,
-            category=CATEGORY_MALFORMED_RESPONSE,
-            status_code=response.status_code,
-            debug_id=debug_id,
-            operation=operation,
-        )
 
     logger.info(
         "PayPal REST call completed",
@@ -1053,31 +1175,13 @@ async def _get_json(
                 path, operation=operation, allow_refresh=False
             )
         response.raise_for_status()
-        payload = response.json()
+        payload = _decoded_object(response, operation)
     except PayPalAPIError:
         raise
     except _TRANSPORT_ERRORS as error:
         raise _api_error(error, path, operation) from None
 
     debug_id = _debug_id(response)
-    if not isinstance(payload, dict):
-        logger.error(
-            "PayPal REST read returned a body that is not an object",
-            extra={
-                "path": path,
-                "provider_operation": operation,
-                "provider_status": response.status_code,
-                "paypal_debug_id": debug_id,
-                "body_type": type(payload).__name__,
-            },
-        )
-        raise PayPalAPIError(
-            _CALL_FAILED,
-            category=CATEGORY_MALFORMED_RESPONSE,
-            status_code=response.status_code,
-            debug_id=debug_id,
-            operation=operation,
-        )
 
     logger.info(
         "PayPal REST read completed",
@@ -1249,9 +1353,13 @@ async def capture_order(
     with the state change this capture drives. An order that resolves to
     no row or to another principal's row is refused with
     :class:`OrderOwnershipError` before any request leaves the process.
-    The row the lookup resolves must therefore already be durable when
-    this is called, which is why the endpoint commits the pending row
-    before it opens the order.
+    The row the lookup resolves must already be durable when this is
+    called; the endpoint commits the pending row before it opens the
+    order.
+
+    The lookup is issued on a worker thread, so this coroutine occupies
+    the event loop for none of it. The session is used by one thread at a
+    time: the lookup completes before the provider call is awaited.
 
     ``idempotency_key`` defaults to the key derived from the resolved
     row, so a repeated capture resolves to the capture already performed.
@@ -1269,8 +1377,8 @@ async def capture_order(
 
     The lookup is read-only: nothing is written, flushed or committed.
     """
-    subscription = _resolve_owned_order(
-        db, order_id, current_user, request
+    subscription = await run_in_threadpool(
+        _resolve_owned_order, db, order_id, current_user, request
     )
     # Read after the ownership check, so no attribute is loaded again.
     key = idempotency_key or capture_request_id(subscription.id)
@@ -1329,12 +1437,17 @@ async def verify_settled_order(
 
     ``db`` is the caller's request-scoped session and is only read here:
     nothing is written, flushed, committed or rolled back, so the
-    caller's transaction is intact when this returns.
+    caller's transaction is intact when this returns. The lookup is issued
+    on a worker thread and completes before the read is awaited, so this
+    coroutine occupies the event loop for none of it and the session is
+    used by one thread at a time.
 
     Raises :class:`OrderOwnershipError` when the order resolves to no
     owned row and :class:`PayPalAPIError` when the read fails.
     """
-    _resolve_owned_order(db, order_id, current_user, request)
+    await run_in_threadpool(
+        _resolve_owned_order, db, order_id, current_user, request
+    )
     payload = await fetch_order(order_id)
     return read_capture(
         payload, order_id, expected_amount, expected_currency
@@ -1383,8 +1496,8 @@ def read_capture(
     fails names the ``reason``, and no later check is applied.
 
     A completed outcome therefore always carries a non-blank
-    ``capture_id``, so the row a caller activates from it is
-    reconcilable against the provider.
+    ``capture_id``. The caller writes that identifier to its activation
+    audit record; no column holds it.
     """
     if not isinstance(payload, dict):
         return CaptureOutcome(

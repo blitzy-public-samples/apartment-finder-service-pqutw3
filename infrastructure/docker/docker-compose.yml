@@ -1,18 +1,101 @@
+# Developer stack for the apartment-finder service.
+#
+# No value below is a credential and no value is committed: every
+# mandatory setting is a required substitution, so `docker compose up`
+# stops and names the variable when it is absent from the invoking shell
+# or from an uncommitted `.env` beside this file. Copy the repository's
+# `.env.example`, fill it in, and export it or place it here.
+#
+# Required by both profiles: COMPOSE_DATABASE_URL, SECRET_KEY,
+# ZILLOW_API_KEY, PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET,
+# PAYPAL_WEBHOOK_ID and SENDGRID_API_KEY. The local profile also requires
+# POSTGRES_PASSWORD; the gcp profile also requires
+# CLOUD_SQL_INSTANCE_CONNECTION_NAME. Everything else carries the code
+# default, so an absent optional value never blocks a start.
 version: '3.8'
+
+# The local stack runs against the PostgreSQL service defined below:
+#   docker compose --profile local up -d
+# The Cloud SQL stack runs against the proxy defined below:
+#   docker compose --profile gcp up -d
+# COMPOSE_PROFILES carries the profile name when the flag is not passed.
+#
+# Every value below is read from the environment or from the .env file
+# sitting beside this file. The names are documented in .env.example.
+
+x-backend-environment: &backend-environment
+  ENVIRONMENT: ${BACKEND_ENVIRONMENT:-local}
+  DATABASE_URL: ${COMPOSE_DATABASE_URL:?COMPOSE_DATABASE_URL must be set}
+  SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+  # The endpoint is not a credential and the code defaults it, so it
+  # carries that default here. The key beside it is a credential.
+  ZILLOW_API_URL: ${ZILLOW_API_URL:-https://zillow-api.example.com/v2/listings}
+  ZILLOW_API_KEY: ${ZILLOW_API_KEY:?ZILLOW_API_KEY must be set}
+  PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:?PAYPAL_CLIENT_ID must be set}
+  PAYPAL_CLIENT_SECRET: ${PAYPAL_CLIENT_SECRET:?PAYPAL_CLIENT_SECRET must be set}
+  PAYPAL_WEBHOOK_ID: ${PAYPAL_WEBHOOK_ID:?PAYPAL_WEBHOOK_ID must be set}
+  SENDGRID_API_KEY: ${SENDGRID_API_KEY:?SENDGRID_API_KEY must be set}
+  FROM_EMAIL: ${FROM_EMAIL:-no-reply@example.com}
+  # Payment mode and the API base it must agree with. ENVIRONMENT production
+  # is refused while either still names sandbox.
+  PAYPAL_MODE: ${PAYPAL_MODE:-sandbox}
+  PAYPAL_API_BASE: ${PAYPAL_API_BASE:-https://api-m.sandbox.paypal.com}
+  ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-http://localhost,http://localhost:80}
+  ALLOWED_HOSTS: ${BACKEND_ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+  PAYPAL_RETURN_URL: ${PAYPAL_RETURN_URL:-http://localhost/subscription?paypal=return}
+  PAYPAL_CANCEL_URL: ${PAYPAL_CANCEL_URL:-http://localhost/subscription?paypal=cancel}
+  RATE_LIMIT_STORAGE_URI: ${RATE_LIMIT_STORAGE_URI:-bounded-memory://}
+  # Token minting and verification
+  JWT_ALGORITHMS: ${JWT_ALGORITHMS:-HS256}
+  JWT_ISSUER: ${JWT_ISSUER:-apartment-finder-service}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:-apartment-finder-web}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+  # Password hashing
+  BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+  # Request bounds
+  MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-1048576}
+  MAX_REQUEST_BODY_CHUNKS: ${MAX_REQUEST_BODY_CHUNKS:-2048}
+  MAX_PAGE_SIZE: ${MAX_PAGE_SIZE:-100}
+  MAX_PAGINATION_OFFSET: ${MAX_PAGINATION_OFFSET:-10000}
+  # Rate limits
+  RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-5/minute}
+  RATE_LIMIT_REGISTER: ${RATE_LIMIT_REGISTER:-3/minute}
+  RATE_LIMIT_WEBHOOK: ${RATE_LIMIT_WEBHOOK:-60/minute}
+  RATE_LIMIT_MAX_TRACKED_KEYS: ${RATE_LIMIT_MAX_TRACKED_KEYS:-4096}
+  # Login lockout
+  LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+  LOGIN_LOCKOUT_MINUTES: ${LOGIN_LOCKOUT_MINUTES:-15}
+  # Outbound HTTP
+  HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-10}
+  PAYPAL_MAX_CONNECTIONS: ${PAYPAL_MAX_CONNECTIONS:-20}
+  # Webhook certificate hosts the verifier will fetch from
+  PAYPAL_CERT_HOST_ALLOWLIST: ${PAYPAL_CERT_HOST_ALLOWLIST:-api.paypal.com,api.sandbox.paypal.com,api-m.paypal.com,api-m.sandbox.paypal.com}
+  # Secret delivery and observability
+  SECRET_BACKEND: ${SECRET_BACKEND:-env}
+  SENTRY_DSN: ${SENTRY_DSN:-}
 
 services:
   frontend:
     build:
       context: ../../frontend
-      dockerfile: Dockerfile
+      dockerfile: ../infrastructure/docker/Dockerfile.frontend
+      args:
+        # The bundle is produced at build time and cannot read a runtime
+        # variable, so these are build arguments. The frontend image must
+        # declare a matching `ARG` for each before `npm run build` for the
+        # value to reach the bundle.
+        REACT_APP_API_BASE_URL: ${REACT_APP_API_BASE_URL:-http://localhost:8000}
+        REACT_APP_PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:?PAYPAL_CLIENT_ID must be set}
+    profiles:
+      - local
+      - gcp
     ports:
       - "80:80"
     depends_on:
       - backend
-    environment:
-      - REACT_APP_API_URL=http://backend:5000
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      # nginx:alpine carries BusyBox wget and no curl.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:80/"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -21,33 +104,86 @@ services:
   backend:
     build:
       context: ../../backend
-      dockerfile: Dockerfile
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
+    profiles:
+      - local
+      - gcp
     ports:
       - "8000:8000"
     depends_on:
-      - db
+      migrate:
+        condition: service_completed_successfully
     environment:
-      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL must be set}
-      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set}
+      <<: *backend-environment
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      # python:3.9-slim carries python and no curl.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).getcode() == 200 else 1)"
       interval: 30s
       timeout: 10s
       retries: 3
     restart: unless-stopped
 
-  db:
-    image: gcr.io/cloudsql-docker/gce-proxy:1.19.1
+  # Applies the Alembic revisions and exits. The backend starts only
+  # after this service has exited successfully.
+  migrate:
+    build:
+      context: ../../backend
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
+    profiles:
+      - local
+      - gcp
+    environment:
+      <<: *backend-environment
     command:
-      - "/cloud_sql_proxy"
-      - "-instances=<INSTANCE_CONNECTION_NAME>=tcp:5432"
-    ports:
-      - "5432:5432"
+      - /bin/sh
+      - -c
+      - >-
+        attempt=1;
+        while [ "$$attempt" -le 10 ]; do
+        python -m alembic -c backend/alembic.ini upgrade head && exit 0;
+        echo "migration attempt $$attempt did not complete, retrying";
+        attempt=$$((attempt + 1));
+        sleep 3;
+        done;
+        exit 1
+    restart: "no"
+
+  db:
+    image: postgres:13-alpine
+    profiles:
+      - local
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-apartment_finder}
+      POSTGRES_USER: ${POSTGRES_USER:-apartment_finder}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "5432"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 30s
       timeout: 10s
       retries: 3
+    restart: unless-stopped
+
+  # Reached under the network alias db, the same name the local
+  # PostgreSQL service answers to. The proxy authenticates with the
+  # ambient credentials of the host it runs on; no credential file is
+  # mounted into this service and none is read from this repository.
+  cloud-sql-proxy:
+    image: gcr.io/cloudsql-docker/gce-proxy:1.19.1
+    profiles:
+      - gcp
+    command:
+      - "/cloud_sql_proxy"
+      - "-instances=${CLOUD_SQL_INSTANCE_CONNECTION_NAME:?CLOUD_SQL_INSTANCE_CONNECTION_NAME must be set}=tcp:0.0.0.0:5432"
+    networks:
+      default:
+        aliases:
+          - db
     restart: unless-stopped
 
 networks:
@@ -57,6 +193,3 @@ networks:
 volumes:
   db-data:
     driver: local
-
-# HUMAN ASSISTANCE NEEDED
-# Please replace <INSTANCE_CONNECTION_NAME> with the actual Google Cloud SQL instance connection name.

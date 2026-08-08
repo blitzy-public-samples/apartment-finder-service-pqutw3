@@ -40,6 +40,10 @@ The checks applied here are:
   neither this host nor a private network
 * the production environment must not be paired with sandbox payment
   configuration
+* each setting named by :data:`PROVIDER_SECRET_SETTINGS` must be at
+  least :data:`MIN_PROVIDER_SECRET_LENGTH` characters long, which is the
+  shortest value the redaction registry in
+  :mod:`backend.app.core.logging` accepts
 * the sender address must be a routable ``<local-part>@<domain>``
   address
 * each rate limit must carry a positive, bounded count and period
@@ -49,8 +53,8 @@ The checks applied here are:
   :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` must carry the address of the
   store it names
 * outside :data:`LOCAL_ENVIRONMENT` the rate-limit storage URI must name
-  a scheme in :data:`DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES`, which
-  excludes the in-process schemes whose tracked-key count is unbounded
+  a scheme in :data:`DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES`, which holds
+  the shared schemes and excludes every in-process scheme
 * placeholder values and reserved example domains are refused outside
   :data:`LOCAL_ENVIRONMENT`
 * when ``SECRET_BACKEND`` names :data:`MANAGED_BACKEND_NAME`, every
@@ -84,20 +88,25 @@ from pydantic import BaseSettings, Field, root_validator, validator
 __all__ = [
     "ALLOWED_JWT_ALGORITHMS",
     "BOUNDED_MEMORY_SCHEME",
+    "DEFAULT_ENV_FILE",
+    "DEFAULT_MAX_PAGINATION_OFFSET",
     "DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES",
     "ENVIRONMENT_BACKEND_NAME",
+    "ENV_FILE_VARIABLE",
     "ENVIRONMENT_NAMES",
     "IN_PROCESS_RATE_LIMIT_SCHEMES",
     "LIVE_MODE",
     "LOCAL_ENVIRONMENT",
     "MANAGED_BACKEND_NAME",
     "MANAGED_SECRET_SETTINGS",
-    "MAX_PAGINATION_OFFSET",
+    "MAX_PAGINATION_OFFSET_CEILING",
     "MAX_SIGNING_KEY_REPEAT_RUN",
     "MAX_SIGNING_KEY_SEQUENCE_RUN",
+    "MIN_PROVIDER_SECRET_LENGTH",
     "MIN_SIGNING_KEY_BYTES",
     "MIN_SIGNING_KEY_BYTES_BY_ALGORITHM",
     "MIN_SIGNING_KEY_DISTINCT_CHARS",
+    "PROVIDER_SECRET_SETTINGS",
     "PAYPAL_API_BASES",
     "PAYPAL_MODES",
     "PRODUCTION_ENVIRONMENT",
@@ -132,6 +141,15 @@ LOCAL_ENVIRONMENT = "local"
 
 #: PayPal environment name that identifies non-live credentials.
 SANDBOX_MODE = "sandbox"
+
+#: Environment variable naming the file settings are also read from. An
+#: empty value reads no file at all, leaving the process environment as
+#: the only source.
+ENV_FILE_VARIABLE = "ENV_FILE"
+
+#: File settings are also read from when :data:`ENV_FILE_VARIABLE` is
+#: absent from the process environment.
+DEFAULT_ENV_FILE = ".env"
 
 #: PayPal environment name that identifies live credentials.
 LIVE_MODE = "live"
@@ -226,7 +244,7 @@ SHARED_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
 )
 
 #: The in-process schemes whose number of tracked keys has no ceiling.
-#: :data:`BOUNDED_MEMORY_SCHEME` is absent because
+#: :data:`BOUNDED_MEMORY_SCHEME` is absent:
 #: :mod:`backend.app.core.rate_limit` caps it at
 #: ``Settings.RATE_LIMIT_MAX_TRACKED_KEYS``.
 UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
@@ -236,19 +254,21 @@ UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
 )
 
 #: Rate-limit storage schemes accepted outside :data:`LOCAL_ENVIRONMENT`:
-#: every shared scheme, plus the bounded in-process scheme. A scheme in
-#: this set that is also in :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` counts
-#: inside one process, which :func:`backend.app.core.rate_limit.
-#: build_limiter` records once against the setting that named it.
+#: the shared schemes only. Every scheme in
+#: :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` is absent, so a deployment
+#: running more than one process cannot configure counters that each of
+#: its processes holds separately.
 DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES = frozenset(
-    SHARED_RATE_LIMIT_STORAGE_SCHEMES | {BOUNDED_MEMORY_SCHEME}
+    SHARED_RATE_LIMIT_STORAGE_SCHEMES
 )
 
-#: Largest row offset a paged read may name. It is the ceiling of the
-#: signed 64-bit integer the database binds an ``OFFSET`` parameter to, so
-#: an offset above it cannot be executed at all and is refused by request
-#: validation rather than reaching SQL.
-MAX_PAGINATION_OFFSET = 2 ** 63 - 1
+#: Largest value ``Settings.MAX_PAGINATION_OFFSET`` may be set to. An
+#: offset above it is refused by settings validation.
+MAX_PAGINATION_OFFSET_CEILING = 1000000
+
+#: Row offset applied to ``Settings.MAX_PAGINATION_OFFSET`` when the
+#: environment names none.
+DEFAULT_MAX_PAGINATION_OFFSET = 10000
 
 #: Smallest accepted length of the token signing key, in UTF-8 bytes.
 MIN_SIGNING_KEY_BYTES = 32
@@ -268,6 +288,23 @@ MIN_SIGNING_KEY_BYTES_BY_ALGORITHM: Mapping[str, int] = MappingProxyType(
 
 #: Smallest accepted number of distinct characters in a signing key.
 MIN_SIGNING_KEY_DISTINCT_CHARS = 12
+
+#: Settings carrying a provider credential that is registered for
+#: redaction by the module that reads it. Each value passes through
+#: :func:`backend.app.core.logging.register_secret_values`.
+PROVIDER_SECRET_SETTINGS = (
+    "PAYPAL_CLIENT_SECRET",
+    "PAYPAL_WEBHOOK_ID",
+    "SENDGRID_API_KEY",
+    "ZILLOW_API_KEY",
+)
+
+#: Smallest accepted length of a setting named by
+#: :data:`PROVIDER_SECRET_SETTINGS`, in characters. It equals
+#: ``backend.app.core.logging.MIN_SECRET_VALUE_LENGTH``, the shortest
+#: value that module's registry accepts, so every accepted value here is
+#: a value the registry holds and replaces.
+MIN_PROVIDER_SECRET_LENGTH = 8
 
 #: Longest accepted run of one repeated character in a signing key.
 MAX_SIGNING_KEY_REPEAT_RUN = 3
@@ -459,7 +496,7 @@ _REQUIRED_TEXT_FIELDS = (
 
 # Shape of a rate-limit expression: a count, a separator, an optional
 # period multiple and a period name. The count and the multiple are
-# captured so that each can be measured numerically.
+# captured, and each is measured numerically.
 _RATE_LIMIT_PATTERN = re.compile(
     r"^(?P<count>\d+)\s*(?:/|\s+per\s+)\s*(?:(?P<multiple>\d+)\s*)?"
     r"(?:second|minute|hour|day|month|year)s?$",
@@ -684,6 +721,21 @@ def is_allowed_listing_provider_url(url: Any) -> bool:
     )
 
 
+def _configured_env_file() -> Optional[str]:
+    """Return the environment file to read, or ``None`` to read none.
+
+    :data:`DEFAULT_ENV_FILE` is returned when
+    :data:`ENV_FILE_VARIABLE` is absent from the process environment,
+    and ``None`` when it is present and names nothing. A process that
+    supplies every setting itself therefore reads no file.
+    """
+    declared = os.environ.get(ENV_FILE_VARIABLE)
+    if declared is None:
+        return DEFAULT_ENV_FILE
+    trimmed = declared.strip()
+    return trimmed or None
+
+
 class Settings(BaseSettings):
     """Validated application settings.
 
@@ -718,6 +770,11 @@ class Settings(BaseSettings):
     MAX_REQUEST_BODY_BYTES: int = Field(1048576, ge=1, le=104857600)
     MAX_REQUEST_BODY_CHUNKS: int = Field(2048, ge=1, le=1048576)
     MAX_PAGE_SIZE: int = Field(100, ge=1, le=1000)
+    MAX_PAGINATION_OFFSET: int = Field(
+        DEFAULT_MAX_PAGINATION_OFFSET,
+        ge=0,
+        le=MAX_PAGINATION_OFFSET_CEILING,
+    )
     RATE_LIMIT_LOGIN: str = "5/minute"
     RATE_LIMIT_REGISTER: str = "3/minute"
     RATE_LIMIT_WEBHOOK: str = "60/minute"
@@ -776,6 +833,22 @@ class Settings(BaseSettings):
         if not candidate:
             raise ValueError("must not be empty")
         return candidate
+
+    @validator(*PROVIDER_SECRET_SETTINGS)
+    def _check_provider_secret_length(cls, value: str) -> str:
+        """Return the credential, refusing one too short to redact.
+
+        A value shorter than :data:`MIN_PROVIDER_SECRET_LENGTH` is
+        refused, because the redaction registry accepts no shorter value
+        and would hold no entry for it.
+        """
+        if len(value) < MIN_PROVIDER_SECRET_LENGTH:
+            raise ValueError(
+                "must be at least "
+                f"{MIN_PROVIDER_SECRET_LENGTH} characters long so it can"
+                " be redacted from every log record"
+            )
+        return value
 
     @validator("SECRET_KEY")
     def _check_signing_key(cls, value: str) -> str:
@@ -1218,20 +1291,21 @@ class Settings(BaseSettings):
     def _check_rate_limit_sharing(
         cls, values: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Require deployable rate-limit storage outside local runs.
+        """Require shared rate-limit storage outside local runs.
 
         Outside :data:`LOCAL_ENVIRONMENT` the scheme must appear in
-        :data:`DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES`: every shared
-        scheme, plus :data:`BOUNDED_MEMORY_SCHEME`, whose tracked-key
-        count is capped by ``RATE_LIMIT_MAX_TRACKED_KEYS``. A scheme in
-        :data:`UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES` is refused, because
-        it holds one counter per caller address with no ceiling.
+        :data:`DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES`, which holds the
+        shared schemes only. Every scheme in
+        :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` is refused there, including
+        :data:`BOUNDED_MEMORY_SCHEME`: counters held inside one process
+        admit each configured limit once per process and are discarded
+        when that process ends.
 
-        A scheme that counts inside one process is recorded once by
-        :func:`backend.app.core.rate_limit.build_limiter`, which names
-        this setting, the scheme and the environment, so a deployment
-        running more than one process can see that its
-        credential-endpoint limits are enforced per process.
+        ``ENVIRONMENT`` set to :data:`LOCAL_ENVIRONMENT` accepts an
+        in-process scheme, and
+        :func:`backend.app.core.rate_limit.build_limiter` records one
+        line naming this setting, the scheme and the environment whenever
+        the configured store counts inside a single process.
         """
         uri = values.get("RATE_LIMIT_STORAGE_URI")
         if not isinstance(uri, str):
@@ -1242,8 +1316,8 @@ class Settings(BaseSettings):
             DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES
         ):
             raise ValueError(
-                "RATE_LIMIT_STORAGE_URI must name storage whose tracked "
-                "keys are bounded, one of "
+                "RATE_LIMIT_STORAGE_URI must name storage shared by "
+                "every process, one of "
                 f"{sorted(DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES)}, "
                 f"unless ENVIRONMENT is {LOCAL_ENVIRONMENT}"
             )
@@ -1376,7 +1450,7 @@ class Settings(BaseSettings):
         return values
 
     class Config:
-        env_file = ".env"
+        env_file = _configured_env_file()
         env_file_encoding = "utf-8"
 
         @classmethod

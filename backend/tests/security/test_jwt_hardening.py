@@ -1,4 +1,4 @@
-"""Regression tests for access-token verification at the HTTP boundary.
+"""Access-token verification at the HTTP boundary.
 
 Every case in this module presents a crafted access token on a
 protected route and asserts that the request is refused. The refusal
@@ -8,26 +8,19 @@ it will not accept: status ``401``, the body
 ``{"detail": "Could not validate credentials"}`` and the header
 ``WWW-Authenticate: Bearer``.
 
-This module is the named verifier for three findings.
+Three families of case run against that contract.
 
-* **C-2** -- the signing and verification algorithm was read from
-  unvalidated configuration. The ``finding_c2`` cases assert that a
-  token declaring ``none`` in any letter case, a token correctly signed
-  with an algorithm absent from the accepted list, a token correctly
-  signed with an asymmetric algorithm, and a token declaring an
-  asymmetric algorithm over an empty signature are each refused.
-* **H-7** -- the token subject carried an email address while the
-  column it was compared against holds an integer. The ``finding_h7``
-  cases assert that a token whose subject is a stored address, and a
-  token whose subject is not an integer, are each refused outright
-  rather than left unresolved.
-* **M-1**, response-code half -- a valid token naming a missing account
-  was answered ``404 "User not found"`` while an invalid token was
-  answered ``401``. The ``finding_m1`` cases assert that the response
-  for a deleted account, and the response for a subject naming no
-  stored row, are each indistinguishable from the response an invalid
-  token receives, in status code, in body bytes, in decoded body and in
-  challenge header.
+* Algorithm -- a token declaring ``none`` in any letter case, a token
+  correctly signed with an algorithm absent from the accepted list, a
+  token correctly signed with an asymmetric algorithm, and a token
+  declaring an asymmetric algorithm over an empty signature are each
+  refused.
+* Subject -- a token whose subject is a stored address, and a token
+  whose subject is not an integer, are each refused.
+* Refusal uniformity -- the response for a deleted account, and the
+  response for a subject naming no stored row, are each
+  indistinguishable from the response an invalid token receives, in
+  status code, in body bytes, in decoded body and in challenge header.
 
 The remaining cases assert that a foreign signing key, an elapsed
 expiry, a not-before time still in the future, a foreign audience, a
@@ -53,7 +46,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from backend.app.core.config import MIN_SIGNING_KEY_BYTES, settings
 from backend.app.core.security import JWT_ALGORITHMS, REQUIRED_CLAIMS
 from backend.app.db.models import User
-from backend.tests.conftest import (
+from backend.tests.support import (
     FOREIGN_AUDIENCE,
     FOREIGN_ISSUER,
     FOREIGN_SIGNING_KEY,
@@ -166,7 +159,6 @@ def assert_indistinguishable(first, second):
 def test_the_reference_token_is_accepted(
     client, forged_token_factory, registered_user
 ):
-    """Asserts the token every forgery is derived from is accepted."""
     response = present(
         client, forged_token_factory.valid(sub=str(registered_user.id))
     )
@@ -179,7 +171,6 @@ def test_the_reference_token_is_accepted(
 def test_finding_c2_a_token_declaring_none_is_rejected(
     client, forged_token_factory, registered_user, spelling
 ):
-    """Asserts an unsigned token is refused in every letter case."""
     token = forged_token_factory.unsigned(
         spelling, sub=str(registered_user.id)
     )
@@ -227,7 +218,6 @@ def test_finding_c2_an_asymmetric_algorithm_is_rejected(
 def test_finding_c2_a_stripped_asymmetric_signature_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts an asymmetric header over no signature is refused."""
     token = forged_token_factory.unsigned(
         ASYMMETRIC_ALGORITHM, sub=str(registered_user.id)
     )
@@ -261,7 +251,6 @@ def test_a_token_signed_with_a_foreign_key_is_rejected(
 def test_an_expired_token_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts a token whose validity has ended is refused."""
     token = forged_token_factory.expired(sub=str(registered_user.id))
     assert carried_claims(token)["exp"] < time.time()
     assert_refused(present(client, token))
@@ -270,7 +259,6 @@ def test_an_expired_token_is_rejected(
 def test_a_token_whose_validity_has_not_begun_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts a token with a future not-before time is refused."""
     token = forged_token_factory.future_not_before(
         sub=str(registered_user.id)
     )
@@ -283,7 +271,6 @@ def test_a_token_whose_validity_has_not_begun_is_rejected(
 def test_a_token_carrying_a_foreign_audience_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts a token minted for another audience is refused."""
     assert FOREIGN_AUDIENCE != settings.JWT_AUDIENCE
     token = forged_token_factory.wrong_audience(
         sub=str(registered_user.id)
@@ -295,7 +282,6 @@ def test_a_token_carrying_a_foreign_audience_is_rejected(
 def test_a_token_carrying_a_foreign_issuer_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts a token minted by another issuer is refused."""
     assert FOREIGN_ISSUER != settings.JWT_ISSUER
     token = forged_token_factory.wrong_issuer(
         sub=str(registered_user.id)
@@ -308,7 +294,6 @@ def test_a_token_carrying_a_foreign_issuer_is_rejected(
 def test_a_token_missing_a_required_claim_is_rejected(
     client, forged_token_factory, registered_user, claim
 ):
-    """Asserts a token lacking one required claim is refused."""
     token = forged_token_factory.without_claim(
         claim, sub=str(registered_user.id)
     )
@@ -317,7 +302,6 @@ def test_a_token_missing_a_required_claim_is_rejected(
 
 
 def test_the_claim_drop_cases_cover_every_required_claim():
-    """Asserts the parametrized claims are the required claims."""
     assert REQUIRED_CLAIM_NAMES == tuple(REQUIRED_CLAIMS)
 
 
@@ -341,7 +325,6 @@ def test_finding_h7_a_token_whose_subject_is_an_address_is_rejected(
 def test_finding_h7_a_subject_that_is_not_an_integer_is_rejected(
     client, forged_token_factory, registered_user, subject
 ):
-    """Asserts a subject naming no row identifier is refused."""
     assert str(registered_user.id) != subject
     token = forged_token_factory.valid(sub=subject)
     assert carried_claims(token)["sub"] == subject

@@ -83,17 +83,24 @@ and is admitted on its signature alone; the account whose entitlement it
 grants is resolved from the stored order identifier, never from the
 notification.
 
-``POST /`` and ``POST /webhook`` are declared ``async`` because each
-awaits a provider call, and the session they hold is the synchronous one
+``POST /`` and ``POST /webhook`` are ``async`` routes that each await a
+provider call, and the session they hold is the synchronous one
 :func:`backend.app.db.database.get_db` yields. Every statement these two
 routes issue therefore runs through :func:`_in_session`, which hands it
 to a worker thread, so a statement waiting on a database lock never
 occupies the event loop and the completion of a provider call awaited by
-another request stays deliverable. The session is used by one thread at a
-time and never by two at once. The one read they do not issue themselves
-is the ownership resolution inside
-:mod:`backend.app.services.paypal_service`, which is a plain select
-holding no lock and waiting on none.
+another request stays deliverable. The ownership resolution inside
+:mod:`backend.app.services.paypal_service` runs on the same kind of
+worker-thread boundary. The session is used by one thread at a time and
+never by two at once.
+
+A transition is applied to the row as it stands when the transition is
+written, not as it stood when the notification arrived: :func:`_activate`
+and :func:`_revoke` each re-read the row under a write lock held for the
+rest of the transaction. A subscription already in one of
+:data:`TERMINAL_STATUSES` is never moved out of it, so an approval whose
+capture was still in flight when a refund or a cancellation was recorded
+leaves that outcome in place.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -160,8 +167,8 @@ logger = get_logger(__name__)
 
 #: Status stored on a subscription row whose payment was captured. Every
 #: status this module writes is re-exported from the plan catalog, which
-#: holds the complete set so that the endpoint writing the column and
-#: the authorization module reading it cannot drift apart.
+#: holds the complete set read both by the endpoint writing the column
+#: and by the authorization module reading it.
 ACTIVE_STATUS = STATUS_ACTIVE
 
 #: Status stored on a row recorded before its payment is captured.
@@ -263,6 +270,15 @@ _REVOKED_STATUSES = {
 
 # Statuses a subscription may still be moved out of.
 _OPEN_STATUSES = (PENDING_STATUS, FAILED_STATUS)
+
+#: Statuses no notification moves a subscription out of. Each records a
+#: settlement the provider has undone, and each closes the entitlement
+#: window, so a later approval of the same order leaves them in place.
+TERMINAL_STATUSES = frozenset(_REVOKED_STATUSES.values())
+
+#: Reason recorded when a transition is abandoned because the row reached
+#: a terminal status while the transition was being decided.
+REASON_TERMINAL_STATUS = "subscription_already_terminal"
 
 # Provider failure categories answered with a client-facing 4xx. Every
 # other category is a dependency failure.
@@ -820,32 +836,34 @@ async def receive_paypal_webhook(
     5. the notification is applied to the subscription it names
     6. the delivery record and the transition are committed together
 
-    Every statement of steps 4 to 6 runs through :func:`_in_session`, so
+    Every statement of steps 4 to 6 runs through :func:`_in_session`, and
     the flush that waits on the uniqueness constraint while a concurrent
     delivery of the same identifier is still open waits in a worker
-    thread. That concurrent delivery is parked in the provider call of
-    step 5 with its own delivery row uncommitted, and its completion is
-    delivered by the event loop, which the wait therefore must not hold.
-    The wait resolves either way: a commit raises ``IntegrityError`` and
-    the repeat is acknowledged, a rollback lets the waiting insert succeed
-    and the notification is still settled.
+    thread, holding no event-loop time. That concurrent delivery is parked
+    in the provider call of step 5 with its own delivery row uncommitted,
+    and its completion is delivered by the event loop. The wait resolves
+    either way: a commit raises ``IntegrityError`` and the repeat is
+    acknowledged, a rollback lets the waiting insert succeed and the
+    notification is still settled.
 
     A notification that fails the check -- including one whose body does
     not decode to an object -- is answered ``400``. A notification that
-    could not be checked at all is answered ``503``, so PayPal delivers it
-    again. A delivery identifier already recorded is answered ``200`` and
-    is **not** processed again, because PayPal redelivers every
-    notification it is not answered ``2xx``. Nothing is written on any
+    could not be checked at all is answered ``503``, and PayPal delivers
+    it again, as it redelivers every notification it is not answered
+    ``2xx`` for. A delivery identifier already recorded is answered
+    ``200`` and is **not** processed again. Nothing is written on any
     rejected path.
 
     A transition that cannot be committed is answered ``503`` carrying
     :data:`RECONCILIATION_DETAIL` after one record naming
-    :data:`REASON_ACTIVATION_NOT_RECORDED`, so a charge PayPal has taken
-    is never silently forgotten and the notification is delivered again.
+    :data:`REASON_ACTIVATION_NOT_RECORDED`, and the notification is
+    delivered again.
 
     Only the rejection reason, the request path and safe identifiers are
     recorded; no header value, signature or notification body reaches a
-    log record.
+    log record. The record for a repeated delivery names the verified
+    delivery identifier and the provider's order identifier, so it is
+    correlated with the delivery that was processed.
     """
     raw_body = await request.body()
 
@@ -898,6 +916,13 @@ async def receive_paypal_webhook(
                 "reason": REASON_REPLAY,
                 "path": request.scope.get("path"),
                 "event_type": event_type,
+                # Identity of the delivery, taken from the verified
+                # headers, so the repeat is correlated with the delivery
+                # that was processed. The order identifier is the
+                # provider's own and is present when the notification
+                # names one.
+                "transmission_id": verification.transmission_id,
+                "paypal_order_id": _order_id_from(notification),
             },
         )
         return {"status": OUTCOME_DUPLICATE}
@@ -1176,6 +1201,44 @@ def _plan_for(subscription: SubscriptionModel) -> Optional[Plan]:
         return None
 
 
+def _lock_subscription(
+    db: Session, subscription: SubscriptionModel
+) -> Optional[SubscriptionModel]:
+    """Returns the subscription row held under a write lock.
+
+    The row is re-read inside the current transaction and the lock is held
+    until that transaction ends, so two notifications naming the same
+    subscription are applied one after the other rather than interleaved.
+    ``populate_existing`` discards the copy loaded earlier, so the
+    attributes read are the persisted ones. ``None`` is returned when the
+    row is no longer there.
+    """
+    return (
+        db.query(SubscriptionModel)
+        .filter(SubscriptionModel.id == subscription.id)
+        .populate_existing()
+        .with_for_update()
+        .one_or_none()
+    )
+
+
+def _abandon_terminal(
+    subscription: SubscriptionModel, event_type: str
+) -> str:
+    """Records a transition abandoned against a terminal status."""
+    logger.warning(
+        "Left a subscription in the terminal status the provider "
+        "recorded for it",
+        extra={
+            "event_type": event_type,
+            "subscription_id": subscription.id,
+            "subscription_status": subscription.status,
+            "reason": REASON_TERMINAL_STATUS,
+        },
+    )
+    return OUTCOME_IGNORED
+
+
 def _activate(
     db: Session,
     subscription: SubscriptionModel,
@@ -1191,6 +1254,14 @@ def _activate(
     those leaves the subscription in the status it already held and grants
     no role, so a redelivery or a later attempt can still settle the row
     correctly.
+
+    The row is re-read under a write lock before it is written, and the
+    status read back decides the transition: a row now in one of
+    :data:`TERMINAL_STATUSES` is left as it is, a row already in
+    :data:`ACTIVE_STATUS` is reported as processed without being written
+    again, and a row in any other status outside :data:`_OPEN_STATUSES` is
+    left as it is. A concurrent revocation recorded while the capture was
+    in flight therefore stands.
 
     The provider's own capture identifier is recorded in the activation
     record, and a settled capture carrying none activates nothing, so
@@ -1227,21 +1298,58 @@ def _activate(
         )
         return OUTCOME_IGNORED
 
+    locked = _lock_subscription(db, subscription)
+    if locked is None:
+        logger.warning(
+            "A verified PayPal notification named a subscription that "
+            "is no longer stored",
+            extra={
+                "event_type": event_type,
+                "subscription_id": subscription.id,
+                "reason": REASON_UNMATCHED_ORDER,
+            },
+        )
+        return OUTCOME_IGNORED
+    if locked.status in TERMINAL_STATUSES:
+        return _abandon_terminal(locked, event_type)
+    if locked.status == ACTIVE_STATUS:
+        logger.info(
+            "A verified PayPal notification reported a subscription "
+            "already active",
+            extra={
+                "event_type": event_type,
+                "subscription_id": locked.id,
+                "subscription_status": locked.status,
+            },
+        )
+        return OUTCOME_PROCESSED
+    if locked.status not in _OPEN_STATUSES:
+        logger.warning(
+            "A verified PayPal notification could not move a "
+            "subscription out of its stored status",
+            extra={
+                "event_type": event_type,
+                "subscription_id": locked.id,
+                "subscription_status": locked.status,
+            },
+        )
+        return OUTCOME_IGNORED
+
     started = datetime.now(timezone.utc)
-    subscription.status = ACTIVE_STATUS
-    subscription.start_date = started
-    subscription.end_date = started + timedelta(days=plan.period_days)
-    granted = _grant_role(subscription.user, plan.required_role)
+    locked.status = ACTIVE_STATUS
+    locked.start_date = started
+    locked.end_date = started + timedelta(days=plan.period_days)
+    granted = _grant_role(locked.user, plan.required_role)
     db.flush()
     logger.info(
         "Activated a subscription against a confirmed PayPal capture",
         extra={
             "event_type": event_type,
-            "subscription_id": subscription.id,
+            "subscription_id": locked.id,
             "plan_id": plan.plan_id,
-            "paypal_order_id": subscription.paypal_order_id,
+            "paypal_order_id": locked.paypal_order_id,
             "paypal_capture_id": outcome.capture_id,
-            "subscription_status": subscription.status,
+            "subscription_status": locked.status,
             "capture_status": outcome.status,
             "granted_role": granted,
         },
@@ -1256,24 +1364,39 @@ def _revoke(
 ) -> str:
     """Ends an entitlement PayPal reports as undone.
 
-    The subscription is moved to the status the notification maps to, its
-    entitlement window is closed at the server clock, and the principal
-    is demoted when it holds the subscriber role and no other
+    The row is re-read under the same write lock the activation path takes.
+    A row already in one of :data:`TERMINAL_STATUSES` is left as it is,
+    which covers a second revoking notification for the same order.
+    Otherwise the subscription is moved to the status the notification maps
+    to, its entitlement window is closed at the server clock, and the
+    principal is demoted when it holds the subscriber role and no other
     subscription still entitles it.
     """
-    subscription.status = _REVOKED_STATUSES.get(
-        event_type, CANCELLED_STATUS
-    )
-    subscription.end_date = datetime.now(timezone.utc)
+    locked = _lock_subscription(db, subscription)
+    if locked is None:
+        logger.warning(
+            "A verified PayPal notification named a subscription that "
+            "is no longer stored",
+            extra={
+                "event_type": event_type,
+                "subscription_id": subscription.id,
+                "reason": REASON_UNMATCHED_ORDER,
+            },
+        )
+        return OUTCOME_IGNORED
+    if locked.status in TERMINAL_STATUSES:
+        return _abandon_terminal(locked, event_type)
+    locked.status = _REVOKED_STATUSES.get(event_type, CANCELLED_STATUS)
+    locked.end_date = datetime.now(timezone.utc)
     db.flush()
-    revoked = _revoke_role(db, subscription.user)
+    revoked = _revoke_role(db, locked.user)
     db.flush()
     logger.warning(
         "Ended a subscription PayPal reported as undone",
         extra={
             "event_type": event_type,
-            "subscription_id": subscription.id,
-            "subscription_status": subscription.status,
+            "subscription_id": locked.id,
+            "subscription_status": locked.status,
             "revoked_role": revoked,
         },
     )

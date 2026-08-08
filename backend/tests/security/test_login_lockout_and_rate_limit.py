@@ -1,8 +1,8 @@
-"""Regression tests for the credential endpoints' brute-force controls.
+"""The credential endpoints' brute-force controls.
 
 The unit under test is :mod:`backend.app.api.endpoints.auth`. Each case
-drives an attack against ``POST /auth/login`` or ``POST /auth/register``
-and asserts that the attack fails.
+exercises ``POST /auth/login`` or ``POST /auth/register`` and asserts
+the refusal the control under test returns.
 
 Four controls are covered:
 
@@ -14,7 +14,8 @@ Four controls are covered:
   password does not match
 * the per-address rate limit the two credential endpoints declare
   against ``settings.RATE_LIMIT_LOGIN`` and
-  ``settings.RATE_LIMIT_REGISTER``
+  ``settings.RATE_LIMIT_REGISTER``, measured on an account carrying no
+  lock and answered without any credential work or account lookup
 * the password contract :mod:`backend.app.schema.user` applies -- a
   seventy-two byte ceiling and the four-class policy floor
 
@@ -22,9 +23,11 @@ Every request body is posted as JSON keyed on ``email`` and
 ``password``.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import event
 
 from backend.app.api.endpoints import auth as auth_module
 from backend.app.core import security
@@ -37,7 +40,7 @@ from backend.app.main import (
     app,
     limiter,
 )
-from backend.tests.conftest import VALID_TEST_PASSWORD
+from backend.tests.support import VALID_TEST_PASSWORD
 
 #: Clears the shared per-address limiter counters around every case in
 #: this module.
@@ -189,18 +192,67 @@ def _invalid_credentials_body():
     return {"detail": auth_module.INVALID_CREDENTIALS_DETAIL}
 
 
+def _throttled_body():
+    """Return the body every request refused by the throttle carries."""
+    return {"detail": TOO_MANY_REQUESTS_DETAIL}
+
+
+@contextmanager
+def _recorded_statements(session):
+    """Record every statement the shared engine runs inside the block.
+
+    ``session`` names any session on the test database; the engine
+    behind it is the one the application's request-scoped sessions are
+    also drawn from, so a statement any request issues is recorded. The
+    yielded list receives each statement in the order it ran, and the
+    listener is removed when the block ends.
+    """
+    statements = []
+    engine = session.get_bind()
+
+    def record(
+        connection, cursor, statement, parameters, context, executemany
+    ):
+        """Append one executed statement to the recording."""
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+def _touching_accounts(statements):
+    """Return the recorded statements naming the accounts table."""
+    return [
+        statement
+        for statement in statements
+        if User.__tablename__ in statement.lower()
+    ]
+
+
+def _consume_login_allowance(test_client, email):
+    """Spend the login allowance on logins that succeed.
+
+    ``settings.RATE_LIMIT_LOGIN`` names the allowance. Each request
+    carries the password the account was seeded with, so each answers
+    200 and each returns the failed-attempt count to zero -- leaving the
+    allowance spent and the account carrying no lock. The shared
+    per-address counter is not cleared between the requests.
+    """
+    admitted = [
+        _post_login(test_client, email, VALID_TEST_PASSWORD, reset=False)
+        for _ in range(_allowance(settings.RATE_LIMIT_LOGIN))
+    ]
+    for response in admitted:
+        assert response.status_code == 200
+    return admitted
+
+
 def test_every_failure_up_to_the_threshold_is_refused_alike(
     client, login_json, registered_user
 ):
-    """Each failure up to the threshold answers the same refusal.
-
-    The number of failures driven is
-    ``settings.LOGIN_MAX_ATTEMPTS``. Every response answers 401
-    carrying :data:`backend.app.api.endpoints.auth.
-    INVALID_CREDENTIALS_DETAIL`, no response carries a token, and each
-    response is equal to the first in status, raw body and headers
-    outside :data:`VOLATILE_HEADERS`.
-    """
     responses = _drive_to_threshold(
         login_json, client, registered_user.email
     )
@@ -219,12 +271,6 @@ def test_every_failure_up_to_the_threshold_is_refused_alike(
 def test_reaching_the_threshold_locks_the_account_row(
     db, client, login_json, registered_user
 ):
-    """The threshold is recorded on the row with a future lock.
-
-    ``failed_login_attempts`` holds ``settings.LOGIN_MAX_ATTEMPTS``,
-    and ``locked_until`` names an instant ahead of the server clock and
-    no later than ``settings.LOGIN_LOCKOUT_MINUTES`` minutes from it.
-    """
     _drive_to_threshold(login_json, client, registered_user.email)
 
     stored = _stored(db, registered_user.id)
@@ -241,13 +287,6 @@ def test_reaching_the_threshold_locks_the_account_row(
 def test_the_correct_password_is_refused_while_the_lock_holds(
     db, client, login_json, registered_user
 ):
-    """The correct password is refused while the lock is in force.
-
-    The login is posted with the password the account was seeded with.
-    It answers 401 carrying :data:`backend.app.api.endpoints.auth.
-    INVALID_CREDENTIALS_DETAIL` and no token, and the lock is still
-    recorded on the row afterwards.
-    """
     _drive_to_threshold(login_json, client, registered_user.email)
 
     response = login_json(client, registered_user.email)
@@ -261,12 +300,6 @@ def test_the_correct_password_is_refused_while_the_lock_holds(
 def test_a_failure_while_locked_does_not_advance_the_count(
     db, client, login_json, registered_user
 ):
-    """A further failure during the lock leaves the row unchanged.
-
-    ``failed_login_attempts`` still holds
-    ``settings.LOGIN_MAX_ATTEMPTS`` and ``locked_until`` still names
-    the instant the threshold set.
-    """
     _drive_to_threshold(login_json, client, registered_user.email)
     at_threshold = _stored(db, registered_user.id)
     locked_until = at_threshold.locked_until
@@ -288,12 +321,6 @@ def test_the_lock_does_not_reach_a_second_account(
     registered_user,
     second_registered_user,
 ):
-    """A lock on one account leaves a second account able to log in.
-
-    The second account's login answers 200 carrying the frozen
-    ``access_token`` and ``token_type`` keys, and its row records no
-    failed attempt and no lock while the first account stays locked.
-    """
     _drive_to_threshold(login_json, client, registered_user.email)
 
     response = login_json(client, second_registered_user.email)
@@ -312,12 +339,6 @@ def test_the_lock_does_not_reach_a_second_account(
 def test_a_successful_login_clears_the_failure_count(
     db, client, login_json, registered_user
 ):
-    """A success below the threshold returns the count to zero.
-
-    ``settings.LOGIN_MAX_ATTEMPTS`` minus one failures are counted on
-    the row and leave it unlocked. The login that follows answers 200,
-    after which the count is zero and no lock is recorded.
-    """
     below_threshold = settings.LOGIN_MAX_ATTEMPTS - 1
     for _ in range(below_threshold):
         refused = login_json(
@@ -341,12 +362,6 @@ def test_a_successful_login_clears_the_failure_count(
 def test_a_lock_that_has_expired_admits_the_correct_password(
     db, client, login_json, registered_user
 ):
-    """A lock whose instant has passed no longer refuses the login.
-
-    ``locked_until`` is moved behind the server clock on the stored row
-    and the count is set to the threshold. The login then answers 200,
-    and the row records no failed attempt and no lock.
-    """
     registered_user.failed_login_attempts = settings.LOGIN_MAX_ATTEMPTS
     registered_user.locked_until = datetime.now(
         timezone.utc
@@ -367,13 +382,6 @@ def test_a_lock_that_has_expired_admits_the_correct_password(
 def test_an_unknown_address_and_a_wrong_password_answer_identically(
     client, login_json, registered_user
 ):
-    """Two refusals share their status, body and headers.
-
-    One login names an address holding no account and one names a
-    stored account with a password that does not match. The status
-    code, the raw body bytes, the parsed body and every header outside
-    :data:`VOLATILE_HEADERS` are equal.
-    """
     unknown = login_json(client, UNKNOWN_EMAIL, WRONG_PASSWORD)
     mismatched = login_json(
         client, registered_user.email, WRONG_PASSWORD
@@ -390,13 +398,6 @@ def test_an_unknown_address_and_a_wrong_password_answer_identically(
 def test_the_locked_refusal_matches_the_unknown_address_refusal(
     client, login_json, registered_user
 ):
-    """The lock's refusal shares the refusal for an unknown address.
-
-    The account is driven to its lock, then a login with the correct
-    password and a login for an address holding no account are
-    compared. The status code, the raw body bytes and every header
-    outside :data:`VOLATILE_HEADERS` are equal.
-    """
     _drive_to_threshold(login_json, client, registered_user.email)
 
     locked = login_json(client, registered_user.email)
@@ -410,12 +411,6 @@ def test_the_locked_refusal_matches_the_unknown_address_refusal(
 def test_both_credential_branches_run_exactly_one_credential_check(
     monkeypatch, client, login_json, registered_user
 ):
-    """Each branch drives the credential check exactly once.
-
-    The unknown-address branch is handed ``None`` as the stored hash and
-    the mismatched-password branch is handed the row's stored hash. The
-    two branches make the same number of calls.
-    """
     stored_hash = registered_user.hashed_password
     record = _credential_calls(monkeypatch)
 
@@ -432,14 +427,6 @@ def test_both_credential_branches_run_exactly_one_credential_check(
 def test_the_unknown_address_branch_compares_against_the_decoy_hash(
     monkeypatch, client, login_json, registered_user
 ):
-    """Both branches perform the same hash comparisons.
-
-    The unknown-address branch compares only against
-    :data:`backend.app.core.security.DECOY_HASH`. The
-    mismatched-password branch compares against the row's stored hash
-    and then against the same decoy. Both branches perform the same
-    number of comparisons.
-    """
     stored_hash = registered_user.hashed_password
     record = _credential_calls(monkeypatch)
 
@@ -454,12 +441,6 @@ def test_the_unknown_address_branch_compares_against_the_decoy_hash(
 
 
 def test_the_limiter_is_registered_on_the_application():
-    """The application carries the limiter the endpoints decorate.
-
-    ``app.state.limiter`` is the object
-    :mod:`backend.app.api.endpoints.auth` declares its limits against,
-    and the object :mod:`backend.app.main` exports.
-    """
     assert getattr(app.state, "limiter", None) is not None
     assert app.state.limiter is limiter
     assert app.state.limiter is auth_module.limiter
@@ -468,13 +449,6 @@ def test_the_limiter_is_registered_on_the_application():
 def test_login_beyond_the_configured_rate_is_throttled(
     client, registered_user
 ):
-    """The login past the configured allowance answers 429.
-
-    The number of requests admitted is taken from
-    ``settings.RATE_LIMIT_LOGIN``. Every request inside the allowance
-    answers 401 and the next answers 429 carrying
-    :data:`backend.app.main.TOO_MANY_REQUESTS_DETAIL`.
-    """
     allowance = _allowance(settings.RATE_LIMIT_LOGIN)
     for _ in range(allowance):
         admitted = _post_login(
@@ -494,13 +468,6 @@ def test_login_beyond_the_configured_rate_is_throttled(
 
 
 def test_registration_beyond_the_configured_rate_is_throttled(client):
-    """The registration past the configured allowance answers 429.
-
-    The number of requests admitted is taken from
-    ``settings.RATE_LIMIT_REGISTER``. Every request inside the
-    allowance answers 200 and the next answers 429 carrying
-    :data:`backend.app.main.TOO_MANY_REQUESTS_DETAIL`.
-    """
     allowance = _allowance(settings.RATE_LIMIT_REGISTER)
     for index in range(allowance):
         admitted = _post_registration(
@@ -523,36 +490,100 @@ def test_registration_beyond_the_configured_rate_is_throttled(client):
 
 
 def test_a_throttled_login_never_reaches_the_account(
-    db, client, registered_user
+    monkeypatch, db, client, registered_user
 ):
-    """A login refused by the rate limit leaves the row untouched.
+    """A login refused by the throttle runs no part of the handler.
 
-    The requests inside the allowance are counted on
-    ``users.failed_login_attempts``. The request answered 429 adds
-    nothing to that count and creates no lock the count did not already
-    carry.
+    The allowance is spent on logins that succeed, so the account
+    carries no lock and a zero failed-attempt count when the throttled
+    request arrives, and the correct password is what that request
+    carries. That request answers 429 carrying
+    :data:`backend.app.main.TOO_MANY_REQUESTS_DETAIL` and no token, it
+    issues no statement against ``users``, it drives no credential check
+    and no password comparison, and it leaves the count and the lock as
+    it found them.
     """
-    allowance = _allowance(settings.RATE_LIMIT_LOGIN)
-    for _ in range(allowance):
-        _post_login(
+    _consume_login_allowance(client, registered_user.email)
+    unlocked = _stored(db, registered_user.id)
+    assert unlocked.failed_login_attempts == 0
+    assert unlocked.locked_until is None
+
+    record = _credential_calls(monkeypatch)
+    with _recorded_statements(db) as statements:
+        throttled = _post_login(
             client,
             registered_user.email,
-            WRONG_PASSWORD,
+            VALID_TEST_PASSWORD,
             reset=False,
         )
-    counted = _stored(db, registered_user.id)
-    attempts = counted.failed_login_attempts
-    locked_until = counted.locked_until
-
-    throttled = _post_login(
-        client, registered_user.email, WRONG_PASSWORD, reset=False
-    )
 
     assert throttled.status_code == 429
-    assert throttled.json() == {"detail": TOO_MANY_REQUESTS_DETAIL}
+    assert throttled.json() == _throttled_body()
+    assert "access_token" not in throttled.json()
+    assert _touching_accounts(statements) == []
+    assert statements == []
+    assert record["checks"] == []
+    assert record["comparisons"] == []
     unchanged = _stored(db, registered_user.id)
-    assert unchanged.failed_login_attempts == attempts
-    assert unchanged.locked_until == locked_until
+    assert unchanged.failed_login_attempts == 0
+    assert unchanged.locked_until is None
+
+
+def test_the_throttle_and_the_lock_are_told_apart(
+    monkeypatch,
+    db,
+    client,
+    login_json,
+    registered_user,
+    second_registered_user,
+):
+    """The two controls answer differently and neither stands in.
+
+    One account is driven to its lock with the allowance cleared before
+    each request, so the lock alone refuses it; a second account spends
+    the allowance on logins that succeed, so the throttle alone refuses
+    it. The lock's refusal answers 401 carrying
+    :data:`backend.app.api.endpoints.auth.INVALID_CREDENTIALS_DETAIL`
+    after reading the row and running one credential check, and the
+    throttle's refusal answers 429 carrying
+    :data:`backend.app.main.TOO_MANY_REQUESTS_DETAIL` having read no row
+    and run no credential check. The two statuses and the two bodies
+    differ.
+    """
+    _drive_to_threshold(login_json, client, registered_user.email)
+    assert _stored(db, registered_user.id).locked_until is not None
+
+    record = _credential_calls(monkeypatch)
+    limiter.reset()
+    with _recorded_statements(db) as locked_statements:
+        locked = login_json(
+            client, registered_user.email, reset=False
+        )
+    locked_checks = list(record["checks"])
+
+    assert locked.status_code == 401
+    assert locked.json() == _invalid_credentials_body()
+    assert _touching_accounts(locked_statements) != []
+    assert locked_checks != []
+
+    limiter.reset()
+    _consume_login_allowance(client, second_registered_user.email)
+    assert _stored(db, second_registered_user.id).locked_until is None
+    spent = len(record["checks"])
+    with _recorded_statements(db) as throttled_statements:
+        throttled = _post_login(
+            client,
+            second_registered_user.email,
+            VALID_TEST_PASSWORD,
+            reset=False,
+        )
+
+    assert throttled.status_code == 429
+    assert throttled.json() == _throttled_body()
+    assert _touching_accounts(throttled_statements) == []
+    assert record["checks"][spent:] == []
+    assert throttled.status_code != locked.status_code
+    assert throttled.json() != locked.json()
 
 
 @pytest.mark.parametrize(
@@ -570,12 +601,6 @@ def test_a_throttled_login_never_reaches_the_account(
 def test_a_registration_password_beyond_the_byte_ceiling_is_refused(
     db, client, password
 ):
-    """A registration password over the byte ceiling answers 422.
-
-    The refusal carries :data:`backend.app.main.
-    INVALID_REQUEST_DETAIL` rather than a server error, and no account
-    is created.
-    """
     address = "over.the.ceiling@example.com"
     assert len(password.encode("utf-8")) > PASSWORD_MAX_BYTES
 
@@ -589,11 +614,6 @@ def test_a_registration_password_beyond_the_byte_ceiling_is_refused(
 def test_a_login_password_beyond_the_byte_ceiling_is_refused(
     client, registered_user
 ):
-    """A login password over the byte ceiling answers 422.
-
-    The refusal carries :data:`backend.app.main.
-    INVALID_REQUEST_DETAIL` rather than a server error.
-    """
     response = _post_login(
         client, registered_user.email, PASSWORD_OVER_CEILING_ASCII
     )
@@ -603,12 +623,6 @@ def test_a_login_password_beyond_the_byte_ceiling_is_refused(
 
 
 def test_the_byte_ceiling_counts_bytes_and_not_characters():
-    """The multi-byte password straddles the two measures.
-
-    :data:`PASSWORD_OVER_CEILING_MULTIBYTE` carries fewer characters
-    than :data:`PASSWORD_MAX_BYTES` while encoding to more bytes than
-    it, and it carries every class the policy floor names.
-    """
     password = PASSWORD_OVER_CEILING_MULTIBYTE
 
     assert len(password) < PASSWORD_MAX_BYTES
@@ -621,11 +635,6 @@ def test_the_byte_ceiling_counts_bytes_and_not_characters():
 
 
 def test_a_password_at_the_byte_ceiling_is_accepted(client):
-    """A password of exactly the ceiling registers an account.
-
-    The response is 200 and carries the created user beside the frozen
-    ``access_token`` and ``token_type`` keys.
-    """
     address = "at.the.ceiling@example.com"
     assert (
         len(PASSWORD_AT_BYTE_CEILING.encode("utf-8"))
@@ -656,12 +665,6 @@ def test_a_password_at_the_byte_ceiling_is_accepted(client):
 def test_a_password_failing_the_policy_floor_is_refused(
     db, client, password
 ):
-    """A password missing a policy requirement answers 422.
-
-    Each case stays inside :data:`PASSWORD_MAX_BYTES`. The refusal
-    carries :data:`backend.app.main.INVALID_REQUEST_DETAIL` and no
-    account is created.
-    """
     address = "policy.candidate@example.com"
     assert len(password.encode("utf-8")) <= PASSWORD_MAX_BYTES
 

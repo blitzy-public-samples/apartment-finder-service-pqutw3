@@ -78,6 +78,19 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Local and generated database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+apartment_finder_test
+apartment_finder_test.*
+test.db
+test.sqlite
+test.sqlite3
+
 # Node dependencies and build output
 node_modules/
 frontend/build/

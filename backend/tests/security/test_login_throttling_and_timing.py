@@ -1,14 +1,19 @@
 """Regression tests for login lockout counting, throttling and timing.
 
-The cases here cover the two ways the credential endpoint previously gave
-ground: a failed-attempt count that two simultaneous attempts could hold
-below the lockout threshold, and a response time that differed according
-to the cost factor of the stored hash and so disclosed whether an address
-held an account.
+The cases here cover three ways the credential endpoint gave ground: a
+failed-attempt count that two simultaneous attempts could hold below the
+lockout threshold, a response time that differed according to the cost
+factor of the stored hash, and a refusal branch whose attempt-counting
+statements made it slower than the branch that found no account.
+
+The timing cases measure the elapsed time of complete requests and
+compare the median of each refusal branch against the others.
 """
 
+import statistics
 import time
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import bcrypt
 import pytest
@@ -32,13 +37,32 @@ WRONG_PASSWORD = "not-the-password-at-all"
 # before the current setting was chosen.
 LEGACY_ROUNDS = 4
 
+# A cost factor above the supported ceiling.
+UNSUPPORTED_ROUNDS = security.MAX_SUPPORTED_BCRYPT_COST + 1
+
+# Requests measured per refusal branch. The median of each branch is
+# compared, so one scheduling delay does not decide a case.
+TIMING_SAMPLES = 3
+
+# Seconds two branch medians may differ by. It is below the cost of one
+# comparison at the supported ceiling, so an extra or missing comparison
+# fails the case.
+TIMING_TOLERANCE_SECONDS = max(
+    0.15, security.MIN_LOGIN_REFUSAL_SECONDS * 0.35
+)
+
+
+def hash_at(password, rounds):
+    """Returns a bcrypt hash of ``password`` at ``rounds``."""
+    return bcrypt.hashpw(
+        password.encode("utf-8"),
+        bcrypt.gensalt(rounds=rounds),
+    ).decode("utf-8")
+
 
 def legacy_hash(password):
     """Returns a bcrypt hash carrying a lower cost than configured."""
-    return bcrypt.hashpw(
-        password.encode("utf-8"),
-        bcrypt.gensalt(rounds=LEGACY_ROUNDS),
-    ).decode("utf-8")
+    return hash_at(password, LEGACY_ROUNDS)
 
 
 @pytest.fixture(autouse=True)
@@ -406,6 +430,151 @@ class TestCredentialCheckWorkIsUniform:
 
         assert len(set(answers)) == 1
         assert answers[0][0] == 401
+
+
+class TestStoredCostRangeIsBounded:
+    """A stored cost factor outside the supported range is refused."""
+
+    def test_the_ceiling_covers_the_configured_cost(self):
+        assert security.MAX_SUPPORTED_BCRYPT_COST >= (
+            settings.BCRYPT_ROUNDS
+        )
+        assert security.MAX_SUPPORTED_BCRYPT_COST >= (
+            security.INHERITED_BCRYPT_COST
+        )
+        assert security.MIN_SUPPORTED_BCRYPT_COST <= LEGACY_ROUNDS
+
+    def test_the_decoy_carries_the_ceiling(self):
+        assert security.stored_bcrypt_cost(security.DECOY_HASH) == (
+            security.MAX_SUPPORTED_BCRYPT_COST
+        )
+
+    def test_a_hash_at_the_ceiling_still_verifies(self):
+        stored = hash_at(
+            PASSWORD, security.MAX_SUPPORTED_BCRYPT_COST
+        )
+        assert security.verify_credential(PASSWORD, stored) is True
+
+    def test_a_hash_above_the_ceiling_is_refused(self):
+        stored = hash_at(PASSWORD, UNSUPPORTED_ROUNDS)
+        assert security.stored_bcrypt_cost(stored) == UNSUPPORTED_ROUNDS
+        assert security.verify_password(PASSWORD, stored) is False
+        assert security.verify_credential(PASSWORD, stored) is False
+
+    def test_a_hash_above_the_ceiling_is_recorded(self):
+        stored = hash_at(PASSWORD, UNSUPPORTED_ROUNDS)
+        records = []
+        with mock.patch.object(
+            security.logger,
+            "error",
+            lambda message, **kwargs: records.append((message, kwargs)),
+        ):
+            security.verify_password(PASSWORD, stored)
+        assert [message for message, _ in records] == [
+            security.UNSUPPORTED_COST_MESSAGE
+        ]
+        fields = records[0][1]["extra"]
+        assert fields["stored_cost"] == UNSUPPORTED_ROUNDS
+        assert fields["max_supported_cost"] == (
+            security.MAX_SUPPORTED_BCRYPT_COST
+        )
+        assert stored not in str(records)
+
+    def test_a_hash_above_the_ceiling_costs_no_more_than_the_budget(
+        self,
+    ):
+        stored = hash_at(PASSWORD, UNSUPPORTED_ROUNDS)
+        started = time.monotonic()
+        security.verify_credential(PASSWORD, stored)
+        measured = time.monotonic() - started
+        assert measured < security.MIN_CREDENTIAL_CHECK_SECONDS * 2
+
+    @pytest.mark.parametrize(
+        "cost", [LEGACY_ROUNDS, security.MIN_SUPPORTED_BCRYPT_COST]
+    )
+    def test_a_lower_cost_hash_still_verifies(self, cost):
+        stored = hash_at(PASSWORD, cost)
+        assert security.verify_credential(PASSWORD, stored) is True
+
+
+class TestRefusalBranchesTakeTheSameTime:
+    """Every login refusal is held to one budget, measured end to end."""
+
+    @staticmethod
+    def _median_elapsed(client, address, password):
+        measured = []
+        for _ in range(TIMING_SAMPLES):
+            started = time.monotonic()
+            response = login(client, address, password)
+            measured.append(time.monotonic() - started)
+            assert response.status_code == 401
+        return statistics.median(measured)
+
+    def test_the_branch_medians_agree_and_reach_the_budget(
+        self, db, client
+    ):
+        """The four refusals are indistinguishable in elapsed time.
+
+        The branches are an unknown address, which issues no write; a
+        wrong password, which locks the row and counts the attempt; a lock
+        already in force, which counts nothing; and a wrong password
+        against a stored hash above the supported cost ceiling, which is
+        refused without a comparison.
+        """
+        make_user(
+            db,
+            "current@example.com",
+            security.get_password_hash(PASSWORD),
+        )
+        make_user(
+            db,
+            "expensive@example.com",
+            hash_at(PASSWORD, UNSUPPORTED_ROUNDS),
+        )
+        locked = make_user(
+            db,
+            "locked@example.com",
+            security.get_password_hash(PASSWORD),
+        )
+        locked.locked_until = datetime.now(timezone.utc) + timedelta(
+            minutes=30
+        )
+        db.commit()
+
+        medians = {
+            "unknown": self._median_elapsed(
+                client, "absent@example.com", WRONG_PASSWORD
+            ),
+            "wrong_password": self._median_elapsed(
+                client, "current@example.com", WRONG_PASSWORD
+            ),
+            "locked": self._median_elapsed(
+                client, "locked@example.com", PASSWORD
+            ),
+            "unsupported_cost": self._median_elapsed(
+                client, "expensive@example.com", WRONG_PASSWORD
+            ),
+        }
+
+        budget = security.MIN_LOGIN_REFUSAL_SECONDS
+        for name, measured in medians.items():
+            assert measured >= budget * 0.9, (name, measured, budget)
+        spread = max(medians.values()) - min(medians.values())
+        assert spread <= TIMING_TOLERANCE_SECONDS, medians
+
+    def test_the_refusal_budget_covers_the_credential_budget(self):
+        assert security.MIN_LOGIN_REFUSAL_SECONDS > (
+            security.MIN_CREDENTIAL_CHECK_SECONDS
+        )
+        assert security.REFUSAL_WORK_ALLOWANCE > 0
+
+    def test_the_padding_helper_returns_at_once_past_the_budget(self):
+        started = time.monotonic() - (
+            security.MIN_LOGIN_REFUSAL_SECONDS + 1.0
+        )
+        entered = time.monotonic()
+        security.equalize_login_refusal(started)
+        assert time.monotonic() - entered < 0.05
 
 
 class TestFrozenLoginContract:

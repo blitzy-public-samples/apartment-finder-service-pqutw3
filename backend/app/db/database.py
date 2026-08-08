@@ -1,15 +1,13 @@
 """Database engine, session factory and the request-scoped session.
 
 The engine opens every PostgreSQL connection with its session time zone
-set to UTC, so a naive ``TIMESTAMP`` value written by the application is
-read back as the same instant regardless of the zone the server is
-configured with. The application writes timezone-aware UTC values, and
-this setting is what makes the naive columns unambiguous on the way
-back out.
+set to UTC. A naive ``TIMESTAMP`` value written by the application is
+therefore read back as the same instant regardless of the zone the server
+is configured with, and the naive columns are unambiguous on the way back
+out. The application writes timezone-aware UTC values.
 
-``Base`` is re-exported from :mod:`backend.app.db.models` so that one
-metadata registry serves the models, the Alembic environment and the
-application.
+``Base`` is re-exported from :mod:`backend.app.db.models`. One metadata
+registry serves the models, the Alembic environment and the application.
 """
 
 from typing import Any, Dict
@@ -55,7 +53,7 @@ def _connect_args(url: str) -> Dict[str, Any]:
 
 # hide_parameters omits the values bound into a statement from the text
 # of any error the driver raises. The connect arguments pin a PostgreSQL
-# session to UTC, so a naive timestamp read back is unambiguous.
+# session to UTC, under which a naive timestamp read back is unambiguous.
 engine = create_engine(
     settings.DATABASE_URL,
     hide_parameters=True,

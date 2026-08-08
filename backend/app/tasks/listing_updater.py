@@ -3,9 +3,8 @@
 One pass reads the postal codes stored on saved filters, asks the
 provider for the listings covering them, maps each returned record onto
 the listing creation contract, and reconciles it against the stored
-corpus on :data:`IDENTITY_COLUMN`, which
-:class:`backend.app.db.models.Listing` constrains to be unique so that
-one provider address identifies at most one row.
+corpus on :data:`IDENTITY_COLUMN`: a record whose value already names a
+stored row updates that row rather than adding another.
 
 Every write goes through a mapped ORM instance and names its columns
 explicitly: a record is either constructed as a new
@@ -14,27 +13,34 @@ mutable columns of the row it matches. No attribute is copied
 dynamically from a provider object, and the identity column and the
 server-assigned ``id`` and ``created_at`` are never reassigned.
 
-A record carrying no identity is discarded rather than recorded, because
-it cannot be reconciled on a later pass and would otherwise be inserted
-again on every one. A record that fails the contract is discarded the
-same way, and names the contract fields it failed. A record the database
-refuses for a reason that describes that record -- one of
+A record carrying no identity is discarded rather than recorded, so it is
+never inserted and never reconciled. A record that fails the contract is
+discarded the same way, and names the contract fields it failed. A record
+the database refuses for a reason that describes that record -- one
+:func:`_is_record_failure` attributes to it, drawn from
 :data:`RECORD_FAILURES` -- is discarded too: each record is written inside
 its own savepoint, so one unwritable record is counted and dropped while
 every other record in the same payload is still recorded. All three are
-counted and reported once per pass.
+counted and reported once per pass. A failure that describes the session,
+the database or this module ends the pass instead, and is never counted as
+a record the database refused.
 
 The pass owns one session and commits once. Any failure rolls the session
-back and is reported rather than propagated, so a failing provider or
-database never ends the schedule. A failure is reported by exception
-class -- and by the driver's error class where the database raised it --
-carrying no message text, so no provider value travels with it.
+back and is reported rather than propagated, and the schedule continues.
+A failure is reported by exception class -- and by the driver's error
+class where the database raised it -- carrying no message text, and no
+provider value travels with it.
 """
 
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
-from sqlalchemy.exc import DataError, IntegrityError
+from sqlalchemy.exc import (
+    DataError,
+    DBAPIError,
+    IntegrityError,
+    StatementError,
+)
 from sqlalchemy.orm import Session
 from backend.app.db.database import SessionLocal
 from backend.app.services.zillow_service import (
@@ -49,9 +55,9 @@ from backend.app.core.logging import get_logger, log_exception
 UPDATE_INTERVAL = timedelta(hours=1)
 
 #: Column a provider record is reconciled against. It is the only
-#: declared column carrying a value the provider assigns per listing, and
-#: :class:`backend.app.db.models.Listing` constrains it to be unique, so
-#: one value identifies at most one row.
+#: declared column carrying a value the provider assigns per listing. A
+#: record whose value already names a row updates that row, so one value
+#: reaches at most one row.
 IDENTITY_COLUMN = "zillow_url"
 
 #: Provider query filters sent with every scheduled pass. The pass
@@ -64,15 +70,40 @@ INGESTION_FAILED_MESSAGE = "An error occurred while updating listings"
 #: Message recorded when the database refuses one provider record.
 RECORD_REFUSED_MESSAGE = "Discarded a provider listing the database refused"
 
-#: Failures attributed to the one record being written rather than to the
-#: pass. A constraint violation and a value the column cannot hold both
-#: describe that record, and the driver raises ``ValueError`` for a value
-#: it cannot adapt at all. Every other failure -- a lost connection, a
-#: missing privilege, a schema mismatch -- describes the session or the
-#: database, applies to every record equally, and ends the pass.
-RECORD_FAILURES = (IntegrityError, DataError, ValueError)
+#: Failures :func:`_is_record_failure` examines. Every one of them is
+#: raised for one statement, so the record that statement writes is named
+#: by the exception itself. A failure outside this set -- a lost
+#: connection, a missing privilege, a schema mismatch, or a defect in
+#: this module raising ``ValueError`` or ``TypeError`` on its own --
+#: describes the session, the database or the code rather than the record,
+#: applies to every record equally, and ends the pass.
+RECORD_FAILURES = (IntegrityError, DataError, StatementError)
+
+#: Causes a bind-processing failure carries. A statement whose parameters
+#: could not be prepared raises before the database is reached, and the
+#: value that could not be prepared belongs to the one record being
+#: written.
+BIND_FAILURE_CAUSES = (TypeError, ValueError)
 
 logger = get_logger(__name__)
+
+
+def _is_record_failure(error: BaseException) -> bool:
+    """Reports whether ``error`` describes the record being written.
+
+    A constraint violation and a value the column cannot hold both name
+    that record. So does a statement whose parameters could not be
+    prepared, which the database never received: it carries one of
+    :data:`BIND_FAILURE_CAUSES` and is not a driver error. Every other
+    driver error describes the session or the database.
+    """
+    if isinstance(error, (IntegrityError, DataError)):
+        return True
+    if isinstance(error, DBAPIError):
+        return False
+    return isinstance(
+        getattr(error, "orig", None), BIND_FAILURE_CAUSES
+    )
 
 
 def _failure_fields(error: BaseException) -> Dict[str, Optional[str]]:
@@ -188,12 +219,12 @@ def _write(
     """Writes one record inside its own savepoint. Reports whether it was.
 
     The row is constructed or refreshed and flushed within a nested
-    transaction, so a record the database refuses is rolled back to the
-    savepoint on its own and the records already written in this pass stay
-    pending. A failure listed in :data:`RECORD_FAILURES` is attributed to
-    the record: it is recorded by exception class, naming no provider
-    value, and False is returned. Every other failure describes the
-    session or the database rather than the record and is raised, ending
+    transaction. A record the database refuses is rolled back to the
+    savepoint on its own, and the records already written in this pass
+    stay pending. A failure :func:`_is_record_failure` attributes to the
+    record is recorded by exception class, naming no provider value, and
+    False is returned. Every other failure describes the session, the
+    database or this module rather than the record and is raised, ending
     the pass.
     """
     try:
@@ -204,6 +235,8 @@ def _write(
                 _refresh_listing(existing_listing, mapped, moment)
             db.flush()
     except RECORD_FAILURES as error:
+        if not _is_record_failure(error):
+            raise
         fields = _failure_fields(error)
         fields["identity_column"] = IDENTITY_COLUMN
         logger.warning(RECORD_REFUSED_MESSAGE, extra=fields)
@@ -255,10 +288,9 @@ async def update_listings():
                 continue
             processed += 1
             identity = getattr(mapped, IDENTITY_COLUMN)
-            # The identity column is uniquely constrained and each record
-            # is flushed as it is written, so this matches the one row
-            # carrying the value -- including one written earlier in this
-            # same pass -- or none at all.
+            # Each record is flushed as it is written, so this matches a
+            # row carrying the value -- including one written earlier in
+            # this same pass -- or none at all.
             existing_listing = db.query(Listing).filter(
                 getattr(Listing, IDENTITY_COLUMN) == identity
             ).first()
@@ -304,10 +336,10 @@ async def run_listing_updater():
     :data:`UPDATE_INTERVAL`, so cycles never overlap and the interval is
     measured between the end of one cycle and the start of the next.
 
-    This coroutine does not return: it is meant to be scheduled as a
-    background task and cancelled to stop it. Because
-    :func:`update_listings` swallows its own errors, a failed cycle is
-    followed by the next one after the same interval.
+    This coroutine does not return: it is scheduled as a background task
+    and cancelled to stop it. A failed cycle is followed by the next one
+    after the same interval; :func:`update_listings` reports every
+    failure rather than propagating it.
     """
     while True:
         await update_listings()

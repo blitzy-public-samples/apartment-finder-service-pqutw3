@@ -25,13 +25,17 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.api.endpoints import filters as filters_module
 from backend.app.api.endpoints import listings as listings_module
 from backend.app.services import zillow_service
-from backend.app.core.config import MAX_PAGINATION_OFFSET, settings
+from backend.app.core.config import (
+    MAX_PAGINATION_OFFSET_CEILING,
+    settings,
+)
 from backend.app.core.rate_limit import (
     RATE_LIMIT_HEADERS,
     RATE_LIMIT_RESET_HEADER,
@@ -64,7 +68,11 @@ from backend.app.schema.filter import (
     MIN_CRITERIA,
 )
 from backend.app.schema.listing import (
+    COUNT_FIELDS,
+    LISTING_URL_DOMAINS,
+    LISTING_URL_SCHEMES,
     MEASUREMENT_FIELDS,
+    NUMERIC_FIELDS,
     Listing,
     ListingCreate,
 )
@@ -79,11 +87,13 @@ CSP_HEADER = "content-security-policy"
 #: documentation page.
 API_POLICY = SECURITY_HEADERS["Content-Security-Policy"]
 
-# Offsets a paged read must refuse: the first value above the one the
-# database can bind, and three further values above that.
+# Offsets a paged read must refuse: the first value above the configured
+# cap, the ceiling that cap may itself be raised to, the first value the
+# database could not bind, and two further values above that.
 REFUSED_OFFSETS = (
+    str(settings.MAX_PAGINATION_OFFSET + 1),
+    str(MAX_PAGINATION_OFFSET_CEILING + 1),
     str(2 ** 63),
-    str(2 ** 64),
     str(10 ** 20 - 1),
     "9" * 200,
 )
@@ -234,10 +244,25 @@ def paged_parameters(path):
 
 
 class TestPagedOffsetIsBounded:
-    """A paged read refuses an offset it could not execute."""
+    """A paged read refuses an offset above the configured cap."""
 
-    def test_the_bound_is_the_value_the_database_can_bind(self):
-        assert MAX_PAGINATION_OFFSET == 2 ** 63 - 1
+    def test_the_bound_is_an_operational_cap(self):
+        assert settings.MAX_PAGINATION_OFFSET <= (
+            MAX_PAGINATION_OFFSET_CEILING
+        )
+        assert MAX_PAGINATION_OFFSET_CEILING < 2 ** 63 - 1
+        assert settings.MAX_PAGINATION_OFFSET >= 1
+
+    def test_the_cap_cannot_be_configured_above_the_ceiling(self):
+        with pytest.raises(PydanticValidationError):
+            settings.__class__(
+                **dict(
+                    settings.dict(),
+                    MAX_PAGINATION_OFFSET=(
+                        MAX_PAGINATION_OFFSET_CEILING + 1
+                    ),
+                )
+            )
 
     @pytest.mark.parametrize("offset", REFUSED_OFFSETS)
     def test_the_public_read_refuses_an_offset_above_it(
@@ -263,7 +288,8 @@ class TestPagedOffsetIsBounded:
         self, client
     ):
         response = client.get(
-            "/listings/", params={"skip": str(MAX_PAGINATION_OFFSET)}
+            "/listings/",
+            params={"skip": str(settings.MAX_PAGINATION_OFFSET)},
         )
         assert response.status_code == 200
         assert response.json() == []
@@ -273,7 +299,7 @@ class TestPagedOffsetIsBounded:
     ):
         response = client.get(
             "/filters/",
-            params={"skip": str(MAX_PAGINATION_OFFSET)},
+            params={"skip": str(settings.MAX_PAGINATION_OFFSET)},
             headers=bearer(registered_user),
         )
         assert response.status_code == 200
@@ -292,15 +318,17 @@ class TestPagedOffsetIsBounded:
     @pytest.mark.parametrize("path", ("/listings/", "/filters/"))
     def test_the_published_schema_advertises_the_bound(self, path):
         parameters = paged_parameters(path)
-        assert "maximum" in parameters["skip"]
+        assert parameters["skip"]["maximum"] == (
+            settings.MAX_PAGINATION_OFFSET
+        )
         assert parameters["skip"]["minimum"] == 0
         assert parameters["limit"]["maximum"] == settings.MAX_PAGE_SIZE
 
     @pytest.mark.parametrize(
         "module", (listings_module, filters_module)
     )
-    def test_both_reads_share_one_declared_ceiling(self, module):
-        assert module.MAX_PAGINATION_OFFSET is MAX_PAGINATION_OFFSET
+    def test_neither_read_declares_a_ceiling_of_its_own(self, module):
+        assert not hasattr(module, "MAX_PAGINATION_OFFSET")
 
 
 class TestSavedFilterHoldsSeveralPredicates:
@@ -639,6 +667,246 @@ class TestMeasurementsMustBeFiniteAndRepresentable:
             for entry in raised.value.errors()
         )
 
+
+class TestNumericFieldsRefuseBooleans:
+    """A boolean must not become listing data.
+
+    A boolean is a numeric type in Python, so a declared float or integer
+    field converts ``true`` to 1 and ``false`` to 0. Every numeric field
+    of both contracts refuses one instead.
+    """
+
+    @pytest.mark.parametrize("field", NUMERIC_FIELDS)
+    @pytest.mark.parametrize("value", [True, False])
+    def test_the_request_contract_refuses_a_boolean(self, field, value):
+        body = dict(BASE_LISTING)
+        body[field] = value
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(**body)
+
+    @pytest.mark.parametrize("field", NUMERIC_FIELDS)
+    @pytest.mark.parametrize("value", [True, False])
+    def test_the_response_contract_refuses_a_boolean(self, field, value):
+        body = dict(BASE_LISTING_RESPONSE)
+        body[field] = value
+        with pytest.raises(PydanticValidationError):
+            Listing(**body)
+
+    @pytest.mark.parametrize("field", COUNT_FIELDS)
+    @pytest.mark.parametrize("value", [0, 1, 4])
+    def test_a_whole_number_count_is_still_accepted(self, field, value):
+        body = dict(BASE_LISTING)
+        body[field] = value
+        assert getattr(ListingCreate(**body), field) == value
+
+    def test_the_write_route_refuses_a_boolean_and_stores_nothing(
+        self, client, db, admin_user
+    ):
+        response = client.post(
+            "/listings/",
+            json=dict(BASE_LISTING, bedrooms=True),
+            headers=bearer(admin_user),
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+        assert db.query(ListingModel).count() == 0
+
+    def test_every_declared_numeric_field_is_covered(self):
+        assert set(NUMERIC_FIELDS) == set(MEASUREMENT_FIELDS) | set(
+            COUNT_FIELDS
+        )
+        assert set(NUMERIC_FIELDS) <= set(ListingCreate.__fields__)
+        assert set(NUMERIC_FIELDS) <= set(Listing.__fields__)
+
+
+class TestListingUrlMustAddressTheProvider:
+    """A stored listing address must be a provider address over TLS.
+
+    The read endpoint's response is rendered by the frontend as a link
+    labelled for the provider, so an address outside the allowlist would
+    be presented under the provider's name. Both the admin write route
+    and the ingestion contract are governed by the same model, so a
+    provider record carrying an outside address is discarded rather than
+    stored.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://zillow.com/homedetails/1",
+            "https://www.zillow.com/homedetails/1",
+            "https://ZILLOW.COM/homedetails/1",
+            "https://www.zillow.com./homedetails/1",
+            "https://newyork.zillow.com/homedetails/1",
+        ],
+    )
+    def test_an_allowlisted_address_is_accepted(self, url):
+        assert ListingCreate(rent=2400.0, zillow_url=url).zillow_url == (
+            url
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://www.zillow.com/homedetails/1",
+            "http://zillow.com/homedetails/1",
+        ],
+    )
+    def test_a_plaintext_address_is_refused(self, url):
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(rent=2400.0, zillow_url=url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://evil.example.com/homedetails/1",
+            "https://notzillow.com/homedetails/1",
+            "https://xzillow.com/homedetails/1",
+            "https://zillow.com.evil.example.net/homedetails/1",
+            "https://evil.example.com/?u=https://www.zillow.com/1",
+            "https://evil.example.com/#www.zillow.com",
+            "https://www.zillow.com@evil.example.com/homedetails/1",
+            "//www.zillow.com/homedetails/1",
+            "javascript:alert(1)",
+            "ftp://www.zillow.com/homedetails/1",
+        ],
+    )
+    def test_an_address_outside_the_allowlist_is_refused(self, url):
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(rent=2400.0, zillow_url=url)
+
+    def test_the_allowlist_admits_tls_and_the_provider_only(self):
+        assert LISTING_URL_SCHEMES == ("https",)
+        assert LISTING_URL_DOMAINS == ("zillow.com",)
+
+    def test_the_write_route_refuses_an_outside_address(
+        self, client, db, admin_user
+    ):
+        response = client.post(
+            "/listings/",
+            json=dict(
+                BASE_LISTING, zillow_url="https://evil.example.com/1"
+            ),
+            headers=bearer(admin_user),
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+        assert db.query(ListingModel).count() == 0
+
+    def test_the_provider_mapper_discards_an_outside_address(self):
+        with pytest.raises(zillow_service.ListingMappingError) as raised:
+            zillow_service.process_listing(
+                {
+                    "price": 2400.0,
+                    "square_feet": 900.0,
+                    "address": "1 Ingest Way",
+                    "listing_url": "https://evil.example.com/1",
+                }
+            )
+        assert "zillow_url" in raised.value.fields
+
+    def test_a_stored_outside_address_still_projects(self):
+        projected = Listing(
+            **dict(
+                BASE_LISTING_RESPONSE,
+                zillow_url="https://legacy.example.net/1",
+            )
+        )
+        assert projected.zillow_url == "https://legacy.example.net/1"
+
+
+class TestAListingIntegrityConflictIsNotAServerError:
+    """An integrity violation on the write path answers as 409.
+
+    Revision 0001 adds no uniqueness over the address column, so a
+    repeated address is stored rather than refused. The conflict
+    branch still exists for any integrity violation the database
+    does raise, and the point of it is that such a violation is
+    reported as a deterministic outcome of the request rather than
+    as a database failure that leaks internals.
+    """
+
+    #: Address both write attempts carry.
+    ADDRESS = "https://www.zillow.com/homedetails/duplicate"
+
+    def _create(self, client, admin_user, **overrides):
+        return client.post(
+            "/listings/",
+            json=dict(BASE_LISTING, zillow_url=self.ADDRESS, **overrides),
+            headers=bearer(admin_user),
+        )
+
+    def test_a_repeated_address_is_stored_rather_than_refused(
+        self, client, db, admin_user
+    ):
+        first = self._create(client, admin_user)
+        assert first.status_code == 200
+
+        second = self._create(client, admin_user, rent=9999.0)
+        assert second.status_code == 200
+
+        stored = db.query(ListingModel).all()
+        assert len(stored) == 2
+        assert sorted(row.rent for row in stored) == [
+            BASE_LISTING["rent"],
+            9999.0,
+        ]
+        assert {row.zillow_url for row in stored} == {self.ADDRESS}
+
+    def test_an_integrity_violation_is_refused_as_a_conflict(
+        self, client, db, admin_user, monkeypatch
+    ):
+        def refuse(self_, *args, **kwargs):
+            raise IntegrityError("insert", {}, Exception("unique"))
+
+        monkeypatch.setattr(Session, "commit", refuse)
+        response = self._create(client, admin_user)
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": listings_module.LISTING_DUPLICATE_DETAIL
+        }
+
+    def test_the_conflict_is_not_reported_as_a_database_failure(
+        self, client, db, admin_user, monkeypatch
+    ):
+        def refuse(self_, *args, **kwargs):
+            raise IntegrityError("insert", {}, Exception("unique"))
+
+        monkeypatch.setattr(Session, "commit", refuse)
+        response = self._create(client, admin_user)
+        assert response.status_code != 500
+        assert response.json()["detail"] != (
+            listings_module.LISTING_NOT_STORED_DETAIL
+        )
+
+    def test_a_distinct_address_is_still_accepted(
+        self, client, db, admin_user
+    ):
+        assert self._create(client, admin_user).status_code == 200
+        other = client.post(
+            "/listings/",
+            json=dict(
+                BASE_LISTING,
+                zillow_url="https://www.zillow.com/homedetails/other",
+            ),
+            headers=bearer(admin_user),
+        )
+        assert other.status_code == 200
+        assert db.query(ListingModel).count() == 2
+
+    def test_a_database_failure_is_still_a_server_error(
+        self, client, db, admin_user, monkeypatch
+    ):
+        def refuse(self_, *args, **kwargs):
+            raise SQLAlchemyError("disk full")
+
+        monkeypatch.setattr(Session, "commit", refuse)
+        response = self._create(client, admin_user)
+        assert response.status_code == 500
+        assert response.json() == {
+            "detail": listings_module.LISTING_NOT_STORED_DETAIL
+        }
+
     @pytest.mark.parametrize("field", MEASUREMENT_FIELDS)
     def test_the_response_contract_refuses_a_non_finite_measurement(
         self, field
@@ -647,6 +915,50 @@ class TestMeasurementsMustBeFiniteAndRepresentable:
         body[field] = float("inf")
         with pytest.raises(PydanticValidationError):
             Listing(**body)
+
+    @pytest.mark.parametrize(
+        "field", MEASUREMENT_FIELDS + COUNT_FIELDS
+    )
+    @pytest.mark.parametrize("value", [True, False])
+    def test_the_contract_refuses_a_boolean_numeric(self, field, value):
+        body = dict(BASE_LISTING)
+        body[field] = value
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(**body)
+
+    @pytest.mark.parametrize(
+        "field", MEASUREMENT_FIELDS + COUNT_FIELDS
+    )
+    def test_the_response_contract_refuses_a_boolean_numeric(
+        self, field
+    ):
+        body = dict(BASE_LISTING_RESPONSE)
+        body[field] = True
+        with pytest.raises(PydanticValidationError):
+            Listing(**body)
+
+    @pytest.mark.parametrize(
+        "literal",
+        [
+            '{"rent": true}',
+            '{"rent": 1000, "bedrooms": true}',
+            '{"rent": 1000, "bathrooms": false}',
+            '{"rent": 1000, "broker_fee": true}',
+        ],
+    )
+    def test_the_write_route_refuses_a_boolean_and_stores_nothing(
+        self, client, db, admin_user, literal
+    ):
+        response = client.post(
+            "/listings/",
+            content=literal,
+            headers=dict(
+                bearer(admin_user), **{"Content-Type": "application/json"}
+            ),
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+        assert db.query(ListingModel).count() == 0
 
     @pytest.mark.parametrize(
         "literal",
@@ -674,7 +986,7 @@ class TestMeasurementsMustBeFiniteAndRepresentable:
         assert db.query(ListingModel).count() == 0
         assert client.get("/listings/").status_code == 200
 
-    def test_the_public_read_serves_a_page_around_an_unusable_row(
+    def test_the_public_read_refuses_a_page_carrying_an_unusable_row(
         self, client, db, admin_user
     ):
         recorded = datetime.now(timezone.utc)
@@ -690,14 +1002,48 @@ class TestMeasurementsMustBeFiniteAndRepresentable:
         db.commit()
         assert db.query(ListingModel).count() == 3
 
-        response = client.get("/listings/")
-        assert response.status_code == 200
-        served = response.json()
-        assert [row["rent"] for row in served] == [1000.0, 3000.0]
+        # The whole corpus, and the single-row window over the unusable
+        # row, are both refused rather than silently shortened.
+        for query in ("", "?skip=1&limit=1"):
+            response = client.get("/listings/" + query)
+            assert response.status_code == 500
+            assert response.json() == {
+                "detail": listings_module.LISTING_NOT_PROJECTABLE_DETAIL
+            }
 
-        page = client.get("/listings/?skip=1&limit=1")
+        # A window that excludes the unusable row is unaffected, and each
+        # page carries every row its window selects.
+        first = client.get("/listings/?skip=0&limit=1")
+        assert first.status_code == 200
+        assert [row["rent"] for row in first.json()] == [1000.0]
+
+        last = client.get("/listings/?skip=2&limit=1")
+        assert last.status_code == 200
+        assert [row["rent"] for row in last.json()] == [3000.0]
+
+    def test_a_short_page_means_the_corpus_ended(
+        self, client, db, admin_user
+    ):
+        recorded = datetime.now(timezone.utc)
+        for rent in (1000.0, 2000.0, 3000.0):
+            db.add(
+                ListingModel(
+                    created_at=recorded, updated_at=recorded, rent=rent
+                )
+            )
+        db.commit()
+
+        page = client.get("/listings/?skip=0&limit=10")
         assert page.status_code == 200
-        assert page.json() == []
+        assert [row["rent"] for row in page.json()] == [
+            1000.0,
+            2000.0,
+            3000.0,
+        ]
+
+        beyond = client.get("/listings/?skip=3&limit=10")
+        assert beyond.status_code == 200
+        assert beyond.json() == []
 
     def test_the_write_route_still_accepts_every_allowed_field(
         self, client, db, admin_user

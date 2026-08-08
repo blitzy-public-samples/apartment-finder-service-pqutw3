@@ -1,23 +1,26 @@
-"""Regression tests for the HTTP surface of the backend application.
+"""Tests for the HTTP surface of the backend application.
 
 The cases here cover the routes the application publishes, the request
 contracts they accept, the response shapes they return and the entitlement
-state they record. A second group covers the interfaces this change holds
-frozen: the login and registration response shapes, the eight pre-existing
-method and path pairs together with the four router prefixes, the public
-reachability of the listings read endpoint, the ownership scoping of the
-filter endpoints, the verifiability of password hashes stored before this
-change, the seventy-two byte password ceiling and the importability of the
-application entrypoint.
+state they record. A second group covers the interfaces the service keeps
+frozen: the login and registration response shapes, the nine method and
+path pairs mounted under the four router prefixes, the public reachability
+of the listings read endpoint, the ownership scoping of the filter
+endpoints, the verifiability of the ``$2a$`` and ``$2b$`` hash formats an
+account may carry, the seventy-two byte password ceiling and the
+importability of the application entrypoint.
 
-Every fixture is drawn from ``backend/tests/conftest.py``: the isolated
-per-test database session, the test client bound to it, one stored row per
-role and the factories that mint access tokens and the header carrying
-them. No fixture is redefined here.
+Fixtures come from ``backend/tests/conftest.py``: the isolated per-test
+database session, the test client bound to it, one stored row per role and
+the factories that mint access tokens and the header carrying them. One
+fixture is defined here -- :func:`unthrottled`, which suspends the shared
+rate limiter for the cases that drive more login attempts than the
+per-address rate admits.
 """
 
 import asyncio
 import importlib
+import json
 import logging as stdlib_logging
 import os
 import subprocess
@@ -30,6 +33,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import urlsplit
 
 import pytest
+from conftest import assert_paypal_call
 from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -57,7 +61,10 @@ from backend.app.core.authorization import (
 )
 from backend.app.core.config import settings
 from backend.app.core.logging import (
+    CONTEXT_FIELD,
     HANDLER_NAME,
+    RedactingFilter,
+    RedactingJsonFormatter,
     configure_logging,
     log_exception,
     redact,
@@ -101,7 +108,7 @@ from backend.app.services.paypal_service import (
     PayPalError,
     WebhookVerification,
 )
-from conftest import REPO_ROOT, VALID_TEST_PASSWORD
+from backend.tests.support import REPO_ROOT, VALID_TEST_PASSWORD
 
 
 AUTH_MODULE = 'backend.app.api.endpoints.auth'
@@ -111,6 +118,14 @@ SUBSCRIPTIONS_MODULE = 'backend.app.api.endpoints.subscriptions'
 ORDER_ID = 'ORDER-TEST-1'
 
 APPROVAL_URL = 'https://www.paypal.com/checkoutnow?token=' + ORDER_ID
+
+#: Correlation identifier the caller-supplied cases present. It carries
+#: only characters the identifier check accepts.
+SUPPLIED_REQUEST_ID = 'caller0trace0denial1'
+
+#: Seconds a fresh interpreter is given to import the application
+#: entrypoint before the case reports a failed startup.
+STARTUP_IMPORT_TIMEOUT_SECONDS = 180.0
 
 #: The five headers a PayPal notification must carry. The signature check
 #: is stood in for, so the values need only be present.
@@ -270,12 +285,6 @@ def test_login_response_shape_is_unchanged(client, registered_user):
 
 
 def test_register_response_shape_is_unchanged(client):
-    """The registration body keeps its nested user object and its token.
-
-    Each required member is asserted present, carrying the value the
-    contract names. The token member is named ``access_token`` and the
-    nested user object carries an integer ``id`` and an ``email``.
-    """
     response = client.post('/auth/register', json={
         'email': 'shape@example.com',
         'password': VALID_TEST_PASSWORD
@@ -496,9 +505,8 @@ def test_a_stored_admin_role_is_never_lowered_by_derivation(
 def test_the_failed_attempt_write_takes_a_row_lock(registered_user, db):
     """The counter's read-modify-write is serialized by a row lock.
 
-    The statement is compiled against PostgreSQL because SQLite omits
-    the locking clause, so the assertion has to name the dialect that
-    honours it.
+    The statement is compiled against the PostgreSQL dialect, which is
+    the dialect that renders the locking clause.
     """
     statement = (
         db.query(User)
@@ -615,11 +623,6 @@ def test_listing_retrieval_is_public(client):
 def test_listing_retrieval_needs_no_authorization_header(
     anonymous_client
 ):
-    """The read endpoint answers a request carrying no credential.
-
-    The request that was sent is asserted to carry no ``Authorization``
-    header, and the response is a success carrying a list.
-    """
     response = anonymous_client.get('/listings/')
     assert 'authorization' not in {
         name.lower() for name in response.request.headers
@@ -933,7 +936,7 @@ def test_a_capture_that_is_not_complete_grants_nothing(
 def test_a_repeated_delivery_is_acknowledged_without_reprocessing(
     client, registered_user, auth_header_factory
 ):
-    """PayPal redelivers anything not answered 2xx, so a replay is 200."""
+    """A repeated delivery is answered 200 and is not reprocessed."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=order_response(),
@@ -1278,6 +1281,43 @@ def test_a_rejected_request_still_carries_a_correlation_id(client):
     assert response.headers.get(REQUEST_ID_HEADER)
 
 
+def test_a_supplied_correlation_id_reaches_the_refusal_record(
+    client, registered_user, auth_header_factory
+):
+    """The identifier a caller supplies is on the record of its refusal.
+
+    The assertion is made on the serialised line the process writes, not
+    on the response header alone, so the trace the caller holds and the
+    trace an operator reads are the same value.
+    """
+    headers = auth_header_factory(registered_user)
+    headers[REQUEST_ID_HEADER] = SUPPLIED_REQUEST_ID
+
+    with watching_audit_trail() as records:
+        response = client.post(
+            '/listings/',
+            json={'street_address': '1 Main St', 'rent': 1000.0},
+            headers=headers,
+        )
+
+    assert response.status_code == 403
+    assert response.headers[REQUEST_ID_HEADER] == SUPPLIED_REQUEST_ID
+
+    refusals = [
+        record
+        for record in records
+        if record.getMessage() == REFUSAL_MESSAGE
+    ]
+    assert len(refusals) == 1
+    contexts = [
+        json.loads(line)[CONTEXT_FIELD]
+        for line in formatted_lines(refusals)
+    ]
+    assert contexts[0]['request_id'] == SUPPLIED_REQUEST_ID
+    assert contexts[0]['path'] == '/listings/'
+    assert contexts[0]['decision']
+
+
 @pytest.mark.parametrize('text, expected', [
     ('boot /srv/app/backend/app/main.py', 'boot <path>/main.py'),
     ('read C:\\app\\backend\\app\\main.py', 'read <path>/main.py'),
@@ -1365,6 +1405,21 @@ def watching_audit_trail():
 def messages(records):
     """Returns the plain message of every collected record."""
     return [record.getMessage() for record in records]
+
+
+def formatted_lines(records):
+    """Returns each collected record as the line the process writes.
+
+    The application's redacting filter and formatter are applied, so an
+    assertion reads the serialised record rather than its attributes.
+    """
+    log_filter = RedactingFilter()
+    formatter = RedactingJsonFormatter()
+    return [
+        formatter.format(record)
+        for record in records
+        if log_filter.filter(record)
+    ]
 
 
 def test_a_denial_survives_a_failing_audit_sink(
@@ -1578,12 +1633,18 @@ def test_throttling_is_audited_and_answered_429(client):
 
 
 class FakeResponse:
-    """Stands in for a provider response at the transport boundary."""
+    """Stands in for a provider response at the transport boundary.
+
+    ``content`` and the declared length are derived from the payload, so
+    the service's response-size cap is applied to this stand-in exactly as
+    it is to a real response.
+    """
 
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
-        self.headers = {}
+        self.content = json.dumps(self._payload).encode("utf-8")
+        self.headers = {"Content-Length": str(len(self.content))}
 
     def json(self):
         return self._payload
@@ -1593,17 +1654,33 @@ class FakeResponse:
 
 
 class FakeClient:
-    """Records the calls a provider function issues."""
+    """Records the calls a provider function issues.
+
+    Every call is asserted against the provider wire contract before a
+    response is served, so a call carrying the wrong method, host, path,
+    authentication, headers, body or timeout raises rather than receiving
+    a plausible answer. ``routes`` holds the contract route each recorded
+    call addressed. Only the two call shapes the service makes are
+    served: ``post`` and ``request``.
+    """
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+        self.routes = []
 
-    async def post(self, url, **kwargs):
+    def _serve(self, method, url, kwargs):
+        self.routes.append(assert_paypal_call(method, url, **kwargs))
         self.calls.append((url, kwargs))
         if len(self._responses) > 1:
             return self._responses.pop(0)
         return self._responses[0]
+
+    async def post(self, url, **kwargs):
+        return self._serve('POST', url, kwargs)
+
+    async def request(self, method, url, **kwargs):
+        return self._serve(method, url, kwargs)
 
 
 @contextmanager
@@ -2171,9 +2248,9 @@ def test_the_order_idempotency_key_is_derived_from_the_stored_row(
 ):
     """The key is a function of the committed row, stored nowhere.
 
-    Re-deriving it from the same row is what makes a repeat of an
-    uncertain call present the same ``PayPal-Request-Id``, so no column is
-    needed to remember it.
+    Re-derived from the same row it is the same value: a repeat of an
+    uncertain call presents the same ``PayPal-Request-Id``. No column
+    holds it.
     """
     creator = AsyncMock(return_value=_created_order())
     with patch(SUBSCRIPTIONS_MODULE + '.create_order', new=creator):
@@ -2185,7 +2262,7 @@ def test_the_order_idempotency_key_is_derived_from_the_stored_row(
     sent = creator.await_args.kwargs['idempotency_key']
     assert sent == paypal_module.order_request_id(stored.id)
     assert sent == paypal_module.order_request_id(stored.id)
-    # Nothing on the row remembers it, and nothing needs to.
+    # No column on the row holds it.
     assert not hasattr(stored, 'paypal_request_id')
 
 
@@ -2227,10 +2304,9 @@ def test_an_order_already_captured_is_read_back_and_activated(
 ):
     """A settled order is measured, not charged again.
 
-    PayPal rejects a second capture of an order it has already settled, so
-    the approval continuation reads that order back and measures what it
-    settled against the catalog rather than refusing the entitlement the
-    payer has paid for.
+    PayPal rejects a second capture of an order it has already settled.
+    The approval continuation reads that order back, measures what it
+    settled against the catalog, and grants the entitlement.
     """
     assert _open_order(
         client, auth_header_factory(registered_user)
@@ -2509,11 +2585,11 @@ def test_the_api_route_surface_is_exactly_the_expected_nine():
 
 @pytest.mark.parametrize('prefix', sorted(LEGACY_HASHES))
 def test_pre_existing_bcrypt_hashes_still_verify(prefix):
-    """A hash stored before this change verifies, and no reset is needed.
+    """Both fixed stored-hash literals verify the shared password.
 
-    The stored value is the fixed literal :data:`LEGACY_HASHES` holds for
-    the format tag under test. The shared password verifies against it and
-    a different password does not.
+    The stored value is the ``$2a$`` or ``$2b$`` literal
+    :data:`LEGACY_HASHES` holds for the format tag under test, and a
+    different password does not verify against it.
     """
     stored = LEGACY_HASHES[prefix]
     assert stored.startswith('$' + prefix + '$')
@@ -2525,7 +2601,6 @@ def test_pre_existing_bcrypt_hashes_still_verify(prefix):
 def test_a_pre_existing_hash_is_accepted_at_the_login_endpoint(
     client, db, prefix
 ):
-    """The endpoint admits an account whose stored hash predates the change."""
     email = 'legacy-' + prefix + '@example.com'
     db.add(User(
         email=email,
@@ -2545,7 +2620,6 @@ def test_a_pre_existing_hash_is_accepted_at_the_login_endpoint(
 
 @pytest.mark.parametrize('stored', MALFORMED_HASHES)
 def test_a_malformed_stored_hash_is_refused_without_raising(stored):
-    """Verification answers False for a hash it cannot read."""
     assert verify_password(VALID_TEST_PASSWORD, stored) is False
 
 
@@ -2568,8 +2642,26 @@ def test_a_password_past_the_byte_ceiling_is_refused_cleanly(client):
     assert attempted.status_code < 500
 
 
+def test_the_shared_test_values_are_held_by_one_module_object():
+    """The values the suite shares are loaded under one module name.
+
+    pytest imports ``backend/tests/conftest.py`` as the top-level module
+    ``conftest``. A test module importing that same file again under a
+    package name loads it a second time, and the two module objects then
+    hold separate copies of every class and constant in it. The shared
+    values are published by ``backend/tests/support.py`` instead, which
+    every module imports as ``backend.tests.support``.
+    """
+    loaded = sorted(
+        name for name in sys.modules
+        if name in ('support', 'backend.tests.support')
+    )
+    assert loaded == ['backend.tests.support']
+    assert 'backend.tests.conftest' not in sys.modules
+    assert REPO_ROOT is sys.modules['backend.tests.support'].REPO_ROOT
+
+
 def test_the_application_entrypoint_imports():
-    """The application entrypoint imports under its canonical name."""
     module = importlib.import_module('backend.app.main')
     assert module.app is app
     assert module.app.routes
@@ -2579,17 +2671,31 @@ def test_the_application_entrypoint_imports_in_a_fresh_interpreter():
     """A new interpreter imports the entrypoint and exits reporting success.
 
     The import runs out of process, on the interpreter running this suite,
-    with the repository root on its import path.
+    with the repository root on its import path. It is given
+    :data:`STARTUP_IMPORT_TIMEOUT_SECONDS` to finish; an import that has
+    not returned by then is reported as a failed startup rather than left
+    to hold the suite open.
     """
     environment = dict(os.environ)
     environment['PYTHONPATH'] = str(REPO_ROOT)
-    completed = subprocess.run(
-        [sys.executable, '-c', 'import backend.app.main'],
-        cwd=str(REPO_ROOT),
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, '-c', 'import backend.app.main'],
+            cwd=str(REPO_ROOT),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=STARTUP_IMPORT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as expired:
+        raise AssertionError(
+            'importing backend.app.main did not finish within '
+            '{0} seconds; stdout={1!r} stderr={2!r}'.format(
+                STARTUP_IMPORT_TIMEOUT_SECONDS,
+                expired.stdout,
+                expired.stderr,
+            )
+        ) from None
     assert completed.returncode == 0, completed.stderr.decode(
         'utf-8', 'replace'
     )

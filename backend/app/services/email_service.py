@@ -1,16 +1,19 @@
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 from backend.app.core.config import settings
-from backend.app.core.logging import get_logger, register_secret_values
+from backend.app.core.logging import (
+    get_logger,
+    register_required_secret_values,
+)
 
 logger = get_logger(__name__)
 
 SENDGRID_API_KEY = settings.SENDGRID_API_KEY
 FROM_EMAIL = settings.FROM_EMAIL
 
-# Replaces the provider credential wherever it appears in a record, so it
-# is removed from text that names no key -- provider error prose included.
-register_secret_values(SENDGRID_API_KEY)
+# Replaces the provider credential wherever it appears in a record,
+# including in text that names no key such as provider error prose.
+register_required_secret_values(SENDGRID_API_KEY)
 
 
 def send_email(to_email: str, subject: str, content: str) -> bool:

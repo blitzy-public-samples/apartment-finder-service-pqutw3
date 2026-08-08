@@ -21,9 +21,8 @@ class Subscription(BaseModel):
     identifier are held only server-side and are absent from this
     contract.
 
-    The hosted-checkout address is not declared here. It belongs to the
-    response that opens a subscription, and is carried by
-    :class:`SubscriptionCreated`.
+    The hosted-checkout address is not declared here. It is carried by
+    :class:`SubscriptionCreated`, the response that opens a subscription.
     """
 
     id: int
@@ -62,14 +61,13 @@ class SubscriptionCreated(Subscription):
     """Response contract for a newly opened subscription.
 
     Carries every field of :class:`Subscription` and adds the hosted
-    PayPal redirect the payer must visit to approve the order. The row is
+    PayPal redirect the payer visits to approve the order. The row is
     created with the pending status and carries no entitlement until the
     approved order has been captured and reconciled.
 
     ``approval_url`` is required. An order carrying no allowlisted
-    approval target is refused rather than returned, so this response is
-    never produced without one and a generated client is told the
-    continuation is always present.
+    approval target is refused rather than returned, and this response is
+    never produced without one.
     """
 
     approval_url: str

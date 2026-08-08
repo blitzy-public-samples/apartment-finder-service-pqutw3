@@ -10,19 +10,24 @@ and returns the created user beside the token. An address already taken
 is answered ``400`` carrying :data:`DUPLICATE_EMAIL_DETAIL`, whether the
 address is found by the lookup or by the unique constraint on the
 insert. The ``users.email`` unique constraint is the authority on
-whether an address is taken, so a race between two registrations for one
-address ends with the loser rolled back and answered exactly as the
-ordinary duplicate is.
+whether an address is taken: of two registrations racing for one
+address, the loser is rolled back and answered exactly as the ordinary
+duplicate is.
 
 Login answers with one response -- ``401`` carrying
 :data:`INVALID_CREDENTIALS_DETAIL` -- for an address that names no
 account, for an account whose lock is still in force, and for a password
 that does not match. Each of those three paths runs one password
 comparison, against :data:`backend.app.core.security.DECOY_HASH` where
-there is no stored hash to compare with. A password that does not match
-is counted on the row, reaching ``settings.LOGIN_MAX_ATTEMPTS`` locks
-the account for ``settings.LOGIN_LOCKOUT_MINUTES`` minutes, and a login
-that succeeds clears both the count and the lock. Both of those writes
+there is no stored hash to compare with, and each is held until
+:data:`backend.app.core.security.MIN_LOGIN_REFUSAL_SECONDS` have elapsed
+since the handler was entered, so the attempt-counting statements the
+wrong-password path issues and the lookup every path issues are covered
+by one budget and no branch answers sooner than another. A password that
+does not match is counted on the row, reaching
+``settings.LOGIN_MAX_ATTEMPTS`` locks the account for
+``settings.LOGIN_LOCKOUT_MINUTES`` minutes, and a login that succeeds
+clears both the count and the lock. Both of those writes
 re-read the row under a write lock held for the transaction, so
 attempts arriving at once are counted one by one and no count is lost.
 Neither write can change the response: a failure to persist one is
@@ -38,6 +43,7 @@ Usage::
     POST /auth/login     {"email": ..., "password": ...}
 """
 
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -48,6 +54,7 @@ from backend.app.core.logging import get_logger, log_exception
 from backend.app.core.rate_limit import build_limiter
 from backend.app.core.security import (
     create_access_token,
+    equalize_login_refusal,
     get_password_hash,
     verify_credential,
 )
@@ -93,12 +100,18 @@ limiter = build_limiter()
 router = APIRouter()
 
 
-def _invalid_credentials() -> HTTPException:
+def _invalid_credentials(started: float) -> HTTPException:
     """Return the ``HTTPException`` every rejected login raises.
 
     It carries status ``401`` and :data:`INVALID_CREDENTIALS_DETAIL`
-    whatever the reason for the rejection.
+    whatever the reason for the rejection. ``started`` is the
+    ``time.monotonic()`` reading taken on entering the handler, and the
+    exception is returned only once
+    :data:`backend.app.core.security.MIN_LOGIN_REFUSAL_SECONDS` have
+    elapsed since then, so every refusal branch takes the same time
+    whatever work it did.
     """
+    equalize_login_refusal(started)
     return HTTPException(
         status_code=401,
         detail=INVALID_CREDENTIALS_DETAIL,
@@ -131,10 +144,10 @@ def _lock_row(db: Session, user_id: int) -> Optional[User]:
     """Return the account row held under a write lock, or ``None``.
 
     The row is re-read inside the current transaction and the lock is
-    held until that transaction ends, so two requests touching the same
-    account are serialised rather than interleaved.
-    ``populate_existing`` discards the copy the request loaded earlier,
-    so the attributes returned are the persisted ones.
+    held until that transaction ends, and two requests touching the same
+    account are serialised. ``populate_existing`` discards the copy the
+    request loaded earlier, and the attributes returned are the persisted
+    ones.
     """
     return (
         db.query(User)
@@ -148,9 +161,8 @@ def _lock_row(db: Session, user_id: int) -> Optional[User]:
 def _abandon(db: Session, decision: str, user: User) -> None:
     """Discard the pending change and record that it did not persist.
 
-    The session is left clean so the request can still be answered, and
-    the record names the decision and the account rather than any
-    credential.
+    The session is left clean and the request is still answerable. The
+    record names the decision and the account, and no credential.
     """
     db.rollback()
     logger.error(
@@ -167,7 +179,7 @@ def _record_failed_attempt(
     """Count one failed attempt, locking the account at the threshold.
 
     The count is read back from the locked row and incremented in the
-    same transaction, so concurrent failures each advance it once.
+    same transaction, and concurrent failures each advance it once.
 
     A lock that has already expired restarts the count at one, and a
     lock still in force is left in place. Reaching
@@ -175,9 +187,8 @@ def _record_failed_attempt(
     ``settings.LOGIN_LOCKOUT_MINUTES`` minutes after ``moment``.
 
     A persistence failure is rolled back and recorded rather than
-    raised: the caller answers the same
-    :data:`INVALID_CREDENTIALS_DETAIL` either way, so a database fault
-    never discloses that the account exists.
+    raised. The caller is answered the same
+    :data:`INVALID_CREDENTIALS_DETAIL` either way.
     """
     try:
         row = _lock_row(db, user.id)
@@ -307,21 +318,22 @@ def login_user(
     user: UserLogin,
     db: Session = Depends(get_db),
 ):
+    started = time.monotonic()
     db_user = db.query(User).filter(User.email == user.email).first()
     attempted_at = datetime.now(timezone.utc)
     if db_user is None:
         verify_credential(user.password, None)
-        raise _invalid_credentials()
+        raise _invalid_credentials(started)
     if _is_locked(db_user, attempted_at):
         verify_credential(user.password, db_user.hashed_password)
         logger.warning(
             "Refused a login while the account lock was in force",
             extra={"user_id": db_user.id},
         )
-        raise _invalid_credentials()
+        raise _invalid_credentials(started)
     if not verify_credential(user.password, db_user.hashed_password):
         _record_failed_attempt(db, db_user, attempted_at)
-        raise _invalid_credentials()
+        raise _invalid_credentials(started)
     _record_successful_attempt(db, db_user)
 
     access_token = create_access_token(

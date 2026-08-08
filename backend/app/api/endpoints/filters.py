@@ -8,14 +8,14 @@ they touch to that principal's identifier.
 
 A filter is stored with its children: each accepted predicate becomes one
 ``criteria`` row and each accepted postal code becomes one ``zip_codes``
-row, so every value the request contract admits is persisted and read
-back by the response model. A filter that cannot be persisted is rolled
-back, recorded through the redacting logger and answered ``500`` carrying
+row. Every value the request contract admits is persisted and read back
+by the response model. A filter that cannot be persisted is rolled back,
+recorded through the redacting logger and answered ``500`` carrying
 :data:`FILTER_NOT_STORED_DETAIL`.
 
 Retrieval is paged in SQL and its page size is bounded by
-``settings.MAX_PAGE_SIZE``, and the children of a whole page are loaded
-by two further statements rather than by two per filter.
+``settings.MAX_PAGE_SIZE``. The children of a whole page are loaded by
+two further statements, not by two per filter.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -31,7 +31,7 @@ from backend.app.db.models import (
     ZipCode as ZipCodeModel,
 )
 from backend.app.core.authorization import Role, require_role
-from backend.app.core.config import MAX_PAGINATION_OFFSET, settings
+from backend.app.core.config import settings
 from datetime import datetime, timezone
 from typing import List
 
@@ -100,7 +100,7 @@ def create_filter(
 def get_user_filters(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(Role.REGISTERED)),
-    skip: int = Query(0, ge=0, le=MAX_PAGINATION_OFFSET),
+    skip: int = Query(0, ge=0, le=settings.MAX_PAGINATION_OFFSET),
     limit: int = Query(
         DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE
     ),
@@ -109,8 +109,8 @@ def get_user_filters(
 
     ``skip`` and ``limit`` are applied in SQL, and both are bounded:
     ``limit`` by ``settings.MAX_PAGE_SIZE`` and ``skip`` by
-    ``MAX_PAGINATION_OFFSET``, so an offset the database cannot bind is
-    refused by request validation. The postal codes and the predicates
+    ``settings.MAX_PAGINATION_OFFSET``, so an offset above the configured
+    cap is refused by request validation. The postal codes and the predicates
     of the returned filters are loaded by two further statements for the
     whole page rather than by two per filter, so the number of
     statements does not follow the page size. The number of children per

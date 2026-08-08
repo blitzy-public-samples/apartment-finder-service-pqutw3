@@ -53,7 +53,11 @@ the value, so it cannot reach a credential quoted inside free prose --
 the text of a provider error, for instance. A registered value is matched
 literally, which covers that case. The module holds the values it is
 given and reads none for itself: each caller registers the credential it
-handles.
+handles. :func:`register_secret_values` reports how many values the
+registry holds and never raises;
+:func:`register_required_secret_values` registers the same way and then
+raises when a value it was given is not held, so a caller that depends
+on a credential being redacted is told when it is not.
 
 Redaction runs twice. Every part of a record -- message, interpolated
 arguments, formatted exception text and each ``extra`` value, walked
@@ -165,6 +169,7 @@ __all__ = [
     "redact",
     "redact_structure",
     "registered_secret_count",
+    "register_required_secret_values",
     "register_secret_values",
     "reset_request_id",
     "unredacted_handler_names",
@@ -207,12 +212,11 @@ EXCEPTION_MESSAGE_LIMIT = 512
 AUDITED_ATTRIBUTE = "_audit_record_emitted"
 
 #: Shortest value :func:`register_secret_values` accepts. A shorter value
-#: is refused, because replacing it literally would rewrite text that
-#: merely contains those characters.
+#: is refused.
 MIN_SECRET_VALUE_LENGTH = 8
 
 #: Most values the registry holds. A further value is refused once the
-#: registry is full, so the per-record replacement stays bounded.
+#: registry is full.
 MAX_REGISTERED_SECRETS = 32
 
 #: Records the queue holds before an emission falls back to inline
@@ -326,6 +330,14 @@ _URL_CREDENTIAL_RE = re.compile(
     r"(?P<user>[^\s:/@\"']{1,128}:)"
     r"(?P<value>[^\s@/\"']{1,256})"
     r"(?P<at>@)",
+)
+
+# The query string of a URL, from the first question mark to the end of
+# the target. The whole query is replaced, so a value carried in it is
+# removed whether or not its key name spells a credential stem.
+_URL_QUERY_RE = re.compile(
+    r"(?P<url>[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s\"'<>\\?]{0,2048})"
+    r"\?(?P<query>[^\s\"'<>\\]{1,4096})",
 )
 
 # Marker substituted for the directory part of an internal path.
@@ -555,13 +567,29 @@ def _replace_email(match: "re.Match") -> str:
     return REDACTION_PLACEHOLDER
 
 
+def _replace_url_query(match: "re.Match") -> str:
+    """Replaces the whole query string of a URL, keeping the target.
+
+    The scheme, host and path are emitted unchanged, so a record still
+    names what was called. A query already reduced to the placeholder is
+    left as it is, so applying the rules twice is idempotent.
+    """
+    query = match.group("query")
+    if not query or _is_skipped_value(query):
+        return match.group(0)
+    return match.group("url") + "?" + REDACTION_PLACEHOLDER
+
+
 # Redaction rules in application order. Each pattern is compiled once at
-# module import. The traceback frame rule runs before the general path
+# module import. The URL query rule runs before the mapping and
+# assignment rules, so a parameter carried in a query is replaced with
+# the whole query. The traceback frame rule runs before the general path
 # rules so a frame header keeps its quoted shape.
 _REDACTION_RULES: Tuple[Tuple[Any, Callable[[Any], str]], ...] = (
     (_AUTH_HEADER_RE, _replace_auth_header),
     (_BEARER_RE, _replace_bearer),
     (_URL_CREDENTIAL_RE, _replace_url_credential),
+    (_URL_QUERY_RE, _replace_url_query),
     (_MAPPING_RE, _replace_mapping),
     (_ENCODED_MAPPING_RE, _replace_mapping),
     (_ASSIGNMENT_RE, _replace_assignment),
@@ -604,6 +632,31 @@ def register_secret_values(*values: Any) -> int:
             return len(_SECRET_VALUES)
     except Exception:
         return len(_SECRET_VALUES)
+
+
+def register_required_secret_values(*values: Any) -> int:
+    """Registers values whose redaction the caller depends on.
+
+    Each value is registered through :func:`register_secret_values` and
+    then confirmed to be held. Raises :class:`ValueError` naming how many
+    values the registry did not accept -- never a value itself -- so a
+    caller whose credential could not be registered fails rather than
+    continuing with that credential unredacted. Returns the number of
+    values the registry holds afterwards.
+    """
+    held_count = register_secret_values(*values)
+    held = set(_SECRET_VALUES)
+    refused = sum(
+        1
+        for value in values
+        if not isinstance(value, str) or value.strip() not in held
+    )
+    if refused:
+        raise ValueError(
+            "{0} of {1} required secret value(s) could not be "
+            "registered for redaction".format(refused, len(values))
+        )
+    return held_count
 
 
 def registered_secret_count() -> int:
@@ -1083,16 +1136,15 @@ class QueueDispatchHandler(logging.handlers.QueueHandler):
     """Hands a record to the listener queue without rendering it.
 
     ``prepare`` attaches the bound request identifier and returns the
-    record otherwise unchanged, so no redaction, no formatting and no
+    record otherwise unchanged: no redaction, no formatting and no
     serialisation happens on the thread that logged. The identifier is
-    read there because it is bound per task and per thread, and the
-    listener that drains the queue runs on a thread of its own. The queue
-    is drained in the same process, so the record needs no pickling and
-    keeps its ``exc_info`` and its ``extra`` fields.
+    bound per task and per thread and is read on that thread; the listener
+    that drains the queue runs on a thread of its own. The queue is
+    drained in the same process, and the record is neither pickled nor
+    stripped of its ``exc_info`` and ``extra`` fields.
 
     A record that finds the queue full is written through ``target``
-    inline. That bounds the queue's memory without discarding a record,
-    at the cost of the caller performing that one write itself.
+    inline, on the thread that logged it, and is not discarded.
     """
 
     def __init__(

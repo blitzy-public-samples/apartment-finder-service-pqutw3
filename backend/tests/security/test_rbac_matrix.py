@@ -1,57 +1,55 @@
 """The exhaustive deny-by-default authorization matrix.
 
-Every route the service publishes is exercised against every principal
-the role model admits. The status each cell must answer is written down
-as literal data in :data:`ROUTE_MATRIX`, so the grid reads as a table
-and no expectation is computed.
+The nine API routes :data:`ROUTE_MATRIX` names are exercised against
+every principal the role model admits. The status each cell must answer
+is written down as literal data in that matrix, so the grid reads as a
+table and no expectation is computed.
 
 The unit under test is :mod:`backend.app.core.authorization` --
 :class:`backend.app.core.authorization.Role`,
 :func:`backend.app.core.authorization.require_role` and
 :func:`backend.app.core.authorization.resolve_role` -- reached through
-the routes that declare it rather than called directly.
+the routes that declare it, and is not called directly.
 
-This module is the verifier recorded for the finding that the service
-carried no role-based access control and no ``role`` column, and for the
-object-level half of the authorization cluster.
-
-The grid is the nine published routes by the five principals, so
+The grid is the nine role-governed routes by the five principals, so
 :data:`MATRIX_CASES` holds forty-five cells and
 :func:`test_rbac_matrix_cell` reports one case per cell. Every case is
-identified as ``<route-slug>__<principal>``, so a cell named in
-``docs/security/TRACEABILITY_MATRIX.md`` is locatable by that
-identifier, and
+identified as ``<route-slug>__<principal>``, so any one cell is locatable
+by that identifier, and
 :func:`test_the_matrix_is_nine_routes_by_five_principals` asserts the
 shape that count rests on. The nine route slugs and the five principal
 names are the stable halves of every identifier.
 
-What each row records:
+The grid is not self-referential. :func:`published_routes` reads
+``app.routes`` -- the routes the application object actually serves --
+and :func:`test_the_matrix_covers_every_route_the_application_publishes`
+compares the grid against it in both directions, so a route the
+application gains without a row here fails, and a row naming a route the
+application does not serve fails too. Two deliberate classifications sit
+inside that comparison rather than outside it:
 
-* ``01_auth_register`` and ``02_auth_login`` answer every principal,
-  including one presenting no credential.
-* ``03_listings_read`` answers every principal, including one
-  presenting no credential.
-* ``04_listings_write`` answers ``admin`` alone. This row records the
-  one authorization level that changed: ``registered`` and ``premium``
-  are refused where they were formerly admitted.
-* ``05_filters_create``, ``06_filters_list``,
-  ``07_subscriptions_create`` and ``08_subscriptions_read`` answer
-  ``registered`` and above, and refuse ``guest`` and the anonymous
-  caller.
-* ``09_subscriptions_webhook`` answers on the signature alone. All five
-  principals are recorded against it: an unverifiable notification is
-  refused and a verified one is accepted whichever credential
-  accompanies it, so a role token confers nothing there.
+* ``GET /health`` is published and is governed by no role. It is
+  accounted for by name in the comparison and asserted separately by
+  :func:`test_the_health_route_answers_every_principal`, which sends it
+  every principal's credential and requires the same answer from each.
+* The framework's own documentation routes -- the four paths in
+  :data:`DOCUMENTATION_PATHS` -- are excluded, by the
+  ``include_in_schema`` flag each carries rather than by path matching.
+  The comparison asserts that the excluded set is exactly those paths and
+  that it is disjoint from the published set.
 
 A refused principal presenting no credential is answered ``401`` and a
 refused principal presenting one is answered ``403``. Every cell names
 the status it expects, so neither a ``404`` nor a ``422`` stands in for
-an authorization refusal.
+an authorization refusal. The notification route records
+:data:`SIGNATURE_GATED` in place of a status, and
+:func:`test_rbac_matrix_cell` asserts both responses that expectation
+names.
 
 The four cross-tenant cases assert that two valid principals holding
 :data:`backend.app.core.authorization.Role.REGISTERED` reach neither
 each other's filters nor each other's subscriptions, in both
-directions. They sit outside :data:`MATRIX_CASES` so the reported cell
+directions. They sit outside :data:`MATRIX_CASES`, and the reported cell
 count stays at forty-five.
 
 Signature verification, certificate-host allowlisting and replay
@@ -67,15 +65,20 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from backend.app.core.authorization import Role
+from backend.app.core.authorization import (
+    Role,
+    effective_role,
+    resolve_role,
+)
 from backend.app.core.plans import (
     PREMIUM_MONTHLY,
     STATUS_ACTIVE,
     get_plan,
 )
 from backend.app.db.models import Subscription as SubscriptionModel
+from backend.app.main import app
 from backend.app.services import paypal_service
-from backend.tests.conftest import ROLE_EMAILS, VALID_TEST_PASSWORD
+from backend.tests.support import ROLE_EMAILS, VALID_TEST_PASSWORD
 
 #: Import path the two provider-facing names are patched on. They are
 #: patched where the endpoint module bound them, not where they are
@@ -171,6 +174,39 @@ MOUNTED_PREFIXES = (
     "/listings/",
     "/filters/",
     "/subscriptions/",
+)
+
+#: Path of the readiness route the application mounts directly rather
+#: than through the router. It sits under none of
+#: :data:`MOUNTED_PREFIXES`.
+HEALTH_PATH = "/health"
+
+#: The readiness route, as ``app.routes`` reports it.
+HEALTH_ROUTE = ("GET", HEALTH_PATH)
+
+#: Slug the readiness cases report under. It is deliberately outside the
+#: numbered sequence :data:`ROUTE_MATRIX` uses, because the route is
+#: governed by no role.
+HEALTH_ROUTE_SLUG = "health"
+
+#: Body the readiness route answers. Written out here rather than read
+#: from :data:`backend.app.main.HEALTH_STATUS`, so the assertion states
+#: an independent expectation instead of comparing the application with
+#: itself; a route that merely answers ``200`` cannot pass for a
+#: readiness report.
+HEALTH_BODY = {"status": "ok"}
+
+#: Paths the framework mounts for its own documentation. Each is
+#: registered with ``include_in_schema`` cleared, which is the property
+#: :func:`published_routes` filters on; they are named here so the
+#: exclusion is deliberate and asserted rather than incidental.
+DOCUMENTATION_PATHS = frozenset(
+    (
+        "/openapi.json",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
+    )
 )
 
 # ---------------------------------------------------------------------
@@ -362,11 +398,8 @@ ENTITLEMENT_WINDOW = timedelta(days=30)
 
 
 def register_body(principal: str) -> Dict[str, Any]:
-    """Returns the registration body one cell submits.
-
-    The address is distinct per principal, so an admitted cell stores a
-    new account rather than colliding with a stored one.
-    """
+    """Returns the principal-specific registration body one cell
+    submits."""
     return {
         "email": "rbac-matrix-{0}@example.com".format(principal),
         "password": VALID_TEST_PASSWORD,
@@ -374,10 +407,9 @@ def register_body(principal: str) -> Dict[str, Any]:
 
 
 def login_body(principal: str) -> Dict[str, Any]:
-    """Returns the login body one cell submits.
+    """Returns the principal-specific login body one cell submits.
 
-    The credentials are correct for a stored account, so no cell leaves
-    a failed attempt behind for the lockout counter.
+    The credentials are correct for a stored account.
     """
     return {
         "email": ROLE_EMAILS.get(principal, LOGIN_FALLBACK_EMAIL),
@@ -388,8 +420,7 @@ def login_body(principal: str) -> Dict[str, Any]:
 def order_response(principal: str) -> Dict[str, Any]:
     """Returns a created-order response shaped like PayPal's.
 
-    The order identifier is distinct per principal, so the uniqueness
-    constraint on the stored column cannot refuse an admitted cell.
+    The order identifier is distinct per principal.
     """
     return {
         "id": "ORDER-RBAC-{0}".format(principal.upper()),
@@ -469,7 +500,7 @@ def request_for_cell(
     """Returns the response one non-notification cell provokes.
 
     The order call is stood in for on the subscription-creation route,
-    on refused cells as well as admitted ones, so no cell can reach
+    on refused cells as well as admitted ones, and no cell reaches
     PayPal.
     """
     if route == ROUTE_REGISTER:
@@ -503,7 +534,7 @@ def deliver(
 ) -> Any:
     """Returns the response to one notification delivery.
 
-    The signature check is stood in for, so nothing here reaches
+    The signature check is stood in for, and nothing here reaches
     PayPal. A verified outcome carries the delivery identifier and the
     event type, matching what the real check reports from the body it
     verified.
@@ -530,6 +561,45 @@ def deliver(
         )
 
 
+# ---------------------------------------------------------------------
+# Route authority. ``app.routes`` is the only source consulted for what
+# the application actually serves, so the grid is checked against the
+# application rather than against itself.
+# ---------------------------------------------------------------------
+
+
+def _route_pairs(documented: bool) -> set:
+    """Returns ``(method, path)`` for routes on one side of the flag.
+
+    ``app.routes`` is the authority. Passing ``True`` selects the routes
+    the framework mounts for its own documentation, each registered with
+    ``include_in_schema`` cleared; passing ``False`` selects the routes
+    this service publishes.
+    """
+    pairs = set()
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        if path is None or not methods:
+            continue
+        in_schema = bool(getattr(route, "include_in_schema", False))
+        if in_schema is documented:
+            continue
+        for method in methods:
+            pairs.add((method, path))
+    return pairs
+
+
+def published_routes() -> set:
+    """Returns every route this service publishes, from ``app.routes``."""
+    return _route_pairs(documented=False)
+
+
+def documentation_routes() -> set:
+    """Returns the framework's own documentation routes."""
+    return _route_pairs(documented=True)
+
+
 @pytest.fixture(autouse=True)
 def clear_throttle_counters(reset_rate_limits):
     """Clears the shared limiter counters around every case here.
@@ -540,15 +610,61 @@ def clear_throttle_counters(reset_rate_limits):
     return None
 
 
-def test_the_matrix_is_nine_routes_by_five_principals():
-    """Asserts the grid's shape and that every row names all five.
+def test_the_matrix_covers_every_route_the_application_publishes():
+    """Asserts the grid is the application's own published route set.
 
-    The reported cell count rests on this shape, so a row that lost a
-    principal or a duplicated identifier fails here rather than
-    silently reducing the number of cells that run. Every path is
-    asserted to sit under one of :data:`MOUNTED_PREFIXES`, so no cell
-    can address a prefix the router does not mount.
+    The comparison is against ``app.routes``, so the grid can no longer
+    agree only with itself: a route the application gains without a row
+    here fails, and a row here naming a route the application does not
+    serve fails too. :data:`HEALTH_ROUTE` is accounted for explicitly
+    because it is deliberately outside the grid — no role governs it —
+    and the framework's documentation routes are excluded deliberately
+    too, by the ``include_in_schema`` flag each carries, with the paths
+    that exclusion covers asserted by name.
     """
+    recorded = set(
+        (method, path) for _slug, method, path, _cells in ROUTE_MATRIX
+    )
+    published = published_routes()
+
+    assert len(recorded) == EXPECTED_ROUTE_COUNT
+    assert HEALTH_ROUTE not in recorded
+    assert HEALTH_ROUTE in published
+    assert recorded | {HEALTH_ROUTE} == published
+
+    excluded = documentation_routes()
+    assert excluded
+    assert excluded.isdisjoint(published)
+    assert set(path for _method, path in excluded) == DOCUMENTATION_PATHS
+    assert DOCUMENTATION_PATHS.isdisjoint(
+        set(path for _method, path in published)
+    )
+
+
+@pytest.mark.parametrize("principal", PRINCIPALS)
+def test_the_health_route_answers_every_principal(
+    principal, client, seeded_users, auth_header_factory
+):
+    """Asserts the readiness route is public, deliberately and for all.
+
+    It carries no role dependency by design: it reports whether the
+    process is serving, which a deployment probe reads before any
+    credential exists. Recording it here rather than as a tenth grid row
+    keeps the grid the nine routes the role model governs, while still
+    proving this route's openness is a decision under test.
+    """
+    headers = headers_for(principal, seeded_users, auth_header_factory)
+    method, path = HEALTH_ROUTE
+
+    response = _send(client, method, path, headers, None)
+
+    assert response.status_code == ALLOWED, _report(
+        HEALTH_ROUTE_SLUG, principal, ALLOWED, response
+    )
+    assert response.json() == HEALTH_BODY
+
+
+def test_the_matrix_is_nine_routes_by_five_principals():
     assert len(ROUTE_MATRIX) == EXPECTED_ROUTE_COUNT
     assert len(PRINCIPALS) == EXPECTED_PRINCIPAL_COUNT
     assert len(set(PRINCIPALS)) == EXPECTED_PRINCIPAL_COUNT
@@ -564,11 +680,6 @@ def test_the_matrix_is_nine_routes_by_five_principals():
 
 
 def test_the_matrix_records_the_listings_write_as_admin_only():
-    """Asserts row four admits ``admin`` and refuses the other four.
-
-    The row is read straight out of :data:`ROUTE_MATRIX`, so this is the
-    recorded expectation rather than a second copy of it.
-    """
     recorded = dict(
         (slug, expectations)
         for slug, _method, _path, expectations in ROUTE_MATRIX
@@ -578,6 +689,37 @@ def test_the_matrix_records_the_listings_write_as_admin_only():
     assert recorded[REGISTERED] == FORBIDDEN
     assert recorded[PREMIUM] == FORBIDDEN
     assert recorded[ADMIN] == ALLOWED
+
+
+#: Effective role each authenticated principal must resolve at.
+EXPECTED_EFFECTIVE_ROLES = {
+    GUEST: Role.GUEST,
+    REGISTERED: Role.REGISTERED,
+    PREMIUM: Role.PREMIUM,
+    ADMIN: Role.ADMIN,
+}
+
+
+def test_every_principal_resolves_at_the_role_it_stands_for(
+    db, seeded_users
+):
+    """Asserts each principal's effective role before any cell runs.
+
+    A stored subscriber role is credited at the baseline and is raised to
+    the subscriber role only while an unexpired active subscription
+    grants it, so the premium principal is asserted to resolve at
+    :data:`Role.PREMIUM` rather than merely to store it. Both the stored
+    value and the effective role are asserted, so a principal standing in
+    for a role it does not hold fails here instead of exercising that
+    role's cells as a lower one.
+    """
+    assert set(EXPECTED_EFFECTIVE_ROLES) == set(PRINCIPALS) - {
+        ANONYMOUS
+    }
+    for principal, expected in EXPECTED_EFFECTIVE_ROLES.items():
+        row = seeded_users[principal]
+        assert resolve_role(row) is expected, principal
+        assert effective_role(db, row) is expected, principal
 
 
 @pytest.mark.parametrize(
@@ -690,11 +832,6 @@ def test_a_filter_is_absent_from_the_other_principals_page(
     second_registered_user,
     auth_header_factory,
 ):
-    """Asserts the first principal's filter is absent from the second's.
-
-    The stored filter is scoped to its owner's identifier, and the
-    second principal's page carries the filters it owns and no other.
-    """
     owner = auth_header_factory(registered_user)
     other = auth_header_factory(second_registered_user)
 
@@ -712,11 +849,6 @@ def test_the_second_principals_filter_is_absent_from_the_first_page(
     second_registered_user,
     auth_header_factory,
 ):
-    """Asserts the second principal's filter is absent from the first's.
-
-    This is the reverse direction of
-    :func:`test_a_filter_is_absent_from_the_other_principals_page`.
-    """
     owner = auth_header_factory(registered_user)
     other = auth_header_factory(second_registered_user)
 
@@ -735,11 +867,6 @@ def test_a_subscription_is_absent_from_the_other_principals_row(
     second_registered_user,
     auth_header_factory,
 ):
-    """Asserts the first principal's subscription is not the second's.
-
-    The stored row entitles its owner alone, and the second principal
-    reads nothing from it.
-    """
     owned = _store_active_subscription(db, registered_user, "first")
     owner = auth_header_factory(registered_user)
     other = auth_header_factory(second_registered_user)
@@ -759,11 +886,6 @@ def test_the_second_principals_subscription_is_absent_from_the_first(
     second_registered_user,
     auth_header_factory,
 ):
-    """Asserts the second principal's subscription is not the first's.
-
-    This is the reverse direction of
-    :func:`test_a_subscription_is_absent_from_the_other_principals_row`.
-    """
     owned = _store_active_subscription(
         db, second_registered_user, "second"
     )

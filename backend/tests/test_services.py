@@ -2,41 +2,212 @@ import asyncio
 import contextlib
 import functools
 import inspect
+import io
+import json
 import logging
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import httpx
+from python_http_client.client import Client as HttpClient
+from python_http_client.exceptions import BadRequestsError, HTTPError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.app.core.config import settings
+from conftest import (
+    PAYPAL_OAUTH_PATH,
+    PAYPAL_ORDERS_PATH,
+    PAYPAL_ROUTE_CAPTURE_ORDER,
+    PAYPAL_VERIFY_FIELDS,
+    PAYPAL_VERIFY_PATH,
+    PayPalContractError,
+    assert_paypal_contract,
+    assert_paypal_request,
+)
+
+from backend.app.core.config import (
+    PROVIDER_SECRET_SETTINGS,
+    settings,
+)
 from backend.app.core.logging import (
     BASE_LOGGER_NAME,
+    CONTEXT_FIELD,
+    MIN_SECRET_VALUE_LENGTH,
     REDACTION_PLACEHOLDER,
+    REQUEST_ID_FIELD,
     RedactingFilter,
     RedactingJsonFormatter,
+    bind_request_id,
+    redact,
+    register_required_secret_values,
+    reset_request_id,
+    flush_log_queue,
 )
 from backend.app.core.plans import format_amount, get_plan
 from backend.app.db.models import Base, Subscription, User
+from backend.app.services import email_service as email_service_module
 from backend.app.services import paypal_service
+from backend.app.services import zillow_service
+from backend.app.services import zillow_service as zillow_service_module
 from backend.app.services.email_service import send_email
-from backend.app.services.zillow_service import fetch_listings
+from backend.app.services.zillow_service import (
+    CONTENT_LENGTH_HEADER,
+    fetch_listings,
+)
+from backend.app.tasks import (
+    listing_updater as listing_updater_module,
+)
 
 ZILLOW_MODULE = 'backend.app.services.zillow_service'
 EMAIL_MODULE = 'backend.app.services.email_service'
 
 PLAN_ID = 'premium_monthly'
 ORDER_ID = 'ORDER-SERVICE-1'
+
+#: Path of the order the contract cases address.
+ORDER_PATH = PAYPAL_ORDERS_PATH + '/' + ORDER_ID
+
+#: Grant the contract cases present.
+STAND_IN_GRANT = 'contract-case-access-token'
 APPROVAL_URL = 'https://www.sandbox.paypal.com/checkoutnow?token=1'
 
 #: Header the listing provider credential is carried in.
 API_KEY_HEADER = 'X-API-Key'
 
-#: Query parameter name the credential was previously carried in.
+#: Query parameter name the cases below assert the credential is absent
+#: from, by name and by value.
 LEGACY_KEY_PARAM = 'api_key'
+
+#: Target the SendGrid package transmits a message to.
+SENDGRID_SEND_URL = 'https://api.sendgrid.com/v3/mail/send'
+
+#: Segments the package appends to reach that target. The service
+#: configures the timeout on the root client and the package copies it
+#: onto each chained sub-client it builds to walk them.
+SENDGRID_URL_PATH = ['mail', 'send']
+
+#: Address the delivery cases send to.
+RECIPIENT_EMAIL = 'test@example.com'
+
+#: Subject the delivery cases send.
+EMAIL_SUBJECT = 'Test Notification'
+
+#: Body the delivery cases send.
+EMAIL_CONTENT = '<p>This is a test notification.</p>'
+
+#: Status the provider reports for an accepted message.
+EMAIL_ACCEPTED_STATUS = 202
+
+#: Every status the service reports as a delivery.
+EMAIL_DELIVERED_STATUSES = (200, 201, 202)
+
+#: Status the rejection case reports.
+EMAIL_REJECTED_STATUS = 400
+
+#: Status the unreachable case reports.
+EMAIL_UNAVAILABLE_STATUS = 503
+
+#: Body the rejection case carries.
+EMAIL_REJECTION_BODY = b'{"errors":[{"message":"bad request"}]}'
+
+#: Message the service records when a delivery fails.
+EMAIL_FAILURE_MESSAGE = 'Failed to send email'
+
+#: Detail carried by the bound transport failure below. It is plain
+#: prose naming no credential and no key.
+PROVIDER_UNREACHABLE_DETAIL = 'the listing provider was unreachable'
+
+#: Correlation identifier the provider cases bind before calling.
+BOUND_REQUEST_ID = 'caller0trace0provider1'
+
+#: Address every notification case sends to.
+EMAIL_RECIPIENT = 'notified@example.com'
+
+#: Body every notification case sends.
+EMAIL_BODY = 'Three listings match your saved search.'
+
+#: Failure detail quoting the notification credential in free prose,
+#: with no key name beside it.
+EMAIL_FAILURE_DETAIL = (
+    'the provider rejected the credential '
+    + settings.SENDGRID_API_KEY
+)
+
+#: Failure detail naming the notification credential beside a
+#: credential-shaped key.
+EMAIL_KEYED_FAILURE_DETAIL = (
+    'unauthorized: api_key=' + settings.SENDGRID_API_KEY
+)
+
+#: Exactly what a failed send wrote to standard output before its
+#: failure path was routed through the structured logger.
+BARE_PRINT_SIGNATURE = EMAIL_FAILURE_DETAIL
+
+#: Longest the assertions below wait for the queue-backed log listener
+#: to write every record one send produced.
+LOG_DRAIN_TIMEOUT = 5.0
+
+#: Modules whose bare output calls were replaced by the structured
+#: logger. None of them may write to a stream directly.
+BARE_OUTPUT_FREE_MODULES = (
+    email_service_module,
+    zillow_service_module,
+    listing_updater_module,
+)
+
+
+def _send_failing_with(detail):
+    """Runs one send whose provider construction raises ``detail``."""
+    with patch(
+        EMAIL_MODULE + '.SendGridAPIClient',
+        side_effect=RuntimeError(detail),
+    ):
+        return send_email(EMAIL_RECIPIENT, EMAIL_SUBJECT, EMAIL_BODY)
+
+
+def _structured_entries(lines):
+    """Returns each non-blank line of ``lines`` decoded as an object.
+
+    A line that is not a JSON object raises, which is how a bare write is
+    told apart from a record the logger emitted.
+    """
+    decoded = []
+    for line in lines:
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        if not isinstance(entry, dict):
+            raise AssertionError(
+                'emitted line is not a record: {0!r}'.format(line)
+            )
+        decoded.append(entry)
+    return decoded
+
+
+@contextlib.contextmanager
+def _collecting_emitted_lines():
+    """Collects the lines the redacting handler writes in the block.
+
+    The handler the governed loggers dispatch to is given a buffer of its
+    own for the duration, and the queue is drained before the buffer is
+    installed and again before it is read, so the lines collected are the
+    ones this block produced. The handler's own stream is restored on
+    exit.
+    """
+    dispatcher = logging.getLogger(BASE_LOGGER_NAME).handlers[0]
+    handler = dispatcher.target
+    flush_log_queue(LOG_DRAIN_TIMEOUT)
+    buffer = io.StringIO()
+    original = handler.setStream(buffer)
+    lines = []
+    try:
+        yield lines
+    finally:
+        flush_log_queue(LOG_DRAIN_TIMEOUT)
+        lines.extend(buffer.getvalue().splitlines())
+        handler.setStream(original)
 
 
 def _provider_response(payload):
@@ -89,43 +260,118 @@ def _collecting_application_logs():
         logger.removeHandler(collector)
 
 
-def _outbound_request(mock_get):
-    """Rebuilds the provider call ``mock_get`` recorded as a real request.
+class _ProviderRecorder:
+    """Answers provider calls with ``responder`` and records each one."""
 
-    The recorded target, query parameters and headers are assembled into
-    an ``httpx.Request`` carrying the target and query string the
-    provider would have received.
+    def __init__(self, responder):
+        self._responder = responder
+        self.requests = []
+
+    def handle(self, request):
+        self.requests.append(request)
+        return self._responder(request)
+
+    @property
+    def sent(self):
+        """Returns the one request the provider received."""
+        if len(self.requests) != 1:
+            raise AssertionError(
+                "expected one provider call, got %d" % len(self.requests)
+            )
+        return self.requests[0]
+
+
+@contextlib.contextmanager
+def _provider(responder):
+    """Runs the block with provider calls answered by ``responder``.
+
+    The service's own client factory is replaced by one built on an
+    ``httpx.MockTransport``, so the request the provider receives is
+    assembled, sent and streamed by the real HTTP library.
     """
-    args, kwargs = mock_get.call_args
-    return httpx.Request(
-        'GET',
-        args[0] if args else kwargs['url'],
-        params=kwargs.get('params'),
-        headers=kwargs.get('headers'),
+    recorder = _ProviderRecorder(responder)
+    transport = httpx.MockTransport(recorder.handle)
+
+    def build_client():
+        return httpx.Client(
+            transport=transport, timeout=settings.HTTP_TIMEOUT_SECONDS
+        )
+
+    with patch(ZILLOW_MODULE + '._client', new=build_client):
+        yield recorder
+
+
+def _answering(payload, status_code=200):
+    """Returns a responder answering with ``payload`` as a JSON body."""
+
+    def responder(request):
+        return httpx.Response(status_code, json=payload)
+
+    return responder
+
+
+def _answering_bytes(body, status_code=200, declared=None):
+    """Returns a responder answering with ``body`` verbatim.
+
+    ``declared`` overrides the declared body length, so a body that
+    announces itself as larger than it is can be served.
+    """
+
+    def responder(request):
+        response = httpx.Response(status_code, content=body)
+        if declared is not None:
+            response.headers[CONTENT_LENGTH_HEADER] = str(declared)
+        return response
+
+    return responder
+
+
+def _answering_in_chunks(chunk, count, produced):
+    """Returns a responder streaming ``count`` copies of ``chunk``.
+
+    No body length is declared, so the accumulated-byte cap is the only
+    bound. Each chunk handed to the client is counted in ``produced``, so
+    a read that stops early is visible.
+    """
+
+    def responder(request):
+        def stream():
+            for _ in range(count):
+                produced.append(chunk)
+                yield chunk
+
+        return httpx.Response(200, content=stream())
+
+    return responder
+
+
+def _raising(error_factory):
+    """Returns a responder that fails the way the provider would."""
+
+    def responder(request):
+        raise error_factory(request)
+
+    return responder
+
+
+def _fetch(zip_codes=('12345',), filters=None):
+    """Runs one provider fetch with the module's own entry point."""
+    return fetch_listings(
+        zip_codes=list(zip_codes), filters=dict(filters or {})
     )
-
-
-def _fetch_recording_the_call():
-    """Runs one provider fetch and returns the mock that recorded it."""
-    response = _provider_response({'listings': []})
-    with patch(
-        ZILLOW_MODULE + '.httpx.get', return_value=response
-    ) as mock_get:
-        fetch_listings(zip_codes=['12345'], filters={})
-    return mock_get
 
 
 class TestZillowService(unittest.TestCase):
     def test_fetch_listings(self):
-        response = _provider_response({
+        payload = {
             'listings': [
                 {'id': 1, 'address': '123 Main St', 'price': 300000},
-                {'id': 2, 'address': '456 Elm St', 'price': 250000}
+                {'id': 2, 'address': '456 Elm St', 'price': 250000},
             ]
-        })
+        }
 
-        with patch(ZILLOW_MODULE + '.httpx.get', return_value=response):
-            listings = fetch_listings(zip_codes=['12345'], filters={})
+        with _provider(_answering(payload)):
+            listings = _fetch()
 
         self.assertEqual(len(listings), 2)
         self.assertEqual(listings[0]['address'], '123 Main St')
@@ -133,137 +379,630 @@ class TestZillowService(unittest.TestCase):
 
     def test_api_key_travels_in_a_request_header(self):
         """The credential is carried in the provider request's headers."""
-        built = _outbound_request(_fetch_recording_the_call())
+        with _provider(_answering({'listings': []})) as recorder:
+            _fetch()
 
         self.assertEqual(
-            built.headers[API_KEY_HEADER], settings.ZILLOW_API_KEY
+            recorder.sent.headers[API_KEY_HEADER],
+            settings.ZILLOW_API_KEY,
         )
 
     def test_api_key_is_absent_from_the_request_target(self):
-        """The credential appears nowhere in the assembled target."""
-        built = _outbound_request(_fetch_recording_the_call())
-        target = str(built.url)
+        """The credential appears nowhere in the sent target."""
+        with _provider(_answering({'listings': []})) as recorder:
+            _fetch()
 
-        self.assertNotIn(settings.ZILLOW_API_KEY, target)
+        self.assertNotIn(
+            settings.ZILLOW_API_KEY, str(recorder.sent.url)
+        )
 
     def test_api_key_is_absent_from_the_query_string(self):
-        """The credential appears in no query parameter, by name or value.
+        """The credential appears in no query parameter, name or value.
 
         The parameter name the credential previously travelled under is
         asserted absent alongside the value itself.
         """
-        mock_get = _fetch_recording_the_call()
-        built = _outbound_request(mock_get)
-        query = built.url.query.decode('utf-8')
-        sent_params = mock_get.call_args.kwargs['params']
+        with _provider(_answering({'listings': []})) as recorder:
+            _fetch()
+
+        query = recorder.sent.url.query.decode('utf-8')
 
         self.assertNotIn(settings.ZILLOW_API_KEY, query)
         self.assertNotIn(LEGACY_KEY_PARAM, query)
-        self.assertNotIn(LEGACY_KEY_PARAM, sent_params)
-        self.assertNotIn(settings.ZILLOW_API_KEY, str(sent_params))
+
+    def test_the_search_values_reach_the_provider(self):
+        """The caller's search terms are sent, and only sent."""
+        with _provider(_answering({'listings': []})) as recorder:
+            _fetch(zip_codes=('90210', '10001'), filters={'max_rent': 3000})
+
+        query = recorder.sent.url.query.decode('utf-8')
+
+        self.assertIn('90210', query)
+        self.assertIn('10001', query)
+        self.assertIn('3000', query)
 
     def test_every_request_carries_a_timeout(self):
         """The provider call is bounded by the configured timeout."""
-        mock_get = _fetch_recording_the_call()
+        with _provider(_answering({'listings': []})) as recorder:
+            _fetch()
 
-        self.assertIn('timeout', mock_get.call_args.kwargs)
-        self.assertEqual(
-            mock_get.call_args.kwargs['timeout'],
-            settings.HTTP_TIMEOUT_SECONDS,
-        )
-        self.assertGreater(mock_get.call_args.kwargs['timeout'], 0)
+        timeout = recorder.sent.extensions['timeout']
+
+        self.assertEqual(timeout['connect'], settings.HTTP_TIMEOUT_SECONDS)
+        self.assertEqual(timeout['read'], settings.HTTP_TIMEOUT_SECONDS)
+        self.assertGreater(settings.HTTP_TIMEOUT_SECONDS, 0)
+
+    def test_the_client_factory_carries_the_configured_timeout(self):
+        """The client the service builds is bounded before any call."""
+        with zillow_service._client() as client:
+            self.assertEqual(
+                client.timeout.read, settings.HTTP_TIMEOUT_SECONDS
+            )
+            self.assertEqual(
+                client.timeout.connect, settings.HTTP_TIMEOUT_SECONDS
+            )
 
     def test_provider_failure_yields_an_empty_list(self):
-        with patch(
-            ZILLOW_MODULE + '.httpx.get',
-            side_effect=httpx.ConnectError('unreachable'),
-        ):
-            self.assertEqual(
-                fetch_listings(zip_codes=['12345'], filters={}), []
+        with _provider(
+            _raising(
+                lambda request: httpx.ConnectError(
+                    'unreachable', request=request
+                )
             )
+        ):
+            self.assertEqual(_fetch(), [])
+
+    def test_a_rejected_status_yields_an_empty_list(self):
+        """A status the provider refuses with contributes nothing."""
+        with _provider(_answering({'listings': []}, status_code=503)):
+            self.assertEqual(_fetch(), [])
+
+    def test_an_undecodable_body_yields_an_empty_list(self):
+        with _provider(_answering_bytes(b'not json at all')):
+            self.assertEqual(_fetch(), [])
+
+    def test_a_declared_length_past_the_cap_is_refused_unread(self):
+        """A body announcing itself as oversized is never read."""
+        cap = zillow_service.MAX_PROVIDER_RESPONSE_BYTES
+        with _collecting_application_logs() as collector:
+            with _provider(
+                _answering_bytes(
+                    b'{"listings": [{"id": 1}]}', declared=cap + 1
+                )
+            ):
+                self.assertEqual(_fetch(), [])
+
+        self.assertIn(
+            zillow_service.REASON_RESPONSE_TOO_LARGE,
+            _reasons(collector),
+        )
+        self.assertIn(cap + 1, _measured_sizes(collector))
+
+    def test_a_body_past_the_cap_stops_being_read(self):
+        """An undeclared oversized body is abandoned mid-stream."""
+        cap = zillow_service.MAX_PROVIDER_RESPONSE_BYTES
+        chunk = b'x' * 65536
+        produced = []
+        with _collecting_application_logs() as collector:
+            with _provider(
+                _answering_in_chunks(chunk, 64, produced)
+            ):
+                self.assertEqual(_fetch(), [])
+
+        self.assertIn(
+            zillow_service.REASON_RESPONSE_TOO_LARGE,
+            _reasons(collector),
+        )
+        # The read stopped as soon as the accumulated bytes passed the
+        # cap, rather than draining the whole body.
+        self.assertLess(len(produced) * len(chunk), 2 * cap)
+        self.assertGreater(len(produced) * len(chunk), cap)
+
+    def test_a_body_at_the_cap_is_accepted(self):
+        """The cap is the largest body accepted, not the first refused."""
+        cap = zillow_service.MAX_PROVIDER_RESPONSE_BYTES
+        entry = {'id': 1, 'address': ''}
+        empty = len(json.dumps({'listings': [entry]}).encode('utf-8'))
+        entry['address'] = 'p' * (cap - empty)
+        body = json.dumps({'listings': [entry]}).encode('utf-8')
+        self.assertEqual(len(body), cap)
+
+        with _provider(_answering_bytes(body)):
+            listings = _fetch()
+
+        self.assertEqual(len(listings), 1)
+
+    def test_more_listings_than_the_cap_are_truncated(self):
+        """A response is capped at the accepted number of listings."""
+        limit = zillow_service.MAX_PROVIDER_LISTINGS
+        payload = {
+            'listings': [{'id': index} for index in range(limit + 5)]
+        }
+        with _collecting_application_logs() as collector:
+            with _provider(_answering(payload)):
+                listings = _fetch()
+
+        self.assertEqual(len(listings), limit)
+        self.assertIn(
+            zillow_service.REASON_TOO_MANY_LISTINGS, _reasons(collector)
+        )
+
+    def test_listings_at_the_cap_are_all_returned(self):
+        """The listing cap is a maximum, not a threshold."""
+        limit = zillow_service.MAX_PROVIDER_LISTINGS
+        payload = {'listings': [{'id': index} for index in range(limit)]}
+        with _provider(_answering(payload)):
+            self.assertEqual(len(_fetch()), limit)
+
+    def test_no_search_value_reaches_a_log_record(self):
+        """No postal code or filter value reaches a rendered line.
+
+        The failure the HTTP library raises names the full request
+        target, which carries every search value the caller supplied. The
+        record emitted for it carries the exception's class and nothing
+        else, and no traceback is attached.
+        """
+        postal_code = '90210'
+        neighbourhood = 'PRIVATEFILTERVALUE'
+        target = '%s?zip_codes=%s&neighborhood=%s' % (
+            settings.ZILLOW_API_URL, postal_code, neighbourhood
+        )
+        self.assertIn(postal_code, target)
+        self.assertIn(neighbourhood, target)
+        with _collecting_application_logs() as collector:
+            with _provider(
+                _raising(
+                    lambda request: httpx.ConnectError(
+                        'failed for url ' + target,
+                        request=request,
+                    )
+                )
+            ):
+                self.assertEqual(
+                    _fetch(
+                        zip_codes=(postal_code,),
+                        filters={'neighborhood': neighbourhood},
+                    ),
+                    [],
+                )
+
+        self.assertTrue(collector.records)
+        for record in collector.records:
+            self.assertIsNone(record.exc_info)
+        for line in _rendered_log_lines(collector):
+            self.assertNotIn(postal_code, line)
+            self.assertNotIn(neighbourhood, line)
+            self.assertNotIn(settings.ZILLOW_API_KEY, line)
+            self.assertNotIn(settings.ZILLOW_API_URL, line)
+
+    def test_a_failure_is_recorded_as_its_class(self):
+        """A refused call stays observable without its message."""
+        with _collecting_application_logs() as collector:
+            with _provider(
+                _raising(
+                    lambda request: httpx.ReadTimeout(
+                        'timed out for %s?zip_codes=90210'
+                        % settings.ZILLOW_API_URL,
+                        request=request,
+                    )
+                )
+            ):
+                self.assertEqual(_fetch(), [])
+
+        contexts = _contexts(collector)
+        self.assertTrue(contexts)
+        self.assertEqual(contexts[0]['exception_type'], 'ReadTimeout')
+        self.assertEqual(contexts[0]['exception_module'], 'httpx')
 
     def test_api_key_is_absent_from_every_log_record(self):
         """The credential reaches no rendered log line.
 
-        Two failure messages are driven. The first is the shape the HTTP
-        library produces, naming the full request target, which places
-        the credential beside a credential-shaped parameter name. The
-        second quotes the credential in free prose, with no key name
-        beside it. Each case asserts the raw record carries the
-        credential and that no rendered line does.
+        The provider failure quotes the credential in free prose, with no
+        key name beside it, which is the shape no key-based rule would
+        catch.
         """
         key = settings.ZILLOW_API_KEY
-        keyed_target = (
-            settings.ZILLOW_API_URL + '?' + LEGACY_KEY_PARAM + '=' + key
-        )
-        for label, message in (
-            ('the provider target names the credential',
-             'failed for url ' + keyed_target),
-            ('provider prose quotes the credential',
-             'the credential ' + key + ' was rejected upstream'),
-        ):
-            with self.subTest(label):
-                with _collecting_application_logs() as collector:
-                    with patch(
-                        ZILLOW_MODULE + '.httpx.get',
-                        side_effect=httpx.ConnectError(message),
-                    ):
-                        self.assertEqual(
-                            fetch_listings(
-                                zip_codes=['12345'], filters={}
-                            ),
-                            [],
-                        )
+        with _collecting_application_logs() as collector:
+            with _provider(
+                _raising(
+                    lambda request: httpx.ConnectError(
+                        'the credential ' + key + ' was rejected',
+                        request=request,
+                    )
+                )
+            ):
+                self.assertEqual(_fetch(), [])
 
-                self.assertTrue(collector.records)
-                self.assertTrue(any(
-                    key in repr(record.exc_info)
-                    for record in collector.records
-                ))
-                rendered = _rendered_log_lines(collector)
-                for line in rendered:
-                    self.assertNotIn(key, line)
-                self.assertTrue(any(
-                    REDACTION_PLACEHOLDER in line for line in rendered
-                ))
+        self.assertTrue(collector.records)
+        for line in _rendered_log_lines(collector):
+            self.assertNotIn(key, line)
+
+    def test_the_credential_is_registered_for_replacement(self):
+        """The credential is removed from any text carrying it.
+
+        Nothing in this module renders it. The registry covers every
+        other component that might, provider prose included.
+        """
+        key = settings.ZILLOW_API_KEY
+        rendered = redact('provider rejected ' + key + ' upstream')
+
+        self.assertNotIn(key, rendered)
+        self.assertIn(REDACTION_PLACEHOLDER, rendered)
+
+
+CONTEXT_FIELDS = (
+    'reason',
+    'response_bytes',
+    'max_response_bytes',
+    'received',
+    'max_listings',
+    'exception_type',
+    'exception_module',
+)
+
+
+def _contexts(collector):
+    """Returns the context each collected record carries.
+
+    ``extra`` keys are set as attributes on the record itself, so each
+    one is read back by name.
+    """
+    contexts = []
+    for record in collector.records:
+        context = dict(
+            (name, getattr(record, name))
+            for name in CONTEXT_FIELDS
+            if hasattr(record, name)
+        )
+        if context:
+            contexts.append(context)
+    return contexts
+
+
+def _reasons(collector):
+    """Returns the reason each collected record names."""
+    return [
+        context['reason']
+        for context in _contexts(collector)
+        if context.get('reason')
+    ]
+
+
+def _measured_sizes(collector):
+    """Returns the body size each collected record measured."""
+    return [
+        context['response_bytes']
+        for context in _contexts(collector)
+        if context.get('response_bytes') is not None
+    ]
+
+
+class _SendGridResponse(object):
+    """Stands in for the response ``python_http_client`` reads.
+
+    The three members the package's ``Response`` reads are provided, so
+    the value returned here travels the same path a real delivery does.
+    """
+
+    def __init__(self, status_code=EMAIL_ACCEPTED_STATUS, body=b''):
+        self.status_code = status_code
+        self.body = body
+
+    def getcode(self):
+        """Returns the status the provider reported."""
+        return self.status_code
+
+    def read(self):
+        """Returns the body the provider returned."""
+        return self.body
+
+    def info(self):
+        """Returns the headers the provider returned."""
+        return {}
+
+
+class _SendGridBoundary(object):
+    """Records the request the SendGrid package would transmit.
+
+    The recorder replaces ``python_http_client.client.Client._make_request``,
+    the seam that package documents as the one to stand in for, so the
+    request asserted on is the one the package built: its method, target,
+    headers and serialised body. ``client_timeout`` is the timeout the
+    leaf client carries, which the package copies from the client the
+    service configured onto each chained sub-client it builds.
+    """
+
+    def __init__(self, error=None, status_code=EMAIL_ACCEPTED_STATUS):
+        self.error = error
+        self.status_code = status_code
+        self.calls = []
+
+    def install(self):
+        """Returns the patch that installs this recorder."""
+        boundary = self
+
+        def _make_request(client, opener, request, timeout=None):
+            boundary.calls.append({
+                'method': request.get_method(),
+                'url': request.full_url,
+                'headers': dict(request.header_items()),
+                'body': request.data,
+                'timeout': timeout,
+                'client_timeout': client.timeout,
+                'url_path': list(client._url_path),
+            })
+            if boundary.error is not None:
+                raise boundary.error
+            return _SendGridResponse(boundary.status_code)
+
+        return patch.object(HttpClient, '_make_request', _make_request)
+
+    def one_call(self):
+        """Returns the single recorded request."""
+        assert len(self.calls) == 1, self.calls
+        return self.calls[0]
 
 
 class TestEmailService(unittest.TestCase):
-    def test_send_email_reports_a_delivered_message(self):
-        client = MagicMock()
-        client.send.return_value = MagicMock(status_code=202)
+    """Delivery through the pinned SendGrid package's own boundary."""
 
-        with patch(
-            EMAIL_MODULE + '.SendGridAPIClient', return_value=client
-        ):
+    def test_send_email_transmits_the_documented_request(self):
+        """The transmitted request is the one the provider documents.
+
+        The method, target, authorization, content type and serialised
+        message are asserted, together with the timeout the leaf client
+        carries -- which the package copies onto every chained sub-client,
+        so it is the timeout the delivery would have been bounded by.
+        """
+        boundary = _SendGridBoundary()
+
+        with boundary.install():
             delivered = send_email(
-                'test@example.com',
-                'Test Notification',
-                'This is a test notification.',
+                RECIPIENT_EMAIL,
+                EMAIL_SUBJECT,
+                EMAIL_CONTENT,
             )
 
         self.assertTrue(delivered)
-        client.send.assert_called_once()
+        call = boundary.one_call()
+        self.assertEqual(call['method'], 'POST')
+        self.assertEqual(call['url'], SENDGRID_SEND_URL)
+        self.assertEqual(call['url_path'], SENDGRID_URL_PATH)
+        self.assertEqual(
+            call['headers']['Authorization'],
+            'Bearer ' + settings.SENDGRID_API_KEY,
+        )
+        self.assertEqual(
+            call['headers']['Content-type'], 'application/json'
+        )
+        self.assertEqual(
+            call['client_timeout'], settings.HTTP_TIMEOUT_SECONDS
+        )
+
+        message = json.loads(call['body'].decode('utf-8'))
+        self.assertEqual(
+            message['from']['email'], settings.FROM_EMAIL
+        )
+        self.assertEqual(
+            message['personalizations'][0]['to'][0]['email'],
+            RECIPIENT_EMAIL,
+        )
+        self.assertEqual(message['subject'], EMAIL_SUBJECT)
+        self.assertEqual(
+            message['content'][0]['value'], EMAIL_CONTENT
+        )
+        self.assertEqual(
+            message['content'][0]['type'], 'text/html'
+        )
+
+    def test_send_email_reports_a_status_the_provider_accepts(self):
+        """Each accepted status is reported as a delivery."""
+        for status_code in EMAIL_DELIVERED_STATUSES:
+            with self.subTest(status_code):
+                boundary = _SendGridBoundary(status_code=status_code)
+                with boundary.install():
+                    self.assertTrue(send_email(
+                        RECIPIENT_EMAIL, EMAIL_SUBJECT, EMAIL_CONTENT
+                    ))
 
     def test_send_email_reports_a_rejected_message(self):
-        client = MagicMock()
-        client.send.return_value = MagicMock(status_code=400)
+        """A non-2xx delivery raises in the package and is reported.
 
-        with patch(
-            EMAIL_MODULE + '.SendGridAPIClient', return_value=client
-        ):
-            self.assertFalse(
-                send_email('test@example.com', 'Subject', 'Body')
-            )
+        The pinned package raises :class:`BadRequestsError` for a ``400``
+        rather than returning a response, which is the shape asserted
+        here.
+        """
+        rejection = BadRequestsError(
+            EMAIL_REJECTED_STATUS,
+            'Bad Request',
+            EMAIL_REJECTION_BODY,
+            {},
+        )
+        boundary = _SendGridBoundary(error=rejection)
+
+        with _collecting_application_logs() as collector:
+            with boundary.install():
+                self.assertFalse(send_email(
+                    RECIPIENT_EMAIL, EMAIL_SUBJECT, EMAIL_CONTENT
+                ))
+
+        self.assertEqual(len(boundary.calls), 1)
+        lines = _rendered_log_lines(collector)
+        self.assertTrue(lines)
+        self.assertTrue(any(
+            EMAIL_FAILURE_MESSAGE in line for line in lines
+        ))
+        self.assertTrue(any(
+            BadRequestsError.__name__ in line for line in lines
+        ))
+        for line in lines:
+            self.assertNotIn(settings.SENDGRID_API_KEY, line)
+            self.assertNotIn(RECIPIENT_EMAIL, line)
 
     def test_send_email_swallows_a_transport_failure(self):
+        """A failure reaching the provider is reported, not raised."""
+        boundary = _SendGridBoundary(
+            error=HTTPError(
+                EMAIL_UNAVAILABLE_STATUS,
+                'Service Unavailable',
+                b'',
+                {},
+            )
+        )
+
+        with _collecting_application_logs() as collector:
+            with boundary.install():
+                self.assertFalse(send_email(
+                    RECIPIENT_EMAIL, EMAIL_SUBJECT, EMAIL_CONTENT
+                ))
+
+        lines = _rendered_log_lines(collector)
+        self.assertTrue(any(
+            EMAIL_FAILURE_MESSAGE in line for line in lines
+        ))
+        for line in lines:
+            self.assertNotIn(settings.SENDGRID_API_KEY, line)
+
+    def test_send_email_swallows_a_client_construction_failure(self):
+        """A failure before the request is built is reported."""
         with patch(
             EMAIL_MODULE + '.SendGridAPIClient',
             side_effect=RuntimeError('transport down'),
         ):
             self.assertFalse(
-                send_email('test@example.com', 'Subject', 'Body')
+                send_email(
+                    RECIPIENT_EMAIL, EMAIL_SUBJECT, EMAIL_CONTENT
+                )
             )
+
+    def test_a_failed_send_records_the_failure_on_the_logger(self):
+        """A failed send emits one structured record naming the module.
+
+        The record is asserted to carry the failure as exception
+        information, and that information is asserted to hold the
+        credential, so the redaction cases below are known to be
+        exercising a record that carries it.
+        """
+        with _collecting_application_logs() as collector:
+            self.assertFalse(_send_failing_with(EMAIL_FAILURE_DETAIL))
+
+        failures = [
+            record
+            for record in collector.records
+            if record.getMessage() == EMAIL_FAILURE_MESSAGE
+        ]
+        self.assertEqual(len(failures), 1)
+        record = failures[0]
+        self.assertEqual(record.levelno, logging.ERROR)
+        self.assertEqual(record.name, EMAIL_MODULE)
+        self.assertIsNotNone(record.exc_info)
+        self.assertIn(
+            settings.SENDGRID_API_KEY, repr(record.exc_info)
+        )
+
+    def test_a_failed_send_reaches_no_rendered_line_with_the_key(self):
+        """No rendered line carries the provider credential.
+
+        Two failures are driven. The first quotes the credential in free
+        prose, and the second names it beside a credential-shaped key.
+        Each case asserts the raw record carries the credential and that
+        no rendered line does.
+        """
+        for label, detail in (
+            ('quoted in free prose', EMAIL_FAILURE_DETAIL),
+            ('named beside a key', EMAIL_KEYED_FAILURE_DETAIL),
+        ):
+            with self.subTest(label):
+                with _collecting_application_logs() as collector:
+                    self.assertFalse(_send_failing_with(detail))
+
+                self.assertTrue(collector.records)
+                self.assertTrue(any(
+                    settings.SENDGRID_API_KEY in repr(record.exc_info)
+                    for record in collector.records
+                ))
+                rendered = _rendered_log_lines(collector)
+                for line in rendered:
+                    self.assertNotIn(settings.SENDGRID_API_KEY, line)
+                self.assertTrue(any(
+                    REDACTION_PLACEHOLDER in line for line in rendered
+                ))
+
+    def test_the_send_path_writes_no_bare_output(self):
+        """No module on the notification path calls ``print``.
+
+        The three modules whose bare calls were replaced by the
+        structured logger are read and asserted to contain none.
+        """
+        for module in BARE_OUTPUT_FREE_MODULES:
+            with self.subTest(module.__name__):
+                source = inspect.getsource(module)
+                self.assertNotIn('print(', source)
+
+
+def test_a_failed_send_emits_one_redacted_structured_record():
+    """Every line a failed send emits is a redacted structured record.
+
+    The real logging path runs rather than a stand-in for it: the lines
+    read are the ones the handler the governed loggers dispatch to
+    actually wrote.
+    """
+    with _collecting_emitted_lines() as lines:
+        assert _send_failing_with(EMAIL_FAILURE_DETAIL) is False
+
+    for line in lines:
+        assert settings.SENDGRID_API_KEY not in line
+        assert BARE_PRINT_SIGNATURE not in line
+
+    entries = _structured_entries(lines)
+    failures = [
+        entry
+        for entry in entries
+        if entry.get('message') == EMAIL_FAILURE_MESSAGE
+    ]
+    assert len(failures) == 1
+
+    failure = failures[0]
+    assert failure['level'] == 'ERROR'
+    assert failure['logger'] == EMAIL_MODULE
+    assert REDACTION_PLACEHOLDER in failure['exception']
+    assert settings.SENDGRID_API_KEY not in failure['exception']
+
+
+def test_a_rejected_send_emits_no_record():
+    """A send the provider refuses records nothing.
+
+    The refusal is a reported status rather than a raised failure, so no
+    line is emitted at all.
+    """
+    client = MagicMock()
+    client.send.return_value = MagicMock(status_code=400)
+
+    with _collecting_emitted_lines() as lines:
+        with patch(
+            EMAIL_MODULE + '.SendGridAPIClient', return_value=client
+        ):
+            assert send_email(
+                EMAIL_RECIPIENT, EMAIL_SUBJECT, EMAIL_BODY
+            ) is False
+
+    assert lines == []
+
+
+def test_a_failed_send_writes_no_failure_detail_to_a_stream(capsys):
+    """A failed send writes the failure detail to no stream.
+
+    The real logging path runs rather than a stand-in for it, and the
+    streams are read once the queue-backed listener has drained.
+    """
+    assert _send_failing_with(EMAIL_FAILURE_DETAIL) is False
+
+    flush_log_queue(LOG_DRAIN_TIMEOUT)
+    captured = capsys.readouterr()
+
+    for stream in (captured.out, captured.err):
+        assert BARE_PRINT_SIGNATURE not in stream
+        assert settings.SENDGRID_API_KEY not in stream
 
 
 def _run(coroutine):
@@ -310,11 +1049,19 @@ def _order(
 
 
 class _Recorder:
-    """Answers PayPal REST calls and records every outbound call made."""
+    """Answers PayPal REST calls and records every outbound call made.
+
+    Every call is asserted against the provider wire contract before a
+    response is served, so a call carrying the wrong method, host, path,
+    authentication, headers, body or timeout raises rather than receiving
+    a plausible answer. ``routes`` holds the contract route each recorded
+    call addressed.
+    """
 
     def __init__(self, responses):
         self.responses = responses
         self.calls = []
+        self.routes = []
 
     @staticmethod
     def _path(sent):
@@ -322,11 +1069,16 @@ class _Recorder:
         return sent.url.path
 
     def handle(self, sent):
+        self.routes.append(assert_paypal_request(sent))
         self.calls.append(sent)
         for suffix, status, payload in self.responses:
             if self._path(sent).endswith(suffix):
                 return httpx.Response(status, json=payload)
-        return httpx.Response(404, json={'name': 'NOT_FOUND'})
+        raise AssertionError(
+            'no response is queued for {0} {1}'.format(
+                sent.method, sent.url
+            )
+        )
 
     def paths(self):
         return [self._path(sent) for sent in self.calls]
@@ -440,11 +1192,6 @@ class TestPayPalService(unittest.TestCase):
         self.assertIn('"intent":"CAPTURE"', body.replace(' ', ''))
 
     def test_capture_requires_a_completed_and_reconciled_settlement(self):
-        """A settlement that does not match the catalog is not complete.
-
-        The outcome is reported to the caller rather than raised, and
-        carries a reason naming the mismatch.
-        """
         read_back = ('/v2/checkout/orders/' + ORDER_ID, 200,
                      _order(captured=False))
         for label, payload, extra in (
@@ -475,11 +1222,6 @@ class TestPayPalService(unittest.TestCase):
                 self.assertTrue(outcome.reason)
 
     def test_the_capture_asks_for_a_complete_representation(self):
-        """The capture call asks for the full settled representation.
-
-        The ``Prefer`` header carries the representation preference the
-        service declares.
-        """
         recorder, transport = self._transport(
             [('/capture', 201, _order())]
         )
@@ -496,11 +1238,6 @@ class TestPayPalService(unittest.TestCase):
     def test_a_minimal_capture_response_is_read_back_before_measuring(
         self,
     ):
-        """A capture answered with an identifier and a status settles.
-
-        The order is read back exactly once, and the settlement is then
-        measured against the provider's complete representation.
-        """
         recorder, transport = self._transport([
             ('/capture', 201, {'id': ORDER_ID, 'status': 'COMPLETED'}),
             ('/v2/checkout/orders/' + ORDER_ID, 200, _order()),
@@ -584,11 +1321,6 @@ class TestPayPalService(unittest.TestCase):
     def test_an_already_captured_order_is_reconciled_by_reading_it_back(
         self,
     ):
-        """An order the provider reports as already captured settles.
-
-        The refusal is categorised as a provider-state failure, the
-        settled order is read back, and no second charge is issued.
-        """
         recorder, transport = self._transport([
             ('/capture', 422, {'name': 'UNPROCESSABLE_ENTITY', 'details': [
                 {'issue': 'ORDER_ALREADY_CAPTURED'},
@@ -633,11 +1365,6 @@ class TestPayPalService(unittest.TestCase):
         self.assertEqual(len(exchanges), 1)
 
     def test_every_call_is_made_through_the_async_client(self):
-        """No call is issued through the module's synchronous entrypoint.
-
-        The synchronous entrypoint is made to raise, and the capture
-        still reaches the recording transport.
-        """
         recorder, transport = self._transport(
             [('/capture', 201, _order())]
         )
@@ -654,12 +1381,6 @@ class TestPayPalService(unittest.TestCase):
     def test_create_order_accepts_no_parameter_that_can_set_the_total(
         self,
     ):
-        """Order creation exposes no parameter able to set the charge.
-
-        The signature is asserted to be exactly the plan identifier, the
-        two hosted redirect targets and the idempotency key, and to carry
-        no name through which an amount or a currency could be supplied.
-        """
         accepted = tuple(
             inspect.signature(paypal_service.create_order).parameters
         )
@@ -675,12 +1396,6 @@ class TestPayPalService(unittest.TestCase):
                 self.assertNotIn(forbidden, name.lower())
 
     def test_every_paypal_call_carries_an_explicit_timeout(self):
-        """Every outbound provider call is bounded by the timeout.
-
-        The credential exchange, the order creation and the capture are
-        each asserted to carry the configured timeout on every phase of
-        the connection.
-        """
         recorder, transport = self._transport([
             ('/v2/checkout/orders', 201, _order(
                 status='PAYER_ACTION_REQUIRED', captured=False
@@ -707,12 +1422,6 @@ class TestPayPalService(unittest.TestCase):
                 )
 
     def test_no_credential_or_token_reaches_a_log_record(self):
-        """No provider credential reaches a rendered log line.
-
-        A successful order and a refused one are both driven, and every
-        rendered line is asserted free of the client identifier, the
-        client secret and the granted access token.
-        """
         granted = 'AccessTokenGrantedByTheProvider0123456789'
         recorder, transport = self._transport(
             [
@@ -741,6 +1450,270 @@ class TestPayPalService(unittest.TestCase):
             self.assertNotIn(granted, line)
             self.assertNotIn(settings.PAYPAL_CLIENT_SECRET, line)
             self.assertNotIn(settings.PAYPAL_CLIENT_ID, line)
+
+
+class TestProviderCorrelation(unittest.TestCase):
+    """An inbound identifier survives into the provider's own records."""
+
+    def _contexts(self, collector):
+        """Returns the context of every rendered record."""
+        return [
+            json.loads(line).get(CONTEXT_FIELD, {})
+            for line in _rendered_log_lines(collector)
+        ]
+
+    def test_the_bound_identifier_reaches_a_listing_provider_record(self):
+        """A provider failure records the identifier bound to the caller."""
+        token = bind_request_id(BOUND_REQUEST_ID)
+        try:
+            with _collecting_application_logs() as collector:
+                with _provider(
+                    _raising(
+                        lambda request: httpx.ConnectError(
+                            PROVIDER_UNREACHABLE_DETAIL,
+                            request=request,
+                        )
+                    )
+                ):
+                    fetch_listings(zip_codes=['12345'], filters={})
+        finally:
+            reset_request_id(token)
+
+        contexts = self._contexts(collector)
+        self.assertTrue(contexts)
+        self.assertTrue(any(
+            context.get(REQUEST_ID_FIELD) == BOUND_REQUEST_ID
+            for context in contexts
+        ))
+
+    def test_the_bound_identifier_reaches_an_email_provider_record(self):
+        """A delivery failure records the identifier bound to the caller."""
+        boundary = _SendGridBoundary(
+            error=BadRequestsError(
+                EMAIL_REJECTED_STATUS,
+                'Bad Request',
+                EMAIL_REJECTION_BODY,
+                {},
+            )
+        )
+        token = bind_request_id(BOUND_REQUEST_ID)
+        try:
+            with _collecting_application_logs() as collector:
+                with boundary.install():
+                    send_email(
+                        RECIPIENT_EMAIL, EMAIL_SUBJECT, EMAIL_CONTENT
+                    )
+        finally:
+            reset_request_id(token)
+
+        contexts = self._contexts(collector)
+        self.assertTrue(any(
+            context.get(REQUEST_ID_FIELD) == BOUND_REQUEST_ID
+            for context in contexts
+        ))
+
+
+class TestProviderContractGuard(unittest.TestCase):
+    """The guard every provider stand-in in the suite validates through.
+
+    Each case hands :func:`assert_paypal_contract` a request that departs
+    from the provider contract in one respect and asserts it is refused,
+    so a stand-in cannot answer a malformed call with a plausible
+    response.
+    """
+
+    def _authenticated(self, **overrides):
+        """Returns the arguments of a well-formed settle call."""
+        arguments = {
+            'method': 'POST',
+            'url': settings.PAYPAL_API_BASE + ORDER_PATH + '/capture',
+            'headers': {
+                'Authorization': 'Bearer ' + STAND_IN_GRANT,
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'Prefer': 'return=representation',
+            },
+            'json_body': {},
+            'timeout': settings.HTTP_TIMEOUT_SECONDS,
+        }
+        arguments.update(overrides)
+        return arguments
+
+    def test_a_well_formed_settle_call_is_accepted(self):
+        """The positive control resolves to the settle route."""
+        self.assertEqual(
+            assert_paypal_contract(**self._authenticated()),
+            PAYPAL_ROUTE_CAPTURE_ORDER,
+        )
+
+    def test_another_host_is_refused(self):
+        """A target outside the configured host is refused."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(**self._authenticated(
+                url='https://api-m.paypal.com' + ORDER_PATH + '/capture'
+            ))
+
+    def test_an_unknown_path_is_refused(self):
+        """A path the service never addresses is refused."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(**self._authenticated(
+                url=settings.PAYPAL_API_BASE + '/v2/checkout/refunds'
+            ))
+
+    def test_the_wrong_method_is_refused(self):
+        """A settle call sent as a read is refused."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(**self._authenticated(method='GET'))
+
+    def test_a_missing_grant_is_refused(self):
+        """An authenticated call carrying no Bearer grant is refused."""
+        headers = self._authenticated()['headers'].copy()
+        del headers['Authorization']
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(
+                **self._authenticated(headers=headers)
+            )
+
+    def test_an_empty_grant_is_refused(self):
+        """An authenticated call carrying a blank grant is refused."""
+        headers = self._authenticated()['headers'].copy()
+        headers['Authorization'] = 'Bearer  '
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(
+                **self._authenticated(headers=headers)
+            )
+
+    def test_a_missing_body_is_refused(self):
+        """A write call carrying no body is refused."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(
+                **self._authenticated(json_body=None)
+            )
+
+    def test_a_missing_representation_preference_is_refused(self):
+        """A settle call carrying no preference header is refused."""
+        headers = self._authenticated()['headers'].copy()
+        del headers['Prefer']
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(
+                **self._authenticated(headers=headers)
+            )
+
+    def test_a_missing_timeout_is_refused(self):
+        """A call carrying no timeout is refused."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(**self._authenticated(timeout=None))
+
+    def test_another_timeout_is_refused(self):
+        """A call carrying a timeout other than the configured one."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(**self._authenticated(
+                timeout=settings.HTTP_TIMEOUT_SECONDS + 1
+            ))
+
+    def test_a_credential_exchange_without_the_grant_type_is_refused(self):
+        """A token call sending no client-credentials grant is refused."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(
+                method='POST',
+                url=settings.PAYPAL_API_BASE + PAYPAL_OAUTH_PATH,
+                headers={'Accept': 'application/json'},
+                data={},
+                auth=(
+                    settings.PAYPAL_CLIENT_ID,
+                    settings.PAYPAL_CLIENT_SECRET,
+                ),
+                timeout=settings.HTTP_TIMEOUT_SECONDS,
+            )
+
+    def test_a_credential_exchange_without_credentials_is_refused(self):
+        """A token call sending no Basic credentials is refused."""
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(
+                method='POST',
+                url=settings.PAYPAL_API_BASE + PAYPAL_OAUTH_PATH,
+                headers={'Accept': 'application/json'},
+                data={'grant_type': 'client_credentials'},
+                auth=None,
+                timeout=settings.HTTP_TIMEOUT_SECONDS,
+            )
+
+    def test_a_verifier_document_missing_a_field_is_refused(self):
+        """A verifier document short of one field is refused."""
+        document = dict(
+            (field, 'value') for field in PAYPAL_VERIFY_FIELDS
+        )
+        document['webhook_id'] = settings.PAYPAL_WEBHOOK_ID
+        del document['transmission_sig']
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(**self._authenticated(
+                url=settings.PAYPAL_API_BASE + PAYPAL_VERIFY_PATH,
+                json_body=document,
+            ))
+
+    def test_a_verifier_document_naming_another_webhook_is_refused(self):
+        """A verifier document naming another webhook is refused."""
+        document = dict(
+            (field, 'value') for field in PAYPAL_VERIFY_FIELDS
+        )
+        document['webhook_id'] = 'another-webhook-identifier'
+        with self.assertRaises(PayPalContractError):
+            assert_paypal_contract(**self._authenticated(
+                url=settings.PAYPAL_API_BASE + PAYPAL_VERIFY_PATH,
+                json_body=document,
+            ))
+
+
+class TestProviderCredentialRegistration(unittest.TestCase):
+    """Registration of the credentials each provider module handles."""
+
+    def test_every_configured_provider_credential_is_registered(self):
+        """Each configured credential is replaced in free prose.
+
+        The value is quoted with no key name beside it, which shape
+        matching does not reach, so a rendered placeholder shows the
+        registry holds the value.
+        """
+        for name in PROVIDER_SECRET_SETTINGS:
+            configured = getattr(settings, name)
+            with self.subTest(name):
+                self.assertGreaterEqual(
+                    len(configured), MIN_SECRET_VALUE_LENGTH
+                )
+                rendered = redact(
+                    'the provider rejected ' + configured + ' upstream'
+                )
+                self.assertNotIn(configured, rendered)
+                self.assertIn(REDACTION_PLACEHOLDER, rendered)
+
+    def test_a_registrable_credential_is_accepted_and_held(self):
+        """A value at the floor is registered and reported held."""
+        value = 'v' * MIN_SECRET_VALUE_LENGTH
+        held = register_required_secret_values(value)
+
+        self.assertGreaterEqual(held, 1)
+        self.assertNotIn(value, redact('provider prose ' + value))
+
+    def test_a_credential_the_registry_refuses_raises(self):
+        """A value below the floor raises rather than being ignored.
+
+        The raised message is asserted to name neither the value nor any
+        part of it, so the refusal itself discloses nothing.
+        """
+        value = 'w' * (MIN_SECRET_VALUE_LENGTH - 1)
+
+        with self.assertRaises(ValueError) as raised:
+            register_required_secret_values(value)
+
+        message = str(raised.exception)
+        self.assertNotIn(value, message)
+        self.assertIn('could not be registered', message)
+        self.assertIn(value, redact('provider prose ' + value))
+
+    def test_a_value_that_is_not_text_raises(self):
+        """A non-string value raises rather than being ignored."""
+        with self.assertRaises(ValueError):
+            register_required_secret_values(None)
 
 
 if __name__ == '__main__':

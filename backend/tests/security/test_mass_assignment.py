@@ -1,4 +1,4 @@
-"""Field-level authorization and privilege-escalation regression tests.
+"""Field-level authorization and privilege escalation.
 
 Every case here submits a hostile request body and asserts the hostile
 field reaches no server-side state. Each refusal is asserted twice:
@@ -15,30 +15,66 @@ The properties covered are:
 * ``POST /auth/register`` refuses a body carrying a ``role`` field, and
   every registration that is stored carries
   :data:`backend.app.core.authorization.Role.REGISTERED`
-* the seeded administrator count is unchanged by every registration
-  attempt, and the surviving administrator is the seeded row
+* the number of accounts holding
+  :data:`backend.app.core.authorization.Role.ADMIN` is unchanged by
+  every registration attempt, and the one that survives is the row the
+  fixtures store
+* on a database built by both Alembic revisions, exactly one account
+  holds :data:`Role.ADMIN` and its address is
+  :data:`MIGRATION_ADMIN_EMAIL`, every other account holds
+  :data:`Role.REGISTERED`, and a registration body carrying a ``role``
+  field is still refused
 * no response body from ``/auth/register``, ``/auth/login`` or
   ``/listings/`` carries a stored password hash, under
   :data:`HASH_FIELD_NAME` or under any other key
 
+Every principal here is a row ``backend/tests/conftest.py`` stores. The
+administrator that the revision
+``backend/migrations/versions/0002_seed_single_admin.py`` grants is a
+different account, and that grant is covered in
+``test_admin_seed_migration.py``.
+
+The administrative role has one write site, the migration revision
+``backend/migrations/versions/0002_seed_single_admin.py``, and the cases
+naming ``run_admin_seed`` run that revision itself against the isolated
+database rather than modelling it. They cover:
+
+* the address the revision names, registered through ``/auth/register``
+  first, is promoted, and exactly that one account holds the role
+  afterwards
+* the same address, absent, is stored by the revision holding the role
+  and a credential no password verifies against, and a login attempt
+  for it is refused
+* a second run writes nothing and reports that it wrote nothing
+* a run beside an administrator at any other address raises and changes
+  no stored role
+* the downgrade demotes that one account and reports whether it changed
+  a row
+
+Each of those cases also asserts the revision's own INFO audit record,
+captured from the logger named by :data:`AUDIT_LOGGER_NAME`.
+
 The listing write is exercised with the administrator principal.
 :func:`backend.app.api.endpoints.listings.create_listing` declares
 ``require_role(Role.ADMIN)``. Role admission across every route and
-principal is covered in ``test_authorization.py``.
+principal is covered in ``test_rbac_matrix.py``.
 
 Each hash-exposure case also asserts that a bcrypt hash is present on
-the stored row it reads.
-
-Design rationale is recorded in ``docs/security/DECISION_LOG.md``.
+the stored row it reads. A response is required to carry the members its
+contract declares and is permitted to carry more, so each case asserts
+the declared members are present rather than that no other member is.
 """
 
+import logging
 from datetime import datetime
 
 import pytest
-from conftest import VALID_TEST_PASSWORD
+from sqlalchemy import text
 
 from backend.app.core.authorization import Role
+from backend.app.core.security import verify_password
 from backend.app.db.models import Listing as ListingModel, User
+from backend.tests.support import VALID_TEST_PASSWORD
 
 #: Route the listing contract is exercised on. The trailing slash is
 #: part of the path the router mounts.
@@ -54,8 +90,29 @@ VALIDATION_REFUSED = 422
 #: Status a request both contracts accept is answered with.
 ACCEPTED = 200
 
-#: Administrators the fixtures seed: the single ``admin_user`` row.
+#: Status a refused credential is answered with.
+CREDENTIAL_REFUSED = 401
+
+#: Administrators the fixtures store: the single ``admin_user`` row. The
+#: administrator the seed revision grants the role to is a separate
+#: account, asserted by the ``run_admin_seed`` cases below and in the
+#: dedicated migration modules.
+FIXTURE_ADMINISTRATORS = 1
+
+#: Administrators the grant revision leaves stored.
 SEEDED_ADMINISTRATORS = 1
+
+#: Address revision 0002 leaves holding ``Role.ADMIN``.
+MIGRATION_ADMIN_EMAIL = "test@blitzy.com"
+
+#: Logger the grant revision records its outcome on.
+AUDIT_LOGGER_NAME = "alembic.runtime.migration"
+
+#: Members ``POST /auth/register`` nests under ``user``.
+REGISTERED_USER_MEMBERS = frozenset({"id", "email"})
+
+#: Members ``POST /auth/login`` returns.
+LOGIN_MEMBERS = frozenset({"access_token", "token_type"})
 
 #: Name the stored password hash is held under on ``users``.
 HASH_FIELD_NAME = "hashed_password"
@@ -87,11 +144,10 @@ ALLOWLISTED_LISTING_BODY = {
 }
 
 #: Field names absent from the ``ListingCreate`` allowlist, each paired
-#: with the value an attacker would submit for it. ``owner_id`` is the
-#: name the previously vulnerable constructor injected and is no column
-#: of ``listings``; ``id``, ``created_at`` and ``updated_at`` are
-#: server-assigned columns; ``role`` belongs to another table; and
-#: ``is_promoted`` names nothing at all.
+#: with the value an attacker would submit for it. ``owner_id`` and
+#: ``is_promoted`` name no column of ``listings``; ``id``,
+#: ``created_at`` and ``updated_at`` are server-assigned columns; and
+#: ``role`` belongs to another table.
 HOSTILE_LISTING_FIELDS = [
     pytest.param("owner_id", 999, id="owner_id"),
     pytest.param("id", 424242, id="id"),
@@ -123,15 +179,37 @@ def nested_keys(payload):
     return found
 
 
+def nested_text_values(payload):
+    """Return every string appearing at any depth of ``payload``.
+
+    Mappings and sequences are both descended into, so a value held
+    under any key at any depth is reported.
+    """
+    found = []
+    pending = [payload]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+        elif isinstance(current, str):
+            found.append(current)
+    return found
+
+
 def assert_no_stored_hash(response):
     """Assert ``response`` discloses no stored password hash.
 
-    Three checks are applied: :data:`HASH_FIELD_NAME` appears as a key
-    at no depth of the decoded body, the raw text names it nowhere, and
-    the raw text carries no value beginning with a bcrypt prefix under
-    any key at all.
+    Four checks are applied: :data:`HASH_FIELD_NAME` appears as a key at
+    no depth of the decoded body, no string value at any depth of the
+    decoded body begins with a bcrypt prefix, the raw text names the
+    field nowhere, and the raw text carries no bcrypt prefix under any
+    key at all.
     """
     assert HASH_FIELD_NAME not in nested_keys(response.json())
+    for value in nested_text_values(response.json()):
+        assert not value.startswith(BCRYPT_PREFIXES)
     assert HASH_FIELD_NAME not in response.text
     for prefix in BCRYPT_PREFIXES:
         assert prefix not in response.text
@@ -158,6 +236,28 @@ def administrators(session):
     )
 
 
+def migrated_administrators(connection):
+    """Return the addresses holding ``Role.ADMIN`` on ``connection``."""
+    return [
+        row[0]
+        for row in connection.execute(
+            text(
+                "SELECT email FROM users WHERE role = :role"
+                " ORDER BY email"
+            ),
+            {"role": Role.ADMIN.value},
+        ).fetchall()
+    ]
+
+
+def migrated_role(connection, email):
+    """Return the role stored under ``email``, or ``None``."""
+    return connection.execute(
+        text("SELECT role FROM users WHERE email = :email"),
+        {"email": email},
+    ).scalar()
+
+
 def stored_user(session, email):
     """Return the stored ``users`` row for ``email``, or ``None``."""
     session.expire_all()
@@ -174,6 +274,22 @@ def stored_listings(session):
     return session.query(ListingModel).order_by(ListingModel.id).all()
 
 
+def audit_record(captured):
+    """Return the grant revision's captured records as one text block.
+
+    Only records emitted on :data:`AUDIT_LOGGER_NAME` are included, and
+    each one is rendered with its arguments applied, so the text is the
+    line an operator reads.
+    """
+    lines = [
+        record.getMessage()
+        for record in captured.records
+        if record.name == AUDIT_LOGGER_NAME
+    ]
+    assert lines, "the grant revision emitted no audit record"
+    return "\n".join(lines)
+
+
 @pytest.mark.parametrize(
     "field_name, hostile_value", HOSTILE_LISTING_FIELDS
 )
@@ -185,11 +301,6 @@ def test_a_listing_field_outside_the_allowlist_is_refused(
     field_name,
     hostile_value,
 ):
-    """Assert a hostile field is refused and that no row is stored.
-
-    Every other field of the submitted body is one ``ListingCreate``
-    declares, carrying a value that contract accepts.
-    """
     body = dict(ALLOWLISTED_LISTING_BODY)
     body[field_name] = hostile_value
 
@@ -206,13 +317,6 @@ def test_a_listing_field_outside_the_allowlist_is_refused(
 def test_an_allowlisted_listing_body_is_stored_as_submitted(
     client, db, admin_user, auth_header_factory
 ):
-    """Assert a body naming only declared fields stores those values.
-
-    This is the positive control for
-    :func:`test_a_listing_field_outside_the_allowlist_is_refused`. All
-    eight declared fields are submitted and each is read back from the
-    stored row.
-    """
     response = client.post(
         LISTINGS_PATH,
         json=ALLOWLISTED_LISTING_BODY,
@@ -242,15 +346,7 @@ def test_an_allowlisted_listing_body_is_stored_as_submitted(
 def test_a_registration_carrying_a_role_field_does_not_grant_it(
     client, db, admin_user, reset_rate_limits
 ):
-    """Assert a registration cannot grant itself the administrative role.
-
-    A body carrying ``role`` set to the administrative value is refused
-    and stores no account, and the administrator count is unchanged. The
-    same address is then registered without the field, and the stored
-    ``users.role`` column is asserted to hold
-    ``Role.REGISTERED``.
-    """
-    assert administrator_count(db) == SEEDED_ADMINISTRATORS
+    assert administrator_count(db) == FIXTURE_ADMINISTRATORS
 
     escalating = client.post(
         REGISTER_PATH,
@@ -263,7 +359,7 @@ def test_a_registration_carrying_a_role_field_does_not_grant_it(
 
     assert escalating.status_code == VALIDATION_REFUSED
     assert stored_user(db, ESCALATION_EMAIL) is None
-    assert administrator_count(db) == SEEDED_ADMINISTRATORS
+    assert administrator_count(db) == FIXTURE_ADMINISTRATORS
 
     accepted = client.post(
         REGISTER_PATH,
@@ -279,17 +375,12 @@ def test_a_registration_carrying_a_role_field_does_not_grant_it(
     assert stored is not None
     assert stored.role == Role.REGISTERED.value
     assert stored.role != Role.ADMIN.value
-    assert administrator_count(db) == SEEDED_ADMINISTRATORS
+    assert administrator_count(db) == FIXTURE_ADMINISTRATORS
 
 
 def test_a_registration_without_a_role_field_stores_the_default_role(
     client, db, reset_rate_limits
 ):
-    """Assert an ordinary registration stores ``Role.REGISTERED``.
-
-    The submitted body names no ``role`` field at all, and the value
-    asserted is the one read back from the stored ``users.role`` column.
-    """
     response = client.post(
         REGISTER_PATH,
         json={
@@ -306,13 +397,15 @@ def test_a_registration_without_a_role_field_stores_the_default_role(
     assert stored.role != Role.ADMIN.value
 
 
-def test_the_only_administrator_is_the_seeded_account(
+def test_an_escalating_registration_adds_no_administrative_row(
     client, db, admin_user, reset_rate_limits
 ):
     """Assert an escalating registration adds no administrator.
 
     Every administrative row is read back, and both the number of rows
-    and the address each one holds are asserted.
+    and the address each one holds are asserted. The row asserted is the
+    one ``admin_user`` stored; the migration's own grant is asserted in
+    the dedicated migration modules.
     """
     client.post(
         REGISTER_PATH,
@@ -324,18 +417,214 @@ def test_the_only_administrator_is_the_seeded_account(
     )
 
     holders = administrators(db)
-    assert len(holders) == SEEDED_ADMINISTRATORS
+    assert len(holders) == FIXTURE_ADMINISTRATORS
     assert [holder.email for holder in holders] == [admin_user.email]
+
+
+def test_the_migrated_database_holds_one_administrator(
+    migrated_client, migration_connection, reset_rate_limits
+):
+    """Assert the three properties the migrated grant must satisfy.
+
+    The database is built by both Alembic revisions rather than from
+    ``Base.metadata``. Read back afterwards: exactly one account holds
+    :data:`backend.app.core.authorization.Role.ADMIN` and its address is
+    :data:`MIGRATION_ADMIN_EMAIL`; a registration body carrying a
+    ``role`` field is refused; and every account other than the seeded
+    one holds :data:`Role.REGISTERED`.
+    """
+    assert migrated_administrators(migration_connection) == [
+        MIGRATION_ADMIN_EMAIL
+    ]
+
+    refusal = migrated_client.post(
+        REGISTER_PATH,
+        json={
+            "email": ESCALATION_EMAIL,
+            "password": VALID_TEST_PASSWORD,
+            "role": Role.ADMIN.value,
+        },
+    )
+    assert refusal.status_code == VALIDATION_REFUSED
+
+    accepted = migrated_client.post(
+        REGISTER_PATH,
+        json={
+            "email": ORDINARY_EMAIL,
+            "password": VALID_TEST_PASSWORD,
+        },
+    )
+    assert accepted.status_code == ACCEPTED
+
+    assert migrated_administrators(migration_connection) == [
+        MIGRATION_ADMIN_EMAIL
+    ]
+    assert migrated_role(
+        migration_connection, ORDINARY_EMAIL
+    ) == Role.REGISTERED.value
+    assert migrated_role(migration_connection, ESCALATION_EMAIL) is None
+
+
+def test_the_seed_revision_grants_the_role_to_the_registered_target(
+    client, db, run_admin_seed, admin_seed_revision, reset_rate_limits,
+    caplog,
+):
+    """Assert the revision promotes the registered target account.
+
+    The account is created by the registration endpoint, so it enters the
+    revision holding the role a registration stores. The revision is then
+    run, and the promotion, the resulting administrator set and the audit
+    record are all asserted.
+    """
+    registered = client.post(
+        REGISTER_PATH,
+        json={
+            "email": admin_seed_revision.ADMIN_EMAIL,
+            "password": VALID_TEST_PASSWORD,
+        },
+    )
+    assert registered.status_code == ACCEPTED
+
+    before = stored_user(db, admin_seed_revision.ADMIN_EMAIL)
+    assert before is not None
+    assert before.role == Role.REGISTERED.value
+    assert administrators(db) == []
+
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        run_admin_seed()
+
+    holders = administrators(db)
+    assert [holder.email for holder in holders] == [
+        admin_seed_revision.ADMIN_EMAIL
+    ]
+    assert len(holders) == SEEDED_ADMINISTRATORS
+    assert holders[0].id == before.id
+
+    record = audit_record(caplog)
+    assert admin_seed_revision.ADMIN_EMAIL in record
+    assert "granted the role to the stored account" in record
+    assert "administrator count is 1" in record
+
+
+def test_the_seed_revision_seeds_the_target_when_it_is_absent(
+    client, db, run_admin_seed, admin_seed_revision, reset_rate_limits,
+    caplog,
+):
+    """Assert the revision stores the target when it is absent.
+
+    The stored row is asserted to hold the administrative role and a
+    credential no password verifies against, and a login attempt for it
+    is asserted to be refused.
+    """
+    assert stored_user(db, admin_seed_revision.ADMIN_EMAIL) is None
+
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        run_admin_seed()
+
+    seeded = stored_user(db, admin_seed_revision.ADMIN_EMAIL)
+    assert seeded is not None
+    assert seeded.role == Role.ADMIN.value
+    assert administrator_count(db) == SEEDED_ADMINISTRATORS
+
+    assert not seeded.hashed_password.startswith(BCRYPT_PREFIXES)
+    assert not verify_password(
+        VALID_TEST_PASSWORD, seeded.hashed_password
+    )
+    assert not verify_password(
+        admin_seed_revision.LOCKED_CREDENTIAL, seeded.hashed_password
+    )
+
+    refused = client.post(
+        LOGIN_PATH,
+        json={
+            "email": admin_seed_revision.ADMIN_EMAIL,
+            "password": VALID_TEST_PASSWORD,
+        },
+    )
+    assert refused.status_code == CREDENTIAL_REFUSED
+
+    record = audit_record(caplog)
+    assert "inserted the account and granted it the role" in record
+
+
+def test_the_seed_revision_is_idempotent(
+    db, run_admin_seed, admin_seed_revision, caplog
+):
+    """Assert a second run writes nothing and still holds the shape."""
+    run_admin_seed()
+    first = administrators(db)
+    assert len(first) == SEEDED_ADMINISTRATORS
+
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        run_admin_seed()
+
+    second = administrators(db)
+    assert [holder.id for holder in second] == [
+        holder.id for holder in first
+    ]
+    assert len(second) == SEEDED_ADMINISTRATORS
+
+    record = audit_record(caplog)
+    assert "left the account holding the role it already held" in record
+
+
+def test_the_seed_revision_refuses_a_foreign_administrator(
+    db, admin_user, run_admin_seed, admin_seed_revision
+):
+    """Assert the revision refuses to run beside another administrator.
+
+    The fixture-seeded administrator holds an address the revision does
+    not name. The run is asserted to raise and to leave every stored role
+    as it was.
+    """
+    with pytest.raises(RuntimeError) as refusal:
+        run_admin_seed()
+
+    assert Role.ADMIN.value in str(refusal.value)
+    assert [holder.email for holder in administrators(db)] == [
+        admin_user.email
+    ]
+    assert stored_user(db, admin_seed_revision.ADMIN_EMAIL) is None
+
+
+def test_the_seed_revision_downgrade_returns_the_account_to_registered(
+    db, run_admin_seed, admin_seed_revision, caplog
+):
+    """Assert the downgrade demotes that one account and reports it.
+
+    The demotion is asserted on the stored row, and the second downgrade
+    is asserted to report that it changed nothing.
+    """
+    run_admin_seed()
+    assert administrator_count(db) == SEEDED_ADMINISTRATORS
+
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        run_admin_seed("downgrade")
+
+    demoted = stored_user(db, admin_seed_revision.ADMIN_EMAIL)
+    assert demoted is not None
+    assert demoted.role == Role.REGISTERED.value
+    assert administrator_count(db) == 0
+    assert "Returned" in audit_record(caplog)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        run_admin_seed("downgrade")
+
+    assert administrator_count(db) == 0
+    assert "unchanged" in audit_record(caplog)
 
 
 def test_no_credential_response_carries_a_stored_password_hash(
     client, db, reset_rate_limits
 ):
+
     """Assert the registration and login responses disclose no hash.
 
-    The registration response nests a ``user`` object, which is walked to
-    every depth, and the login response is asserted to carry exactly the
-    two keys its frozen shape declares.
+    Both bodies are walked to every depth. Each is asserted to carry the
+    members its contract declares, and to disclose no stored hash under
+    any key at any depth. A member the contract does not declare is
+    permitted; a stored hash is not.
     """
     registered = client.post(
         REGISTER_PATH,
@@ -346,7 +635,7 @@ def test_no_credential_response_carries_a_stored_password_hash(
     )
 
     assert registered.status_code == ACCEPTED
-    assert set(registered.json()["user"]) == {"id", "email"}
+    assert REGISTERED_USER_MEMBERS <= set(registered.json()["user"])
     assert_no_stored_hash(registered)
 
     logged_in = client.post(
@@ -358,7 +647,7 @@ def test_no_credential_response_carries_a_stored_password_hash(
     )
 
     assert logged_in.status_code == ACCEPTED
-    assert set(logged_in.json()) == {"access_token", "token_type"}
+    assert LOGIN_MEMBERS <= set(logged_in.json())
     assert_no_stored_hash(logged_in)
 
     stored = stored_user(db, ORDINARY_EMAIL)
@@ -369,12 +658,6 @@ def test_no_credential_response_carries_a_stored_password_hash(
 def test_no_listing_response_carries_a_stored_password_hash(
     client, db, admin_user, auth_header_factory
 ):
-    """Assert the listing write and read responses disclose no hash.
-
-    The write is performed by an authenticated principal whose own
-    stored row carries a hash, and the page the read returns is walked
-    to every depth.
-    """
     assert admin_user.hashed_password.startswith(BCRYPT_PREFIXES)
 
     written = client.post(

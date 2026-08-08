@@ -1,6 +1,6 @@
 from sqlalchemy import (
-    Column, Integer, String, Float, DateTime, ForeignKey, Numeric, func,
-    text,
+    Column, Integer, String, Float, DateTime, ForeignKey, Numeric,
+    UniqueConstraint, func, text,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
@@ -18,8 +18,8 @@ class User(Base):
     last_login = Column(DateTime)
     role = Column(String, nullable=False, server_default="registered")
     failed_login_attempts = Column(Integer, nullable=False, server_default="0")
-    # Instant the account's lock expires, held with its offset so the
-    # comparison against the server clock needs no zone assumption.
+    # Instant the account's lock expires, held with its offset. It is
+    # compared against the server clock without a zone assumption.
     locked_until = Column(
         DateTime(timezone=True), nullable=True, server_default=text("NULL")
     )
@@ -42,10 +42,8 @@ class Listing(Base):
     available_date = Column(DateTime)
     street_address = Column(String)
     # Provider address a scheduled ingestion pass reconciles a record
-    # against. The uniqueness constraint applies to the values present,
-    # so at most one row carries any given address while a row carrying
-    # none stays permitted.
-    zillow_url = Column(String, unique=True)
+    # against.
+    zillow_url = Column(String)
 
 
 class Filter(Base):
@@ -86,6 +84,14 @@ class Criteria(Base):
 
 class Subscription(Base):
     __tablename__ = 'subscriptions'
+    # The uniqueness over the provider order identifier is declared
+    # under the name revision 0001 gives it, so the mapped table and the
+    # migrated table carry the same constraint under the same name.
+    __table_args__ = (
+        UniqueConstraint(
+            'paypal_order_id', name='uq_subscriptions_paypal_order_id'
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
@@ -98,7 +104,7 @@ class Subscription(Base):
     )
     currency = Column(String, nullable=False, server_default="USD")
     paypal_order_id = Column(
-        String, unique=True, nullable=True, server_default=text("NULL")
+        String, nullable=True, server_default=text("NULL")
     )
 
     user = relationship("User", back_populates="subscriptions")
@@ -106,9 +112,17 @@ class Subscription(Base):
 
 class WebhookEvent(Base):
     __tablename__ = 'webhook_events'
+    # The uniqueness over the delivery identifier is declared under the
+    # name revision 0001 gives it, so the mapped table and the migrated
+    # table carry the same constraint under the same name.
+    __table_args__ = (
+        UniqueConstraint(
+            'transmission_id', name='uq_webhook_events_transmission_id'
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
-    transmission_id = Column(String, unique=True, nullable=False)
+    transmission_id = Column(String, nullable=False)
     event_type = Column(String, nullable=False)
     # Instant the delivery was recorded, held with its offset.
     received_at = Column(

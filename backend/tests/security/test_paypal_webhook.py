@@ -1,10 +1,4 @@
-"""Webhook authenticity, certificate-host and replay regressions.
-
-Finding H-4 is the complete absence of PayPal webhook signature
-verification anywhere in the codebase: every inbound notification was
-trusted, so anyone able to reach the service could assert an arbitrary
-subscription state. The cases here are the evidence that the control
-which closed it works.
+"""Webhook authenticity, certificate-host and replay controls.
 
 Two surfaces are exercised.
 
@@ -22,14 +16,23 @@ Two surfaces are exercised.
   ``webhook_events`` insert whose UNIQUE ``transmission_id`` column
   detects a repeated delivery.
 
+A repeated delivery is covered twice over: once arriving after the first
+has been answered, and once arriving while the first is still in flight
+with its delivery row inserted and uncommitted.
+:class:`ConcurrentDeliveryBarrier` holds the two deliveries in that
+arrangement and resolves the second one's flush the way the constraint
+would -- refusing it once the first commits, admitting it once the first
+rolls back. Both deliveries are driven as tasks on one event loop, and
+every wait the barrier takes is bounded and is recorded with the thread
+it ran on.
+
 Every outbound call is answered by :class:`VerifierTransport`, a
 stand-in transport that records each request it is handed and opens no
 socket. The cases assert on what the service transmitted and on how
 many calls it made.
 
-The three checks the security reviewer of
-``docs/review/CRITICAL_DECISIONS.md`` entry 4 must be able to point at
-are each a separately named case:
+The three checks a security reviewer of the webhook path must be able to
+point at are each a separately named case:
 
 * the allowlist applied before the certificate URL is fetched or
   forwarded --
@@ -40,22 +43,34 @@ are each a separately named case:
   ``test_a_failed_verification_changes_no_database_state``
 """
 
+import asyncio
 import json
 import logging
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 import httpx
 import pytest
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+from conftest import assert_paypal_request
 
 from backend.app.api.endpoints import subscriptions as subscriptions_module
 from backend.app.core.config import settings
-from backend.app.core.logging import BASE_LOGGER_NAME
+from backend.app.core.logging import (
+    BASE_LOGGER_NAME,
+    CONTEXT_FIELD,
+    REQUEST_ID_FIELD,
+    RedactingFilter,
+    RedactingJsonFormatter,
+)
 from backend.app.core.plans import PREMIUM_MONTHLY, format_amount, get_plan
 from backend.app.db.models import Subscription, User, WebhookEvent
-from backend.app.main import limiter
+from backend.app.main import REQUEST_ID_HEADER, app, limiter
 from backend.app.services import paypal_service
+from backend.tests.support import CLIENT_BASE_URL
 
 #: Import path the transport funnel is patched on.
 SERVICE = "backend.app.services.paypal_service"
@@ -84,6 +99,10 @@ CAPTURE_ID = "CAPTURE-WEBHOOK-H4-1"
 
 #: Delivery identifier a notification carries unless a case varies it.
 TRANSMISSION_ID = "3f6c1e00-1111-2222-3333-444455556666"
+
+#: Correlation identifier the caller-supplied cases present. It carries
+#: only characters the identifier check accepts.
+SUPPLIED_REQUEST_ID = "caller0trace0webhook1"
 
 #: Signature a notification carries unless a case varies it.
 TRANSMISSION_SIG = "dmFsaWQtc2lnbmF0dXJlLXZhbHVl"
@@ -165,8 +184,8 @@ PLAIN_SCHEME_CERT_URL = (
     "http://api.sandbox.paypal.com/v1/notifications/certs/C1"
 )
 
-#: Certificate URLs whose host is outside the allowlist. Each shape
-#: defeats a different insufficient check.
+#: Certificate URLs whose host is outside the allowlist, one per URL
+#: shape the parametrized case covers.
 HOSTILE_CERT_URLS = (
     pytest.param(
         FOREIGN_HOST_CERT_URL, id="wholly_different_domain"
@@ -246,8 +265,15 @@ class VerifierTransport(object):
         self.open_client = open_client
 
     def respond(self, outbound):
-        """Records ``outbound`` and answers the path it addressed."""
+        """Asserts ``outbound``, records it, and answers its path.
+
+        The request is asserted against the provider wire contract before
+        a response is served, so a call carrying the wrong method, host,
+        path, authentication, headers, verifier document or timeout raises
+        rather than receiving a plausible answer.
+        """
         call = RecordedCall(outbound)
+        call.route = assert_paypal_request(outbound)
         self.calls.append(call)
         if call.path == TOKEN_PATH:
             return httpx.Response(
@@ -346,7 +372,8 @@ def deliver(client, body, headers):
 
 
 def stored_state(db):
-    """Returns every stored value a notification could change."""
+    """Returns the event, subscription and role state these cases
+    compare."""
     db.expire_all()
     events = [
         (event.transmission_id, event.event_type)
@@ -398,6 +425,41 @@ def values_found_in(records, values):
     ]
 
 
+def formatted_lines(records):
+    """Returns each record as the line the process would write.
+
+    The application's redacting filter and formatter are applied, so the
+    text asserted on is the serialised record rather than its attributes.
+    """
+    log_filter = RedactingFilter()
+    formatter = RedactingJsonFormatter()
+    return [
+        formatter.format(record)
+        for record in records
+        if log_filter.filter(record)
+    ]
+
+
+def record_with_reason(records, reason):
+    """Returns the one record whose recorded reason is ``reason``."""
+    matching = [
+        record
+        for record in records
+        if getattr(record, "reason", None) == reason
+    ]
+    assert len(matching) == 1, reason
+    return matching[0]
+
+
+def activations(records):
+    """Returns the records reporting a granted entitlement."""
+    return [
+        record
+        for record in records
+        if getattr(record, "granted_role", None) is not None
+    ]
+
+
 #: Values no log record may carry.
 CONFIDENTIAL_VALUES = (
     TRANSMISSION_SIG,
@@ -407,6 +469,207 @@ CONFIDENTIAL_VALUES = (
     settings.PAYPAL_WEBHOOK_ID,
     ALLOWED_CERT_URL,
 )
+
+#: Longest any one step of a concurrent delivery pair may wait.
+STEP_BOUND_SECONDS = 15.0
+
+#: Longest the whole concurrent delivery pair may take to be answered.
+PAIR_BOUND_SECONDS = 60.0
+
+#: Session operations the barrier interposes on.
+CONTROLLED_OPERATIONS = ("flush", "commit", "rollback")
+
+#: Outcome recorded when the first delivery committed its transaction.
+LEFT_BY_COMMIT = "commit"
+
+#: Outcome recorded when the first delivery rolled its transaction back.
+LEFT_BY_ROLLBACK = "rollback"
+
+
+class ConcurrentDeliveryBarrier(object):
+    """Holds two deliveries of one identifier against each other.
+
+    The first delivery to flush is the *holder*: its insert is performed
+    and it is then held inside that flush, its delivery row written and
+    uncommitted. The next delivery to flush is the *waiter*: it is held
+    at the point the uniqueness constraint would make it wait, and its
+    flush resolves only once the holder has left its transaction --
+    raising :class:`sqlalchemy.exc.IntegrityError` when the holder
+    committed, and performing the insert when the holder rolled back.
+
+    ``holder_commit_fails`` makes the holder's commit raise, which is
+    what drives it down its rollback path.
+
+    Every wait is bounded by :data:`STEP_BOUND_SECONDS` and the thread
+    each held flush ran on is recorded, so a wait taken on the event loop
+    is reported rather than left to hang.
+    """
+
+    def __init__(self, holder_commit_fails=False):
+        self.holder_commit_fails = holder_commit_fails
+        self.holder_session = None
+        self.waiter_session = None
+        self.holder_inserted = threading.Event()
+        self.waiter_waiting = threading.Event()
+        self.holder_released = threading.Event()
+        self.holder_left = threading.Event()
+        self.holder_outcome = None
+        self.held_flush_threads = []
+        self.overlapped = False
+
+    def _role(self, session):
+        """Returns which of the two deliveries ``session`` belongs to."""
+        if self.holder_session is None or self.holder_session is session:
+            self.holder_session = session
+            return "holder"
+        if self.waiter_session is None or self.waiter_session is session:
+            self.waiter_session = session
+            return "waiter"
+        return "other"
+
+    def interpose(self, operation, perform):
+        """Returns the result of one session operation, held if needed.
+
+        ``operation`` is the bound session method the route handed to
+        ``_in_session`` and ``perform`` runs it unchanged. An operation
+        outside :data:`CONTROLLED_OPERATIONS`, or one belonging to
+        neither delivery, is performed as it stands.
+        """
+        session = getattr(operation, "__self__", None)
+        name = getattr(operation, "__name__", "")
+        if session is None or name not in CONTROLLED_OPERATIONS:
+            return perform()
+        role = self._role(session)
+        if role == "other":
+            return perform()
+        if name == "flush":
+            return self._flush(role, perform)
+        if name == "commit":
+            return self._commit(role, perform)
+        return self._rollback(role, perform)
+
+    def _flush(self, role, perform):
+        """Performs or holds one flush according to ``role``."""
+        self.held_flush_threads.append(threading.current_thread().ident)
+        if role == "holder":
+            result = perform()
+            self.holder_inserted.set()
+            assert self.holder_released.wait(STEP_BOUND_SECONDS), (
+                "the first delivery was never released from its flush"
+            )
+            return result
+        self.waiter_waiting.set()
+        assert self.holder_left.wait(STEP_BOUND_SECONDS), (
+            "the waiting delivery's flush never resolved"
+        )
+        if self.holder_outcome == LEFT_BY_COMMIT:
+            raise IntegrityError(
+                "INSERT INTO webhook_events (transmission_id) VALUES (?)",
+                {},
+                Exception(
+                    "UNIQUE constraint failed: "
+                    "webhook_events.transmission_id"
+                ),
+            )
+        return perform()
+
+    def _commit(self, role, perform):
+        """Commits, or fails the holder's commit when asked to."""
+        if role == "holder" and self.holder_commit_fails:
+            raise SQLAlchemyError("the transition could not be recorded")
+        result = perform()
+        if role == "holder":
+            self._record_departure(LEFT_BY_COMMIT)
+        return result
+
+    def _rollback(self, role, perform):
+        """Rolls back and reports a holder leaving its transaction."""
+        result = perform()
+        if role == "holder":
+            self._record_departure(LEFT_BY_ROLLBACK)
+        return result
+
+    def _record_departure(self, outcome):
+        """Records how the holder left, the first time it leaves."""
+        if self.holder_outcome is None:
+            self.holder_outcome = outcome
+            self.holder_left.set()
+
+
+def controlled_deliveries(monkeypatch, barrier):
+    """Routes every session operation of the route through ``barrier``.
+
+    The replacement delegates to the real
+    :func:`backend.app.api.endpoints.subscriptions._in_session`, so each
+    operation still runs in a worker thread and a wait the barrier takes
+    is a wait taken off the event loop.
+    """
+    perform_in_session = subscriptions_module._in_session
+
+    async def in_session(operation, *args, **kwargs):
+        """Runs one held session operation in a worker thread."""
+
+        def held(*call_args, **call_kwargs):
+            """Performs ``operation``, held by the barrier if needed."""
+            return barrier.interpose(
+                operation,
+                lambda: operation(*call_args, **call_kwargs),
+            )
+
+        return await perform_in_session(held, *args, **kwargs)
+
+    monkeypatch.setattr(
+        subscriptions_module, "_in_session", in_session
+    )
+
+
+async def reached(signal, description):
+    """Waits for one barrier signal without occupying the event loop."""
+    loop = asyncio.get_event_loop()
+    arrived = await loop.run_in_executor(
+        None, signal.wait, STEP_BOUND_SECONDS
+    )
+    assert arrived, description
+
+
+async def deliver_together(barrier, body, headers):
+    """Answers two overlapping deliveries of one notification.
+
+    The first delivery is started and held once its delivery row is
+    inserted; the second is started and held where the uniqueness
+    constraint would make it wait; the first is then released. Both are
+    driven as tasks on this event loop and the pair is bounded by
+    :data:`PAIR_BOUND_SECONDS`. The two responses are returned in the
+    order the deliveries were started.
+    """
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=CLIENT_BASE_URL,
+    ) as caller:
+
+        async def post():
+            """Posts one notification to the webhook route."""
+            sent = dict(headers)
+            sent["Content-Type"] = "application/json"
+            return await caller.post(
+                WEBHOOK_PATH, content=body, headers=sent
+            )
+
+        first = asyncio.ensure_future(post())
+        await reached(
+            barrier.holder_inserted,
+            "the first delivery never recorded its delivery row",
+        )
+        second = asyncio.ensure_future(post())
+        await reached(
+            barrier.waiter_waiting,
+            "the second delivery never reached the contended insert",
+        )
+        barrier.overlapped = not first.done()
+        barrier.holder_released.set()
+        return await asyncio.wait_for(
+            asyncio.gather(first, second), PAIR_BOUND_SECONDS
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -478,7 +741,6 @@ def captured_records(caplog):
 
 
 def test_the_documented_paypal_headers_are_the_ones_required():
-    """The required headers are PayPal's own documented names."""
     for documented, configured, field in DOCUMENTED_HEADERS:
         assert configured == documented
         assert configured in paypal_service.REQUIRED_WEBHOOK_HEADERS
@@ -495,7 +757,6 @@ def test_the_documented_paypal_headers_are_the_ones_required():
 async def test_a_verified_notification_reports_its_transmission_id(
     recorder,
 ):
-    """A passing check reports the delivery identifier and event type."""
     outcome = await paypal_service.verify_webhook_signature(
         webhook_headers(),
         notification_bytes(capture_completed_event()),
@@ -513,7 +774,6 @@ async def test_a_verified_notification_reports_its_transmission_id(
 async def test_a_verified_notification_posts_the_documented_fields(
     recorder,
 ):
-    """The postback carries PayPal's documented field set verbatim."""
     event = capture_completed_event()
 
     outcome = await paypal_service.verify_webhook_signature(
@@ -536,7 +796,6 @@ async def test_a_verified_notification_posts_the_documented_fields(
 
 @pytest.mark.asyncio
 async def test_a_tampered_signature_is_rejected(failing_recorder):
-    """A signature PayPal does not confirm fails the check."""
     outcome = await paypal_service.verify_webhook_signature(
         webhook_headers(signature=TAMPERED_SIG),
         notification_bytes(capture_completed_event()),
@@ -554,7 +813,6 @@ async def test_a_tampered_signature_is_rejected(failing_recorder):
 
 @pytest.mark.asyncio
 async def test_an_unreachable_verifier_is_reported_as_retryable():
-    """A check that could not be completed is not a passing check."""
     stand_in = VerifierTransport(unreachable=True)
 
     with patch(SERVICE + "._client", new=stand_in.open_client):
@@ -575,7 +833,6 @@ async def test_an_unreachable_verifier_is_reported_as_retryable():
 async def test_a_malformed_notification_body_is_rejected_without_a_call(
     recorder,
 ):
-    """A body that is not a JSON object is refused with nothing sent."""
     outcome = await paypal_service.verify_webhook_signature(
         webhook_headers(), b"not-a-json-object"
     )
@@ -590,13 +847,6 @@ async def test_a_malformed_notification_body_is_rejected_without_a_call(
 async def test_the_certificate_host_allowlist_is_applied_before_any_call(
     recorder, hostile_url
 ):
-    """A certificate host off the allowlist stops the check outright.
-
-    The rejection is asserted together with the transport recording zero
-    calls, so the host is refused before the URL is fetched, and the
-    hostile value is absent from every argument the transport received,
-    so it was not forwarded in a postback either.
-    """
     outcome = await paypal_service.verify_webhook_signature(
         webhook_headers(cert_url=hostile_url),
         notification_bytes(capture_completed_event()),
@@ -614,7 +864,6 @@ async def test_the_certificate_host_allowlist_is_applied_before_any_call(
 async def test_a_certificate_host_on_the_allowlist_reaches_the_verifier(
     recorder,
 ):
-    """An allowlisted certificate host proceeds to the verify call."""
     outcome = await paypal_service.verify_webhook_signature(
         webhook_headers(),
         notification_bytes(capture_completed_event()),
@@ -627,7 +876,6 @@ async def test_a_certificate_host_on_the_allowlist_reaches_the_verifier(
 
 @pytest.mark.asyncio
 async def test_every_outbound_call_carries_an_explicit_timeout(recorder):
-    """Each call the check issues carries the configured timeout."""
     outcome = await paypal_service.verify_webhook_signature(
         webhook_headers(),
         notification_bytes(capture_completed_event()),
@@ -648,12 +896,6 @@ async def test_every_outbound_call_carries_an_explicit_timeout(recorder):
 def test_a_missing_required_header_is_rejected(
     client, db, recorder, captured_records, pending_subscription, dropped
 ):
-    """Omitting any one required header is refused and changes nothing.
-
-    The certificate URL is the first value checked, so omitting it is
-    recorded as a certificate-host rejection and omitting any of the
-    other four as a missing-header rejection.
-    """
     expected = (
         paypal_service.REASON_CERTIFICATE_HOST
         if dropped == paypal_service.CERT_URL_HEADER
@@ -680,7 +922,6 @@ def test_a_missing_required_header_is_rejected(
 def test_a_failed_verification_changes_no_database_state(
     client, db, failing_recorder, pending_subscription
 ):
-    """A refused notification leaves every stored value as it was."""
     before = stored_state(db)
     assert before["event_count"] == 0
     assert len(before["subscriptions"]) == 1
@@ -709,7 +950,6 @@ def test_a_failed_verification_changes_no_database_state(
 def test_an_unverifiable_notification_changes_no_database_state(
     client, db, pending_subscription
 ):
-    """A check that could not be completed mutates nothing either."""
     stand_in = VerifierTransport(unreachable=True)
     before = stored_state(db)
 
@@ -735,7 +975,6 @@ def test_an_unverifiable_notification_changes_no_database_state(
 def test_a_failed_verification_is_logged_without_the_signature(
     client, db, failing_recorder, captured_records, pending_subscription
 ):
-    """The refusal is recorded and carries no confidential value."""
     response = deliver(
         client,
         notification_bytes(capture_completed_event()),
@@ -757,7 +996,6 @@ def test_a_failed_verification_is_logged_without_the_signature(
 def test_a_hostile_certificate_host_records_no_delivery(
     client, db, recorder, captured_records, pending_subscription
 ):
-    """A hostile certificate host is refused at the route with no call."""
     before = stored_state(db)
 
     response = deliver(
@@ -782,7 +1020,6 @@ def test_a_hostile_certificate_host_records_no_delivery(
 def test_a_verified_notification_is_answered_with_a_success_status(
     client, db, recorder, pending_subscription
 ):
-    """Receipt is signalled only once the check and the work are done."""
     response = deliver(
         client,
         notification_bytes(capture_completed_event()),
@@ -805,7 +1042,6 @@ def test_a_verified_notification_is_answered_with_a_success_status(
 def test_a_rejected_notification_is_not_answered_with_a_success(
     client, db, failing_recorder, pending_subscription
 ):
-    """A notification that fails its check is answered 400, never 2xx."""
     response = deliver(
         client,
         notification_bytes(capture_completed_event()),
@@ -824,13 +1060,6 @@ def test_a_rejected_notification_is_not_answered_with_a_success(
 def test_a_replayed_transmission_id_is_rejected_and_processed_once(
     client, db, recorder, pending_subscription
 ):
-    """A repeated delivery identifier is not processed a second time.
-
-    The first delivery is accepted and settles the subscription. The
-    second carries the same ``PAYPAL-TRANSMISSION-ID`` and is rejected as
-    a repeat: ``webhook_events`` holds exactly one row for that
-    identifier and the subscription mutation was applied once.
-    """
     body = notification_bytes(capture_completed_event())
     headers = webhook_headers()
 
@@ -867,3 +1096,237 @@ def test_a_replayed_transmission_id_is_rejected_and_processed_once(
     assert stored_state(db) == settled
     assert db.query(Subscription).count() == 1
     assert db.query(User).one().role == PLAN.required_role
+
+
+def test_a_supplied_correlation_id_reaches_the_rejection_record(
+    client, db, failing_recorder, captured_records, pending_subscription
+):
+    """A refused delivery is recorded under the caller's identifier.
+
+    The identifier travels in the request header the application adopts,
+    and is asserted in the serialised record rather than on the response
+    alone.
+    """
+    response = deliver(
+        client,
+        notification_bytes(capture_completed_event()),
+        dict(
+            webhook_headers(signature=TAMPERED_SIG),
+            **{REQUEST_ID_HEADER: SUPPLIED_REQUEST_ID}
+        ),
+    )
+
+    assert response.status_code == 400
+    assert response.headers[REQUEST_ID_HEADER] == SUPPLIED_REQUEST_ID
+
+    record = record_with_reason(
+        captured_records.records, paypal_service.REASON_SIGNATURE
+    )
+    context = json.loads(formatted_lines([record])[0])[CONTEXT_FIELD]
+    assert context[REQUEST_ID_FIELD] == SUPPLIED_REQUEST_ID
+
+
+def test_a_supplied_correlation_id_reaches_the_replay_record(
+    client, db, recorder, captured_records, pending_subscription
+):
+    """A repeated delivery is recorded under the caller's identifier."""
+    body = notification_bytes(capture_completed_event())
+    headers = dict(
+        webhook_headers(), **{REQUEST_ID_HEADER: SUPPLIED_REQUEST_ID}
+    )
+
+    assert 200 <= deliver(client, body, headers).status_code < 300
+    captured_records.clear()
+
+    replay = deliver(client, body, headers)
+
+    assert replay.json()["status"] == (
+        subscriptions_module.OUTCOME_DUPLICATE
+    )
+    record = record_with_reason(
+        captured_records.records, subscriptions_module.REASON_REPLAY
+    )
+    context = json.loads(formatted_lines([record])[0])[CONTEXT_FIELD]
+    assert context[REQUEST_ID_FIELD] == SUPPLIED_REQUEST_ID
+    assert context["transmission_id"] == TRANSMISSION_ID
+
+
+def test_a_replayed_delivery_is_recorded_with_its_delivery_identity(
+    client, db, recorder, captured_records, pending_subscription
+):
+    """The repeat's record names the delivery it repeats.
+
+    The record is asserted on the serialised line the process writes, so
+    the delivery identifier and the provider's order identifier are
+    asserted where an operator reads them, and the signature, the access
+    token and the webhook identifier are asserted absent from it.
+    """
+    body = notification_bytes(capture_completed_event())
+    headers = webhook_headers()
+
+    assert 200 <= deliver(client, body, headers).status_code < 300
+    captured_records.clear()
+
+    replay = deliver(client, body, headers)
+
+    assert replay.json()["status"] == (
+        subscriptions_module.OUTCOME_DUPLICATE
+    )
+
+    records = captured_records.records
+    record = record_with_reason(records, subscriptions_module.REASON_REPLAY)
+    assert record.levelno >= logging.WARNING
+    assert record.transmission_id == TRANSMISSION_ID
+    assert record.paypal_order_id == ORDER_ID
+
+    lines = formatted_lines([record])
+    assert len(lines) == 1
+    context = json.loads(lines[0])[CONTEXT_FIELD]
+    assert context["transmission_id"] == TRANSMISSION_ID
+    assert context["paypal_order_id"] == ORDER_ID
+    assert context["path"] == WEBHOOK_PATH
+    assert values_found_in(records, CONFIDENTIAL_VALUES) == []
+
+
+@pytest.mark.asyncio
+async def test_two_simultaneous_deliveries_are_processed_exactly_once(
+    monkeypatch, client, db, recorder, captured_records,
+    pending_subscription,
+):
+    """Two deliveries in flight at once settle the subscription once.
+
+    Both carry the same ``PAYPAL-TRANSMISSION-ID``. The second reaches
+    the insert while the first still holds its uncommitted delivery row,
+    and its flush resolves as a repeat once the first commits. Both
+    requests are answered -- one ``processed``, one ``duplicate`` --
+    ``webhook_events`` holds exactly one row for the identifier, exactly
+    one entitlement was granted, and the repeat is recorded under
+    :data:`backend.app.api.endpoints.subscriptions.REASON_REPLAY`.
+    """
+    barrier = ConcurrentDeliveryBarrier()
+    controlled_deliveries(monkeypatch, barrier)
+
+    first, second = await deliver_together(
+        barrier,
+        notification_bytes(capture_completed_event()),
+        webhook_headers(),
+    )
+
+    assert barrier.overlapped is True
+    assert barrier.holder_outcome == LEFT_BY_COMMIT
+    assert 200 <= first.status_code < 300
+    assert 200 <= second.status_code < 300
+    assert first.json()["status"] == (
+        subscriptions_module.OUTCOME_PROCESSED
+    )
+    assert second.json()["status"] == (
+        subscriptions_module.OUTCOME_DUPLICATE
+    )
+    assert len(recorder.verify_calls()) == 2
+    db.expire_all()
+    assert (
+        db.query(WebhookEvent)
+        .filter(WebhookEvent.transmission_id == TRANSMISSION_ID)
+        .count()
+        == 1
+    )
+    assert db.query(WebhookEvent).count() == 1
+    assert db.query(Subscription).count() == 1
+    assert (
+        db.query(Subscription).one().status
+        == subscriptions_module.ACTIVE_STATUS
+    )
+    assert db.query(User).one().role == PLAN.required_role
+    assert len(activations(captured_records.records)) == 1
+    assert subscriptions_module.REASON_REPLAY in logged_reasons(
+        captured_records.records
+    )
+    assert values_found_in(
+        captured_records.records, CONFIDENTIAL_VALUES
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_delivery_settles_once_the_first_rolls_back(
+    monkeypatch, client, db, recorder, pending_subscription
+):
+    """A delivery held at the insert settles after the first rolls back.
+
+    The first delivery cannot record its transition and rolls its
+    transaction back, which releases the delivery row it had inserted.
+    The second delivery's flush then performs that insert and the
+    notification is still settled: the first is answered ``503`` carrying
+    :data:`backend.app.api.endpoints.subscriptions.
+    RECONCILIATION_DETAIL`, the second is answered ``processed``, and one
+    delivery row and one active subscription are stored.
+    """
+    barrier = ConcurrentDeliveryBarrier(holder_commit_fails=True)
+    controlled_deliveries(monkeypatch, barrier)
+
+    first, second = await deliver_together(
+        barrier,
+        notification_bytes(capture_completed_event()),
+        webhook_headers(),
+    )
+
+    assert barrier.overlapped is True
+    assert barrier.holder_outcome == LEFT_BY_ROLLBACK
+    assert first.status_code == 503
+    assert first.json()["detail"] == (
+        subscriptions_module.RECONCILIATION_DETAIL
+    )
+    assert second.json()["status"] == (
+        subscriptions_module.OUTCOME_PROCESSED
+    )
+    assert second.json()["status"] != (
+        subscriptions_module.OUTCOME_DUPLICATE
+    )
+    db.expire_all()
+    assert (
+        db.query(WebhookEvent)
+        .filter(WebhookEvent.transmission_id == TRANSMISSION_ID)
+        .count()
+        == 1
+    )
+    assert db.query(WebhookEvent).count() == 1
+    assert db.query(Subscription).count() == 1
+    assert (
+        db.query(Subscription).one().status
+        == subscriptions_module.ACTIVE_STATUS
+    )
+    assert db.query(User).one().role == PLAN.required_role
+
+
+@pytest.mark.asyncio
+async def test_a_contended_insert_waits_off_the_event_loop(
+    monkeypatch, client, db, recorder, pending_subscription
+):
+    """Neither held insert occupies the loop the deliveries share.
+
+    Both deliveries are driven as tasks on this event loop, and the
+    second reaches the contended insert while the first is still held.
+    Each held flush records the thread it ran on: two are recorded and
+    neither is this thread, and the pair is answered inside
+    :data:`PAIR_BOUND_SECONDS`.
+    """
+    barrier = ConcurrentDeliveryBarrier()
+    controlled_deliveries(monkeypatch, barrier)
+    loop_thread = threading.current_thread().ident
+
+    first, second = await deliver_together(
+        barrier,
+        notification_bytes(capture_completed_event()),
+        webhook_headers(),
+    )
+
+    assert barrier.overlapped is True
+    assert len(barrier.held_flush_threads) == 2
+    assert loop_thread not in barrier.held_flush_threads
+    assert 200 <= first.status_code < 300
+    assert 200 <= second.status_code < 300
+    assert first.json()["status"] == (
+        subscriptions_module.OUTCOME_PROCESSED
+    )
+    assert second.json()["status"] == (
+        subscriptions_module.OUTCOME_DUPLICATE
+    )

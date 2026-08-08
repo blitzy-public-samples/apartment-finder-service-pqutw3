@@ -1,18 +1,23 @@
 import asyncio
+import contextlib
+import logging as stdlib_logging
 import threading
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.core.logging import flush_log_queue
 from backend.app.db.models import Base, Filter, Listing, User, ZipCode
+from backend.app.tasks import listing_updater
 from backend.app.tasks.listing_updater import (
     IDENTITY_COLUMN,
     INGESTION_FAILED_MESSAGE,
+    RECORD_REFUSED_MESSAGE,
     UPDATE_INTERVAL,
     tracked_zip_codes,
     update_listings,
@@ -24,6 +29,19 @@ ZIP_CODE = '12345'
 
 LISTING_URL = 'https://www.zillow.com/homedetails/1'
 
+SECOND_LISTING_URL = 'https://www.zillow.com/homedetails/2'
+
+# Message the pass records when it completes. It is asserted absent from
+# the cases where a failure must end the pass instead.
+PASS_COMPLETED_MESSAGE = 'Completed an ingestion pass'
+
+# Value placed in the numeric rent column to make the flush raise for one
+# statement. The type layer cannot prepare it as a parameter.
+UNBINDABLE_RENT = 'not-a-number'
+
+# Detail carried by the stand-in defect below.
+DEFECT_DETAIL = 'a defect in the row builder'
+
 # Longest a stand-in provider call waits to be released. It bounds the
 # case below so a pass that blocked the loop fails instead of hanging.
 BLOCKED_FETCH_TIMEOUT = 5.0
@@ -33,8 +51,8 @@ BLOCKED_FETCH_TIMEOUT = 5.0
 # formatter leaves unchanged.
 PROVIDER_FAILURE_DETAIL = 'the listing provider was unreachable'
 
-# Exactly what the ingestion pass wrote to standard output before the
-# failure path was routed through the structured logger.
+# Stream signature the cases below assert is absent from stdout and
+# stderr: the ingestion failure message followed by the failure detail.
 BARE_PRINT_SIGNATURE = (
     INGESTION_FAILED_MESSAGE + ': ' + PROVIDER_FAILURE_DETAIL
 )
@@ -42,6 +60,17 @@ BARE_PRINT_SIGNATURE = (
 # Longest the assertions below wait for the queue-backed log listener to
 # write every record one pass produced.
 LOG_DRAIN_TIMEOUT = 5.0
+
+
+class _RecordCollector(stdlib_logging.Handler):
+    """Holds every record the logger it is attached to emits."""
+
+    def __init__(self):
+        super().__init__(level=stdlib_logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
 
 
 @pytest.fixture
@@ -103,6 +132,48 @@ def _provider_listing(**overrides):
     return record
 
 
+def _unbindable_then_valid():
+    """Returns a stand-in for the row builder, failing the first row.
+
+    The first row it returns carries text in a numeric column, which the
+    type layer cannot prepare as a parameter, so the flush raises
+    ``StatementError`` for that one statement. Every later row is built
+    as the module builds it.
+    """
+    real_builder = listing_updater._new_listing
+    calls = {'count': 0}
+
+    def build(mapped, moment):
+        row = real_builder(mapped, moment)
+        calls['count'] += 1
+        if calls['count'] == 1:
+            row.rent = UNBINDABLE_RENT
+        return row
+
+    return build
+
+
+@contextlib.contextmanager
+def _collected_task_records():
+    """Collects the records the ingestion module's logger emits."""
+    collector = _RecordCollector()
+    logger = stdlib_logging.getLogger(TASK_MODULE)
+    logger.addHandler(collector)
+    try:
+        yield collector.records
+    finally:
+        logger.removeHandler(collector)
+
+
+def _record_named(records, message):
+    """Returns the one collected record carrying ``message``."""
+    matching = [
+        record for record in records if record.getMessage() == message
+    ]
+    assert len(matching) == 1, message
+    return matching[0]
+
+
 @pytest.mark.asyncio
 async def test_update_listings_completes_without_raising(
     mock_db_session,
@@ -118,7 +189,6 @@ async def test_update_listings_completes_without_raising(
                 mock_fetch.return_value = []
                 await update_listings()
 
-    # The provider is asked for listings and the pass commits once.
     assert mock_fetch.call_count == 1
     assert mock_db_session.commit.call_count == 1
     assert mock_db_session.rollback.call_count == 0
@@ -143,7 +213,6 @@ async def test_update_listings_closes_the_session_on_failure(
 
     assert mock_db_session.rollback.call_count == 1
     assert mock_db_session.close.call_count == 1
-    # A rolled-back pass commits nothing.
     assert mock_db_session.commit.call_count == 0
 
 
@@ -151,11 +220,6 @@ async def test_update_listings_closes_the_session_on_failure(
 async def test_a_failed_pass_is_reported_through_the_module_logger(
     mock_db_session,
 ):
-    """A failed pass reports through the structured logging helper.
-
-    Asserts the helper receives this module's own logger, the ingestion
-    failure message, the raised error, and no message text.
-    """
     failure = RuntimeError(PROVIDER_FAILURE_DETAIL)
 
     with patch(
@@ -188,10 +252,6 @@ async def test_a_failed_pass_is_reported_through_the_module_logger(
 async def test_a_failed_pass_writes_no_failure_detail_to_a_stream(
     mock_db_session, capsys
 ):
-    """A failed pass writes the failure detail to no stream.
-
-    The real logging path runs rather than a stand-in for it.
-    """
     with patch(
         TASK_MODULE + '.SessionLocal', return_value=mock_db_session
     ):
@@ -211,7 +271,6 @@ async def test_a_failed_pass_writes_no_failure_detail_to_a_stream(
         assert BARE_PRINT_SIGNATURE not in stream
         assert PROVIDER_FAILURE_DETAIL not in stream
 
-    # The pass reached its failure path.
     assert mock_db_session.rollback.call_count == 1
     assert mock_db_session.close.call_count == 1
 
@@ -323,6 +382,110 @@ async def test_a_record_failing_the_contract_is_discarded(
     rows = db.query(Listing).all()
     assert len(rows) == 1
     assert getattr(rows[0], IDENTITY_COLUMN) == LISTING_URL
+
+
+@pytest.mark.asyncio
+async def test_a_value_the_database_cannot_bind_is_a_record_refusal(
+    session_factory, db, saved_zip_code
+):
+    """A parameter that cannot be prepared discards that record only.
+
+    The failure is raised for one statement before the database receives
+    it, so it names the record being written. The pass is asserted to
+    complete, to record the refusal, and to store the other record.
+    """
+    refused = _provider_listing()
+    accepted = _provider_listing(listing_url=SECOND_LISTING_URL)
+
+    with patch(TASK_MODULE + '.SessionLocal', session_factory):
+        with patch(
+            TASK_MODULE + '.fetch_listings',
+            return_value=[refused, accepted],
+        ):
+            with patch(
+                TASK_MODULE + '._new_listing',
+                side_effect=_unbindable_then_valid(),
+            ):
+                with _collected_task_records() as records:
+                    await update_listings()
+
+    rows = db.query(Listing).all()
+    assert [getattr(row, IDENTITY_COLUMN) for row in rows] == [
+        SECOND_LISTING_URL
+    ]
+
+    messages = [record.getMessage() for record in records]
+    assert RECORD_REFUSED_MESSAGE in messages
+    assert INGESTION_FAILED_MESSAGE not in messages
+    assert PASS_COMPLETED_MESSAGE in messages
+    refusal = _record_named(records, RECORD_REFUSED_MESSAGE)
+    assert refusal.exception_type == 'StatementError'
+    assert getattr(refusal, 'identity_column') == IDENTITY_COLUMN
+
+
+@pytest.mark.asyncio
+async def test_a_defect_raising_value_error_ends_the_pass(
+    session_factory, db, saved_zip_code
+):
+    """A bare ``ValueError`` is a defect, not a record the database refused.
+
+    The pass is asserted to roll back, to store nothing, to report the
+    failure through the ingestion failure path, and to report no
+    completion, so a defect can never be counted as a refused record on a
+    pass that reported success.
+    """
+    with patch(TASK_MODULE + '.SessionLocal', session_factory):
+        with patch(
+            TASK_MODULE + '.fetch_listings',
+            return_value=[_provider_listing()],
+        ):
+            with patch(
+                TASK_MODULE + '._new_listing',
+                side_effect=ValueError(DEFECT_DETAIL),
+            ):
+                with _collected_task_records() as records:
+                    await update_listings()
+
+    assert db.query(Listing).count() == 0
+
+    messages = [record.getMessage() for record in records]
+    assert INGESTION_FAILED_MESSAGE in messages
+    assert RECORD_REFUSED_MESSAGE not in messages
+    assert PASS_COMPLETED_MESSAGE not in messages
+    failure = _record_named(records, INGESTION_FAILED_MESSAGE)
+    assert failure.exception_type == 'ValueError'
+
+
+@pytest.mark.asyncio
+async def test_a_lost_connection_ends_the_pass(
+    session_factory, db, saved_zip_code
+):
+    """A driver error that describes the session ends the pass.
+
+    ``OperationalError`` applies to every record equally, so it is
+    asserted to reach the ingestion failure path rather than the
+    record-refusal path.
+    """
+    with patch(TASK_MODULE + '.SessionLocal', session_factory):
+        with patch(
+            TASK_MODULE + '.fetch_listings',
+            return_value=[_provider_listing()],
+        ):
+            with patch(
+                TASK_MODULE + '._new_listing',
+                side_effect=OperationalError(
+                    'INSERT INTO listings', {}, Exception('gone')
+                ),
+            ):
+                with _collected_task_records() as records:
+                    await update_listings()
+
+    assert db.query(Listing).count() == 0
+
+    messages = [record.getMessage() for record in records]
+    assert INGESTION_FAILED_MESSAGE in messages
+    assert RECORD_REFUSED_MESSAGE not in messages
+    assert PASS_COMPLETED_MESSAGE not in messages
 
 
 @pytest.mark.asyncio

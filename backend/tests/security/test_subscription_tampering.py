@@ -1,15 +1,15 @@
-"""Price and entitlement tampering regression tests.
+"""Price and entitlement tampering.
 
-This module is the named verifier for two findings.
+Two properties are covered.
 
-* **H-2** -- the client dictated the charge amount and the entitlement
-  dates. Every ``test_h2_*`` case here submits a tampered subscription
-  request and asserts the server's own values won: the tampered field is
-  refused, no row carries it, the stored price is the plan catalog's
-  price, and the stored entitlement window is the catalog period measured
-  from the server clock.
-* **H-3** -- payment capture accepted both identifiers from the caller
-  with no ownership check. Every ``test_h3_*`` case drives
+* The price and the entitlement window are the server's own. Every
+  ``test_h2_*`` case submits a tampered subscription request and asserts
+  that the tampered field is refused, that no row carries it, that the
+  stored price is the plan catalog's price, and that the stored
+  entitlement window is the catalog period measured from the server
+  clock.
+* Capture is bound to the account that opened the order. Every
+  ``test_h3_*`` case drives
   :func:`backend.app.services.paypal_service.capture_order`, whose
   server-side lookup resolves the stored ``paypal_order_id`` to its row
   and compares that row's owner with the authenticated principal.
@@ -21,19 +21,16 @@ Every outbound PayPal call is served by a stand-in installed at the
 transport boundary of :mod:`backend.app.services.paypal_service`, so no
 case reaches the network. The stand-in records each call, which is what
 the "no payment call was made" assertions read.
-
-Rationale for the choices made here -- including the three places where
-the implemented behaviour differs from the shape this module was
-originally described with -- is recorded in
-``docs/security/DECISION_LOG.md`` section 18, not in this file.
 """
 
+import json
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from conftest import assert_paypal_call
 from fastapi import status
 from sqlalchemy import inspect as sqlalchemy_inspect
 
@@ -113,12 +110,18 @@ UNKNOWN_PLAN_IDS = (
 
 
 class StandInResponse(object):
-    """One provider response served at the transport boundary."""
+    """One provider response served at the transport boundary.
+
+    ``content`` and the declared length are derived from the payload, so
+    the service's response-size cap is applied to this stand-in exactly as
+    it is to a real response.
+    """
 
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
         self._payload = {} if payload is None else payload
-        self.headers = {}
+        self.content = json.dumps(self._payload).encode("utf-8")
+        self.headers = {"Content-Length": str(len(self.content))}
 
     def json(self):
         """Returns the decoded body this response carries."""
@@ -132,25 +135,39 @@ class StandInResponse(object):
 class RecordingTransport(object):
     """Serves queued responses and records every call it is handed.
 
-    ``calls`` holds one ``(url, kwargs)`` pair per call, in order. The
+    Every call is asserted against the provider wire contract before a
+    response is served, so a call carrying the wrong method, host, path,
+    authentication, headers, body or timeout raises rather than receiving
+    a plausible answer. ``calls`` holds one ``(url, kwargs)`` pair per
+    call, in order, and ``routes`` the contract route each addressed. The
     last queued response is served repeatedly once the queue is down to
     it.
+
+    Only the two call shapes the service makes are served: ``post`` and
+    ``request``. The service reads an order through ``request`` with an
+    explicit method, so no ``get`` shape exists here to answer one.
     """
 
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+        self.routes = []
 
-    async def post(self, url, **kwargs):
-        """Records one call and returns the response due for it."""
+    def _serve(self, method, url, kwargs):
+        """Asserts one call and returns the response due for it."""
+        self.routes.append(assert_paypal_call(method, url, **kwargs))
         self.calls.append((url, kwargs))
         if len(self._responses) > 1:
             return self._responses.pop(0)
         return self._responses[0]
 
-    async def get(self, url, **kwargs):
-        """Records one read and returns the response due for it."""
-        return await self.post(url, **kwargs)
+    async def post(self, url, **kwargs):
+        """Records one write and returns the response due for it."""
+        return self._serve('POST', url, kwargs)
+
+    async def request(self, method, url, **kwargs):
+        """Records one call of ``method`` and returns its response."""
+        return self._serve(method, url, kwargs)
 
 
 @contextmanager
@@ -374,14 +391,6 @@ def test_h2_a_client_supplied_amount_is_refused_and_never_reaches_the_row(
     client, db, registered_user, auth_header_factory, plan_id,
     tampered_amount,
 ):
-    """A body carrying an amount is refused and never reaches a row.
-
-    Asserts the response status is the one the generated schema declares
-    for a refused body, that no subscription row exists after the
-    refusal, and that no provider call was issued. The clean request is
-    then submitted and the row it stores is asserted to carry the
-    catalog amount and currency and not the submitted amount.
-    """
     plan = get_plan(plan_id)
     submitted = Decimal(tampered_amount)
     headers = auth_header_factory(registered_user)
@@ -415,12 +424,6 @@ def test_h2_a_client_supplied_price_field_is_refused(
     client, db, registered_user, auth_header_factory, plan_id,
     tampered_field,
 ):
-    """A body carrying any out-of-contract field is refused.
-
-    Asserts the refusal status, that nothing was stored, and that no
-    provider call was issued. The fields include ``payment_method``,
-    which the request contract does not declare.
-    """
     body = {'plan_id': plan_id, tampered_field: 'paypal'}
     with provider_transport([order_reply()]) as transport:
         response = open_subscription(
@@ -436,11 +439,6 @@ def test_h2_a_client_supplied_price_field_is_refused(
 def test_h2_the_stored_price_is_the_catalog_price(
     client, db, registered_user, auth_header_factory, plan_id,
 ):
-    """The clean request stores the catalog amount and currency.
-
-    Both values are read from :func:`get_plan`, so each assertion is an
-    equality with the catalog itself.
-    """
     plan = get_plan(plan_id)
     with provider_transport([order_reply()]) as transport:
         response = open_subscription(
@@ -474,13 +472,6 @@ def test_h2_a_client_supplied_entitlement_window_is_refused(
     client, db, registered_user, auth_header_factory, plan_id,
     tampered_window,
 ):
-    """A body carrying entitlement dates is refused and stores nothing.
-
-    Asserts the refusal status, that no subscription row exists after the
-    refusal, and that no provider call was issued. The clean request is
-    then submitted and the row it stores is asserted to carry neither
-    submitted date.
-    """
     headers = auth_header_factory(registered_user)
     body = {'plan_id': plan_id}
     body.update(tampered_window)
@@ -510,12 +501,6 @@ def test_h2_a_client_supplied_entitlement_window_is_refused(
 def test_h2_the_opened_row_carries_no_entitlement_window(
     client, db, registered_user, auth_header_factory, plan_id,
 ):
-    """The clean request stores a server-clock start and no end.
-
-    Asserts the stored ``start_date`` is within the tolerated window of
-    the clock this case reads, and that ``end_date`` is absent, so no
-    date a client could have sent is present on the row at all.
-    """
     with provider_transport([order_reply()]) as transport:
         response = open_subscription(
             client,
@@ -535,14 +520,6 @@ def test_h2_the_opened_row_carries_no_entitlement_window(
 def test_h2_the_entitlement_window_is_the_catalog_period(
     client, db, registered_user, auth_header_factory, plan_id,
 ):
-    """The settled row's window is the catalog period from the clock.
-
-    The window is measured after the settlement that grants it: the
-    stored ``start_date`` is within the tolerated window of the clock,
-    and ``end_date`` minus ``start_date`` equals the plan's own
-    ``period_days`` read from :func:`get_plan`. The role the plan
-    carries is stored on the account by the same settlement.
-    """
     plan = get_plan(plan_id)
     with provider_transport(
         [order_reply(), capture_reply(plan)]
@@ -579,13 +556,6 @@ def test_h2_the_entitlement_window_is_the_catalog_period(
 def test_h2_an_unknown_plan_is_refused_before_any_row_or_payment_call(
     client, db, registered_user, auth_header_factory, unknown_plan_id,
 ):
-    """An identifier the catalog does not publish is refused.
-
-    Asserts the refusal status, that the subscriptions table holds the
-    same number of rows as before the request and is empty, and that the
-    payment transport was never invoked, so the refusal precedes both the
-    write and the outbound call.
-    """
     count_before = db.query(SubscriptionModel).count()
     with provider_transport([order_reply()]) as transport:
         response = open_subscription(
@@ -602,19 +572,6 @@ def test_h2_an_unknown_plan_is_refused_before_any_row_or_payment_call(
 
 
 def test_h2_the_catalog_is_the_only_source_of_plan_identifiers():
-    """The catalog publishes exactly the two known identifiers.
-
-    Asserts :data:`PLAN_IDS` holds those two and nothing else, that
-    :func:`get_plan` raises :class:`UnknownPlanError` for every
-    unrecognised identifier and retains the rejected value, and that
-    each published entry carries a positive amount, a currency and a
-    positive period.
-
-    Also asserts that no amount in :data:`TAMPERED_AMOUNTS` equals a
-    published amount and that no published period is shared by both
-    plans, so the inequality and per-plan period assertions the other
-    cases make cannot hold by coincidence.
-    """
     assert PLAN_IDS == frozenset({PREMIUM_MONTHLY, PREMIUM_ANNUAL})
     assert set(CATALOG_PLAN_IDS) == set(PLAN_IDS)
 
@@ -641,12 +598,6 @@ def test_h2_the_catalog_is_the_only_source_of_plan_identifiers():
 async def test_h3_capturing_another_principals_order_is_refused(
     db, registered_user, second_registered_user,
 ):
-    """A capture presented by a non-owner is refused before any call.
-
-    Asserts :class:`OrderOwnershipError` is raised for the order stored
-    against the first principal when the second presents it, and that
-    the payment transport recorded no call, so nothing left the process.
-    """
     plan = get_plan(PREMIUM_MONTHLY)
     seed_owned_order(db, registered_user)
 
@@ -665,13 +616,6 @@ async def test_h3_capturing_another_principals_order_is_refused(
 async def test_h3_a_refused_capture_changes_no_stored_state(
     db, registered_user, second_registered_user,
 ):
-    """A refused capture leaves every stored value as it was.
-
-    Asserts the owning row's every mapped column, the subscription row
-    count, the delivery-record count and both principals' stored roles
-    are identical before and after the refusal. The comparison covers
-    every value the capture path writes.
-    """
     plan = get_plan(PREMIUM_MONTHLY)
     owned = seed_owned_order(db, registered_user)
 
@@ -706,12 +650,6 @@ async def test_h3_a_refused_capture_changes_no_stored_state(
 async def test_h3_an_unstored_order_is_refused_on_the_same_terms(
     db, registered_user,
 ):
-    """An identifier resolving to no row is refused identically.
-
-    Asserts the owner of a stored order cannot capture an identifier the
-    service never stored, so the lookup refuses an unmatched identifier
-    as well as one belonging to somebody else.
-    """
     plan = get_plan(PREMIUM_MONTHLY)
     seed_owned_order(db, registered_user)
 
@@ -726,13 +664,6 @@ async def test_h3_an_unstored_order_is_refused_on_the_same_terms(
 async def test_h3_capture_proceeds_and_settles_for_the_owning_principal(
     db, registered_user,
 ):
-    """The owner's own order is captured and settles for the plan price.
-
-    Asserts exactly one provider call was issued, that the returned
-    envelope measures as a completed capture against the catalog amount
-    and currency, and that it carries the provider's own capture
-    identifier.
-    """
     plan = get_plan(PREMIUM_MONTHLY)
     seed_owned_order(db, registered_user)
 

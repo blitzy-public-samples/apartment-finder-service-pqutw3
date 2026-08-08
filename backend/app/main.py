@@ -343,7 +343,7 @@ _REQUEST_MESSAGE = "http.request"
 _EVALUATED_LIMIT_ATTRIBUTE = "view_rate_limit"
 
 # Request-state attribute marking a request already counted, which the
-# endpoint decorators read so that one request is counted once.
+# endpoint decorators read. One request is counted once.
 _COUNTED_ATTRIBUTE = "_rate_limiting_complete"
 
 # ASGI message type carrying the response status and headers.
@@ -419,15 +419,13 @@ def _inline_script_sources(body: bytes) -> Tuple[str, ...]:
 def _documentation_policy(body: bytes) -> str:
     """Returns the content-security policy for one documentation page.
 
-    Everything stays denied by default. Script and stylesheet are
+    Every directive stays denied by default. Script and stylesheet are
     admitted from the pinned viewer origin, and an inline script only by
-    the digest of its own content, so a script this page did not itself
-    carry cannot run. Inline style is admitted because the viewers write
-    their styles into the page as they render it, the worker one viewer
-    builds from the page to index the schema for its search is admitted
-    from that blob source, and same-origin connections are admitted so
-    the page can read the schema it documents. Framing, base URI and form
-    submission stay denied exactly as they are on an API response.
+    the digest of its own content, so a script the page did not itself
+    carry does not run. Inline style is admitted, the worker source
+    admits the blob a viewer builds from the page, and connections are
+    admitted same-origin only. Framing, base URI and form submission
+    stay denied exactly as they are on an API response.
     """
     script_sources = " ".join(
         (DOCUMENTATION_VIEWER_ORIGIN,) + _inline_script_sources(body)
@@ -854,8 +852,8 @@ class TrustedHostGateMiddleware(TrustedHostMiddleware):
 
         The host is matched exactly and against a ``*.`` suffix pattern,
         as the base middleware matches it, and a host it would redirect
-        to the ``www.`` form counts as not refused so that the redirect
-        is still the base middleware's to issue.
+        to the ``www.`` form counts as not refused, and the redirect is
+        still the base middleware's to issue.
         """
         if (
             self.allow_any

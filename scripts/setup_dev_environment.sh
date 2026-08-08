@@ -7,8 +7,7 @@
 #
 # Every step is checked and the script stops at the first failure, so the
 # closing success message is printed only once all of them have
-# succeeded. Decision rationale is recorded in
-# docs/security/DECISION_LOG.md.
+# succeeded.
 
 # Abort on any failing command, on any unset variable and on any failure
 # within a pipeline, and let the ERR trap below reach every function.
@@ -31,16 +30,42 @@ readonly DB_PORT="5432"
 readonly DB_NAME="apartment_finder"
 readonly DB_ROLE="apartment_finder"
 
-# Variety rules the settings validator applies to SECRET_KEY. A key must
-# carry at least this many distinct characters, must not repeat one
-# character more times in a row than this, and must not carry a longer run
-# of consecutive code points than this.
+# Host the same objects answer to from inside a container. It is the name
+# of the database service in infrastructure/docker/docker-compose.yml and
+# is written into the COMPOSE_DATABASE_URL entry of the environment file.
+readonly COMPOSE_DB_HOST="db"
+
+# Account the schema revisions promote, and the role they promote it to.
+# Both values are fixed in
+# backend/migrations/versions/0002_seed_single_admin.py and must match it.
+readonly ADMIN_EMAIL="test@blitzy.com"
+readonly ADMIN_ROLE="admin"
+
+# Revision carrying the schema, and the revision carrying the grant
+readonly SCHEMA_REVISION="0001"
+readonly SEED_REVISION="0002"
+
+# Variety rules the settings validator applies to SECRET_KEY: a key
+# carries at least this many distinct characters, repeats no character
+# more times in a row than this, and carries no longer run of consecutive
+# code points than this.
 readonly MIN_SIGNING_KEY_DISTINCT_CHARACTERS=12
 readonly MAX_SIGNING_KEY_REPEAT_RUN=3
 readonly MAX_SIGNING_KEY_SEQUENCE_RUN=4
 
 # Keys generate_signing_key produces before it gives up
 readonly SIGNING_KEY_ATTEMPTS=10
+
+# Address the administrator seed revision promotes. The same address is
+# written into the ADMIN_SEED_EMAIL entry of the environment file.
+readonly ADMIN_SEED_EMAIL="test@blitzy.com"
+
+# Length of the generated administrator seed password, in characters
+readonly ADMIN_PASSWORD_LENGTH=24
+
+# Revision applying the schema, which the administrator seed account is
+# stored under before the revision that grants the role is applied.
+readonly SCHEMA_REVISION="0001"
 
 # Interpreter found by check_software
 PYTHON_BIN=""
@@ -53,6 +78,9 @@ VENV_ACTIVATE=""
 
 # Key produced by generate_signing_key
 GENERATED_SIGNING_KEY=""
+
+# Password produced by generate_admin_password
+GENERATED_ADMIN_PASSWORD=""
 
 # Variety rule the key last measured by check_signing_key_variety fails,
 # or the empty string when that key clears every rule
@@ -324,6 +352,40 @@ generate_signing_key() {
     exit 1
 }
 
+# Produce a password satisfying the registration policy the schema
+# module applies: at least twelve characters, an uppercase letter, a
+# lowercase letter, a digit and a special character. The alphabet omits
+# the quoting characters so the value passes through the substitution
+# below and the shell unaltered.
+generate_admin_password() {
+    require_venv_python
+
+    GENERATED_ADMIN_PASSWORD="$("${VENV_PYTHON}" -c '
+import secrets
+import string
+
+SPECIAL = "!@#^&*()-_=+"
+ALPHABET = string.ascii_letters + string.digits + SPECIAL
+LENGTH = '"${ADMIN_PASSWORD_LENGTH}"'
+
+while True:
+    candidate = "".join(secrets.choice(ALPHABET) for _ in range(LENGTH))
+    if (
+        any(character.isupper() for character in candidate)
+        and any(character.islower() for character in candidate)
+        and any(character.isdigit() for character in candidate)
+        and any(character in SPECIAL for character in candidate)
+    ):
+        print(candidate)
+        break
+')"
+
+    if [ -z "${GENERATED_ADMIN_PASSWORD}" ]; then
+        echo "Failed to generate a value for ADMIN_SEED_PASSWORD." >&2
+        exit 1
+    fi
+}
+
 configure_env_vars() {
     echo "Configuring environment variables..."
 
@@ -331,6 +393,7 @@ configure_env_vars() {
     local env_file="${REPO_ROOT}/.env"
     local env_tmp
     local secret_key
+    local admin_password
     local line
 
     if [ ! -f "${env_template}" ]; then
@@ -354,6 +417,13 @@ configure_env_vars() {
                 "script." >&2
             exit 1
         fi
+        if ! grep -q '^ADMIN_SEED_PASSWORD=.\{12,\}$' "${env_file}"; then
+            echo "The existing ${env_file} carries no" \
+                "ADMIN_SEED_PASSWORD of at least 12 characters." >&2
+            echo "Set one meeting the registration password policy, or" \
+                "move the file aside and re-run this script." >&2
+            exit 1
+        fi
         echo "Keeping the existing ${env_file}."
         return 0
     fi
@@ -362,13 +432,21 @@ configure_env_vars() {
     generate_signing_key
     secret_key="${GENERATED_SIGNING_KEY}"
 
+    # Generate the password of the administrator seed account
+    generate_admin_password
+    admin_password="${GENERATED_ADMIN_PASSWORD}"
+
     env_tmp="$(mktemp "${env_file}.XXXXXX")"
     TEMP_FILES+=("${env_tmp}")
 
-    # Write the template through, replacing the SECRET_KEY entry
+    # Write the template through, replacing the generated entries
     while IFS= read -r line || [ -n "${line}" ]; do
         case "${line}" in
             SECRET_KEY=*) printf '%s\n' "SECRET_KEY=${secret_key}" ;;
+            ADMIN_SEED_PASSWORD=*)
+                printf '%s\n' \
+                    "ADMIN_SEED_PASSWORD=${admin_password}"
+                ;;
             *) printf '%s\n' "${line}" ;;
         esac
     done < "${env_template}" > "${env_tmp}"
@@ -380,12 +458,21 @@ configure_env_vars() {
         exit 1
     fi
 
+    # Confirm the ADMIN_SEED_PASSWORD entry carries the generated value
+    if ! grep -q '^ADMIN_SEED_PASSWORD=.\{12,\}$' "${env_tmp}"; then
+        echo "Failed to write a generated ADMIN_SEED_PASSWORD into" \
+            "${env_file}." >&2
+        exit 1
+    fi
+
     # The environment file appears complete or not at all
     mv "${env_tmp}" "${env_file}"
     chmod 600 "${env_file}"
 
     echo "Created ${env_file} from ${env_template} with a generated" \
-        "SECRET_KEY."
+        "SECRET_KEY and a generated ADMIN_SEED_PASSWORD."
+    echo "The administrator seed password is in ${env_file} and is" \
+        "written nowhere else."
     echo "Environment variables configured. Please update the values in" \
         ".env file."
 }
@@ -400,6 +487,7 @@ init_database() {
     local db_password_sql
     local db_password_url
     local database_url
+    local compose_database_url
     local env_tmp
     local line
     local role_present
@@ -461,7 +549,7 @@ sys.stdout.write(urllib.parse.quote(os.environ["SETUP_DB_PASSWORD"],
 
     # Create the role when it is absent and set its password either way.
     # The statement carrying the password is passed over standard input,
-    # so the value does not appear in an argument list.
+    # and the value appears in no argument list.
     role_present="$(psql --no-psqlrc --quiet --tuples-only --no-align \
         --dbname=postgres --command \
         "SELECT 1 FROM pg_roles WHERE rolname = '${DB_ROLE}'")"
@@ -489,17 +577,34 @@ sys.stdout.write(urllib.parse.quote(os.environ["SETUP_DB_PASSWORD"],
         --command \
         "GRANT ALL PRIVILEGES ON DATABASE \"${DB_NAME}\" TO \"${DB_ROLE}\""
 
-    # Write the URL the objects above are reached by
+    # Write the two URLs the objects above are reached by: one naming the
+    # host, for a process running outside a container, and one naming the
+    # database service, for a process running inside one
     database_url="postgresql://${DB_ROLE}:${db_password_url}"
     database_url="${database_url}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+
+    compose_database_url="postgresql://${DB_ROLE}:${db_password_url}"
+    compose_database_url="${compose_database_url}@${COMPOSE_DB_HOST}"
+    compose_database_url="${compose_database_url}:${DB_PORT}/${DB_NAME}"
 
     env_tmp="$(mktemp "${env_file}.XXXXXX")"
     TEMP_FILES+=("${env_tmp}")
 
     while IFS= read -r line || [ -n "${line}" ]; do
         case "${line}" in
-            DATABASE_URL=*) printf '%s\n' "DATABASE_URL=${database_url}" ;;
-            *) printf '%s\n' "${line}" ;;
+            COMPOSE_DATABASE_URL=*)
+                printf '%s\n' \
+                    "COMPOSE_DATABASE_URL=${compose_database_url}"
+                ;;
+            DATABASE_URL=*)
+                printf '%s\n' "DATABASE_URL=${database_url}"
+                ;;
+            POSTGRES_PASSWORD=*)
+                printf '%s\n' "POSTGRES_PASSWORD=${db_password}"
+                ;;
+            *)
+                printf '%s\n' "${line}"
+                ;;
         esac
     done < "${env_file}" > "${env_tmp}"
 
@@ -509,11 +614,145 @@ sys.stdout.write(urllib.parse.quote(os.environ["SETUP_DB_PASSWORD"],
         exit 1
     fi
 
+    if ! grep -q "^COMPOSE_DATABASE_URL=postgresql://${DB_ROLE}:" \
+        "${env_tmp}"; then
+        echo "Failed to write the COMPOSE_DATABASE_URL entry into" \
+            "${env_file}." >&2
+        exit 1
+    fi
+
     mv "${env_tmp}" "${env_file}"
     chmod 600 "${env_file}"
 
     echo "Local database ${DB_NAME} and role ${DB_ROLE} are ready."
-    echo "Wrote the matching DATABASE_URL entry into ${env_file}."
+    echo "Wrote the matching DATABASE_URL and COMPOSE_DATABASE_URL" \
+        "entries into ${env_file}."
+}
+
+# Run an Alembic command from the repository root
+alembic_command() {
+    (cd "${REPO_ROOT}" \
+        && "${VENV_PYTHON}" -m alembic -c backend/alembic.ini "$@")
+}
+
+# Report whether Alembic records the grant revision as applied
+seed_revision_applied() {
+    local reported
+
+    reported="$(alembic_command current 2>&1)"
+    case "${reported}" in
+        *"${SEED_REVISION}"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+
+# Print the count of accounts holding the administrator role and, when
+# exactly one holds it, that account's address
+administrator_summary() {
+    (cd "${REPO_ROOT}" && SETUP_ADMIN_ROLE="${ADMIN_ROLE}" \
+        "${VENV_PYTHON}" - <<'PYTHON'
+import os
+
+from backend.app.db.database import SessionLocal
+from backend.app.db.models import User
+
+session = SessionLocal()
+try:
+    holders = (
+        session.query(User.email)
+        .filter(User.role == os.environ["SETUP_ADMIN_ROLE"])
+        .all()
+    )
+finally:
+    session.close()
+
+print("%d|%s" % (len(holders), holders[0][0] if len(holders) == 1 else ""))
+PYTHON
+    )
+}
+
+# Report whether exactly one account holds the administrator role and it
+# is the account the grant revision promotes
+single_administrator_present() {
+    [ "$(administrator_summary)" = "1|${ADMIN_EMAIL}" ]
+}
+
+# Stop unless exactly one account holds the administrator role
+verify_single_administrator() {
+    local summary
+
+    summary="$(administrator_summary)"
+    if [ "${summary}" != "1|${ADMIN_EMAIL}" ]; then
+        echo "The administrator grant did not settle as required." >&2
+        echo "Expected one holder of the role ${ADMIN_ROLE}," \
+            "${ADMIN_EMAIL}; the database reports" \
+            "${summary%%|*} holder(s)." >&2
+        exit 1
+    fi
+
+    echo "Exactly one account holds the role ${ADMIN_ROLE}:" \
+        "${ADMIN_EMAIL}."
+}
+
+# Store the administrator seed account under the address the grant
+# revision names, with the default role the schema assigns. The account
+# is stored once: a run that finds it already stored leaves it as it is.
+seed_admin_account() {
+    local admin_password
+
+    require_venv_python
+
+    admin_password="$(
+        sed -n 's/^ADMIN_SEED_PASSWORD=//p' "${REPO_ROOT}/.env" \
+            | head -n 1
+    )"
+
+    if [ -z "${admin_password}" ]; then
+        echo "The ADMIN_SEED_PASSWORD entry of ${REPO_ROOT}/.env is" \
+            "empty." >&2
+        echo "Set one meeting the registration password policy and" \
+            "re-run this script." >&2
+        exit 1
+    fi
+
+    (cd "${REPO_ROOT}" \
+        && ADMIN_SEED_EMAIL="${ADMIN_SEED_EMAIL}" \
+           ADMIN_SEED_PASSWORD="${admin_password}" \
+           "${VENV_PYTHON}" -c '
+import os
+import sys
+from datetime import datetime, timezone
+
+from backend.app.core.security import get_password_hash
+from backend.app.db.database import SessionLocal
+from backend.app.db.models import User
+from backend.app.schema.user import UserCreate
+
+email = os.environ["ADMIN_SEED_EMAIL"]
+requested = UserCreate(
+    email=email, password=os.environ["ADMIN_SEED_PASSWORD"]
+)
+
+session = SessionLocal()
+try:
+    stored = session.query(User).filter(User.email == email).first()
+    if stored is not None:
+        print("Account %s is already stored." % email)
+        sys.exit(0)
+    session.add(
+        User(
+            email=requested.email,
+            hashed_password=get_password_hash(requested.password),
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    session.commit()
+finally:
+    session.close()
+
+print("Stored the account %s." % email)
+')
 }
 
 run_migrations() {
@@ -521,11 +760,25 @@ run_migrations() {
 
     require_venv_python
 
-    # Apply the Alembic migrations from the repository root
-    (cd "${REPO_ROOT}" \
-        && "${VENV_PYTHON}" -m alembic -c backend/alembic.ini upgrade head)
+    # Bring the schema to the revision the account row needs
+    if ! seed_revision_applied; then
+        alembic_command upgrade "${SCHEMA_REVISION}"
+    fi
+
+    seed_admin_account
+
+    alembic_command upgrade head
+
+    # Re-apply the grant revision over the account stored above
+    if ! single_administrator_present; then
+        alembic_command downgrade "${SCHEMA_REVISION}"
+        alembic_command upgrade head
+    fi
+
+    verify_single_administrator
 
     echo "Initial data migrations completed."
+    echo "The administrator role is held by ${ADMIN_SEED_EMAIL} alone."
 }
 
 main() {

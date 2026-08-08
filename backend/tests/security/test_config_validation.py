@@ -1,23 +1,41 @@
-"""Regression tests for the startup validation in the settings module.
+"""Startup validation in the settings module.
 
-Every case constructs :class:`backend.app.core.config.Settings` from a
-complete valid baseline with one value replaced, and asserts the
-outcome: a rejected value raises ``ValidationError`` naming the setting
-that failed, and an accepted value resolves as supplied.
+The cases run on two surfaces, and every one of them asserts that a
+misconfiguration is refused rather than accepted.
 
-The cases cover:
+The first surface is the settings class itself. Each case constructs
+:class:`backend.app.core.config.Settings` from a complete valid baseline
+with one or more targeted values overridden, and asserts the outcome: a
+rejected value raises ``ValidationError`` naming the setting that failed,
+and an accepted value resolves as supplied.
 
-* ``SECRET_KEY`` below the byte floor, exactly at it, and one byte
-  under it
-* the ``SECRET_KEY`` placeholder ``scripts/setup_dev_environment.sh``
-  writes, both verbatim and extended past the byte floor
+The second surface is application startup. Each case starts a fresh
+interpreter, hands it the same valid baseline through its environment
+with one value replaced, and imports either
+``backend.app.core.config`` or ``backend.app.main``. A refused value
+must end that interpreter with a non-zero status, before the imported
+module finishes initialising, so a misconfigured deployment cannot serve
+a request.
+
+The validation categories covered are:
+
+* ``SECRET_KEY`` below the byte floor, exactly at it, one byte under it,
+  and carrying no characters at all
+* the ``SECRET_KEY`` value ``your_secret_key_here``, which the validator
+  rejects as a known placeholder, both verbatim and extended past the
+  byte floor
 * ``JWT_ALGORITHMS`` naming an algorithm outside the allowlist, naming
   no algorithm at all, and naming the unsigned algorithm in five letter
   cases
 * ``ENVIRONMENT`` naming production while ``PAYPAL_MODE`` names
   sandbox, the two pairings that are accepted, an unknown name for
   either setting, and a payment base that contradicts the mode
-* the complete valid baseline and the values it resolves to
+* each setting in
+  :data:`backend.app.core.config.PROVIDER_SECRET_SETTINGS` one character
+  below the redaction floor, exactly at it, and registered through the
+  logging module's registry so the two floors are asserted equal
+* the complete valid baseline and the values it resolves to, on both
+  surfaces
 
 :func:`valid_settings` returns the baseline, :func:`build_settings`
 constructs from it, and :func:`rejection_message` returns the text of
@@ -25,22 +43,55 @@ the error one construction raises. The autouse
 :func:`settings_environment` fixture removes every declared setting
 name from the process environment, and every construction passes
 ``_env_file=None``.
+
+:func:`start_interpreter` drives the startup surface. It runs the child
+in a directory of its own, so the repository's own environment file is
+not on the path the settings class reads it from, and hands the child
+only the baseline plus the case's replacement.
 """
 
-from typing import Any, Dict
+import os
+import subprocess
+import sys
+import tempfile
+from typing import Any, Dict, Optional
 
 import pytest
 from pydantic import ValidationError
 
 from backend.app.core.config import (
     ALLOWED_JWT_ALGORITHMS,
+    DEFAULT_ENV_FILE,
+    DEFAULT_MAX_PAGINATION_OFFSET,
+    ENV_FILE_VARIABLE,
+    IN_PROCESS_RATE_LIMIT_SCHEMES,
     LIVE_MODE,
+    MAX_PAGINATION_OFFSET_CEILING,
+    MIN_PROVIDER_SECRET_LENGTH,
     MIN_SIGNING_KEY_BYTES,
     PAYPAL_API_BASES,
+    PROVIDER_SECRET_SETTINGS,
     PRODUCTION_ENVIRONMENT,
     SANDBOX_MODE,
     Settings,
+    _configured_env_file,
+    rate_limit_storage_scheme,
+    settings,
 )
+from backend.app.core.logging import (
+    MIN_SECRET_VALUE_LENGTH,
+    REDACTION_PLACEHOLDER,
+    redact,
+    register_secret_values,
+    registered_secret_count,
+)
+from backend.tests.support import REPO_ROOT
+
+# pytest loads backend/tests/conftest.py as the top-level module
+# ``conftest``. Importing it here under its package path would load the
+# file a second time, and the guards asserted below would then be a
+# separate copy of the ones actually protecting this run.
+import conftest
 
 #: Signing key long enough for every algorithm on the allowlist. It is a
 #: fixed local test value, not a credential.
@@ -58,8 +109,15 @@ UNDERSIZED_SIGNING_KEY = MINIMUM_LENGTH_SIGNING_KEY[:-1]
 #: Signing key far below :data:`MIN_SIGNING_KEY_BYTES`.
 SHORT_SIGNING_KEY = "short-key"
 
-#: The signing key ``scripts/setup_dev_environment.sh`` line 54 writes
-#: into the environment file of every developer environment, verbatim.
+#: Provider credential measuring exactly
+#: :data:`MIN_PROVIDER_SECRET_LENGTH` characters. It is a fixed local
+#: test value, not a credential.
+MINIMUM_PROVIDER_SECRET = "k" * MIN_PROVIDER_SECRET_LENGTH
+
+#: The same credential one character shorter.
+UNDERSIZED_PROVIDER_SECRET = "k" * (MIN_PROVIDER_SECRET_LENGTH - 1)
+
+#: A signing key the validator rejects as a placeholder, verbatim.
 PLACEHOLDER_SIGNING_KEY = "your_secret_key_here"
 
 #: The same placeholder extended past :data:`MIN_SIGNING_KEY_BYTES`.
@@ -92,6 +150,12 @@ SANDBOX_API_BASE = "https://api-m.sandbox.paypal.com"
 #: The PayPal REST API base that belongs to the live mode.
 LIVE_API_BASE = "https://api-m.paypal.com"
 
+#: A rate-limit store whose counters are shared by every process
+#: addressing it. Every environment accepts such a store; the declared
+#: default keeps its counters in one process and is accepted only while
+#: the environment is local.
+SHARED_RATE_LIMIT_STORE = "redis://cache.apartment-finder.dev:6379/0"
+
 
 def valid_settings() -> Dict[str, Any]:
     """Returns a fresh mapping of settings that passes every check.
@@ -111,6 +175,7 @@ def valid_settings() -> Dict[str, Any]:
         "JWT_ALGORITHMS": ["HS256"],
         "ALLOWED_ORIGINS": ["https://app.apartment-finder.dev"],
         "ALLOWED_HOSTS": ["app.apartment-finder.dev"],
+        "RATE_LIMIT_STORAGE_URI": SHARED_RATE_LIMIT_STORE,
         "ZILLOW_API_URL": "https://api.zillow.com/v2/listings",
         "ZILLOW_API_KEY": "listing-provider-test-key",
         "PAYPAL_MODE": "sandbox",
@@ -165,11 +230,164 @@ def settings_environment(monkeypatch):
         monkeypatch.delenv(name.lower(), raising=False)
 
 
+# --- The startup surface ---------------------------------------------
+
+
+#: Module imported by a startup case that names no other.
+STARTUP_MODULE = "backend.app.main"
+
+#: Settings module, imported by the cases that assert the refusal
+#: happens in the settings themselves rather than later in assembly.
+SETTINGS_MODULE = "backend.app.core.config"
+
+#: Written to standard output by a child interpreter that finished its
+#: import. Its absence is how a case asserts initialisation stopped.
+STARTUP_MARKER = "APPLICATION-INITIALISED"
+
+#: Seconds a child interpreter is allowed before it is abandoned.
+STARTUP_TIMEOUT_SECONDS = 180.0
+
+#: Names taken from this process's environment so a child interpreter can
+#: run at all. None of them is a setting.
+PASSTHROUGH_ENVIRONMENT = (
+    "COMSPEC",
+    "NUMBER_OF_PROCESSORS",
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "WINDIR",
+)
+
+#: The class of error a refused setting ends a child interpreter with.
+STARTUP_ERROR_NAME = "ValidationError"
+
+
+def _child_environment(overrides: Dict[str, Any]) -> Dict[str, str]:
+    """Returns the environment one child interpreter is handed.
+
+    It carries the values needed to run an interpreter, the repository
+    root as the import path, the complete valid baseline, and
+    ``overrides`` applied over that baseline. A value of ``None`` removes
+    the name instead of setting it.
+    """
+    environment = dict(
+        (name, os.environ[name])
+        for name in PASSTHROUGH_ENVIRONMENT
+        if name in os.environ
+    )
+    environment["PYTHONPATH"] = str(REPO_ROOT)
+    environment["PYTHONIOENCODING"] = "utf-8"
+    for name, value in valid_settings().items():
+        environment[name] = _as_environment_value(value)
+    for name, value in overrides.items():
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = _as_environment_value(value)
+    return environment
+
+
+def _as_environment_value(value: Any) -> str:
+    """Returns one setting value in the form an environment carries.
+
+    A list is joined with commas, which
+    :meth:`backend.app.core.config.Settings.Config.parse_env_var` reads
+    back as a list. Any other value is rendered as text.
+    """
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(entry) for entry in value)
+    return str(value)
+
+
+class StartupOutcome(object):
+    """What one child interpreter did with the settings it was handed."""
+
+    def __init__(self, module: str, completed: Any) -> None:
+        self.module = module
+        self.returncode = completed.returncode
+        self.stdout = completed.stdout.decode("utf-8", "replace")
+        self.stderr = completed.stderr.decode("utf-8", "replace")
+
+    @property
+    def started(self) -> bool:
+        """Reports whether the imported module finished initialising."""
+        return STARTUP_MARKER in self.stdout
+
+    def __repr__(self) -> str:
+        return (
+            "StartupOutcome(module={0!r}, returncode={1!r}, "
+            "stdout={2!r}, stderr={3!r})".format(
+                self.module, self.returncode, self.stdout, self.stderr
+            )
+        )
+
+
+def start_interpreter(
+    module: str = STARTUP_MODULE,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> StartupOutcome:
+    """Returns what a fresh interpreter did importing ``module``.
+
+    The child runs in a directory of its own, so the repository's
+    environment file is not on the relative path
+    ``Settings.Config.env_file`` names, and its whole configuration is
+    the baseline plus ``overrides``. It writes :data:`STARTUP_MARKER` to
+    standard output once the import has returned, and is abandoned after
+    :data:`STARTUP_TIMEOUT_SECONDS`.
+    """
+    program = (
+        "import {0}\n"
+        "import sys\n"
+        "sys.stdout.write({1!r})\n"
+    ).format(module, STARTUP_MARKER)
+    environment = _child_environment(overrides or {})
+    with tempfile.TemporaryDirectory() as working_directory:
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", program],
+                cwd=working_directory,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=STARTUP_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as expired:
+            raise AssertionError(
+                "importing {0} did not finish within {1} seconds; "
+                "stdout={2!r} stderr={3!r}".format(
+                    module,
+                    STARTUP_TIMEOUT_SECONDS,
+                    expired.stdout,
+                    expired.stderr,
+                )
+            ) from None
+    return StartupOutcome(module, completed)
+
+
+def assert_startup_refused(
+    outcome: StartupOutcome, setting: str, fragment: str
+) -> None:
+    """Asserts a child interpreter refused the settings it was handed.
+
+    Four properties are asserted: the interpreter ended with a non-zero
+    status, the module never finished initialising, the report names the
+    setting that was refused, and the report carries ``fragment`` and the
+    name of the error a refused setting raises.
+    """
+    assert outcome.returncode != 0, outcome
+    assert not outcome.started, outcome
+    assert setting in outcome.stderr, outcome
+    assert fragment in outcome.stderr, outcome
+    assert STARTUP_ERROR_NAME in outcome.stderr, outcome
+
+
 # --- Positive control ------------------------------------------------
 
 
 def test_the_valid_baseline_configuration_is_accepted():
-    """The complete baseline constructs and resolves as supplied."""
     baseline = valid_settings()
     settings = build_settings()
     assert settings.ENVIRONMENT == baseline["ENVIRONMENT"]
@@ -184,7 +402,6 @@ def test_the_valid_baseline_configuration_is_accepted():
 
 
 def test_the_baseline_normalises_delimited_and_cased_settings():
-    """A delimited list resolves to a list and a name folds its case."""
     delimited = build_settings(JWT_ALGORITHMS="HS256,HS384")
     assert delimited.JWT_ALGORITHMS == ["HS256", "HS384"]
     cased = build_settings(
@@ -196,11 +413,10 @@ def test_the_baseline_normalises_delimited_and_cased_settings():
     assert cased.PAYPAL_MODE == "live"
 
 
-# --- C-1: weak or placeholder signing key ----------------------------
+# --- Signing-key validation ------------------------------------------
 
 
 def test_a_signing_key_below_the_minimum_length_is_rejected():
-    """A signing key far below the byte floor is refused."""
     message = rejection_message(SECRET_KEY=SHORT_SIGNING_KEY)
     assert "SECRET_KEY" in message
     assert (
@@ -210,7 +426,6 @@ def test_a_signing_key_below_the_minimum_length_is_rejected():
 
 
 def test_a_signing_key_of_exactly_the_minimum_length_is_accepted():
-    """A signing key measuring exactly the byte floor is accepted."""
     assert MIN_SIGNING_KEY_BYTES == 32
     assert (
         len(MINIMUM_LENGTH_SIGNING_KEY.encode("utf-8"))
@@ -224,7 +439,6 @@ def test_a_signing_key_of_exactly_the_minimum_length_is_accepted():
 
 
 def test_a_signing_key_one_byte_below_the_minimum_is_rejected():
-    """A signing key one byte under the byte floor is refused."""
     assert (
         len(UNDERSIZED_SIGNING_KEY.encode("utf-8"))
         == MIN_SIGNING_KEY_BYTES - 1
@@ -244,14 +458,12 @@ def test_a_signing_key_one_byte_below_the_minimum_is_rejected():
 
 
 def test_the_setup_script_placeholder_signing_key_is_rejected():
-    """The placeholder the setup script writes is refused verbatim."""
     assert PLACEHOLDER_SIGNING_KEY == "your_secret_key_here"
     message = rejection_message(SECRET_KEY=PLACEHOLDER_SIGNING_KEY)
     assert "SECRET_KEY" in message
 
 
 def test_a_padded_placeholder_signing_key_is_still_rejected():
-    """A placeholder extended past the byte floor is refused."""
     assert PADDED_PLACEHOLDER_SIGNING_KEY.startswith(
         PLACEHOLDER_SIGNING_KEY
     )
@@ -267,17 +479,15 @@ def test_a_padded_placeholder_signing_key_is_still_rejected():
 
 
 def test_a_blank_signing_key_is_rejected():
-    """A signing key carrying no characters is refused."""
     message = rejection_message(SECRET_KEY="   ")
     assert "SECRET_KEY" in message
     assert "must not be blank" in message
 
 
-# --- C-2: algorithm read from unvalidated configuration ---------------
+# --- JWT algorithm validation ----------------------------------------
 
 
 def test_the_algorithm_allowlist_is_immutable_and_holds_only_hmac():
-    """The allowlist is a frozen set of the three HMAC algorithms."""
     assert ALLOWLISTED_ALGORITHMS == ("HS256", "HS384", "HS512")
     assert isinstance(ALLOWED_JWT_ALGORITHMS, frozenset)
     assert ALLOWED_JWT_ALGORITHMS == frozenset(ALLOWLISTED_ALGORITHMS)
@@ -285,7 +495,6 @@ def test_the_algorithm_allowlist_is_immutable_and_holds_only_hmac():
 
 @pytest.mark.parametrize("algorithm", UNLISTED_ALGORITHMS)
 def test_an_algorithm_outside_the_allowlist_is_rejected(algorithm):
-    """An algorithm absent from the allowlist is refused."""
     assert algorithm not in ALLOWED_JWT_ALGORITHMS
     message = rejection_message(JWT_ALGORITHMS=[algorithm])
     assert "JWT_ALGORITHMS" in message
@@ -298,8 +507,6 @@ def test_an_algorithm_outside_the_allowlist_is_rejected(algorithm):
 def test_an_unlisted_algorithm_is_rejected_beside_a_listed_one(
     algorithm,
 ):
-    """A list pairing an accepted algorithm with an unlisted one is
-    refused."""
     message = rejection_message(
         JWT_ALGORITHMS=["HS256", algorithm]
     )
@@ -309,20 +516,17 @@ def test_an_unlisted_algorithm_is_rejected_beside_a_listed_one(
 
 @pytest.mark.parametrize("algorithm", ALLOWLISTED_ALGORITHMS)
 def test_every_allowlisted_algorithm_is_accepted(algorithm):
-    """Each algorithm the allowlist holds constructs."""
     settings = build_settings(JWT_ALGORITHMS=[algorithm])
     assert settings.JWT_ALGORITHMS == [algorithm]
 
 
 def test_an_empty_algorithm_list_is_rejected():
-    """Naming no algorithm at all is refused."""
     message = rejection_message(JWT_ALGORITHMS=[])
     assert "JWT_ALGORITHMS" in message
     assert "must not be empty" in message
 
 
 def test_the_unsigned_algorithm_cases_cover_a_mixed_case_spelling():
-    """The refused spellings include a mixed-case ``NoNe``."""
     assert "none" in UNSIGNED_ALGORITHM_SPELLINGS
     assert "NoNe" in UNSIGNED_ALGORITHM_SPELLINGS
     assert all(
@@ -335,7 +539,6 @@ def test_the_unsigned_algorithm_cases_cover_a_mixed_case_spelling():
 def test_the_unsigned_algorithm_is_rejected_in_any_letter_case(
     spelling,
 ):
-    """Every letter case of the unsigned algorithm name is refused."""
     message = rejection_message(JWT_ALGORITHMS=[spelling])
     assert "JWT_ALGORITHMS" in message
     assert "must not name an unsigned algorithm" in message
@@ -345,8 +548,6 @@ def test_the_unsigned_algorithm_is_rejected_in_any_letter_case(
 def test_the_unsigned_algorithm_is_rejected_beside_a_listed_one(
     spelling,
 ):
-    """A list pairing an accepted algorithm with the unsigned one is
-    refused."""
     message = rejection_message(
         JWT_ALGORITHMS=["HS256", spelling]
     )
@@ -354,11 +555,10 @@ def test_the_unsigned_algorithm_is_rejected_beside_a_listed_one(
     assert "must not name an unsigned algorithm" in message
 
 
-# --- C-3: payment mode fixed by validated configuration --------------
+# --- Payment-mode validation -----------------------------------------
 
 
 def test_production_paired_with_sandbox_payment_mode_is_rejected():
-    """Production paired with the sandbox payment mode is refused."""
     assert PRODUCTION_ENVIRONMENT == "production"
     assert SANDBOX_MODE == "sandbox"
     assert PAYPAL_API_BASES[SANDBOX_MODE] == SANDBOX_API_BASE
@@ -372,7 +572,6 @@ def test_production_paired_with_sandbox_payment_mode_is_rejected():
 
 
 def test_production_paired_with_live_payment_mode_is_accepted():
-    """Production paired with the live payment mode constructs."""
     assert LIVE_MODE == "live"
     assert PAYPAL_API_BASES[LIVE_MODE] == LIVE_API_BASE
     settings = build_settings(
@@ -389,7 +588,6 @@ def test_production_paired_with_live_payment_mode_is_accepted():
 def test_a_non_production_environment_accepts_sandbox_payment_mode(
     environment,
 ):
-    """The sandbox payment mode constructs outside production."""
     assert environment != PRODUCTION_ENVIRONMENT
     settings = build_settings(ENVIRONMENT=environment)
     assert settings.ENVIRONMENT == environment
@@ -398,7 +596,6 @@ def test_a_non_production_environment_accepts_sandbox_payment_mode(
 
 
 def test_a_payment_base_that_contradicts_the_mode_is_rejected():
-    """A payment base belonging to the other mode is refused."""
     message = rejection_message(
         PAYPAL_MODE="live",
         PAYPAL_API_BASE=SANDBOX_API_BASE,
@@ -408,7 +605,6 @@ def test_a_payment_base_that_contradicts_the_mode_is_rejected():
 
 
 def test_an_unknown_environment_name_is_rejected():
-    """An environment name outside the accepted set is refused."""
     message = rejection_message(ENVIRONMENT="prod")
     assert "ENVIRONMENT" in message
     assert "must be one of" in message
@@ -416,9 +612,434 @@ def test_an_unknown_environment_name_is_rejected():
 
 
 def test_an_unknown_payment_mode_is_rejected():
-    """A payment mode outside the accepted set is refused."""
     message = rejection_message(PAYPAL_MODE="test")
     assert "PAYPAL_MODE" in message
     assert "must be one of" in message
     for mode in (SANDBOX_MODE, LIVE_MODE):
         assert mode in message
+
+
+# --- Provider credentials the redaction registry must be able to hold --
+
+
+@pytest.mark.parametrize("setting", PROVIDER_SECRET_SETTINGS)
+def test_a_provider_credential_below_the_redaction_floor_is_rejected(
+    setting,
+):
+    """A credential the registry would not hold is refused."""
+    message = rejection_message(**{setting: UNDERSIZED_PROVIDER_SECRET})
+    assert setting in message
+    assert str(MIN_PROVIDER_SECRET_LENGTH) in message
+
+
+@pytest.mark.parametrize("setting", PROVIDER_SECRET_SETTINGS)
+def test_a_provider_credential_at_the_redaction_floor_is_accepted(
+    setting,
+):
+    """A credential of exactly the floor length constructs."""
+    settings = build_settings(**{setting: MINIMUM_PROVIDER_SECRET})
+    assert getattr(settings, setting) == MINIMUM_PROVIDER_SECRET
+
+
+@pytest.mark.parametrize("setting", PROVIDER_SECRET_SETTINGS)
+def test_every_accepted_provider_credential_can_be_registered(setting):
+    """The floor here is the floor the redaction registry applies.
+
+    The accepted value is registered through the logging module's own
+    registry, and the count it reports is asserted to have grown, so the
+    two floors cannot drift apart unnoticed.
+    """
+    assert MIN_PROVIDER_SECRET_LENGTH == MIN_SECRET_VALUE_LENGTH
+
+    accepted = getattr(
+        build_settings(**{setting: MINIMUM_PROVIDER_SECRET}), setting
+    )
+    before = registered_secret_count()
+    after = register_secret_values(accepted)
+
+    assert after >= before
+    assert REDACTION_PLACEHOLDER in redact(
+        "provider rejected " + accepted
+    )
+
+
+# --- Startup: the valid baseline reaches a running application -------
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        pytest.param(SETTINGS_MODULE, id="settings_module"),
+        pytest.param(STARTUP_MODULE, id="application_entrypoint"),
+    ],
+)
+def test_the_valid_baseline_starts_a_fresh_interpreter(module):
+    """A fresh interpreter imports the module and reports success.
+
+    This is the positive control for every startup case below: it proves
+    the baseline handed to a child interpreter is one that starts, so a
+    refusal in a case below is the case's own replacement and not the
+    harness.
+    """
+    outcome = start_interpreter(module)
+
+    assert outcome.returncode == 0, outcome
+    assert outcome.started, outcome
+    assert outcome.stderr == "", outcome
+
+
+def test_the_startup_harness_reads_no_repository_environment_file():
+    """The child reads no environment file from the repository.
+
+    The child runs in a directory of its own and is handed a signing key
+    that only this case supplies, so the value it resolves proves the
+    repository's own environment file did not reach it.
+    """
+    supplied = "startup-harness-signing-key-for-this-case-only!!"
+    program = (
+        "import sys\n"
+        "from backend.app.core.config import settings\n"
+        "sys.stdout.write(settings.SECRET_KEY)\n"
+    )
+    environment = _child_environment({"SECRET_KEY": supplied})
+    with tempfile.TemporaryDirectory() as working_directory:
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=working_directory,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=STARTUP_TIMEOUT_SECONDS,
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.decode("utf-8") == supplied
+
+
+# --- Startup: C-1, a weak or placeholder signing key -----------------
+
+
+@pytest.mark.parametrize(
+    "key, fragment",
+    [
+        pytest.param(
+            SHORT_SIGNING_KEY,
+            "at least {0} UTF-8 bytes".format(MIN_SIGNING_KEY_BYTES),
+            id="far_below_the_byte_floor",
+        ),
+        pytest.param(
+            UNDERSIZED_SIGNING_KEY,
+            "at least {0} UTF-8 bytes".format(MIN_SIGNING_KEY_BYTES),
+            id="one_byte_below_the_byte_floor",
+        ),
+        pytest.param(
+            PLACEHOLDER_SIGNING_KEY,
+            "SECRET_KEY",
+            id="the_setup_script_placeholder",
+        ),
+        pytest.param(
+            PADDED_PLACEHOLDER_SIGNING_KEY,
+            "must not be a placeholder value",
+            id="the_placeholder_padded_past_the_byte_floor",
+        ),
+        pytest.param(
+            "   ", "must not be blank", id="blank"
+        ),
+    ],
+)
+def test_a_weak_signing_key_stops_a_fresh_interpreter(key, fragment):
+    """A refused signing key ends startup before initialisation."""
+    outcome = start_interpreter(overrides={"SECRET_KEY": key})
+
+    assert_startup_refused(outcome, "SECRET_KEY", fragment)
+
+
+def test_the_setup_script_placeholder_stops_the_settings_module():
+    """The refusal is in the settings, not later in assembly.
+
+    The placeholder is handed to a fresh interpreter importing the
+    settings module alone, so nothing that imports it afterwards can be
+    what refused it.
+    """
+    outcome = start_interpreter(
+        module=SETTINGS_MODULE,
+        overrides={"SECRET_KEY": PLACEHOLDER_SIGNING_KEY},
+    )
+
+    assert_startup_refused(outcome, "SECRET_KEY", "SECRET_KEY")
+
+
+# --- Startup: C-2, the algorithm allowlist ---------------------------
+
+
+@pytest.mark.parametrize("algorithm", UNLISTED_ALGORITHMS)
+def test_an_unlisted_algorithm_stops_a_fresh_interpreter(algorithm):
+    """An algorithm outside the allowlist ends startup."""
+    outcome = start_interpreter(
+        overrides={"JWT_ALGORITHMS": algorithm}
+    )
+
+    assert_startup_refused(
+        outcome, "JWT_ALGORITHMS", "must name only"
+    )
+
+
+@pytest.mark.parametrize("spelling", UNSIGNED_ALGORITHM_SPELLINGS)
+def test_the_unsigned_algorithm_stops_a_fresh_interpreter(spelling):
+    """Every letter case of the unsigned algorithm ends startup."""
+    outcome = start_interpreter(
+        overrides={"JWT_ALGORITHMS": spelling}
+    )
+
+    assert_startup_refused(
+        outcome,
+        "JWT_ALGORITHMS",
+        "must not name an unsigned algorithm",
+    )
+
+
+@pytest.mark.parametrize("spelling", UNSIGNED_ALGORITHM_SPELLINGS)
+def test_the_unsigned_algorithm_stops_startup_beside_a_listed_one(
+    spelling,
+):
+    """The unsigned algorithm ends startup even paired with a listed
+    one."""
+    outcome = start_interpreter(
+        overrides={"JWT_ALGORITHMS": ["HS256", spelling]}
+    )
+
+    assert_startup_refused(
+        outcome,
+        "JWT_ALGORITHMS",
+        "must not name an unsigned algorithm",
+    )
+
+
+# --- Startup: C-3, the payment mode guard ----------------------------
+
+
+def test_production_paired_with_sandbox_stops_a_fresh_interpreter():
+    """A production environment on sandbox payment credentials ends
+    startup."""
+    outcome = start_interpreter(
+        overrides={"ENVIRONMENT": PRODUCTION_ENVIRONMENT}
+    )
+
+    assert_startup_refused(
+        outcome, "PAYPAL_MODE", "must not be sandbox"
+    )
+    assert "ENVIRONMENT is production" in outcome.stderr
+
+
+def test_production_paired_with_live_starts_a_fresh_interpreter():
+    """A production environment on live payment credentials starts.
+
+    This is the pairing control for the case above: it proves the guard
+    refuses the combination rather than the production environment.
+    """
+    outcome = start_interpreter(
+        overrides={
+            "ENVIRONMENT": PRODUCTION_ENVIRONMENT,
+            "PAYPAL_MODE": LIVE_MODE,
+            "PAYPAL_API_BASE": LIVE_API_BASE,
+        }
+    )
+
+    assert outcome.returncode == 0, outcome
+    assert outcome.started, outcome
+
+
+# --- Startup: the remaining refused settings -------------------------
+
+
+@pytest.mark.parametrize(
+    "setting, value, fragment",
+    [
+        pytest.param(
+            "ENVIRONMENT",
+            "prod",
+            "must be one of",
+            id="unknown_environment_name",
+        ),
+        pytest.param(
+            "PAYPAL_MODE",
+            "test",
+            "must be one of",
+            id="unknown_payment_mode",
+        ),
+        pytest.param(
+            "PAYPAL_API_BASE",
+            SANDBOX_API_BASE,
+            LIVE_API_BASE,
+            id="payment_base_contradicting_the_mode",
+        ),
+    ],
+)
+def test_a_refused_setting_stops_a_fresh_interpreter(
+    setting, value, fragment
+):
+    """Each remaining refused value ends startup before initialisation."""
+    overrides = {setting: value}
+    if setting == "PAYPAL_API_BASE":
+        overrides["PAYPAL_MODE"] = LIVE_MODE
+
+    outcome = start_interpreter(overrides=overrides)
+
+    assert_startup_refused(outcome, setting, fragment)
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "DATABASE_URL",
+        "SECRET_KEY",
+        "ZILLOW_API_KEY",
+        "PAYPAL_CLIENT_ID",
+        "PAYPAL_CLIENT_SECRET",
+        "PAYPAL_WEBHOOK_ID",
+        "SENDGRID_API_KEY",
+    ],
+)
+def test_an_absent_required_setting_stops_a_fresh_interpreter(setting):
+    """A setting with no default ends startup when it is not supplied."""
+    outcome = start_interpreter(overrides={setting: None})
+
+    assert outcome.returncode != 0, outcome
+    assert not outcome.started, outcome
+    assert setting in outcome.stderr, outcome
+    assert STARTUP_ERROR_NAME in outcome.stderr, outcome
+
+
+@pytest.mark.parametrize(
+    "uri", ["bounded-memory://", "memory://", "async+memory://"]
+)
+def test_a_deployed_in_process_rate_limit_store_is_rejected(uri):
+    """Outside a local environment the counters must be shared."""
+    message = rejection_message(RATE_LIMIT_STORAGE_URI=uri)
+    assert "RATE_LIMIT_STORAGE_URI" in message
+    assert "shared by every process" in message
+
+
+def test_a_local_environment_accepts_the_in_process_store():
+    """A single-process local run keeps its counters in memory."""
+    settings = build_settings(
+        ENVIRONMENT="local",
+        RATE_LIMIT_STORAGE_URI="bounded-memory://",
+    )
+    assert settings.RATE_LIMIT_STORAGE_URI == "bounded-memory://"
+
+
+def test_a_pagination_offset_above_the_ceiling_is_rejected():
+    """The paged-read offset cap is bounded by its own ceiling."""
+    message = rejection_message(
+        MAX_PAGINATION_OFFSET=MAX_PAGINATION_OFFSET_CEILING + 1
+    )
+    assert "MAX_PAGINATION_OFFSET" in message
+
+
+def test_the_default_pagination_offset_is_an_operational_cap():
+    """The declared default is small enough to bound the work."""
+    assert build_settings().MAX_PAGINATION_OFFSET == (
+        DEFAULT_MAX_PAGINATION_OFFSET
+    )
+    assert DEFAULT_MAX_PAGINATION_OFFSET <= (
+        MAX_PAGINATION_OFFSET_CEILING
+    )
+    assert MAX_PAGINATION_OFFSET_CEILING < 2 ** 63 - 1
+
+
+class TestEnvironmentFileSelection:
+    """The file settings are read from is named by the environment."""
+
+    def test_an_absent_variable_names_the_default_file(self, monkeypatch):
+        monkeypatch.delenv(ENV_FILE_VARIABLE, raising=False)
+
+        assert _configured_env_file() == DEFAULT_ENV_FILE
+
+    @pytest.mark.parametrize("declared", ["", "   ", "\t"])
+    def test_a_variable_naming_nothing_reads_no_file(
+        self, monkeypatch, declared
+    ):
+        monkeypatch.setenv(ENV_FILE_VARIABLE, declared)
+
+        assert _configured_env_file() is None
+
+    def test_a_declared_path_is_used_as_given(self, monkeypatch):
+        monkeypatch.setenv(ENV_FILE_VARIABLE, " local.env ")
+
+        assert _configured_env_file() == "local.env"
+
+
+class TestTheSuiteRunsOnIsolatedConfiguration:
+    """The suite supplies every setting and reads no file.
+
+    The bootstrap in :mod:`backend.tests.conftest` places each setting in
+    the process environment and switches environment-file loading off,
+    so neither the repository's own file nor an ambient value reaches a
+    test.
+    """
+
+    def test_no_environment_file_is_read(self):
+        assert Settings.Config.env_file is None
+
+    def test_every_declared_setting_is_supplied_by_the_suite(self):
+        """The forced set covers every field, so none can be inherited."""
+        declared = set(Settings.__fields__)
+        supplied = set(conftest.TEST_SETTINGS) - {ENV_FILE_VARIABLE}
+
+        assert declared - supplied == set()
+        assert supplied - declared == set()
+
+    def test_the_prior_value_of_every_forced_name_is_recorded(self):
+        assert set(conftest.PRIOR_ENVIRONMENT) == set(
+            conftest.TEST_SETTINGS
+        )
+
+    def test_every_isolated_setting_resolved_to_its_forced_value(self):
+        for name in conftest.ISOLATED_SETTINGS:
+            assert str(getattr(settings, name)) == (
+                conftest.TEST_SETTINGS[name]
+            )
+
+    def test_the_limiter_counters_are_held_in_this_process(self):
+        assert conftest.LIMITER_IS_IN_PROCESS is True
+        assert rate_limit_storage_scheme(
+            settings.RATE_LIMIT_STORAGE_URI
+        ) in IN_PROCESS_RATE_LIMIT_SCHEMES
+
+    def test_a_setting_resolving_elsewhere_stops_collection(
+        self, monkeypatch
+    ):
+        """The refusal names the setting and the value it found."""
+        monkeypatch.setattr(
+            settings, "DATABASE_URL", "postgresql://live-host/prod"
+        )
+        with pytest.raises(RuntimeError) as raised:
+            conftest._refuse_unisolated_configuration()
+
+        assert conftest.UNISOLATED_SETTING_MESSAGE in str(raised.value)
+        assert "DATABASE_URL" in str(raised.value)
+
+    def test_a_shared_rate_limit_store_stops_collection(
+        self, monkeypatch
+    ):
+        """A shared store is refused even when it was the forced value."""
+        shared = "redis://cache.example.com:6379/0"
+        monkeypatch.setitem(
+            conftest.TEST_SETTINGS, "RATE_LIMIT_STORAGE_URI", shared
+        )
+        monkeypatch.setattr(
+            settings, "RATE_LIMIT_STORAGE_URI", shared
+        )
+        with pytest.raises(RuntimeError) as raised:
+            conftest._refuse_unisolated_configuration()
+
+        assert "shared with other processes" in str(raised.value)
+
+    def test_a_shared_store_is_never_cleared(self, monkeypatch):
+        """A store outside this process is refused, not emptied."""
+        monkeypatch.setattr(conftest, "LIMITER_IS_IN_PROCESS", False)
+        with pytest.raises(RuntimeError) as raised:
+            conftest.reset_limiter_counters()
+
+        assert conftest.SHARED_LIMITER_MESSAGE in str(raised.value)

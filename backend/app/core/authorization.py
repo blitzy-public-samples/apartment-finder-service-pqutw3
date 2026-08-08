@@ -14,25 +14,24 @@ header or token claim is consulted, and no function here writes a role.
 A paid entitlement is resolved by :func:`entitled_role`: a subscription
 row belonging to the principal, carrying the active status and not yet
 past its end date, grants the role its plan registers in
-:mod:`backend.app.core.plans`. Because the grant is derived from the row
-rather than read off the user, it lapses when the row expires and
-nothing has to demote the account.
+:mod:`backend.app.core.plans`. The grant is derived from the row and not
+read off the user, and it lapses when the row expires with no account
+being demoted.
 
-The unexpired subscription is therefore the authority for every role a
-plan can grant, and the stored column alone never carries one. A stored
-value naming a member of :data:`SUBSCRIPTION_DERIVED_ROLES` is credited
-by :func:`stored_credit` as :data:`BASELINE_ROLE`, so a decision that
-turns on such a role always reads the subscription and a closed window
-admits nothing beyond that baseline. A stored role no plan grants --
+The unexpired subscription is the authority for every role a plan can
+grant, and the stored column alone never carries one. A stored value
+naming a member of :data:`SUBSCRIPTION_DERIVED_ROLES` is credited by
+:func:`stored_credit` as :data:`BASELINE_ROLE`: a decision that turns on
+such a role reads the subscription, and a closed window admits nothing
+beyond that baseline. A stored role no plan grants --
 :data:`LOWEST_ROLE`, :data:`BASELINE_ROLE` and ``Role.ADMIN`` -- is
 never lowered, and :func:`require_role` resolves an entitlement only
-when the credited stored role does not already satisfy the minimum, so
-a route no entitlement can affect costs no extra query.
+when the credited stored role does not already satisfy the minimum: a
+route no entitlement can affect issues no extra query.
 
 A subscription that cannot be read grants nothing:
-:func:`entitled_role` records the failure and reports no entitlement, so
-the decision rests on the credited stored role alone rather than
-failing open.
+:func:`entitled_role` records the failure and reports no entitlement, and
+the decision rests on the credited stored role alone.
 
 Resolution denies by default. A stored value is matched only when it
 equals a :class:`Role` member's value exactly: no whitespace is stripped
@@ -77,8 +76,6 @@ record emitted here.
 This module installs no middleware and guards no route on its own: a
 route is guarded where it declares the dependency, and a route
 declaring none stays reachable.
-
-Design rationale is recorded in ``docs/security/DECISION_LOG.md``.
 
 Usage::
 

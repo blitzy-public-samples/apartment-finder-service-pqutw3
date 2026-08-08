@@ -28,6 +28,7 @@ from backend.app.core.logging import (
     RedactingJsonFormatter,
     configure_logging,
     get_logger,
+    redact,
     unredacted_handler_names,
 )
 
@@ -707,36 +708,52 @@ class TestPaymentCallbackUrls:
 
 
 class TestRateLimitStorage:
-    """Credential-endpoint counters must be bounded once deployed."""
-
-    def test_local_accepts_process_local_memory(self):
-        assert build_settings(
-            RATE_LIMIT_STORAGE_URI="memory://"
-        ).RATE_LIMIT_STORAGE_URI == "memory://"
+    """Credential-endpoint counters must be shared once deployed."""
 
     @pytest.mark.parametrize(
-        "uri", ["memory://", "async+memory://"]
+        "uri",
+        [
+            "memory://",
+            "async+memory://",
+            CONFIG.BOUNDED_MEMORY_SCHEME + "://",
+        ],
     )
-    def test_deployed_rejects_unbounded_process_local_memory(self, uri):
+    def test_local_accepts_every_process_local_store(self, uri):
+        assert build_settings(
+            RATE_LIMIT_STORAGE_URI=uri
+        ).RATE_LIMIT_STORAGE_URI == uri
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "memory://",
+            "async+memory://",
+            CONFIG.BOUNDED_MEMORY_SCHEME + "://",
+        ],
+    )
+    def test_deployed_rejects_every_process_local_store(self, uri):
         assert_deployed_rejected(RATE_LIMIT_STORAGE_URI=uri)
 
-    def test_deployed_accepts_the_bounded_in_process_store(self):
-        assert build_deployed(
-            RATE_LIMIT_STORAGE_URI=(
-                CONFIG.BOUNDED_MEMORY_SCHEME + "://"
-            )
-        ).RATE_LIMIT_STORAGE_URI == CONFIG.BOUNDED_MEMORY_SCHEME + "://"
-
-    def test_deployed_accepts_the_declared_default(self):
+    def test_deployed_rejects_the_declared_default(self):
         values = dict(DEPLOYED_SETTINGS)
         values.pop("RATE_LIMIT_STORAGE_URI", None)
+        with pytest.raises(Exception):
+            with _environment_without_settings():
+                Settings(
+                    _env_file=None, **dict(BASELINE_SETTINGS, **values)
+                )
+
+    def test_local_accepts_the_declared_default(self):
+        values = dict(BASELINE_SETTINGS)
+        values.pop("RATE_LIMIT_STORAGE_URI", None)
         with _environment_without_settings():
-            built = Settings(
-                _env_file=None, **dict(BASELINE_SETTINGS, **values)
-            )
+            built = Settings(_env_file=None, **values)
         assert built.RATE_LIMIT_STORAGE_URI == (
             Settings.__fields__["RATE_LIMIT_STORAGE_URI"].default
         )
+        assert CONFIG.rate_limit_storage_scheme(
+            built.RATE_LIMIT_STORAGE_URI
+        ) in CONFIG.IN_PROCESS_RATE_LIMIT_SCHEMES
 
     @pytest.mark.parametrize(
         "uri",
@@ -757,12 +774,9 @@ class TestRateLimitStorage:
     def test_unknown_storage_schemes_are_rejected(self, uri):
         assert_rejected(RATE_LIMIT_STORAGE_URI=uri)
 
-    def test_the_deployable_set_is_the_shared_set_plus_the_bounded_one(
-        self,
-    ):
+    def test_the_deployable_set_is_exactly_the_shared_set(self):
         assert CONFIG.DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES == (
             CONFIG.SHARED_RATE_LIMIT_STORAGE_SCHEMES
-            | {CONFIG.BOUNDED_MEMORY_SCHEME}
         )
         assert CONFIG.UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES == (
             CONFIG.IN_PROCESS_RATE_LIMIT_SCHEMES
@@ -770,24 +784,24 @@ class TestRateLimitStorage:
         )
         assert not (
             CONFIG.DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES
-            & CONFIG.UNBOUNDED_RATE_LIMIT_STORAGE_SCHEMES
+            & CONFIG.IN_PROCESS_RATE_LIMIT_SCHEMES
+        )
+        assert CONFIG.BOUNDED_MEMORY_SCHEME not in (
+            CONFIG.DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES
         )
 
-    def test_a_deployed_in_process_store_is_recorded_once(self):
+    def test_an_in_process_store_is_recorded_once(self):
         from backend.app.core import rate_limit
 
-        built = build_deployed(
-            RATE_LIMIT_STORAGE_URI=(
-                CONFIG.BOUNDED_MEMORY_SCHEME + "://"
-            )
-        )
         records = []
         with mock.patch.object(
             rate_limit.settings,
             "RATE_LIMIT_STORAGE_URI",
-            built.RATE_LIMIT_STORAGE_URI,
+            CONFIG.BOUNDED_MEMORY_SCHEME + "://",
         ), mock.patch.object(
-            rate_limit.settings, "ENVIRONMENT", built.ENVIRONMENT
+            rate_limit.settings,
+            "ENVIRONMENT",
+            DEPLOYED_SETTINGS["ENVIRONMENT"],
         ), mock.patch.object(
             rate_limit.logger,
             "warning",
@@ -956,6 +970,87 @@ class TestRedactionOfCredentialShapedText:
     )
     def test_credential_never_reaches_the_stream(self, name, build):
         assert SENTINEL not in emit(build), name
+
+
+class TestUrlQueryStringsAreRemoved:
+    """A query string is removed whole, whatever its keys are named.
+
+    A key-based rule only covers a parameter whose name spells a
+    credential stem. A search term does not, so a URL rendered into a
+    record previously disclosed the values a caller searched for.
+    """
+
+    #: A value carried in a query whose key names no credential.
+    SEARCH_VALUE = "90210"
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            (
+                "https://h/v2/listings?zip_codes=90210",
+                "https://h/v2/listings?" + REDACTION_PLACEHOLDER,
+            ),
+            (
+                "https://h/p?a=1&b=2",
+                "https://h/p?" + REDACTION_PLACEHOLDER,
+            ),
+            (
+                "http://h:8080/p/q?x=y",
+                "http://h:8080/p/q?" + REDACTION_PLACEHOLDER,
+            ),
+        ],
+    )
+    def test_the_query_is_replaced_and_the_target_kept(
+        self, text, expected
+    ):
+        assert redact(text) == expected
+
+    def test_a_search_value_is_removed_from_provider_prose(self):
+        """The shape the HTTP library renders discloses nothing."""
+        rendered = redact(
+            "Client error '404 Not Found' for url "
+            "'https://h/v2/listings?zip_codes=" + self.SEARCH_VALUE
+            + "&max_rent=3000'"
+        )
+
+        assert self.SEARCH_VALUE not in rendered
+        assert "3000" not in rendered
+        assert "https://h/v2/listings" in rendered
+        assert rendered.endswith("'")
+
+    def test_a_target_without_a_query_is_unchanged(self):
+        assert redact("https://h/v2/listings") == (
+            "https://h/v2/listings"
+        )
+
+    def test_user_information_is_still_replaced_alongside(self):
+        rendered = redact(
+            "postgresql://svc:" + SENTINEL + "@db:5432/app?sslmode=require"
+        )
+
+        assert SENTINEL not in rendered
+        assert "sslmode" not in rendered
+        assert REDACTION_PLACEHOLDER in rendered
+
+    def test_replacement_is_idempotent(self):
+        once = redact("https://h/p?zip_codes=" + self.SEARCH_VALUE)
+
+        assert redact(once) == once
+
+    def test_a_query_carried_in_a_record_is_removed(self):
+        """The rule applies to a record as the process would emit it."""
+        rendered = emit(
+            lambda logger: logger.info(
+                "provider call failed",
+                extra={
+                    "target": "https://h/v2/listings?zip_codes="
+                    + self.SEARCH_VALUE
+                },
+            )
+        )
+
+        assert self.SEARCH_VALUE not in rendered
+        assert REDACTION_PLACEHOLDER in rendered
 
 
 def _exercise_governed_logger(logger):

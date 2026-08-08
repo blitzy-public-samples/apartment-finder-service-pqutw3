@@ -24,9 +24,14 @@ sendgrid==6.12.5
 # ASGI server
 uvicorn==0.39.0
 
-# Request rate limiting
+# Request rate limiting. Outside ENVIRONMENT=local the settings validator
+# requires RATE_LIMIT_STORAGE_URI to name storage shared by every
+# process; redis is the client for the redis, rediss, redis+unix,
+# redis+cluster and redis+sentinel schemes limits addresses. limits 4.2
+# accepts redis>3,<6.0.0.
 slowapi==0.1.10
 limits==4.2
+redis==5.3.1
 
 # Environment file loading
 python-dotenv==1.2.1

@@ -15,6 +15,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
 
@@ -131,18 +132,65 @@ def webhook_headers(cert_url=CERT_URL, transmission_id=TRANSMISSION_ID):
 
 
 class StubResponse:
-    """A successful httpx-like response carrying ``payload``."""
+    """A successful httpx-like response carrying ``payload``.
 
-    def __init__(self, payload, status_code=200):
+    ``content`` and the declared length are derived from the payload, so a
+    stand-in is measured against the service's response-size cap exactly
+    as a real response is. ``content`` may be given directly to serve a
+    body larger than its payload declares.
+    """
+
+    def __init__(self, payload, status_code=200, content=None):
         self._payload = payload
         self.status_code = status_code
-        self.headers = {}
+        if content is None:
+            content = json.dumps(payload).encode("utf-8")
+        self.content = content
+        self.headers = {"Content-Length": str(len(content))}
 
     def raise_for_status(self):
         return None
 
     def json(self):
         return self._payload
+
+
+class CountedResponse(StubResponse):
+    """A response that declares ``declared`` bytes and counts decodes."""
+
+    def __init__(self, payload, declared):
+        super().__init__(payload)
+        self.headers = {"Content-Length": str(declared)}
+        self.decoded = 0
+
+    def json(self):
+        self.decoded += 1
+        return super().json()
+
+
+class UnmeasuredResponse(StubResponse):
+    """A response declaring no length and exposing no bytes."""
+
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.headers = {}
+        self.content = None
+
+
+class BoundedClient:
+    """A client whose every call answers with one stored response."""
+
+    def __init__(self, response):
+        self._response = response
+        self.calls = 0
+
+    async def post(self, *args, **kwargs):
+        self.calls += 1
+        return self._response
+
+    async def request(self, *args, **kwargs):
+        self.calls += 1
+        return self._response
 
 
 def stub_client(client):
@@ -332,9 +380,9 @@ def open_subscription(client, user, plan_id=PREMIUM_MONTHLY):
 def deliver(client, event, headers=None, verified=True, reason=None):
     """Delivers one notification with verification stood in for.
 
-    The verification outcome carries the event type, because the real
-    check reads it from the body it verified rather than leaving the
-    caller to re-read it from an unverified one.
+    The verification outcome carries the event type, matching the real
+    check, which reads it from the body it verified rather than leaving
+    the caller to re-read it from an unverified one.
     """
     outcome = paypal_service.WebhookVerification(
         verified=verified,
@@ -1484,6 +1532,323 @@ class TestEntitlementLifecycle:
         assert fetched.json() is None
 
 
+class TestTerminalStatusTakesPrecedence:
+    """A status the provider settled on is not written over afterwards.
+
+    Two notifications for one order can be outstanding at once: an
+    approval whose capture is being awaited, and a refund, reversal or
+    denial recorded while that capture is in flight. Every transition is
+    decided from the row read back under a write lock, so the terminal
+    status stands and no entitlement follows it.
+    """
+
+    @staticmethod
+    def _record(session_factory, status, order_id=ORDER_ID):
+        """Records ``status`` against ``order_id`` from another session."""
+        session = session_factory()
+        try:
+            row = (
+                session.query(Subscription)
+                .filter(Subscription.paypal_order_id == order_id)
+                .one()
+            )
+            row.status = status
+            row.end_date = datetime.now(timezone.utc)
+            session.commit()
+        finally:
+            session.close()
+
+    @staticmethod
+    def _revoke_from_another_session(session_factory, event_type):
+        """Applies the revoking transition from a session of its own."""
+        session = session_factory()
+        try:
+            row = (
+                session.query(Subscription)
+                .filter(Subscription.paypal_order_id == ORDER_ID)
+                .one()
+            )
+            outcome = subscriptions_module._revoke(
+                session, row, event_type
+            )
+            session.commit()
+            return outcome
+        finally:
+            session.close()
+
+    @staticmethod
+    def _remove(session_factory, order_id=ORDER_ID):
+        """Deletes the stored order row from another session."""
+        session = session_factory()
+        try:
+            session.query(Subscription).filter(
+                Subscription.paypal_order_id == order_id
+            ).delete()
+            session.commit()
+        finally:
+            session.close()
+
+    @staticmethod
+    def _settled():
+        """Returns the outcome a complete capture of the plan reports."""
+        return paypal_service.CaptureOutcome(
+            completed=True,
+            order_id=ORDER_ID,
+            status="COMPLETED",
+            amount=format_amount(PLAN.amount),
+            currency=PLAN.currency,
+            capture_id=CAPTURE_ID,
+        )
+
+    def test_the_terminal_statuses_are_the_revoked_ones(self):
+        """Only a revoked status is terminal."""
+        assert subscriptions_module.TERMINAL_STATUSES == frozenset(
+            {
+                subscriptions_module.CANCELLED_STATUS,
+                subscriptions_module.REFUNDED_STATUS,
+            }
+        )
+        for status in subscriptions_module._REVOKED_STATUSES.values():
+            assert status in subscriptions_module.TERMINAL_STATUSES
+        for status in (
+            subscriptions_module.PENDING_STATUS,
+            subscriptions_module.FAILED_STATUS,
+            subscriptions_module.ACTIVE_STATUS,
+        ):
+            assert status not in subscriptions_module.TERMINAL_STATUSES
+
+    @pytest.mark.parametrize(
+        "event_type",
+        list(subscriptions_module.REVOKING_EVENTS),
+    )
+    def test_a_revocation_applied_during_the_capture_stands(
+        self, client, db, subscriber, session_factory, event_type
+    ):
+        """An approval settled after a revocation entitles nothing."""
+        open_subscription(client, subscriber)
+        applied = []
+
+        async def capture(*args, **kwargs):
+            applied.append(
+                self._revoke_from_another_session(
+                    session_factory, event_type
+                )
+            )
+            return capture_response()
+
+        with patch(
+            MODULE + ".capture_order", new=AsyncMock(side_effect=capture)
+        ):
+            response = deliver(client, approved_event())
+
+        assert applied == [subscriptions_module.OUTCOME_PROCESSED]
+        assert response.status_code == 200
+        assert response.json()["status"] == (
+            subscriptions_module.OUTCOME_IGNORED
+        )
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == (
+            subscriptions_module._REVOKED_STATUSES[event_type]
+        )
+        assert stored.end_date <= datetime.now(timezone.utc).replace(
+            tzinfo=None
+        ) + timedelta(seconds=5)
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            subscriptions_module.REFUNDED_STATUS,
+            subscriptions_module.CANCELLED_STATUS,
+        ],
+    )
+    def test_a_terminal_status_written_during_the_capture_stands(
+        self, client, db, subscriber, session_factory, status
+    ):
+        """The row read before the capture is not the row written."""
+        open_subscription(client, subscriber)
+
+        async def capture(*args, **kwargs):
+            self._record(session_factory, status)
+            return capture_response()
+
+        with patch(
+            MODULE + ".capture_order", new=AsyncMock(side_effect=capture)
+        ):
+            response = deliver(client, approved_event())
+
+        assert response.status_code == 200
+        assert response.json()["status"] == (
+            subscriptions_module.OUTCOME_IGNORED
+        )
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == status
+        assert stored.end_date <= datetime.now(timezone.utc).replace(
+            tzinfo=None
+        ) + timedelta(seconds=5)
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            subscriptions_module.REFUNDED_STATUS,
+            subscriptions_module.CANCELLED_STATUS,
+        ],
+    )
+    def test_the_activation_reads_the_row_back_before_writing(
+        self, db, subscriber, session_factory, status
+    ):
+        """A stale copy is not the copy the write is judged by."""
+        db.add(self._pending(subscriber))
+        db.commit()
+        stale = db.query(Subscription).one()
+        assert stale.status == subscriptions_module.PENDING_STATUS
+        self._record(session_factory, status)
+
+        outcome = subscriptions_module._activate(
+            db,
+            stale,
+            PLAN,
+            self._settled(),
+            "CHECKOUT.ORDER.APPROVED",
+        )
+
+        assert outcome == subscriptions_module.OUTCOME_IGNORED
+        db.rollback()
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == status
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    def test_a_second_revocation_leaves_the_first_status_alone(
+        self, db, subscriber, session_factory
+    ):
+        """The status the first revocation recorded is the one kept."""
+        db.add(self._pending(subscriber))
+        db.commit()
+        stale = db.query(Subscription).one()
+        self._record(
+            session_factory, subscriptions_module.REFUNDED_STATUS
+        )
+
+        outcome = subscriptions_module._revoke(
+            db, stale, "PAYMENT.CAPTURE.DENIED"
+        )
+
+        assert outcome == subscriptions_module.OUTCOME_IGNORED
+        db.rollback()
+        db.expire_all()
+        assert (
+            db.query(Subscription).one().status
+            == subscriptions_module.REFUNDED_STATUS
+        )
+
+    @pytest.mark.parametrize("transition", ["_activate", "_revoke"])
+    def test_a_removed_row_is_neither_written_nor_recreated(
+        self, db, subscriber, session_factory, transition
+    ):
+        """A row deleted mid-flight is not written back into existence."""
+        db.add(self._pending(subscriber))
+        db.commit()
+        stale = db.query(Subscription).one()
+        self._remove(session_factory)
+
+        if transition == "_activate":
+            outcome = subscriptions_module._activate(
+                db,
+                stale,
+                PLAN,
+                self._settled(),
+                "CHECKOUT.ORDER.APPROVED",
+            )
+        else:
+            outcome = subscriptions_module._revoke(
+                db, stale, "PAYMENT.CAPTURE.REFUNDED"
+            )
+
+        assert outcome == subscriptions_module.OUTCOME_IGNORED
+        db.rollback()
+        db.expire_all()
+        assert db.query(Subscription).count() == 0
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    def test_the_abandoned_transition_is_recorded_with_its_reason(
+        self, db, subscriber, session_factory
+    ):
+        """An abandoned transition names why it was abandoned."""
+        db.add(self._pending(subscriber))
+        db.commit()
+        stale = db.query(Subscription).one()
+        self._record(
+            session_factory, subscriptions_module.REFUNDED_STATUS
+        )
+
+        with patch.object(
+            subscriptions_module.logger, "warning"
+        ) as noted:
+            outcome = subscriptions_module._activate(
+                db,
+                stale,
+                PLAN,
+                self._settled(),
+                "CHECKOUT.ORDER.APPROVED",
+            )
+
+        assert outcome == subscriptions_module.OUTCOME_IGNORED
+        reasons = [
+            call.kwargs["extra"].get("reason")
+            for call in noted.call_args_list
+            if "extra" in call.kwargs
+        ]
+        assert subscriptions_module.REASON_TERMINAL_STATUS in reasons
+
+    @pytest.mark.parametrize("transition", ["_activate", "_revoke"])
+    def test_every_transition_locks_the_row_it_writes(self, transition):
+        """Neither transition writes the copy handed to it."""
+        source = inspect.getsource(
+            getattr(subscriptions_module, transition)
+        )
+        assert "_lock_subscription(db, subscription)" in source
+        assert "TERMINAL_STATUSES" in source
+        assert "subscription.status =" not in source
+        assert "subscription.end_date =" not in source
+
+    def test_the_lock_discards_the_copy_loaded_earlier(self):
+        """The re-read is forced rather than served from the session."""
+        source = inspect.getsource(
+            subscriptions_module._lock_subscription
+        )
+        assert "populate_existing()" in source
+        assert "with_for_update()" in source
+
+    @staticmethod
+    def _pending(subscriber):
+        """Returns a pending row naming the order under test."""
+        return Subscription(
+            user_id=subscriber.id,
+            plan_id=PREMIUM_MONTHLY,
+            amount=PLAN.amount,
+            currency=PLAN.currency,
+            status=subscriptions_module.PENDING_STATUS,
+            start_date=datetime.now(timezone.utc),
+            paypal_order_id=ORDER_ID,
+        )
+
+
 class TestOrderOwnershipBinding:
     """An order is only ever acted on through the row that owns it."""
 
@@ -1767,6 +2132,207 @@ class TestOutboundCallsDoNotBlockTheEventLoop:
             == "token"
         )
 
+    @pytest.mark.parametrize(
+        "call", ["capture_order", "verify_settled_order"]
+    )
+    def test_the_ownership_lookup_runs_on_another_thread(self, call):
+        """Neither entry point resolves the owner on the event loop.
+
+        The lookup reaches the database through the caller's synchronous
+        session, so it is issued on a worker thread. The thread it ran on
+        is recorded and compared with the thread the loop runs on.
+        """
+        import asyncio
+
+        observed = {}
+
+        def resolve(db, order_id, current_user, request):
+            observed["lookup"] = threading.get_ident()
+            return SimpleNamespace(id=7)
+
+        async def run():
+            observed["loop"] = threading.get_ident()
+            with patch(
+                SERVICE + "._resolve_owned_order", new=resolve
+            ), patch(
+                SERVICE + "._post_json",
+                new=AsyncMock(return_value=capture_response()),
+            ), patch(
+                SERVICE + "._get_json",
+                new=AsyncMock(return_value=capture_response()),
+            ):
+                if call == "capture_order":
+                    return await paypal_service.capture_order(
+                        None, ORDER_ID, SimpleNamespace(id=1)
+                    )
+                return await paypal_service.verify_settled_order(
+                    None,
+                    ORDER_ID,
+                    SimpleNamespace(id=1),
+                    PLAN.amount,
+                    PLAN.currency,
+                )
+
+        outcome = asyncio.get_event_loop().run_until_complete(run())
+
+        assert outcome is not None
+        assert observed["lookup"] != observed["loop"]
+
+    @pytest.mark.parametrize(
+        "call", ["capture_order", "verify_settled_order"]
+    )
+    def test_the_ownership_lookup_is_awaited_off_the_loop(self, call):
+        """The lookup is never called directly from the coroutine."""
+        source = inspect.getsource(getattr(paypal_service, call))
+        assert "run_in_threadpool(" in source
+        assert "_resolve_owned_order(db" not in source
+
+    def test_a_reset_during_the_exchange_discards_the_grant(self):
+        """A rotation is not undone by an exchange already in flight.
+
+        The caller that asked for the grant still receives it, and
+        nothing is held for the callers that follow the rotation.
+        """
+        import asyncio
+
+        started = asyncio.Event()
+
+        async def slow_exchange():
+            started.set()
+            await asyncio.sleep(0.05)
+            return "grant-from-rotated-credentials", 3600.0
+
+        async def run():
+            paypal_service.reset_access_token_cache()
+            with patch(
+                SERVICE + "._exchange_credentials",
+                new=AsyncMock(side_effect=slow_exchange),
+            ):
+                pending = asyncio.ensure_future(
+                    paypal_service._bearer_credential()
+                )
+                await started.wait()
+                paypal_service.reset_access_token_cache()
+                granted = await pending
+            return granted, paypal_service._read_cached_token()
+
+        try:
+            granted, held = asyncio.get_event_loop().run_until_complete(
+                run()
+            )
+        finally:
+            paypal_service.reset_access_token_cache()
+
+        assert granted == "grant-from-rotated-credentials"
+        assert held is None
+
+    def test_a_reset_during_a_failing_exchange_discards_the_backoff(
+        self,
+    ):
+        """A rotation clears the window a racing failure would open."""
+        import asyncio
+
+        started = asyncio.Event()
+
+        async def slow_failure():
+            started.set()
+            await asyncio.sleep(0.05)
+            raise paypal_service.PayPalAPIError(
+                "grant refused",
+                category=paypal_service.CATEGORY_AUTHENTICATION,
+                status_code=401,
+            )
+
+        async def run():
+            paypal_service.reset_access_token_cache()
+            with patch(
+                SERVICE + "._exchange_credentials",
+                new=AsyncMock(side_effect=slow_failure),
+            ):
+                pending = asyncio.ensure_future(
+                    paypal_service._bearer_credential()
+                )
+                await started.wait()
+                paypal_service.reset_access_token_cache()
+                with pytest.raises(paypal_service.PayPalAPIError):
+                    await pending
+            return paypal_service._held_back_failure()
+
+        try:
+            held_back = asyncio.get_event_loop().run_until_complete(
+                run()
+            )
+        finally:
+            paypal_service.reset_access_token_cache()
+
+        assert held_back is None
+
+    def test_every_reset_advances_the_cache_generation(self):
+        """The generation is what a racing exchange is measured against."""
+        try:
+            first = paypal_service._current_generation()
+            paypal_service.reset_access_token_cache()
+            second = paypal_service._current_generation()
+            paypal_service.reset_access_token_cache()
+            third = paypal_service._current_generation()
+        finally:
+            paypal_service.reset_access_token_cache()
+
+        assert second == first + 1
+        assert third == second + 1
+
+    def test_a_grant_from_the_current_generation_is_held(self):
+        """A grant exchanged without a rotation is reused."""
+        try:
+            paypal_service.reset_access_token_cache()
+            generation = paypal_service._current_generation()
+            stored = paypal_service._store_cached_token(
+                "current-grant", 3600.0, generation
+            )
+            held = paypal_service._read_cached_token()
+        finally:
+            paypal_service.reset_access_token_cache()
+
+        assert stored is True
+        assert held == "current-grant"
+
+    def test_a_grant_from_an_earlier_generation_is_discarded(self):
+        """A grant that lost the race to a rotation is not held."""
+        try:
+            paypal_service.reset_access_token_cache()
+            superseded = paypal_service._current_generation()
+            paypal_service.reset_access_token_cache()
+            stored = paypal_service._store_cached_token(
+                "superseded-grant", 3600.0, superseded
+            )
+            held = paypal_service._read_cached_token()
+        finally:
+            paypal_service.reset_access_token_cache()
+
+        assert stored is False
+        assert held is None
+
+    def test_a_failure_from_an_earlier_generation_is_discarded(self):
+        """A failure that lost the race to a rotation holds nothing back."""
+        refusal = paypal_service.PayPalAPIError(
+            "grant refused",
+            category=paypal_service.CATEGORY_AUTHENTICATION,
+            status_code=401,
+        )
+        try:
+            paypal_service.reset_access_token_cache()
+            superseded = paypal_service._current_generation()
+            paypal_service.reset_access_token_cache()
+            recorded = paypal_service._record_exchange_failure(
+                refusal, superseded
+            )
+            held_back = paypal_service._held_back_failure()
+        finally:
+            paypal_service.reset_access_token_cache()
+
+        assert recorded is False
+        assert held_back is None
+
     def test_the_webhook_route_is_rate_limited(self, client, db):
         """The unauthenticated route bounds what a caller can ask for."""
         allowed = int(settings.RATE_LIMIT_WEBHOOK.split("/", 1)[0])
@@ -1789,6 +2355,146 @@ class TestOutboundCallsDoNotBlockTheEventLoop:
                 )
         assert statuses[-1] == 429
         assert statuses[0] == 400
+
+
+class TestProviderResponsesAreBounded:
+    """No provider body past the accepted size is read into memory.
+
+    Every REST helper measures the body before decoding it, so a
+    provider or an intermediary answering with an unbounded body cannot
+    exhaust the process. The declared length is read first, so a body
+    announcing itself as oversized is refused without being parsed at
+    all.
+    """
+
+    @staticmethod
+    def _run(coroutine_factory, response):
+        """Awaits ``coroutine_factory`` with ``response`` stood in for."""
+        import asyncio
+
+        client = BoundedClient(response)
+
+        async def run():
+            paypal_service.reset_access_token_cache()
+            with patch(SERVICE + "._client", new=stub_client(client)), patch(
+                SERVICE + "._bearer_credential",
+                new=AsyncMock(return_value="bearer-token"),
+            ):
+                return await coroutine_factory()
+
+        try:
+            return asyncio.get_event_loop().run_until_complete(run()), client
+        finally:
+            paypal_service.reset_access_token_cache()
+
+    @staticmethod
+    def _post():
+        return paypal_service._post_json(
+            "/v2/checkout/orders", {}, operation="create_order"
+        )
+
+    @staticmethod
+    def _read():
+        return paypal_service._get_json(
+            "/v2/checkout/orders/" + ORDER_ID, operation="fetch_order"
+        )
+
+    @staticmethod
+    def _exchange():
+        return paypal_service._exchange_credentials()
+
+    def test_the_accepted_size_is_a_megabyte(self):
+        """The cap is stated once and reported on every refusal."""
+        assert paypal_service.MAX_RESPONSE_BYTES == 1048576
+        assert paypal_service.REASON_RESPONSE_TOO_LARGE == (
+            "response_body_too_large"
+        )
+        assert paypal_service.CONTENT_LENGTH_HEADER == "Content-Length"
+
+    @pytest.mark.parametrize(
+        "call", ["_post", "_read", "_exchange"]
+    )
+    def test_a_body_past_the_cap_is_refused(self, call):
+        """An oversized body raises rather than being decoded."""
+        response = StubResponse(
+            order_response(),
+            content=b"x" * (paypal_service.MAX_RESPONSE_BYTES + 1),
+        )
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(getattr(self, call), response)
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
+
+    @pytest.mark.parametrize(
+        "call", ["_post", "_read", "_exchange"]
+    )
+    def test_a_declared_length_past_the_cap_is_refused_unparsed(
+        self, call
+    ):
+        """A body announcing itself as oversized is never parsed."""
+        response = CountedResponse(
+            order_response(),
+            declared=paypal_service.MAX_RESPONSE_BYTES + 1,
+        )
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(getattr(self, call), response)
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
+        assert response.decoded == 0
+
+    def test_a_body_at_the_cap_is_accepted(self):
+        """The cap is the largest body accepted, not the first refused."""
+        response = StubResponse(
+            order_response(),
+            content=b"x" * paypal_service.MAX_RESPONSE_BYTES,
+        )
+        payload, client = self._run(self._post, response)
+        assert payload == order_response()
+        assert client.calls == 1
+
+    def test_an_unmeasurable_body_is_still_decoded(self):
+        """A body declaring no length and carrying no bytes still reads."""
+        response = UnmeasuredResponse(order_response())
+        payload, client = self._run(self._post, response)
+        assert payload == order_response()
+        assert client.calls == 1
+
+    def test_a_refusal_names_the_reason_and_the_cap(self):
+        """The refusal is recorded with the size it measured."""
+        response = StubResponse(
+            order_response(),
+            content=b"x" * (paypal_service.MAX_RESPONSE_BYTES + 2),
+        )
+        with patch.object(paypal_service.logger, "error") as noted:
+            with pytest.raises(paypal_service.PayPalAPIError):
+                self._run(self._post, response)
+        extras = [
+            call.kwargs["extra"]
+            for call in noted.call_args_list
+            if "extra" in call.kwargs
+        ]
+        refusals = [
+            extra
+            for extra in extras
+            if extra.get("reason")
+            == paypal_service.REASON_RESPONSE_TOO_LARGE
+        ]
+        assert refusals
+        assert refusals[0]["max_response_bytes"] == (
+            paypal_service.MAX_RESPONSE_BYTES
+        )
+        assert refusals[0]["response_bytes"] == (
+            paypal_service.MAX_RESPONSE_BYTES + 2
+        )
+
+    def test_no_provider_body_is_decoded_before_it_is_measured(self):
+        """Every helper reaches the decoder through the measured path."""
+        for name in ("_post_json", "_get_json", "_exchange_credentials"):
+            source = inspect.getsource(getattr(paypal_service, name))
+            assert "_decoded_object(response" in source
+            assert "response.json()" not in source
 
 
 class TestRequestContractStaysPlanOnly:
