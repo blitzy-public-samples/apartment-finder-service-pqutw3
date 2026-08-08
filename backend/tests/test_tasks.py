@@ -8,9 +8,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from backend.app.core.logging import flush_log_queue
 from backend.app.db.models import Base, Filter, Listing, User, ZipCode
 from backend.app.tasks.listing_updater import (
     IDENTITY_COLUMN,
+    INGESTION_FAILED_MESSAGE,
     UPDATE_INTERVAL,
     tracked_zip_codes,
     update_listings,
@@ -25,6 +27,21 @@ LISTING_URL = 'https://www.zillow.com/homedetails/1'
 # Longest a stand-in provider call waits to be released. It bounds the
 # case below so a pass that blocked the loop fails instead of hanging.
 BLOCKED_FETCH_TIMEOUT = 5.0
+
+# Detail carried by the stand-in provider failure below. The value is
+# plain prose holding no credential shape, which the redacting
+# formatter leaves unchanged.
+PROVIDER_FAILURE_DETAIL = 'the listing provider was unreachable'
+
+# Exactly what the ingestion pass wrote to standard output before the
+# failure path was routed through the structured logger.
+BARE_PRINT_SIGNATURE = (
+    INGESTION_FAILED_MESSAGE + ': ' + PROVIDER_FAILURE_DETAIL
+)
+
+# Longest the assertions below wait for the queue-backed log listener to
+# write every record one pass produced.
+LOG_DRAIN_TIMEOUT = 5.0
 
 
 @pytest.fixture
@@ -101,6 +118,10 @@ async def test_update_listings_completes_without_raising(
                 mock_fetch.return_value = []
                 await update_listings()
 
+    # The provider is asked for listings and the pass commits once.
+    assert mock_fetch.call_count == 1
+    assert mock_db_session.commit.call_count == 1
+    assert mock_db_session.rollback.call_count == 0
     assert mock_db_session.close.call_count == 1
 
 
@@ -120,6 +141,77 @@ async def test_update_listings_closes_the_session_on_failure(
             ):
                 await update_listings()
 
+    assert mock_db_session.rollback.call_count == 1
+    assert mock_db_session.close.call_count == 1
+    # A rolled-back pass commits nothing.
+    assert mock_db_session.commit.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pass_is_reported_through_the_module_logger(
+    mock_db_session,
+):
+    """A failed pass reports through the structured logging helper.
+
+    Asserts the helper receives this module's own logger, the ingestion
+    failure message, the raised error, and no message text.
+    """
+    failure = RuntimeError(PROVIDER_FAILURE_DETAIL)
+
+    with patch(
+        TASK_MODULE + '.SessionLocal', return_value=mock_db_session
+    ):
+        with patch(
+            TASK_MODULE + '.tracked_zip_codes', return_value=[ZIP_CODE]
+        ):
+            with patch(
+                TASK_MODULE + '.fetch_listings', side_effect=failure
+            ):
+                with patch(
+                    TASK_MODULE + '.log_exception'
+                ) as mock_log_exception:
+                    await update_listings()
+
+    assert mock_log_exception.call_count == 1
+    reported_logger, message, error = mock_log_exception.call_args.args[:3]
+    assert reported_logger.name == TASK_MODULE
+    assert message == INGESTION_FAILED_MESSAGE
+    assert error is failure
+    assert mock_log_exception.call_args.kwargs['exception_message'] is None
+
+    assert mock_db_session.rollback.call_count == 1
+    assert mock_db_session.commit.call_count == 0
+    assert mock_db_session.close.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pass_writes_no_failure_detail_to_a_stream(
+    mock_db_session, capsys
+):
+    """A failed pass writes the failure detail to no stream.
+
+    The real logging path runs rather than a stand-in for it.
+    """
+    with patch(
+        TASK_MODULE + '.SessionLocal', return_value=mock_db_session
+    ):
+        with patch(
+            TASK_MODULE + '.tracked_zip_codes', return_value=[ZIP_CODE]
+        ):
+            with patch(
+                TASK_MODULE + '.fetch_listings',
+                side_effect=RuntimeError(PROVIDER_FAILURE_DETAIL),
+            ):
+                await update_listings()
+
+    flush_log_queue(LOG_DRAIN_TIMEOUT)
+    captured = capsys.readouterr()
+
+    for stream in (captured.out, captured.err):
+        assert BARE_PRINT_SIGNATURE not in stream
+        assert PROVIDER_FAILURE_DETAIL not in stream
+
+    # The pass reached its failure path.
     assert mock_db_session.rollback.call_count == 1
     assert mock_db_session.close.call_count == 1
 

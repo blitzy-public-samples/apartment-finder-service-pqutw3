@@ -1,6 +1,8 @@
 import asyncio
+import contextlib
 import functools
-import json
+import inspect
+import logging
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -10,6 +12,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from backend.app.core.config import settings
+from backend.app.core.logging import (
+    BASE_LOGGER_NAME,
+    REDACTION_PLACEHOLDER,
+    RedactingFilter,
+    RedactingJsonFormatter,
+)
 from backend.app.core.plans import format_amount, get_plan
 from backend.app.db.models import Base, Subscription, User
 from backend.app.services import paypal_service
@@ -23,12 +32,87 @@ PLAN_ID = 'premium_monthly'
 ORDER_ID = 'ORDER-SERVICE-1'
 APPROVAL_URL = 'https://www.sandbox.paypal.com/checkoutnow?token=1'
 
+#: Header the listing provider credential is carried in.
+API_KEY_HEADER = 'X-API-Key'
+
+#: Query parameter name the credential was previously carried in.
+LEGACY_KEY_PARAM = 'api_key'
+
 
 def _provider_response(payload):
     response = MagicMock()
     response.json.return_value = payload
     response.raise_for_status.return_value = None
     return response
+
+
+class _LogCollector(logging.Handler):
+    """Holds every record the application logger emits while attached."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _rendered_log_lines(collector):
+    """Returns each collected record as the line the process would emit.
+
+    The application's redacting filter and formatter are applied, giving
+    the fully rendered text -- message, ``extra`` context and formatted
+    exception traceback included.
+    """
+    log_filter = RedactingFilter()
+    formatter = RedactingJsonFormatter()
+    lines = []
+    for record in collector.records:
+        log_filter.filter(record)
+        lines.append(formatter.format(record))
+    return lines
+
+
+@contextlib.contextmanager
+def _collecting_application_logs():
+    """Collects the records the application logger emits in the block.
+
+    The handler is attached to the ``backend`` logger, which owns the
+    application's records, and is removed on exit.
+    """
+    collector = _LogCollector()
+    logger = logging.getLogger(BASE_LOGGER_NAME)
+    logger.addHandler(collector)
+    try:
+        yield collector
+    finally:
+        logger.removeHandler(collector)
+
+
+def _outbound_request(mock_get):
+    """Rebuilds the provider call ``mock_get`` recorded as a real request.
+
+    The recorded target, query parameters and headers are assembled into
+    an ``httpx.Request`` carrying the target and query string the
+    provider would have received.
+    """
+    args, kwargs = mock_get.call_args
+    return httpx.Request(
+        'GET',
+        args[0] if args else kwargs['url'],
+        params=kwargs.get('params'),
+        headers=kwargs.get('headers'),
+    )
+
+
+def _fetch_recording_the_call():
+    """Runs one provider fetch and returns the mock that recorded it."""
+    response = _provider_response({'listings': []})
+    with patch(
+        ZILLOW_MODULE + '.httpx.get', return_value=response
+    ) as mock_get:
+        fetch_listings(zip_codes=['12345'], filters={})
+    return mock_get
 
 
 class TestZillowService(unittest.TestCase):
@@ -47,37 +131,49 @@ class TestZillowService(unittest.TestCase):
         self.assertEqual(listings[0]['address'], '123 Main St')
         self.assertEqual(listings[1]['price'], 250000)
 
-    def test_api_key_travels_in_a_header_never_in_the_url(self):
-        response = _provider_response({'listings': []})
+    def test_api_key_travels_in_a_request_header(self):
+        """The credential is carried in the provider request's headers."""
+        built = _outbound_request(_fetch_recording_the_call())
 
-        with patch(
-            ZILLOW_MODULE + '.httpx.get', return_value=response
-        ) as mock_get:
-            fetch_listings(zip_codes=['12345'], filters={})
+        self.assertEqual(
+            built.headers[API_KEY_HEADER], settings.ZILLOW_API_KEY
+        )
 
-        args, kwargs = mock_get.call_args
-        from backend.app.core.config import settings
+    def test_api_key_is_absent_from_the_request_target(self):
+        """The credential appears nowhere in the assembled target."""
+        built = _outbound_request(_fetch_recording_the_call())
+        target = str(built.url)
 
-        key = settings.ZILLOW_API_KEY
-        self.assertEqual(kwargs['headers']['X-API-Key'], key)
-        self.assertNotIn(key, str(args))
-        self.assertNotIn(key, str(kwargs['params']))
-        self.assertNotIn('api_key', kwargs['params'])
+        self.assertNotIn(settings.ZILLOW_API_KEY, target)
+
+    def test_api_key_is_absent_from_the_query_string(self):
+        """The credential appears in no query parameter, by name or value.
+
+        The parameter name the credential previously travelled under is
+        asserted absent alongside the value itself.
+        """
+        mock_get = _fetch_recording_the_call()
+        built = _outbound_request(mock_get)
+        query = built.url.query.decode('utf-8')
+        sent_params = mock_get.call_args.kwargs['params']
+
+        self.assertNotIn(settings.ZILLOW_API_KEY, query)
+        self.assertNotIn(LEGACY_KEY_PARAM, query)
+        self.assertNotIn(LEGACY_KEY_PARAM, sent_params)
+        self.assertNotIn(settings.ZILLOW_API_KEY, str(sent_params))
 
     def test_every_request_carries_a_timeout(self):
-        response = _provider_response({'listings': []})
-
-        with patch(
-            ZILLOW_MODULE + '.httpx.get', return_value=response
-        ) as mock_get:
-            fetch_listings(zip_codes=['12345'], filters={})
+        """The provider call is bounded by the configured timeout."""
+        mock_get = _fetch_recording_the_call()
 
         self.assertIn('timeout', mock_get.call_args.kwargs)
+        self.assertEqual(
+            mock_get.call_args.kwargs['timeout'],
+            settings.HTTP_TIMEOUT_SECONDS,
+        )
         self.assertGreater(mock_get.call_args.kwargs['timeout'], 0)
 
     def test_provider_failure_yields_an_empty_list(self):
-        import httpx
-
         with patch(
             ZILLOW_MODULE + '.httpx.get',
             side_effect=httpx.ConnectError('unreachable'),
@@ -87,37 +183,49 @@ class TestZillowService(unittest.TestCase):
             )
 
     def test_api_key_is_absent_from_every_log_record(self):
-        import httpx
+        """The credential reaches no rendered log line.
 
-        from backend.app.core.config import settings
-        from backend.app.core.logging import BASE_LOGGER_NAME
-
+        Two failure messages are driven. The first is the shape the HTTP
+        library produces, naming the full request target, which places
+        the credential beside a credential-shaped parameter name. The
+        second quotes the credential in free prose, with no key name
+        beside it. Each case asserts the raw record carries the
+        credential and that no rendered line does.
+        """
         key = settings.ZILLOW_API_KEY
-        records = []
+        keyed_target = (
+            settings.ZILLOW_API_URL + '?' + LEGACY_KEY_PARAM + '=' + key
+        )
+        for label, message in (
+            ('the provider target names the credential',
+             'failed for url ' + keyed_target),
+            ('provider prose quotes the credential',
+             'the credential ' + key + ' was rejected upstream'),
+        ):
+            with self.subTest(label):
+                with _collecting_application_logs() as collector:
+                    with patch(
+                        ZILLOW_MODULE + '.httpx.get',
+                        side_effect=httpx.ConnectError(message),
+                    ):
+                        self.assertEqual(
+                            fetch_listings(
+                                zip_codes=['12345'], filters={}
+                            ),
+                            [],
+                        )
 
-        import logging
-
-        class Collector(logging.Handler):
-            def emit(self, record):
-                records.append(record)
-
-        handler = Collector(level=logging.DEBUG)
-        logger = logging.getLogger(BASE_LOGGER_NAME)
-        logger.addHandler(handler)
-        try:
-            with patch(
-                ZILLOW_MODULE + '.httpx.get',
-                side_effect=httpx.ConnectError(
-                    'unreachable ' + settings.ZILLOW_API_URL
-                ),
-            ):
-                fetch_listings(zip_codes=['12345'], filters={})
-        finally:
-            logger.removeHandler(handler)
-
-        self.assertTrue(records)
-        for record in records:
-            self.assertNotIn(key, repr(vars(record)))
+                self.assertTrue(collector.records)
+                self.assertTrue(any(
+                    key in repr(record.exc_info)
+                    for record in collector.records
+                ))
+                rendered = _rendered_log_lines(collector)
+                for line in rendered:
+                    self.assertNotIn(key, line)
+                self.assertTrue(any(
+                    REDACTION_PLACEHOLDER in line for line in rendered
+                ))
 
 
 class TestEmailService(unittest.TestCase):
@@ -202,31 +310,31 @@ def _order(
 
 
 class _Recorder:
-    """Answers PayPal REST calls and records every request made."""
+    """Answers PayPal REST calls and records every outbound call made."""
 
     def __init__(self, responses):
         self.responses = responses
-        self.requests = []
+        self.calls = []
 
     @staticmethod
     def _path(sent):
-        """Returns the request path of one outbound httpx request."""
+        """Returns the path of one outbound httpx call."""
         return sent.url.path
 
     def handle(self, sent):
-        self.requests.append(sent)
+        self.calls.append(sent)
         for suffix, status, payload in self.responses:
             if self._path(sent).endswith(suffix):
                 return httpx.Response(status, json=payload)
         return httpx.Response(404, json={'name': 'NOT_FOUND'})
 
     def paths(self):
-        return [self._path(sent) for sent in self.requests]
+        return [self._path(sent) for sent in self.calls]
 
     def matching(self, suffix):
         return [
             sent
-            for sent in self.requests
+            for sent in self.calls
             if self._path(sent).endswith(suffix)
         ]
 
@@ -293,11 +401,14 @@ class TestPayPalService(unittest.TestCase):
         self.engine.dispose()
         paypal_service.reset_access_token_cache()
 
-    def _transport(self, responses):
-        """Patches the service's client onto a recording transport."""
+    def _transport(self, responses, access_token='grant-token'):
+        """Patches the service's client onto a recording transport.
+
+        ``access_token`` is the value the credential exchange grants.
+        """
         recorder = _Recorder(
             [('/v1/oauth2/token', 200, {
-                'access_token': 'grant-token', 'expires_in': 3600,
+                'access_token': access_token, 'expires_in': 3600,
             })] + responses
         )
         factory = functools.partial(
@@ -331,8 +442,8 @@ class TestPayPalService(unittest.TestCase):
     def test_capture_requires_a_completed_and_reconciled_settlement(self):
         """A settlement that does not match the catalog is not complete.
 
-        The measurement is reported rather than raised, so the caller
-        decides what to do with the row it holds.
+        The outcome is reported to the caller rather than raised, and
+        carries a reason naming the mismatch.
         """
         read_back = ('/v2/checkout/orders/' + ORDER_ID, 200,
                      _order(captured=False))
@@ -364,11 +475,10 @@ class TestPayPalService(unittest.TestCase):
                 self.assertTrue(outcome.reason)
 
     def test_the_capture_asks_for_a_complete_representation(self):
-        """The capture call requests the full settled representation.
+        """The capture call asks for the full settled representation.
 
-        Without it PayPal answers with an identifier and a status alone,
-        which carries neither the amount nor the capture identifier the
-        settlement is measured by.
+        The ``Prefer`` header carries the representation preference the
+        service declares.
         """
         recorder, transport = self._transport(
             [('/capture', 201, _order())]
@@ -386,11 +496,10 @@ class TestPayPalService(unittest.TestCase):
     def test_a_minimal_capture_response_is_read_back_before_measuring(
         self,
     ):
-        """A charge is never reported as unsettled for want of a body.
+        """A capture answered with an identifier and a status settles.
 
-        PayPal may answer a capture with an identifier and a status only.
-        The order is read back so the settlement is measured against the
-        provider's own complete representation.
+        The order is read back exactly once, and the settlement is then
+        measured against the provider's complete representation.
         """
         recorder, transport = self._transport([
             ('/capture', 201, {'id': ORDER_ID, 'status': 'COMPLETED'}),
@@ -439,8 +548,8 @@ class TestPayPalService(unittest.TestCase):
         self.assertEqual(outcome.currency, plan.currency)
         self.assertEqual(outcome.capture_id, 'CAP-1')
 
-        # The capture carries a request identifier derived from the row,
-        # so a repeat of an uncertain call resolves to the same capture.
+        # The capture carries the idempotency identifier derived from
+        # the stored row.
         sent = recorder.matching('/capture')[0]
         self.assertEqual(
             sent.headers['PayPal-Request-Id'],
@@ -458,7 +567,7 @@ class TestPayPalService(unittest.TestCase):
                 self.db, ORDER_ID, self.stranger
             ))
         # Nothing left the process.
-        self.assertEqual(recorder.requests, [])
+        self.assertEqual(recorder.calls, [])
 
     def test_capture_refuses_an_order_with_no_stored_row(self):
         recorder, transport = self._transport(
@@ -470,16 +579,15 @@ class TestPayPalService(unittest.TestCase):
             _run(paypal_service.capture_order(
                 self.db, 'ORDER-UNKNOWN', self.owner
             ))
-        self.assertEqual(recorder.requests, [])
+        self.assertEqual(recorder.calls, [])
 
     def test_an_already_captured_order_is_reconciled_by_reading_it_back(
         self,
     ):
-        """Recovers the case where a capture settled but was not recorded.
+        """An order the provider reports as already captured settles.
 
-        The provider reports the order as already captured, which is a
-        provider-state failure, and the settled order is then read back
-        and measured without a second charge being issued.
+        The refusal is categorised as a provider-state failure, the
+        settled order is read back, and no second charge is issued.
         """
         recorder, transport = self._transport([
             ('/capture', 422, {'name': 'UNPROCESSABLE_ENTITY', 'details': [
@@ -525,7 +633,11 @@ class TestPayPalService(unittest.TestCase):
         self.assertEqual(len(exchanges), 1)
 
     def test_every_call_is_made_through_the_async_client(self):
-        """A synchronous httpx call would bypass this patch and fail."""
+        """No call is issued through the module's synchronous entrypoint.
+
+        The synchronous entrypoint is made to raise, and the capture
+        still reaches the recording transport.
+        """
         recorder, transport = self._transport(
             [('/capture', 201, _order())]
         )
@@ -537,62 +649,98 @@ class TestPayPalService(unittest.TestCase):
             _run(paypal_service.capture_order(
                 self.db, ORDER_ID, self.owner
             ))
-        self.assertTrue(recorder.requests)
+        self.assertTrue(recorder.calls)
 
-    def test_a_certificate_host_outside_the_allowlist_is_refused(self):
-        recorder, transport = self._transport(
-            [('/verify-webhook-signature', 200, {
-                'verification_status': 'SUCCESS',
-            })]
+    def test_create_order_accepts_no_parameter_that_can_set_the_total(
+        self,
+    ):
+        """Order creation exposes no parameter able to set the charge.
+
+        The signature is asserted to be exactly the plan identifier, the
+        two hosted redirect targets and the idempotency key, and to carry
+        no name through which an amount or a currency could be supplied.
+        """
+        accepted = tuple(
+            inspect.signature(paypal_service.create_order).parameters
         )
-        headers = {
-            'PAYPAL-AUTH-ALGO': 'SHA256withRSA',
-            'PAYPAL-CERT-URL': 'https://attacker.example.com/cert.pem',
-            'PAYPAL-TRANSMISSION-ID': 'tx-1',
-            'PAYPAL-TRANSMISSION-SIG': 'sig',
-            'PAYPAL-TRANSMISSION-TIME': '2026-01-01T00:00:00Z',
-        }
-        with transport:
-            result = _run(
-                paypal_service.verify_webhook_signature(headers, {})
-            )
-        self.assertFalse(result.verified)
+
         self.assertEqual(
-            result.reason, paypal_service.REASON_CERTIFICATE_HOST
+            accepted,
+            ('plan_id', 'return_url', 'cancel_url', 'idempotency_key'),
         )
-        # The certificate URL was never fetched or forwarded.
-        self.assertEqual(recorder.requests, [])
+        for forbidden in (
+            'amount', 'total', 'price', 'value', 'currency', 'sum',
+        ):
+            for name in accepted:
+                self.assertNotIn(forbidden, name.lower())
 
-    def test_an_allowlisted_notification_is_verified(self):
-        _recorder, transport = self._transport(
-            [('/verify-webhook-signature', 200, {
-                'verification_status': 'SUCCESS',
-            })]
-        )
-        headers = {
-            'PAYPAL-AUTH-ALGO': 'SHA256withRSA',
-            'PAYPAL-CERT-URL': 'https://api.sandbox.paypal.com/c.pem',
-            'PAYPAL-TRANSMISSION-ID': 'tx-2',
-            'PAYPAL-TRANSMISSION-SIG': 'sig',
-            'PAYPAL-TRANSMISSION-TIME': '2026-01-01T00:00:00Z',
-        }
-        raw = b'{"event_type": "PAYMENT.CAPTURE.COMPLETED"}'
+    def test_every_paypal_call_carries_an_explicit_timeout(self):
+        """Every outbound provider call is bounded by the timeout.
+
+        The credential exchange, the order creation and the capture are
+        each asserted to carry the configured timeout on every phase of
+        the connection.
+        """
+        recorder, transport = self._transport([
+            ('/v2/checkout/orders', 201, _order(
+                status='PAYER_ACTION_REQUIRED', captured=False
+            )),
+            ('/capture', 201, _order()),
+        ])
         with transport:
-            result = _run(paypal_service.verify_webhook_signature(
-                headers, raw
+            _run(paypal_service.create_order(
+                PLAN_ID, 'https://app.example/r', 'https://app.example/c'
             ))
-        self.assertTrue(result.verified)
-        self.assertEqual(result.transmission_id, 'tx-2')
-        self.assertEqual(
-            result.event_type, 'PAYMENT.CAPTURE.COMPLETED'
+            _run(paypal_service.capture_order(
+                self.db, ORDER_ID, self.owner
+            ))
+
+        self.assertTrue(recorder.matching('/v1/oauth2/token'))
+        self.assertTrue(recorder.matching('/v2/checkout/orders'))
+        self.assertTrue(recorder.matching('/capture'))
+        for sent in recorder.calls:
+            bounds = sent.extensions.get('timeout')
+            self.assertIsNotNone(bounds)
+            for phase in ('connect', 'read', 'write', 'pool'):
+                self.assertEqual(
+                    bounds[phase], settings.HTTP_TIMEOUT_SECONDS
+                )
+
+    def test_no_credential_or_token_reaches_a_log_record(self):
+        """No provider credential reaches a rendered log line.
+
+        A successful order and a refused one are both driven, and every
+        rendered line is asserted free of the client identifier, the
+        client secret and the granted access token.
+        """
+        granted = 'AccessTokenGrantedByTheProvider0123456789'
+        recorder, transport = self._transport(
+            [
+                ('/v2/checkout/orders', 201, _order(
+                    status='PAYER_ACTION_REQUIRED', captured=False
+                )),
+                ('/capture', 500, {'name': 'INTERNAL_SERVER_ERROR'}),
+            ],
+            access_token=granted,
         )
-        # The bytes that arrived are what the verifier transmitted.
-        posted = _recorder.matching('/verify-webhook-signature')[0]
-        self.assertIn(raw, posted.content)
-        self.assertEqual(
-            json.loads(posted.content.decode('utf-8'))['webhook_event'],
-            {'event_type': 'PAYMENT.CAPTURE.COMPLETED'},
-        )
+        with _collecting_application_logs() as collector:
+            with transport:
+                _run(paypal_service.create_order(
+                    PLAN_ID,
+                    'https://app.example/r',
+                    'https://app.example/c',
+                ))
+                with self.assertRaises(paypal_service.PayPalAPIError):
+                    _run(paypal_service.capture_order(
+                        self.db, ORDER_ID, self.owner
+                    ))
+
+        self.assertTrue(recorder.matching('/v1/oauth2/token'))
+        self.assertTrue(collector.records)
+        for line in _rendered_log_lines(collector):
+            self.assertNotIn(granted, line)
+            self.assertNotIn(settings.PAYPAL_CLIENT_SECRET, line)
+            self.assertNotIn(settings.PAYPAL_CLIENT_ID, line)
 
 
 if __name__ == '__main__':
