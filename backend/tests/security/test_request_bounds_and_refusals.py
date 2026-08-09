@@ -11,8 +11,15 @@ allowed list answered in plain text. One content-security policy governed
 both the API responses and the documentation pages, so a published page
 could not load the viewer it names.
 
+A later runtime review added two more. A filter name or a predicate value
+carrying a character no text column can store reached the driver, which
+refused it with an error the endpoint does not handle, so the request
+ended as an unhandled server error. A listing count above the range of
+its column reached the database, which refused it, so the request ended
+as a server error rather than a refusal.
+
 Each case asserts the behaviour through the application, so a change that
-reintroduces any of the four fails here rather than at a later review.
+reintroduces any of them fails here rather than at a later review.
 """
 
 import base64
@@ -46,7 +53,7 @@ from backend.app.core.security import (
     get_password_hash,
 )
 from backend.app.db import database as database_module
-from backend.app.db.models import Base, Criteria, Filter, User
+from backend.app.db.models import Base, Criteria, Filter, User, ZipCode
 from backend.app.db.models import Listing as ListingModel
 from backend.tests.support import enforce_sqlite_foreign_keys
 from backend.app.main import (
@@ -63,15 +70,20 @@ from backend.app.main import (
     TOO_MANY_REQUESTS_DETAIL,
     app,
 )
+from backend.app.schema import filter as filter_schema
+from backend.app.schema import listing as listing_schema
 from backend.app.schema.filter import (
     MAX_CRITERIA,
     MAX_ZIP_CODES,
     MIN_CRITERIA,
+    CriteriaCreate,
+    FilterCreate,
 )
 from backend.app.schema.listing import (
     COUNT_FIELDS,
     LISTING_URL_DOMAINS,
     LISTING_URL_SCHEMES,
+    MAX_COUNT,
     MEASUREMENT_FIELDS,
     NUMERIC_FIELDS,
     Listing,
@@ -1219,3 +1231,322 @@ class TestAListingRefusedByTheDatabaseIsOneFixedError:
         )
         assert mapped.rent == 2400.0
         assert mapped.square_footage == 900.0
+
+
+class TestFilterTextRefusesAnUnstorableCharacter:
+    """A filter's free text is refused when no column could store it.
+
+    ``criteria.field``, ``criteria.operator`` and ``zip_codes.code`` are
+    each shaped by a pattern or an allowlist, so a character no text
+    column accepts never reaches the database through them. The filter
+    name and a predicate value are bounded in length and otherwise free,
+    and the cases here hold both of them to the same characters.
+
+    The driver refuses such a character with an exception that is not a
+    database error, so it passed the endpoint's own handling and answered
+    as an unhandled server error.
+    """
+
+    #: Creation body each case replaces exactly one field of.
+    BASE = {
+        "name": "Storable",
+        "zip_codes": [{"code": "10001"}],
+        "criteria": [{"field": "rent", "operator": "lte", "value": "1"}],
+    }
+
+    def _post(self, client, user, body):
+        return client.post("/filters/", json=body, headers=bearer(user))
+
+    def _rows(self, db):
+        """Returns the parent and child row counts, in that order."""
+        return (
+            db.query(Filter).count(),
+            db.query(ZipCode).count(),
+            db.query(Criteria).count(),
+        )
+
+    def _named(self, character):
+        return dict(self.BASE, name="bad%sname" % character)
+
+    def _valued(self, character):
+        return dict(
+            self.BASE,
+            criteria=[
+                {
+                    "field": "rent",
+                    "operator": "lte",
+                    "value": "1%s2" % character,
+                }
+            ],
+        )
+
+    @pytest.mark.parametrize(
+        "character", filter_schema.FORBIDDEN_TEXT_CHARACTERS
+    )
+    def test_the_contract_refuses_the_character_in_the_name(
+        self, character
+    ):
+        with pytest.raises(PydanticValidationError):
+            FilterCreate(**self._named(character))
+
+    @pytest.mark.parametrize(
+        "character", filter_schema.FORBIDDEN_TEXT_CHARACTERS
+    )
+    def test_the_contract_refuses_the_character_in_a_predicate_value(
+        self, character
+    ):
+        with pytest.raises(PydanticValidationError):
+            CriteriaCreate(
+                field="rent", operator="lte", value="1%s2" % character
+            )
+
+    @pytest.mark.parametrize(
+        "character", filter_schema.FORBIDDEN_TEXT_CHARACTERS
+    )
+    def test_every_text_surface_of_the_contract_refuses_the_character(
+        self, character
+    ):
+        shaped = (
+            dict(
+                self.BASE,
+                criteria=[
+                    {
+                        "field": "re%snt" % character,
+                        "operator": "lte",
+                        "value": "1",
+                    }
+                ],
+            ),
+            dict(
+                self.BASE,
+                criteria=[
+                    {
+                        "field": "rent",
+                        "operator": "lt%se" % character,
+                        "value": "1",
+                    }
+                ],
+            ),
+            dict(self.BASE, zip_codes=[{"code": "1000%s1" % character}]),
+        )
+        for body in (
+            self._named(character),
+            self._valued(character),
+        ) + shaped:
+            with pytest.raises(PydanticValidationError):
+                FilterCreate(**body)
+
+    def test_the_two_contracts_refuse_the_same_characters(self):
+        assert filter_schema.FORBIDDEN_TEXT_CHARACTERS == (
+            listing_schema.FORBIDDEN_TEXT_CHARACTERS
+        )
+
+    @pytest.mark.parametrize(
+        "character", filter_schema.FORBIDDEN_TEXT_CHARACTERS
+    )
+    def test_the_write_route_refuses_a_name_carrying_one(
+        self, client, db, registered_user, character
+    ):
+        response = self._post(
+            client, registered_user, self._named(character)
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+        assert self._rows(db) == (0, 0, 0)
+
+    @pytest.mark.parametrize(
+        "character", filter_schema.FORBIDDEN_TEXT_CHARACTERS
+    )
+    def test_the_write_route_refuses_a_predicate_value_carrying_one(
+        self, client, db, registered_user, character
+    ):
+        response = self._post(
+            client, registered_user, self._valued(character)
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+        assert self._rows(db) == (0, 0, 0)
+
+    def test_the_refusal_names_neither_the_value_nor_the_character(
+        self, client, registered_user
+    ):
+        response = self._post(
+            client,
+            registered_user,
+            dict(self.BASE, name="oracle\x00name"),
+        )
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+        assert "oracle" not in response.text
+        assert "\\u0000" not in response.text
+
+    def test_ordinary_text_is_still_accepted_and_stored(
+        self, client, db, registered_user
+    ):
+        name = "Cambridge 2BR \u00e9\u4e2d\U0001f3e0"
+        value = "2500 \u20ac"
+        response = self._post(
+            client,
+            registered_user,
+            dict(
+                self.BASE,
+                name=name,
+                criteria=[
+                    {"field": "rent", "operator": "lte", "value": value}
+                ],
+            ),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["name"] == name
+        assert body["criteria"][0]["value"] == value
+        assert db.query(Filter).one().name == name
+        assert self._rows(db) == (1, 1, 1)
+
+    def test_a_refused_request_leaves_the_account_able_to_save(
+        self, client, db, registered_user
+    ):
+        refused = self._post(
+            client, registered_user, self._named("\x00")
+        )
+        assert refused.status_code == 422
+        accepted = self._post(client, registered_user, dict(self.BASE))
+        assert accepted.status_code == 200
+        assert self._rows(db) == (1, 1, 1)
+
+
+class TestCountsMustFitTheirColumn:
+    """A listing count is refused when its column could not hold it.
+
+    ``bedrooms`` and ``bathrooms`` are stored in an integer column whose
+    range ends at :data:`MAX_COUNT`. A body carrying more than that was
+    accepted by the contract and refused by the database, so the write
+    answered as a server error. Both ends of the range are asserted here,
+    at the contract and through the write route, alongside the provider
+    mapper that builds the same contract.
+    """
+
+    #: Counts above the range of the column, in each form a JSON body can
+    #: carry one: the first value beyond it, a value beyond the range of a
+    #: 64-bit integer, a whole number far beyond any of them, the same
+    #: magnitude written as a float, and one written as text.
+    REFUSED = (
+        MAX_COUNT + 1,
+        2 ** 63,
+        10 ** 30,
+        1e30,
+        str(MAX_COUNT + 1),
+    )
+
+    def _post(self, client, admin_user, field, value):
+        return client.post(
+            "/listings/",
+            json=dict(BASE_LISTING, **{field: value}),
+            headers=bearer(admin_user),
+        )
+
+    def test_the_bound_is_the_range_of_the_column(self):
+        assert MAX_COUNT == 2 ** 31 - 1
+
+    @pytest.mark.parametrize("field", COUNT_FIELDS)
+    def test_the_contract_accepts_the_largest_storable_count(self, field):
+        body = dict(BASE_LISTING, **{field: MAX_COUNT})
+        assert getattr(ListingCreate(**body), field) == MAX_COUNT
+
+    @pytest.mark.parametrize("field", COUNT_FIELDS)
+    @pytest.mark.parametrize("value", REFUSED)
+    def test_the_contract_refuses_a_count_beyond_the_column(
+        self, field, value
+    ):
+        body = dict(BASE_LISTING, **{field: value})
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(**body)
+
+    @pytest.mark.parametrize("field", COUNT_FIELDS)
+    def test_the_contract_still_refuses_a_negative_count(self, field):
+        body = dict(BASE_LISTING, **{field: -1})
+        with pytest.raises(PydanticValidationError):
+            ListingCreate(**body)
+
+    @pytest.mark.parametrize("field", COUNT_FIELDS)
+    def test_the_published_request_schema_names_the_bound(self, field):
+        published = app.openapi()["components"]["schemas"][
+            "ListingCreate"
+        ]["properties"][field]
+        assert published["maximum"] == MAX_COUNT
+        assert published["minimum"] == 0
+
+    @pytest.mark.parametrize("field", COUNT_FIELDS)
+    def test_the_write_route_stores_the_largest_storable_count(
+        self, client, db, admin_user, field
+    ):
+        response = self._post(client, admin_user, field, MAX_COUNT)
+        assert response.status_code == 200
+        assert response.json()[field] == MAX_COUNT
+        assert getattr(db.query(ListingModel).one(), field) == MAX_COUNT
+
+    @pytest.mark.parametrize("field", COUNT_FIELDS)
+    @pytest.mark.parametrize("value", REFUSED)
+    def test_the_write_route_refuses_one_beyond_it_and_stores_nothing(
+        self, client, db, admin_user, field, value
+    ):
+        response = self._post(client, admin_user, field, value)
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+        assert db.query(ListingModel).count() == 0
+        assert client.get("/listings/").status_code == 200
+
+    @pytest.mark.parametrize("field", COUNT_FIELDS)
+    def test_the_refusal_names_no_database_detail(
+        self, client, admin_user, field
+    ):
+        response = self._post(client, admin_user, field, MAX_COUNT + 1)
+        assert response.status_code == 422
+        body = response.text
+        assert "integer out of range" not in body
+        assert "psycopg2" not in body
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+
+    def test_a_refused_write_leaves_the_route_able_to_store(
+        self, client, db, admin_user
+    ):
+        refused = self._post(client, admin_user, "bedrooms", 2 ** 63)
+        assert refused.status_code == 422
+        accepted = client.post(
+            "/listings/",
+            json=dict(BASE_LISTING, bedrooms=2, bathrooms=1),
+            headers=bearer(admin_user),
+        )
+        assert accepted.status_code == 200
+        stored = db.query(ListingModel).one()
+        assert (stored.bedrooms, stored.bathrooms) == (2, 1)
+
+    @pytest.mark.parametrize("provider_field", ("bedrooms", "bathrooms"))
+    def test_the_provider_mapper_discards_a_count_beyond_the_column(
+        self, provider_field
+    ):
+        raw = {
+            "price": 2400.0,
+            "square_feet": 900.0,
+            "address": "1 Ingest Way",
+            "listing_url": "https://www.zillow.com/homedetails/x",
+            provider_field: MAX_COUNT + 1,
+        }
+        with pytest.raises(zillow_service.ListingMappingError) as raised:
+            zillow_service.process_listing(raw)
+        assert provider_field in raised.value.fields
+
+    @pytest.mark.parametrize("provider_field", ("bedrooms", "bathrooms"))
+    def test_the_provider_mapper_still_accepts_a_storable_count(
+        self, provider_field
+    ):
+        raw = {
+            "price": 2400.0,
+            "square_feet": 900.0,
+            "address": "1 Ingest Way",
+            "listing_url": "https://www.zillow.com/homedetails/x",
+            provider_field: 3,
+        }
+        assert getattr(
+            zillow_service.process_listing(raw), provider_field
+        ) == 3

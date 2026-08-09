@@ -29,6 +29,10 @@ MEASUREMENT_FIELDS = ("rent", "broker_fee", "square_footage")
 #: Names of the fields carrying a count stored in an integer column.
 COUNT_FIELDS = ("bedrooms", "bathrooms")
 
+#: Largest value an integer column holds. A JSON body cannot carry a
+#: count above this, so each of those fields refuses one.
+MAX_COUNT = 2 ** 31 - 1
+
 #: Every field carrying a number, measurements and counts together. A
 #: boolean is refused on each of them.
 NUMERIC_FIELDS = MEASUREMENT_FIELDS + COUNT_FIELDS
@@ -148,15 +152,17 @@ class ListingCreate(BaseModel):
 
     Each field in :data:`MEASUREMENT_FIELDS` must be a finite number the
     column's type can represent, so a body carrying an infinity, a NaN or
-    a magnitude beyond that type is refused here rather than stored, and
-    each field in :data:`NUMERIC_FIELDS` refuses a boolean.
+    a magnitude beyond that type is refused here rather than stored. Each
+    field in :data:`COUNT_FIELDS` is bounded at :data:`MAX_COUNT` for the
+    same reason, and each field in :data:`NUMERIC_FIELDS` refuses a
+    boolean.
     """
 
     rent: float = Field(..., ge=0)
     broker_fee: Optional[float] = Field(None, ge=0)
     square_footage: Optional[float] = Field(None, ge=0)
-    bedrooms: Optional[int] = Field(None, ge=0)
-    bathrooms: Optional[int] = Field(None, ge=0)
+    bedrooms: Optional[int] = Field(None, ge=0, le=MAX_COUNT)
+    bathrooms: Optional[int] = Field(None, ge=0, le=MAX_COUNT)
     available_date: Optional[datetime] = None
     street_address: Optional[str] = Field(None, max_length=255)
     zillow_url: Optional[str] = Field(None, max_length=2048)

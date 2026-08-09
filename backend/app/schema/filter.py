@@ -45,6 +45,32 @@ _ZIP_CODE_REGEX = r"^\d{5}(?:-\d{4})?$"
 # or underscores.
 _CRITERIA_FIELD_REGEX = r"^[A-Za-z][A-Za-z0-9_]*$"
 
+# Characters refused in a text field. A text column stores no NUL, so a
+# value carrying one cannot be written and is refused by the contract
+# instead of by the driver. This set is held equal to the one
+# backend.app.schema.listing declares.
+FORBIDDEN_TEXT_CHARACTERS = ("\x00",)
+
+# Refusal reported for a text value a text column cannot store.
+UNSTORABLE_TEXT_DETAIL = (
+    "value carries a character a text column cannot store"
+)
+
+
+def _storable_text(value):
+    """Returns ``value`` when a text column can store it, else refuses it.
+
+    Every character in :data:`FORBIDDEN_TEXT_CHARACTERS` is refused. The
+    refusal names neither the character nor the value.
+    """
+    if value is None:
+        return value
+    for character in FORBIDDEN_TEXT_CHARACTERS:
+        if character in value:
+            raise ValueError(UNSTORABLE_TEXT_DETAIL)
+    return value
+
+
 _NameField = constr(strip_whitespace=True, min_length=1, max_length=120)
 
 _ZipCodeField = constr(
@@ -135,6 +161,11 @@ class CriteriaCreate(BaseModel):
             raise ValueError(f"operator must be one of: {accepted}")
         return candidate
 
+    @validator("value")
+    def validate_value(cls, value: str) -> str:
+        """Refuse a text value a text column cannot store."""
+        return _storable_text(value)
+
 
 class FilterCreate(BaseModel):
     # Allowlist of client-settable fields. This contract carries no id,
@@ -147,3 +178,8 @@ class FilterCreate(BaseModel):
 
     class Config:
         extra = "forbid"
+
+    @validator("name")
+    def validate_name(cls, value: str) -> str:
+        """Refuse a text value a text column cannot store."""
+        return _storable_text(value)
