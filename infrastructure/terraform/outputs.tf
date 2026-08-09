@@ -9,30 +9,23 @@ output "database_instance_connection_name" {
 }
 
 output "storage_bucket_urls" {
-  description = "The URLs of the created storage buckets"
+  description = "The URLs of the created storage buckets, keyed by resource name"
   value = {
-    raw_data     = google_storage_bucket.raw_data.url
-    processed_data = google_storage_bucket.processed_data.url
-    artifacts    = google_storage_bucket.artifacts.url
+    static_assets = google_storage_bucket.static_assets.url
+    data_lake     = google_storage_bucket.data_lake.url
   }
 }
 
 output "pubsub_topic_names" {
-  description = "The names of the created Pub/Sub topics"
+  description = "The name of the created Pub/Sub topic, keyed by resource name"
   value = {
-    raw_data     = google_pubsub_topic.raw_data.name
-    processed_data = google_pubsub_topic.processed_data.name
+    main = google_pubsub_topic.main.name
   }
 }
 
 output "cloud_functions_urls" {
-  description = "The URLs of the deployed Cloud Functions"
+  description = "The HTTPS trigger URL of the deployed Cloud Function, keyed by resource name"
   value = {
-    data_processor = google_cloudfunctions_function.data_processor.https_trigger_url
-    data_analyzer  = google_cloudfunctions_function.data_analyzer.https_trigger_url
+    function = google_cloudfunctions_function.function.https_trigger_url
   }
 }
-
-# HUMAN ASSISTANCE NEEDED
-# The following outputs may need to be adjusted based on the actual resource names and configurations in your Terraform setup.
-# Please verify and modify as necessary to match your specific infrastructure.

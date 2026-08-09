@@ -5,30 +5,99 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GKE_CLUSTER: ${{ secrets.GKE_CLUSTER_NAME }}
   GKE_ZONE: ${{ secrets.GKE_CLUSTER_ZONE }}
 
 jobs:
-  deploy:
-    name: Deploy to GCP
+  verify:
+    name: Verify security gates
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v2
+      uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.9'
+
+    - name: Install Python dependencies
+      run: |
+        set -euo pipefail
+        python -m pip install --upgrade pip
+        pip install -r backend/requirements.txt
+        pip install -r backend/requirements-dev.txt
+
+    - name: Run pip-audit
+      run: |
+        set -euo pipefail
+        # The advisory identifiers below are registered in
+        # docs/security/RESIDUAL_RISK.md.
+        pip-audit --strict -r backend/requirements.txt \
+          --ignore-vuln PYSEC-2026-161 \
+          --ignore-vuln PYSEC-2026-248 \
+          --ignore-vuln PYSEC-2026-249 \
+          --ignore-vuln PYSEC-2026-2280 \
+          --ignore-vuln PYSEC-2026-2281 \
+          --ignore-vuln PYSEC-2026-2270 \
+          --ignore-vuln PYSEC-2026-2132
+        pip-audit --strict -r backend/requirements-dev.txt \
+          --ignore-vuln PYSEC-2026-1845 \
+          --ignore-vuln PYSEC-2026-3625 \
+          --ignore-vuln PYSEC-2026-1374 \
+          --ignore-vuln PYSEC-2026-1375 \
+          --ignore-vuln PYSEC-2026-2275 \
+          --ignore-vuln PYSEC-2026-141 \
+          --ignore-vuln PYSEC-2026-142
+
+    - name: Run Bandit
+      run: |
+        set -euo pipefail
+        bandit -r backend/app -ll
+
+    - name: Run backend security tests
+      run: |
+        set -euo pipefail
+        python -m pytest backend/tests/security -q
+
+  deploy:
+    name: Deploy to GCP
+    runs-on: ubuntu-latest
+    needs: verify
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v3
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
     - name: Set up Google Cloud SDK
-      uses: google-github-actions/setup-gcloud@v0.2.1
+      uses: google-github-actions/setup-gcloud@v3
       with:
         project_id: ${{ env.PROJECT_ID }}
-        service_account_key: ${{ secrets.GCP_SA_KEY }}
-        export_default_credentials: true
+        install_components: gke-gcloud-auth-plugin
 
-    - name: Authenticate with Google Cloud
+    - name: Configure Docker credential helper
       run: |
-        gcloud auth configure-docker
+        gcloud auth configure-docker gcr.io --quiet
 
     - name: Build and push Docker images
       run: |
@@ -41,22 +110,110 @@ jobs:
       run: |
         gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE
 
+    - name: Apply database migrations
+      run: |
+        set -euo pipefail
+
+        MIGRATION_IMAGE="gcr.io/$PROJECT_ID/backend:${{ github.sha }}"
+        MIGRATION_POD="backend-migrate-${{ github.sha }}"
+
+        # Carries the environment, identity, image pull secrets and volumes
+        # the backend Deployment declares onto a one-shot pod that runs the
+        # image built above.
+        OVERRIDES="$(kubectl get deployment/backend -o json | jq -c \
+          --arg image "$MIGRATION_IMAGE" \
+          '.spec.template.spec as $pod
+           | $pod.containers[0] as $app
+           | {
+               apiVersion: "v1",
+               spec: {
+                 restartPolicy: "Never",
+                 serviceAccountName: ($pod.serviceAccountName // "default"),
+                 imagePullSecrets: ($pod.imagePullSecrets // []),
+                 volumes: ($pod.volumes // []),
+                 containers: [{
+                   name: "migrate",
+                   image: $image,
+                   command: ["python", "-m", "alembic", "-c",
+                             "backend/alembic.ini", "upgrade", "head"],
+                   env: ($app.env // []),
+                   envFrom: ($app.envFrom // []),
+                   volumeMounts: ($app.volumeMounts // [])
+                 }]
+               }
+             }')"
+
+        cleanup() {
+          if ! kubectl delete pod "$MIGRATION_POD" --ignore-not-found --wait=false; then
+            echo "pod $MIGRATION_POD was not removed"
+          fi
+        }
+        trap cleanup EXIT
+
+        kubectl run "$MIGRATION_POD" \
+          --image="$MIGRATION_IMAGE" \
+          --restart=Never \
+          --overrides="$OVERRIDES"
+
+        deadline=$(( SECONDS + 900 ))
+        phase=""
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          if ! phase="$(kubectl get pod "$MIGRATION_POD" -o jsonpath='{.status.phase}')"; then
+            phase=""
+          fi
+          case "$phase" in
+            Succeeded|Failed) break ;;
+          esac
+          sleep 5
+        done
+
+        if ! kubectl logs "$MIGRATION_POD"; then
+          echo "logs for pod $MIGRATION_POD were not retrievable"
+        fi
+
+        if [ "$phase" != "Succeeded" ]; then
+          echo "alembic upgrade head did not complete; observed phase ${phase:-unknown}"
+          if ! kubectl describe pod "$MIGRATION_POD"; then
+            echo "pod $MIGRATION_POD was not describable"
+          fi
+          exit 1
+        fi
+
     - name: Deploy to GKE
       run: |
         kubectl set image deployment/frontend frontend=gcr.io/$PROJECT_ID/frontend:${{ github.sha }}
         kubectl set image deployment/backend backend=gcr.io/$PROJECT_ID/backend:${{ github.sha }}
 
-    - name: Update database schema
-      run: |
-        # HUMAN ASSISTANCE NEEDED
-        # Add commands to update database schema if necessary
-        # Example: kubectl exec -it $(kubectl get pod -l app=backend -o jsonpath="{.items[0].metadata.name}") -- npm run migrate
-
     - name: Run post-deployment health checks
       run: |
-        # HUMAN ASSISTANCE NEEDED
-        # Add commands to run health checks
-        # Example: 
-        # kubectl rollout status deployment/frontend
-        # kubectl rollout status deployment/backend
-        # Add additional health check commands as needed
+        set -euo pipefail
+
+        kubectl rollout status deployment/frontend --timeout=10m
+        kubectl rollout status deployment/backend --timeout=10m
+
+        # Probes the backend health endpoint through a local forward.
+        kubectl port-forward deployment/backend 8000:8000 &
+        forward_pid=$!
+        cleanup() {
+          if kill "$forward_pid" 2>/dev/null; then
+            echo "closed the port forward"
+          fi
+        }
+        trap cleanup EXIT
+
+        sleep 5
+
+        answered=""
+        for attempt in 1 2 3 4 5 6 7 8 9 10; do
+          if curl --fail --silent --show-error http://127.0.0.1:8000/health; then
+            answered="yes"
+            break
+          fi
+          echo "health probe attempt $attempt did not answer, retrying"
+          sleep 5
+        done
+
+        if [ -z "$answered" ]; then
+          echo "the backend health endpoint did not answer on 127.0.0.1:8000/health"
+          exit 1
+        fi
