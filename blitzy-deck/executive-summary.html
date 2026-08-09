@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apartment-finder-service - Security Remediation Executive Summary</title>
+
+<link rel="icon" href="data:,">
+
+<!-- typefaces -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Space+Grotesk:wght@500;600;700&amp;family=Fira+Code:wght@400;500&amp;display=swap">
+
+<!-- reveal.js framework stylesheet -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+
+<style>
+:root {
+  --blitzy-primary: #5B39F3;
+  --blitzy-primary-dark: #2D1C77;
+  --blitzy-primary-navy: #1A105F;
+  --blitzy-primary-light: #7A6DEC;
+  --blitzy-primary-deep: #4101DB;
+  --blitzy-accent-teal: #94FAD5;
+  --blitzy-surface-0: #FFFFFF;
+  --blitzy-surface-1: #F4EFF6;
+  --blitzy-surface-2: #F2F0FE;
+  --blitzy-surface-3: #F5F5F5;
+  --blitzy-border: #D9D9D9;
+  --blitzy-border-soft: rgba(91, 57, 243, 0.18);
+  --blitzy-text: #333333;
+  --blitzy-text-muted: #999999;
+  --blitzy-text-invert: #FFFFFF;
+  --ff-body: 'Inter', system-ui, sans-serif;
+  --ff-display: 'Space Grotesk', 'Inter', sans-serif;
+  --ff-mono: 'Fira Code', 'Courier New', monospace;
+  --gradient-hero: linear-gradient(68deg, #7A6DEC 15.56%, #5B39F3 62.74%, #4101DB 84.44%);
+  --gradient-divider: linear-gradient(135deg, #2D1C77 0%, #5B39F3 100%);
+  --gradient-accent-bar: linear-gradient(90deg, #5B39F3 0%, #94FAD5 100%);
+}
+
+/* base typography */
+html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
+
+.reveal {
+  font-family: var(--ff-body);
+  font-size: 32px;
+  font-weight: 400;
+  color: var(--blitzy-text);
+  background: var(--blitzy-surface-0);
+}
+
+.reveal h1, .reveal h2, .reveal h3, .reveal h4 {
+  font-family: var(--ff-display);
+  font-weight: 600;
+  color: var(--blitzy-primary-dark);
+  text-transform: none;
+  letter-spacing: -0.015em;
+  line-height: 1.08;
+  margin: 0 0 26px 0;
+  text-shadow: none;
+}
+
+.reveal h1 { font-size: 2.6em; font-weight: 700; }
+.reveal h2 { font-size: 1.62em; }
+.reveal h3 { font-size: 1.05em; }
+
+.reveal p { line-height: 1.45; margin: 0 0 14px 0; }
+.reveal ul { list-style: none; margin: 6px 0 0 0; padding: 0; }
+.reveal li {
+  position: relative;
+  padding-left: 42px;
+  margin-bottom: 16px;
+  font-size: 0.62em;
+  line-height: 1.42;
+  color: var(--blitzy-text);
+}
+.reveal li::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 0.52em;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--gradient-accent-bar);
+}
+
+.mono {
+  font-family: var(--ff-mono);
+  font-weight: 500;
+  font-size: 0.94em;
+  background: var(--blitzy-surface-2);
+  color: var(--blitzy-primary-deep);
+  padding: 0.08em 0.34em;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.lede {
+  font-size: 0.6em;
+  color: var(--blitzy-text-muted);
+  max-width: 1500px;
+}
+.emphasis { font-weight: 600; color: var(--blitzy-primary-deep); }
+
+/* full-bleed slide frame */
+.reveal .slides { text-align: left; }
+
+.reveal .slides > section {
+  width: 100%;
+  height: 100%;
+  top: 0 !important;
+  left: 0 !important;
+  box-sizing: border-box;
+  padding: 0;
+  background: var(--blitzy-surface-0);
+}
+
+.slide-body {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding: 78px 104px;
+}
+
+/* slide types */
+.slide-title {
+  background: var(--gradient-hero) !important;
+  color: var(--blitzy-text-invert);
+}
+.slide-title h1 { color: var(--blitzy-text-invert); max-width: 1560px; }
+.slide-title p { color: rgba(255, 255, 255, 0.92); }
+.slide-title .scope { font-size: 0.68em; font-weight: 500; max-width: 1400px; }
+.slide-title .audience {
+  font-family: var(--ff-mono);
+  font-size: 0.44em;
+  letter-spacing: 0.08em;
+  color: var(--blitzy-accent-teal);
+  margin-top: 18px;
+}
+
+.slide-divider {
+  background: var(--gradient-divider) !important;
+  color: var(--blitzy-text-invert);
+  text-align: center;
+}
+.slide-divider .slide-body { align-items: center; }
+.slide-divider h2 {
+  color: var(--blitzy-text-invert);
+  font-size: 2.9em;
+  font-weight: 700;
+  margin: 0;
+}
+.slide-divider .divider-icon svg {
+  width: 128px;
+  height: 128px;
+  stroke: var(--blitzy-accent-teal);
+  stroke-width: 1.5;
+}
+.slide-divider .divider-note {
+  font-family: var(--ff-mono);
+  font-size: 0.42em;
+  letter-spacing: 0.16em;
+  color: rgba(255, 255, 255, 0.78);
+  margin-top: 26px;
+  text-transform: uppercase;
+}
+
+.slide-closing {
+  background: var(--blitzy-primary-navy) !important;
+  color: var(--blitzy-text-invert);
+}
+.slide-closing h2 { color: var(--blitzy-text-invert); font-size: 2.35em; font-weight: 700; }
+.slide-closing li { color: rgba(255, 255, 255, 0.9); }
+.slide-closing li::before { background: var(--blitzy-accent-teal); }
+
+/* component classes */
+.eyebrow {
+  display: block;
+  font-family: var(--ff-mono);
+  font-weight: 500;
+  font-size: 0.44em;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--blitzy-accent-teal);
+  margin: 0 0 22px 0;
+}
+.eyebrow-ink { color: var(--blitzy-primary); }
+
+.hero-icon { display: block; margin: 0 0 34px 0; }
+.hero-icon svg {
+  width: 112px;
+  height: 112px;
+  stroke: var(--blitzy-accent-teal);
+  stroke-width: 1.5;
+}
+
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 26px;
+  margin-top: 26px;
+}
+.kpi-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--blitzy-surface-0);
+  border: 2px solid var(--blitzy-border-soft);
+  border-radius: 18px;
+  padding: 32px 26px;
+  box-shadow: 0 8px 26px rgba(26, 16, 95, 0.07);
+}
+.kpi-icon { display: flex; align-items: center; }
+.kpi-icon svg {
+  width: 38px;
+  height: 38px;
+  stroke: var(--blitzy-primary);
+  stroke-width: 2;
+}
+.kpi-value {
+  font-family: var(--ff-display);
+  font-weight: 700;
+  font-size: 1.72em;
+  line-height: 1;
+  color: var(--blitzy-primary-deep);
+}
+.kpi-label {
+  font-family: var(--ff-body);
+  font-weight: 500;
+  font-size: 0.42em;
+  line-height: 1.38;
+  color: var(--blitzy-text-muted);
+}
+
+.icon-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 26px;
+  margin-top: 34px;
+}
+.icon-row > div {
+  background: var(--blitzy-surface-1);
+  border: 1px solid var(--blitzy-border);
+  border-radius: 16px;
+  padding: 28px 22px;
+  text-align: center;
+}
+.icon-row svg {
+  width: 44px;
+  height: 44px;
+  stroke: var(--blitzy-primary);
+  stroke-width: 2;
+}
+.icon-row span {
+  display: block;
+  margin-top: 14px;
+  font-family: var(--ff-display);
+  font-weight: 600;
+  font-size: 0.4em;
+  line-height: 1.3;
+  color: var(--blitzy-primary-dark);
+}
+
+.accent-bar {
+  display: block;
+  width: 100%;
+  height: 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--gradient-accent-bar);
+  margin: 0;
+}
+
+.brand-lockup { display: flex; align-items: center; gap: 18px; }
+.brand-lockup svg {
+  width: 44px;
+  height: 44px;
+  stroke: var(--blitzy-accent-teal);
+  stroke-width: 2;
+}
+.brand-lockup .brand-word {
+  font-family: var(--ff-display);
+  font-weight: 700;
+  font-size: 0.58em;
+  letter-spacing: 0.05em;
+  color: var(--blitzy-text-invert);
+}
+.brand-lockup .brand-sub {
+  font-family: var(--ff-mono);
+  font-weight: 400;
+  font-size: 0.36em;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--blitzy-accent-teal);
+}
+
+/* styled table */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.44em;
+  margin-top: 22px;
+}
+.data-table th {
+  font-family: var(--ff-display);
+  font-weight: 600;
+  text-align: left;
+  background: var(--blitzy-surface-2);
+  color: var(--blitzy-primary-dark);
+  border: 1px solid var(--blitzy-border);
+  padding: 16px 20px;
+}
+.data-table td {
+  border: 1px solid var(--blitzy-border);
+  color: var(--blitzy-text);
+  padding: 15px 20px;
+  vertical-align: top;
+  line-height: 1.38;
+}
+.data-table tbody tr:nth-child(even) td { background: var(--blitzy-surface-3); }
+.data-table tbody tr.row-flag td {
+  background: var(--blitzy-surface-2);
+  font-weight: 600;
+  color: var(--blitzy-primary-dark);
+}
+.data-table .role-cell {
+  font-family: var(--ff-display);
+  font-weight: 600;
+  color: var(--blitzy-primary-deep);
+  white-space: nowrap;
+}
+
+/* mermaid container */
+.mermaid {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  background: transparent;
+  margin: 0;
+  padding: 0;
+  box-shadow: none;
+  font-size: 1em;
+}
+.reveal pre.mermaid {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  max-width: 100%;
+  background: transparent;
+  box-shadow: none;
+  margin: 8px 0 0 0;
+  padding: 0;
+  font-size: 1em;
+  line-height: 1.2;
+  word-wrap: normal;
+  white-space: normal;
+}
+.reveal pre.mermaid svg {
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: 720px;
+}
+
+.reveal pre.mermaid[data-render-failed="true"] {
+  font-family: var(--ff-body);
+  font-size: 0.5em;
+  color: var(--blitzy-primary-deep);
+}
+
+/* slide header block */
+.slide-head { margin-bottom: 6px; }
+.slide-foot {
+  margin-top: 28px;
+  font-family: var(--ff-mono);
+  font-size: 0.38em;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--blitzy-text-muted);
+}
+.callout {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  background: var(--blitzy-surface-2);
+  border-left: 8px solid var(--blitzy-primary);
+  border-radius: 10px;
+  padding: 20px 26px;
+  margin-top: 24px;
+}
+.callout svg {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 auto;
+  stroke: var(--blitzy-primary-deep);
+  stroke-width: 2;
+}
+.callout p {
+  margin: 0;
+  font-size: 0.5em;
+  font-weight: 600;
+  color: var(--blitzy-primary-dark);
+}
+.closing-foot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 40px;
+  margin-top: 44px;
+}
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- 1. title -->
+<section class="slide-title">
+<div class="slide-body">
+
+    <span class="hero-icon"><i data-lucide="shield-check"></i></span>
+    <span class="eyebrow">Security Remediation</span>
+    <h1>apartment-finder-service</h1>
+    <p class="scope">Twenty security findings closed across authentication, authorization, payments and secrets. No new product functionality, and one deliberate breaking change.</p>
+    <p class="audience">Prepared for executive leadership and the change-approval reviewers</p>
+</div>
+</section>
+
+<!-- 2. headline metrics -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Outcome at a glance</span>
+      <h2>What the work delivered</h2>
+    </div>
+    <p class="lede">Before this work the service could not start and its test suite collected no tests at all. Every figure below is measured, not estimated.</p>
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <span class="kpi-icon"><i data-lucide="shield-check"></i></span>
+        <span class="kpi-value">20</span>
+        <span class="kpi-label">findings closed, spanning four vulnerability clusters</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-icon"><i data-lucide="git-branch"></i></span>
+        <span class="kpi-value">19 &rarr; 7</span>
+        <span class="kpi-label">dependency advisories, falling from seven packages to three</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-icon"><i data-lucide="terminal"></i></span>
+        <span class="kpi-value">1 &rarr; 0</span>
+        <span class="kpi-label">automated code-scan findings at medium severity or above</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-icon"><i data-lucide="file-check"></i></span>
+        <span class="kpi-value">68</span>
+        <span class="kpi-label">entries in the change map: 30 created, 29 updated, none deleted, 9 read-only references</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-icon"><i data-lucide="check-circle"></i></span>
+        <span class="kpi-value">45</span>
+        <span class="kpi-label">access-control assertions, covering nine routes across five kinds of caller</span>
+      </div>
+    </div>
+</div>
+</section>
+
+<!-- 3. architecture overview -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">What changed architecturally</span>
+      <h2>Where the new controls sit</h2>
+    </div>
+    <p class="lede">Hardened boundaries are highlighted. Every other component keeps the role it already had.</p>
+  <pre class="mermaid">
+  graph LR
+    BROWSER["Renter&lt;br/&gt;Browser"] --&gt; LB["Load&lt;br/&gt;Balancer"]
+    LB --&gt; WEB["Web Server"]
+    WEB --&gt; UI["Renter Web&lt;br/&gt;Application"]
+    WEB --&gt; API["Backend&lt;br/&gt;Service"]
+    API --&gt; AUTHZ["Central&lt;br/&gt;Authorization&lt;br/&gt;Check"]
+    AUTHZ --&gt; DB["Listings and&lt;br/&gt;Accounts&lt;br/&gt;Database"]
+    API --&gt; HDR["Protective&lt;br/&gt;Response&lt;br/&gt;Headers"]
+    API --&gt; FILES["Static Asset&lt;br/&gt;Storage"]
+    API --&gt; ZILLOW["Listings Data&lt;br/&gt;Provider"]
+    API --&gt; PAY["Payment&lt;br/&gt;Provider"]
+    INGEST["Listing&lt;br/&gt;Ingestion&lt;br/&gt;Service"] --&gt; ZILLOW
+    INGEST --&gt; DB
+    STREAM["Event Stream"] --&gt; API
+    STREAM --&gt; INGEST
+    VAULT["Managed Secret&lt;br/&gt;Storage"] --&gt; API
+    VAULT --&gt; INGEST
+    classDef hardened fill:#F2F0FE,stroke:#5B39F3,stroke-width:4px,color:#1A105F;
+    class AUTHZ,HDR,VAULT hardened;
+  </pre>
+</div>
+</section>
+
+<!-- 4. divider: authentication -->
+<section class="slide-divider">
+<div class="slide-body">
+
+    <span class="divider-icon"><i data-lucide="key-round"></i></span>
+    <h2>Authentication</h2>
+    <p class="divider-note">Cluster one of four</p>
+</div>
+</section>
+
+<!-- 5. authentication hardening -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Who the service believes you are</span>
+      <h2>Sign-in can no longer be talked into trusting a stranger</h2>
+    </div>
+    <ul>
+      <li>Only approved signing methods are accepted; forged tokens are refused.</li>
+      <li>A weak signing secret stops startup rather than issuing tokens.</li>
+      <li>Sign-in no longer reveals whether an address has an account.</li>
+      <li>Password checking repaired; no user must reset.</li>
+    </ul>
+    <div class="icon-row">
+      <div><i data-lucide="key-round"></i><span>Approved methods only</span></div>
+      <div><i data-lucide="lock"></i><span>Startup validation</span></div>
+      <div><i data-lucide="fingerprint"></i><span>Full claim checks</span></div>
+      <div><i data-lucide="check-circle"></i><span>Passwords still verify</span></div>
+    </div>
+</div>
+</section>
+
+<!-- 6. divider: authorization -->
+<section class="slide-divider">
+<div class="slide-body">
+
+    <span class="divider-icon"><i data-lucide="user-check"></i></span>
+    <h2>Authorization</h2>
+    <p class="divider-note">Cluster two of four</p>
+</div>
+</section>
+
+<!-- 7. authorization model -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Realizing documented design intent</span>
+      <h2>Four roles, one central decision, denied by default</h2>
+    </div>
+    <ul>
+      <li>These four roles are the project's own documented design intent.</li>
+      <li>One central check decides access and denies by default.</li>
+      <li>Roles come from the account record, not the browser.</li>
+      <li>Exactly one administrator exists, via a separate auditable step.</li>
+    </ul>
+    <table class="data-table">
+      <thead>
+        <tr><th>Role</th><th>What an account of this kind may do</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="role-cell">Guest</td><td>Browse listings. No account required, and page sizes are now bounded.</td></tr>
+        <tr><td class="role-cell">Registered</td><td>Save search filters and take out a subscription. Sees only its own records.</td></tr>
+        <tr><td class="role-cell">Premium</td><td>Everything a registered account may do, carrying a paid entitlement.</td></tr>
+        <tr><td class="role-cell">Admin</td><td>Everything above, plus writing to the shared listings corpus. Held by one account.</td></tr>
+      </tbody>
+    </table>
+</div>
+</section>
+
+<!-- 8. divider: payments -->
+<section class="slide-divider">
+<div class="slide-body">
+
+    <span class="divider-icon"><i data-lucide="credit-card"></i></span>
+    <h2>Payments</h2>
+    <p class="divider-note">Cluster three of four</p>
+</div>
+</section>
+
+<!-- 9. payment integrity -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Who decides what is charged</span>
+      <h2>The buyer can no longer name its own price</h2>
+    </div>
+    <ul>
+      <li>Price and period come from a server catalogue.</li>
+      <li>Client amount and date fields no longer exist.</li>
+      <li>Payment capture is bound to the originating account.</li>
+      <li>Hosted redirect retained: no card number enters or is stored here.</li>
+    </ul>
+    <div class="icon-row">
+      <div><i data-lucide="credit-card"></i><span>Server-owned pricing</span></div>
+      <div><i data-lucide="user-check"></i><span>Capture bound to buyer</span></div>
+      <div><i data-lucide="shield-check"></i><span>Notifications verified</span></div>
+      <div><i data-lucide="lock"></i><span>Repeats refused</span></div>
+    </div>
+</div>
+</section>
+
+<!-- 10. divider: secrets and infrastructure -->
+<section class="slide-divider">
+<div class="slide-body">
+
+    <span class="divider-icon"><i data-lucide="lock"></i></span>
+    <h2>Secrets and Infrastructure</h2>
+    <p class="divider-note">Cluster four of four</p>
+</div>
+</section>
+
+<!-- 11. secrets and platform hardening -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Keeping secrets out of the wrong places</span>
+      <h2>Credentials no longer travel with the code</h2>
+    </div>
+    <ul>
+      <li>Credentials left version control; the repository's first ignore rules prevent return.</li>
+      <li>A partner key left web addresses and logs.</li>
+      <li>Managed secret storage now exists where there was none.</li>
+      <li>Protective headers and a narrowed cross-origin policy apply.</li>
+    </ul>
+    <div class="icon-row">
+      <div><i data-lucide="git-branch"></i><span>Out of version control</span></div>
+      <div><i data-lucide="terminal"></i><span>Out of logs</span></div>
+      <div><i data-lucide="server"></i><span>Managed secret storage</span></div>
+      <div><i data-lucide="shield-check"></i><span>Protective headers</span></div>
+    </div>
+</div>
+</section>
+
+<!-- 12. before and after request authorization -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Data flow, before and after</span>
+      <h2>How a paid request is decided now</h2>
+    </div>
+    <p class="lede">The client no longer supplies an amount or the access dates.</p>
+  <pre class="mermaid">
+  graph LR
+    subgraph AFTER["After"]
+      direction LR
+      RQ2["Request"] --&gt; API2["Backend&lt;br/&gt;Service"]
+      API2 --&gt; AZ["Central&lt;br/&gt;authorization&lt;br/&gt;check"]
+      ROLE["Role read from&lt;br/&gt;the account record"] --&gt; AZ
+      AZ --&gt; Q2{"Role&lt;br/&gt;sufficient?"}
+      Q2 --&gt;|"no"| DENY["Denied by&lt;br/&gt;default"]
+      Q2 --&gt;|"yes"| CAT["Server catalogue&lt;br/&gt;sets amount,&lt;br/&gt;currency and period"]
+      CL2["Client sends&lt;br/&gt;no amount&lt;br/&gt;and no dates"] --&gt; CAT
+      CAT --&gt; CLK["Server clock sets&lt;br/&gt;the access dates"]
+      CLK --&gt; SAVE2["Saved from&lt;br/&gt;server-owned&lt;br/&gt;values"]
+    end
+    subgraph BEFORE["Before"]
+      direction LR
+      RQ1["Request"] --&gt; API1["Backend&lt;br/&gt;Service"]
+      API1 --&gt; Q1{"Signed in&lt;br/&gt;at all?"}
+      Q1 --&gt;|"yes"| GO1["Proceed"]
+      CL1["Client sends&lt;br/&gt;its own amount&lt;br/&gt;and access dates"] --&gt; GO1
+      GO1 --&gt; SAVE1["Saved exactly&lt;br/&gt;as sent"]
+    end
+    classDef risk fill:#F4EFF6,stroke:#999999,stroke-width:2px,color:#333333;
+    classDef good fill:#F2F0FE,stroke:#5B39F3,stroke-width:4px,color:#1A105F;
+    class CL1,SAVE1,Q1 risk;
+    class AZ,ROLE,CAT,CLK,CL2 good;
+  </pre>
+</div>
+</section>
+
+<!-- 13. dependency remediation -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Supply chain</span>
+      <h2>Three building blocks replaced, not patched</h2>
+    </div>
+    <ul>
+      <li>Three packages were replaced rather than upgraded: no patched release existed.</li>
+      <li>Several advisories closed by removing or omitting a package, not upgrading one.</li>
+      <li>Fewer packages now reach the running service.</li>
+    </ul>
+    <table class="data-table">
+      <thead>
+        <tr><th>Replaced</th><th>Now in use</th><th>Security outcome</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="role-cell">Token library</td>
+          <td>A maintained token library</td>
+          <td>Removed a bundled component whose known flaw has no planned fix from anyone.</td>
+        </tr>
+        <tr>
+          <td class="role-cell">Password-hashing wrapper</td>
+          <td>The hashing library, called directly</td>
+          <td>Sign-in repaired, and every password already on file still verifies.</td>
+        </tr>
+        <tr>
+          <td class="role-cell">Archived payment kit</td>
+          <td>Direct calls to the payment provider</td>
+          <td>Made verification of incoming payment notifications possible at all.</td>
+        </tr>
+        <tr class="row-flag">
+          <td class="role-cell">Overall</td>
+          <td>19 &rarr; 7 advisories</td>
+          <td>Carried by seven packages before this work and three after it.</td>
+        </tr>
+      </tbody>
+    </table>
+</div>
+</section>
+
+<!-- 14. risk and mitigation -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">What to decide</span>
+      <h2>Residual risk, and what holds it in check</h2>
+    </div>
+    <div class="callout">
+      <i data-lucide="alert-triangle"></i>
+      <p>One deliberate breaking change: <span class="mono">POST /listings/</span> now requires the administrator role.</p>
+    </div>
+    <table class="data-table">
+      <thead>
+        <tr><th>Risk</th><th>How it is held in check</th></tr>
+      </thead>
+      <tbody>
+        <tr class="row-flag">
+          <td><span class="mono">POST /listings/</span> is now restricted to the administrator role. Deliberate, and the one breaking change in this release.</td>
+          <td>Impact was measured, not estimated: no browser client calls it, and the listing ingestion service writes straight to the database, so that workflow is unaffected. Stated in the project readme and in the review document, never introduced silently.</td>
+        </tr>
+        <tr>
+          <td>Seven dependency advisories are accepted as residual risk.</td>
+          <td>No fix for any of them is installable on the runtime this service deliberately pins. Each one carries a named compensating control, and an automated pipeline guard fails the build if a control ever stops holding, so the acceptance cannot lapse quietly.</td>
+        </tr>
+        <tr>
+          <td>The credentials that were exposed stay live until they are rotated.</td>
+          <td>An ordered rotation runbook is delivered with the change. Rotation is the required next step and is sequenced last, because it cannot be reversed.</td>
+        </tr>
+        <tr>
+          <td>New required settings must be present before the service will start.</td>
+          <td>Startup refuses a weak or placeholder value by design rather than degrading quietly, and every setting ships documented with a safe local default.</td>
+        </tr>
+      </tbody>
+    </table>
+</div>
+</section>
+
+<!-- 15. onboarding and continuity -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">How the team continues</span>
+      <h2>Everything needed to pick this up on day one</h2>
+    </div>
+    <ul>
+      <li>Copy the committed <span class="mono">.env.example</span>; every setting has a safe local default.</li>
+      <li>A dependency audit, a code scan and a security suite run in the pipeline.</li>
+      <li>The <span class="mono">docs/</span> set records decisions, traceability, residual risk and rotation.</li>
+    </ul>
+    <div class="icon-row">
+      <div><i data-lucide="file-check"></i><span>Example environment file</span></div>
+      <div><i data-lucide="terminal"></i><span>Pipeline verification</span></div>
+      <div><i data-lucide="book-open"></i><span>Security documentation</span></div>
+      <div><i data-lucide="check-circle"></i><span>Traced to tests</span></div>
+    </div>
+</div>
+</section>
+
+<!-- 16. closing -->
+<section class="slide-closing">
+<div class="slide-body">
+
+    <span class="eyebrow">Where this leaves us</span>
+    <h2>Secured, verifiable, ready to review</h2>
+    <ul>
+      <li>Every finding maps to a fix and a verifying test.</li>
+      <li>Rotating the exposed credentials is the required next step.</li>
+      <li>One deliberate breaking change awaits your sign-off.</li>
+    </ul>
+    <div class="closing-foot">
+      <div class="brand-lockup">
+        <i data-lucide="shield-check"></i>
+        <div>
+          <div class="brand-word">Blitzy</div>
+          <div class="brand-sub">Security Remediation</div>
+        </div>
+      </div>
+    </div>
+    <span class="accent-bar"></span>
+</div>
+</section>
+
+</div>
+</div>
+
+<!-- reveal.js framework -->
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+
+<!-- lucide icon runtime -->
+<script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+
+<!-- mermaid + lucide render cycle -->
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.esm.min.mjs';
+
+window.mermaid = mermaid;
+
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'base',
+  fontFamily: "'Inter', system-ui, sans-serif",
+  htmlLabels: false,
+  flowchart: { htmlLabels: false, nodeSpacing: 44, rankSpacing: 60, padding: 14 },
+  themeVariables: {
+    primaryColor: '#F2F0FE',
+    primaryTextColor: '#333333',
+    primaryBorderColor: '#5B39F3',
+    lineColor: '#999999',
+    secondaryColor: '#F4EFF6'
+  }
+});
+
+/* original diagram source, keyed by node */
+var diagramSource = new WeakMap();
+
+var FONT_GATE_TIMEOUT_MS = 4000;
+
+/* webfont metrics must be available before any diagram is measured */
+function fontsSettled() {
+  var loading = (document.fonts && document.fonts.ready)
+    ? document.fonts.ready
+    : Promise.resolve();
+  var deadline = new Promise(function (resolve) {
+    window.setTimeout(resolve, FONT_GATE_TIMEOUT_MS);
+  });
+  return Promise.race([loading, deadline]);
+}
+
+/* a node with no layout box sits on a slide reveal.js has not laid out yet */
+function hasLayout(node) {
+  return node.offsetWidth > 0 && node.offsetHeight > 0;
+}
+
+/* diagrams awaiting a first draw */
+function pendingDiagrams() {
+  var nodes = Array.prototype.slice.call(document.querySelectorAll('pre.mermaid'));
+  var pending = [];
+  nodes.forEach(function (node) {
+    if (!diagramSource.has(node)) {
+      diagramSource.set(node, node.textContent);
+    }
+    if (node.getAttribute('data-processed') === 'true') {
+      return;
+    }
+    if (!hasLayout(node)) {
+      return;
+    }
+    node.removeAttribute('data-render-failed');
+    node.textContent = diagramSource.get(node);
+    pending.push(node);
+  });
+  return pending;
+}
+
+function markDiagramFailure(error) {
+  var reason = (error && error.message) ? error.message : 'diagram could not be drawn';
+  var nodes = document.querySelectorAll('pre.mermaid:not([data-processed="true"])');
+  Array.prototype.forEach.call(nodes, function (node) {
+    node.setAttribute('data-render-failed', 'true');
+    node.textContent = 'Diagram unavailable: ' + reason;
+  });
+  window.console.error('Mermaid render failed: ' + reason);
+}
+
+if (!window.lucide || typeof window.lucide.createIcons !== 'function') {
+  window.console.error('Lucide runtime unavailable; icon placeholders cannot be drawn.');
+  window.lucide = {
+    createIcons: function () {
+      var placeholders = document.querySelectorAll('[data-lucide]');
+      Array.prototype.forEach.call(placeholders, function (node) {
+        node.setAttribute('data-icon-unavailable', 'true');
+      });
+    }
+  };
+}
+
+await fontsSettled();
+
+if (!window.Reveal || typeof window.Reveal.initialize !== 'function') {
+  window.console.error('reveal.js runtime unavailable; the presentation cannot start.');
+} else {
+  Reveal.on('ready', function () {
+    mermaid.run({ nodes: pendingDiagrams() }).catch(markDiagramFailure);
+    lucide.createIcons();
+  });
+
+  Reveal.on('slidechanged', function () {
+    mermaid.run({ nodes: pendingDiagrams() }).catch(markDiagramFailure);
+    lucide.createIcons();
+  });
+
+  Reveal.initialize({
+    hash: true,
+    transition: 'slide',
+    controlsTutorial: false,
+    width: 1920,
+    height: 1080
+  });
+}
+</script>
+</body>
+</html>
