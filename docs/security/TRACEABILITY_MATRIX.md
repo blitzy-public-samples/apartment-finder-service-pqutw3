@@ -8,7 +8,7 @@ calls, and `paypalrestsdk` with REST calls over `httpx`. The Rule's traceability
 is therefore engaged on two independent grounds, and this file is not discretionary.
 
 The matrix is bidirectional with no gaps, over two populations that must both be
-covered for the claim to mean anything: the **20 findings** and the **129 paths this
+covered for the claim to mean anything: the **20 findings** and the **130 paths this
 work delivered**. Its defining property is that completeness can be confirmed
 by counting rather than by trusting an assertion, so every total below is stated
 explicitly and every total is addable.
@@ -22,15 +22,15 @@ else in this repository except by the artefacts named in section 5.
 | Population | Figure | How it is obtained |
 |---|---|---|
 | Entries in the plan's transformation mapping | **68** | The frozen Agent Action Plan §0.6.1 publishes it: 30 CREATE, 29 UPDATE, 0 DELETE, 9 REFERENCE |
-| Paths this work delivered | **129** | `git diff --name-status a26f7fb HEAD` — 99 created, 30 modified, 0 deleted, with a clean working tree |
-| Rows in the reverse index | **155** | `69 + 26 + 60` across sections 4, 4.1 and 4.3 |
+| Paths this work delivered | **130** | `git diff --name-status a26f7fb HEAD` — 100 created, 30 modified, 0 deleted, with a clean working tree |
+| Rows in the reverse index | **156** | `69 + 26 + 61` across sections 4, 4.1 and 4.3 |
 | Index rows that are not delivered paths | **26** | 9 read-only reference paths confirmed unmodified, plus 17 paths retired by the manifest consolidation |
 
-`129 + 26 = 155`, and every delivered path is reachable from both axes.
+`130 + 26 = 156`, and every delivered path is reachable from both axes.
 
 **Figures earlier revisions of this file published, superseded by that measurement and
-retained only as history.** Five delivered-path totals were published in succession —
-**86**, **91**, **93**, **141** and **125** — each a correct measurement of the tree that
+retained only as history.** Six delivered-path totals were published in succession —
+**86**, **91**, **93**, **141**, **125** and **129** — each a correct measurement of the tree that
 existed when it was taken, and each left standing beside the next one. A reader
 comparing them could not tell which was current, which is the defect. They are
 labelled as superseded snapshots where they appear, in section 2.10, and the table
@@ -61,11 +61,11 @@ correction, and row 91.4 the decision to publish one inventory and where.
 | — of those, DELETE | **0** |
 | — of those, REFERENCE | **9** — section 2.7's table, which is the set the plan's own total counts |
 | Planned changed paths delivered | **59 of 59**, none pending |
-| Paths delivered beyond the plan's mapping | **86** — sections 2.9 and 6 |
-| **Delivered paths in total** | **129** — 99 created, 30 modified, 0 deleted |
-| — of those, created | **99** |
+| Paths delivered beyond the plan's mapping | **87** — sections 2.9 and 6 |
+| **Delivered paths in total** | **130** — 100 created, 30 modified, 0 deleted |
+| — of those, created | **100** |
 | — of those, modified | **30** |
-| Rows in the reverse index | **155** — sections 4, 4.1 and 4.3 |
+| Rows in the reverse index | **156** — sections 4, 4.1 and 4.3 |
 | Index rows that are not delivered paths | **26** — 9 read-only references confirmed unmodified, 17 retired by the manifest consolidation |
 | Dependency advisories | **19 across 7 packages** before, **7 across 3** after |
 | Static-analysis findings at Medium or above | **1** before, **0** after |
@@ -81,9 +81,9 @@ correction, and row 91.4 the decision to publish one inventory and where.
 | ORM relationships | **8**, forming 4 reciprocal pairs |
 | Indexes | **7** — 6 non-unique from `0003`, 1 partial unique from `0004` |
 
-`30 + 29 + 0 + 9 = 68` for the plan, and `59 + 27 + 60 - 17 = 129` for the delivered tree,
+`30 + 29 + 0 + 9 = 68` for the plan, and `59 + 27 + 61 - 17 = 130` for the delivered tree,
 stated in full in sections 2.10 and 6.1. The index adds the paths the tree no longer
-carries and the references it never changed: `129 + 9 + 17 = 155`.
+carries and the references it never changed: `130 + 9 + 17 = 156`.
 
 ## Where this document sits among its siblings
 
@@ -444,7 +444,7 @@ plan does not contain, so that the forward axis covers the tree rather than only
 intention. None of these paths is counted among the 68; each is additive, and each is
 listed with the finding or authority it serves and the decision-log row that admits it.
 
-**86 rows, in two tables.** 69 of them are paths the delivered tree carries, and those 69
+**87 rows, in two tables.** 70 of them are paths the delivered tree carries, and those 70
 are the third term of section 2.10's delivered total. The other 17 are paths a round of
 this work created and a later round removed: 16 retired when the Kubernetes inventory was
 consolidated onto one directory, and 1 whose creation was reverted. Each of the 17 carries
@@ -487,13 +487,14 @@ ignore files, 2 are lock or support files, and 1 is application source. 25 of th
 present in the tree; the withdrawn provider lock file is the one that is not.
 
 **Paths delivered by later rounds.** The table above is the set that existed when it
-was measured. Rounds after it delivered sixty further paths that the plan does not
+was measured. Rounds after it delivered sixty-one further paths that the plan does not
 name either, and the forward axis is only complete if each is reachable from this
 section too. None is counted among the 68, and none is counted among the 26 above.
-Section 4.3 indexes the same sixty from the file side.
+Section 4.3 indexes the same sixty-one from the file side.
 
 | Target path | Mode | Serves | Decision-log row |
 |---|---|---|---|
+| `.gitattributes` | CREATE | Rule 1, and every shell script a POSIX shell executes - the repository declared no line-ending policy, so what a `.sh` file held in a working tree was whatever the contributor's client was configured to do | Row 96.8.1 |
 | `.github/scripts/check_frontend_lint_budget.js` | CREATE | INFRA-2 - the frontend warning ratchet: it judges the eslint report so a new warning fails the job while the eight the read-only source already carries do not | Row 88.7 |
 | `.github/scripts/check_manifest_settings_contract.py` | CREATE | INFRA-2, C-4 - the standing check that the rendered configuration map declares every setting the model carries and no managed credential, held as a script so it runs identically in the pipeline and at a workstation | Row 88.5 |
 | `.github/scripts/check_secret_policy.sh` | CREATE | C-4 - the committed-secret policy gate, which fails the build when a tracked file carries a credential pattern | Row 88.5 |
@@ -577,24 +578,24 @@ statement about this tree.
 | Planned REFERENCE entries (§2.7) | **9** |
 | — of those, unmodified as the plan requires | **8** |
 | — of those, modified in delivery | **1** |
-| Paths delivered beyond the plan (§2.9, both tables) | **86** |
-| — of those, carried by the current tree | **69** |
+| Paths delivered beyond the plan (§2.9, both tables) | **87** |
+| — of those, carried by the current tree | **70** |
 | — of those, retired by the manifest consolidation | **17** |
-| **Delivered paths in total** | **129** |
-| — created | **99** |
+| **Delivered paths in total** | **130** |
+| — created | **100** |
 | — modified | **30** |
 | — deleted | **0** |
-| Rows in the reverse index (sections 4, 4.1 and 4.3) | **155** |
-| — of those, delivered paths | **129** |
+| Rows in the reverse index (sections 4, 4.1 and 4.3) | **156** |
+| — of those, delivered paths | **130** |
 | — of those, read-only references confirmed unmodified | **9** |
 | — of those, retired by the manifest consolidation | **17** |
 | Delivered paths absent from the reverse index | **0** |
 
-`59 + 27 + 60 - 17 = 129` forward, the identity section 6.1 states and the only one this
+`59 + 27 + 61 - 17 = 130` forward, the identity section 6.1 states and the only one this
 document publishes for the delivered total: the plan's 59 changed entries, the 27 paths
 sections 6.2 to 6.4 enumerate beyond it — 26 created plus the one read-only path delivery
-modified — the 60 the rounds after them delivered, less the 17 the manifest consolidation
-withdrew. `129 + 9 + 17 = 155` for the index, and `69 + 26 + 60 = 155` counting its three
+modified — the 61 the rounds after them delivered, less the 17 the manifest consolidation
+withdrew. `130 + 9 + 17 = 156` for the index, and `69 + 26 + 61 = 156` counting its three
 tables directly. The plan's own arithmetic is `30 + 29 + 0 + 9 = 68`, unchanged by any of
 this because it counts intentions rather than paths.
 
@@ -606,7 +607,7 @@ first sixteen carry mode DELETE in section 2.9 and are recorded at
 provider version constraint it locked was reverted with it. A reader following any of them
 finds why it is gone rather than nothing at all.
 
-**Five earlier delivered-path totals, labelled as superseded snapshots.** Each was a
+**Six earlier delivered-path totals, labelled as superseded snapshots.** Each was a
 correct measurement of the tree that existed when it was taken, and each is retained only
 so that a figure quoted elsewhere can be identified rather than reconciled.
 
@@ -617,7 +618,8 @@ so that a figure quoted elsewhere can be identified rather than reconciled.
 | **93** — `69 + 24` | **Superseded** | The reverse index when it was a single table |
 | **141** — `59 + 1 + 25 + 56` | **Superseded** | The tree before the manifest consolidation withdrew 17 paths, and excluding the provider lock file as metadata |
 | **125** — `60 + 65` | **Superseded** | The tree before the concurrency, provisioning and final-assessment rounds delivered four further paths, and while the provider lock file was still committed |
-| **129** — `60 + 69` | **Current** | This measurement, which the table above publishes |
+| **129** — `60 + 69` | **Superseded** | The tree before this round delivered `.gitattributes` |
+| **130** — `60 + 70` | **Current** | This measurement, which the table above publishes |
 
 One difference accounts for the whole gap between 141 and 129: the consolidation withdrew
 17 paths that the 141 counted as present, which is a real reduction in the delivered
@@ -630,8 +632,8 @@ therefore one of the 17, indexed with its withdrawal stated rather than dropped.
 **This supersedes `docs/security/DECISION_LOG.md` §23.1.** That section, written mid-work,
 records 58 changed paths, 47 planned-and-delivered, 11 unplanned and 12 planned paths still
 pending, and projects 70 as the figure downstream documents should use. Every figure in it
-has moved: every planned path is now delivered, the unplanned set has grown from 11 to 86,
-and the delivered total is 129 rather than the projected 70. The projection was sound
+has moved: every planned path is now delivered, the unplanned set has grown from 11 to 87,
+and the delivered total is 130 rather than the projected 70. The projection was sound
 arithmetic on the information available; it is superseded by measurement, and the table
 above is the figure to quote. `docs/security/DECISION_LOG.md` row 36.1.4 records the
 decision that this file rather than that log is where a delivered-path count is maintained.
@@ -805,7 +807,7 @@ tables together and states what each contributes.
 | `backend/app/schema/filter.py` | H-6 | `test_mass_assignment.py` |
 | `backend/app/schema/subscription.py` | H-2 | `test_subscription_tampering.py` (`test_h2_*`) |
 | `backend/requirements.txt` | INFRA-5 | `pip-audit -r backend/requirements.txt` |
-| `backend/requirements-dev.txt` | INFRA-5 | `pip-audit -r backend/requirements-dev.txt` |
+| `backend/requirements-dev.txt` | INFRA-5 | `pip-audit -r backend/requirements-dev.txt`; `test_services.py`, whose module-scope imports depend on the client types this manifest declares |
 | `backend/alembic.ini` | H-1 | `alembic upgrade head`, then one `alembic downgrade -1` per revision in the chain — **five** reversals, the chain being `0001` to `0005`; `test_migration_gate.py::test_each_revision_reverses_and_the_chain_re_applies` walks it a step at a time, and the workflow instead runs `downgrade -1` followed by `downgrade base` so it reaches the empty schema without counting revisions |
 | `backend/migrations/env.py` | H-1 | `test_migrations.py` |
 | `backend/migrations/script.py.mako` | H-1 | `test_revision_contracts.py` |
@@ -916,7 +918,7 @@ and the duplicate rows are gone so that the row count is a count of paths.
 
 ### 4.3 Reverse index &mdash; the paths delivered by later rounds
 
-The same fifty-eight paths section 2.9's second table lists, from the backward
+The same sixty-one paths section 2.9's second table lists, from the backward
 direction. Every delivered path in the tree appears in section 4, section 4.1 or here,
 exactly once across the three. Sixteen of the rows here carry a path a later round removed
 — the manifests and the renderer the Kubernetes consolidation retired — and each says so,
@@ -926,8 +928,9 @@ total.
 
 | Target path | Finding remediated, or governing authority | Verifying test or command |
 |---|---|---|
+| `.gitattributes` | Rule 1 - the repository declared no line-ending policy, so a checkout could give a shell script a carriage return in its `#!` line (row 96.8.1) | `test_deployment_contract.py`, three cases: the two directives, `git check-attr` over the four POSIX-executed scripts, and `git ls-files --eol` over every tracked path |
 | `.github/scripts/check_frontend_lint_budget.js` | INFRA-2 - the frontend lint gate could not tell a new warning from a known one | `node .github/scripts/check_frontend_lint_budget.js` on the report the `frontend` job writes; `backend/tests/security/test_delivery_surface_contract.py` |
-| `.github/scripts/check_manifest_settings_contract.py` | INFRA-2, C-4 - the standing check that the rendered configuration map declares every setting the model carries and no managed credential, held as a script so it runs identically in the pipeline and at a workstation (row 88.5) | The `infrastructure` job in `.github/workflows/ci.yml`; run directly it prints the number of manifests it matched |
+| `.github/scripts/check_manifest_settings_contract.py` | INFRA-2, C-4 - the standing check that the rendered configuration map declares every setting the model carries and no managed credential, held as a script so it runs identically in the pipeline and at a workstation (row 88.5) | `test_delivery_pipeline.py`, which runs the gate itself and holds its recorded exemption against the manifests for equality; the `infrastructure` job in `.github/workflows/ci.yml`; run directly it prints the number of manifests it matched |
 | `.github/scripts/check_secret_policy.sh` | C-4 - the committed-secret policy gate, which fails the build when a tracked file carries a credential pattern (row 88.5) | The `infrastructure` job in `.github/workflows/ci.yml`; `bash -n` parses it |
 | `backend/app/core/admin_provisioning.py` | H-1 - the idempotent administrator credential step, held apart from the revision that grants the role so that neither can silently do the other's work (row 38.1) | `test_admin_provisioning.py`; `test_admin_seed_migration.py` for the exactly-one-administrator post-condition |
 | `backend/app/core/db_contract.py` | C-1, INFRA-5 - the migration environment accepted any non-blank string as a database URL and replaced a malformed bound with a default, where the settings class refused both; one contract now holds each value to one rule (rows 89.5, 89.6) | `test_config_validation.py` through the settings model; `test_migration_revisions.py`, its refusal and connect-argument cases, through the migration environment; `test_database_boundary.py` for the rendered connection arguments |
@@ -1247,14 +1250,14 @@ the plan's side; the two are one figure, not two.
 | Paths beyond the plan that sections 6.2 to 6.4 enumerate | **27** |
 | — of those, created | **26** |
 | — of those, a mode change on a path the plan marks REFERENCE | **1** |
-| Paths beyond the plan delivered by the rounds after them (§2.9's second table) | **60** |
+| Paths beyond the plan delivered by the rounds after them (§2.9's second table) | **61** |
 | — of those, withdrawn by the manifest consolidation | **17** |
-| **Delivered paths in total** | **129** |
-| — created | **99** |
+| **Delivered paths in total** | **130** |
+| — created | **100** |
 | — modified | **30** |
 | Paths the plan marks REFERENCE and that are unmodified | **8** |
 
-`59 + 27 + 60 - 17 = 129`. `8 + 1 = 9`, the plan's REFERENCE count, so every reference
+`59 + 27 + 61 - 17 = 130`. `8 + 1 = 9`, the plan's REFERENCE count, so every reference
 entry is accounted for as either unmodified or mode-changed. `backend/app/api/router.py`
 is the tenth reference-mode row the plan renders and the plan's total does not count; it
 is unmodified, which is what section 2.1 carries it to prove, and section 2.8 records the
@@ -1262,7 +1265,7 @@ treatment.
 
 The subtraction is the only unusual term and it is not a recount: the 17 paths were
 delivered, then withdrawn by the consolidation recorded at `infrastructure/k8s/README.md`,
-so they are indexed with mode DELETE and are not in the tree the 129 measures.
+so they are indexed with mode DELETE and are not in the tree the 130 measures.
 
 **This supersedes the snapshot at `docs/security/DECISION_LOG.md` §23.1**, which recorded
 58 changed paths, 47 planned-and-delivered, 11 unplanned and 12 pending. That was a
@@ -1478,11 +1481,11 @@ import time, with each baseline location read back from revision `a26f7fb`.
 
 **Delivered paths, both directions.** Section 2.9 enumerates the **86** paths delivery
 carries or carried that the plan does not, forward by target path; sections 4.1 and 4.3
-contain the same 86 backward — **26** and **60** across their two tables. Seventeen of the
+contain the same 87 backward — **26** and **61** across their two tables. Seventeen of the
 86 were withdrawn by the manifest consolidation and the provider-pinning revert and are
 indexed with their mode or withdrawal stated, leaving **69** in the current tree. Together
 with the 59 delivered planned changes and the one plan-marked read-only path that was
-modified, the delivered total is **129**, reconciled in section 2.10. Both axes therefore cover the tree as delivered and not only the plan as
+modified, the delivered total is **130**, reconciled in section 2.10. Both axes therefore cover the tree as delivered and not only the plan as
 written, which is the property an earlier revision of this file did not have.
 
 **Schema constructs, both directions.** Section 5 maps the schema construct by construct.
@@ -1529,7 +1532,7 @@ what was planned. Sections 6.2 and 6.3 reach the round's own 27 from the path si
 section 6.4 reaches the same 27 from the finding, Rule or instruction side, which is what
 makes the two directions reconcile rather than merely coexist; the rounds after it are
 carried in section 2.9's second table and in section 4.3 on the same basis.
-`59 + 27 + 60 - 17 = 129` delivered paths, the one identity this document publishes,
+`59 + 27 + 61 - 17 = 130` delivered paths, the one identity this document publishes,
 measured against the tree in [section 6.1](#61-what-this-section-counts-and-what-it-does-not). Section 6.5 adds the
 constructs this work's infrastructure and release-path round removed or replaced, in the
 same old-to-new form section 3 uses.
@@ -1779,7 +1782,7 @@ Each omission is a boundary with a sibling document, not a gap in coverage.
   The one literal that does appear, `your_secret_key_here`, is not a secret: it is the
   placeholder on the rejected-value denylist that C-1 turns into a startup failure.
 - **No repository-wide file count.** This document indexes the paths this remediation
-  created, modified or withdrew — **155** rows, being the **129** delivered paths, the
+  created, modified or withdrew — **156** rows, being the **130** delivered paths, the
   **9** read-only references it confirms unmodified and the **17** paths the manifest
   consolidation retired. It does not count the repository's other files, which this work
   never touched. The introduction and section 2.10 publish that measurement; every earlier

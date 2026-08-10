@@ -4,10 +4,12 @@ Run by the ``infrastructure`` job of ``.github/workflows/ci.yml`` and
 runnable from a workstation with ``python
 .github/scripts/check_manifest_settings_contract.py``.
 
-The check is a script rather than a block embedded in the workflow so that
-it is covered by the repository's own lint, so it can be run without a
-workflow runner, and because a block of this size is piped to ShellCheck by
-actionlint and does not complete there.
+The check is a script rather than a block embedded in the workflow so it
+can be run without a workflow runner, and because a block of this size is
+piped to ShellCheck by actionlint and does not complete there. It is
+written to the style ``setup.cfg`` configures and is checked with
+``flake8 .github/scripts``; the workflow's own ``flake8`` step runs from
+``backend/`` and so does not reach this directory.
 
 What is asserted, against ``infrastructure/kubernetes``:
 
@@ -18,8 +20,11 @@ What is asserted, against ``infrastructure/kubernetes``:
 * the ``backend-secrets`` provider class mounts exactly the managed
   credentials and syncs none of them into a Kubernetes secret
 * no manifest declares a ``Secret`` carrying a literal value
-* every container that reads the ConfigMap also references the secret the
-  deployment publishes, and declares no optional configuration source
+* every container that reads the ConfigMap and constructs ``Settings``
+  also references the secret the deployment publishes, while each
+  container recorded in :data:`SETTINGS_FREE_CONTAINERS` references it not
+  at all
+* no container declares an optional configuration source
 * no container passes an inline environment value other than the ones
   recorded in :data:`PERMITTED_INLINE_ENVIRONMENT`
 
@@ -70,6 +75,24 @@ TOKEN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 #: Neither carries a secret.
 PERMITTED_INLINE_ENVIRONMENT = frozenset(
     {"ENV_FILE", "ADMIN_CREDENTIAL_RESET"}
+)
+
+#: Containers that read the ConfigMap and construct no ``Settings``. Each
+#: is a one-shot operator command that resolves the few values it needs
+#: from the environment directly, as
+#: ``backend/app/core/db_contract.py`` records, so the address of the
+#: shared rate-limit store is not among the values it is given and
+#: :data:`PUBLISHED_SECRET` is not one of its sources. Recorded here rather
+#: than inferred, and held against the manifests by
+#: ``test_delivery_pipeline.py``'s
+#: ``test_the_gate_exempts_only_the_settings_free_containers``. Row 96.6.4
+#: of ``docs/security/DECISION_LOG.md`` records why the exemption sits here
+#: rather than in the manifests.
+SETTINGS_FREE_CONTAINERS = frozenset(
+    {
+        ("60-migration-job.yaml", "migrate"),
+        ("70-admin-credential-job.yaml", "admin-credential"),
+    }
 )
 
 
@@ -182,11 +205,18 @@ def _check_container(name, container):
     referenced = {
         entry["secretRef"]["name"] for entry in sources if "secretRef" in entry
     }
-    assert PUBLISHED_SECRET in referenced, (
-        "%s: %s reads %s without %s, so it would start on the in-process "
-        "rate-limit default the application refuses"
-        % (name, container["name"], CONFIG_MAP, PUBLISHED_SECRET)
-    )
+    if (name, container["name"]) in SETTINGS_FREE_CONTAINERS:
+        assert not referenced, (
+            "%s: %s constructs no Settings, so it is given no published "
+            "secret; it references %s"
+            % (name, container["name"], sorted(referenced))
+        )
+    else:
+        assert PUBLISHED_SECRET in referenced, (
+            "%s: %s reads %s without %s, so it would start on the "
+            "in-process rate-limit default the application refuses"
+            % (name, container["name"], CONFIG_MAP, PUBLISHED_SECRET)
+        )
     for entry in sources:
         for kind in entry:
             assert entry[kind].get("optional") is False, (

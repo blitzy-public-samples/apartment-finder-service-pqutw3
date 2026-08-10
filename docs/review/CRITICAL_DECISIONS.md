@@ -642,8 +642,12 @@ statement of each — what is open, the governing clause, what an operator must 
 it is detectable — is in
 [`../security/RESIDUAL_RISK.md`](../security/RESIDUAL_RISK.md) under *Open items that are
 not dependency advisories*, and the reasoning is logged in §36.6 of the decision log.
-Two of the eight were restated after the delivered tree contradicted them, at log rows
-91.3.1 and 91.3.2.
+Two of the nine were restated after the delivered tree contradicted them, at log rows
+91.3.1 and 91.3.2. **Nine are registered and nine are open; no item is closed in full
+by delivery.** Two of them &mdash; O-7 and O-8 &mdash; are open in narrower senses
+than when they were written, which is not the same as closed, and log row 96.3.1
+records the correction of an earlier "eight registered, seven open" statement of this
+count.
 
 | # | Open item | Governing clause | Where it is reviewed |
 |---|-----------|------------------|----------------------|

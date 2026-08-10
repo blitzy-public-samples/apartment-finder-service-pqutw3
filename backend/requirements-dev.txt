@@ -20,6 +20,15 @@ flake8==7.3.0
 # dependency of bandit and pinned here at the resolved version.
 PyYAML==6.0.3
 
+# --- Mail-client types the tests assert against ------------------------------
+# Imported by backend/tests/test_services.py, which drives the SendGrid
+# client through its own client and exception classes rather than restating
+# them. Resolved as a dependency of sendgrid in backend/requirements.txt and
+# pinned here at the resolved version, so the import a test depends on is
+# declared by the manifest that installs the tests rather than left to a
+# transitive resolution.
+python-http-client==3.3.7
+
 # --- Bootstrap installer, inventoried rather than declared --------------------
 #
 #   pip==26.0.1

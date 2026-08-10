@@ -9,9 +9,20 @@
 # substituted by scripts/render_kubernetes_manifests.sh, which refuses to
 # render while any required token is unset and refuses to emit output
 # carrying an unresolved token.
+#
+# The three pod-security labels below set the admission profile every
+# workload in this namespace is measured against. enforce is baseline, which
+# admits all twelve manifests. audit and warn are restricted, which every
+# workload but the frontend Deployment satisfies: 50-frontend.yaml runs as
+# uid 0 and adds NET_BIND_SERVICE, so it is recorded in the audit log and
+# reported at apply time rather than passing unremarked.
+# docs/security/DECISION_LOG.md row 96.6.2 owns the choice of profile.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: ${K8S_NAMESPACE}
   labels:
     app.kubernetes.io/part-of: apartment-finder
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

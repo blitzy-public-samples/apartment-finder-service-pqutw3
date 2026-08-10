@@ -120,6 +120,44 @@ PRE_FILTER_PATTERNS = (
 #: Control the pre-filter must not treat as a risk.
 PRE_FILTER_EXCLUSION = "TrustedHost"
 
+#: Backend tree, the wider of the two scopes the register reports.
+BACKEND_DIR = REPO_ROOT / "backend"
+
+#: The fourteen patterns the register's broad reachability measurement
+#: searches, in the order it lists them. Matched case-sensitively and
+#: literally, which is how the register describes the search.
+REACHABILITY_PATTERNS = (
+    "request.form",
+    "UploadFile",
+    "File(",
+    "Form(",
+    "OAuth2PasswordRequestForm",
+    "multipart",
+    "StaticFiles",
+    "HTTPEndpoint",
+    "Route(",
+    "request.url",
+    "click",
+    "set_key",
+    "unset_key",
+    "TrustedHost",
+)
+
+#: Patterns that return no match anywhere under ``backend/app``. Every
+#: pattern but the control does, which is the thirteen the register
+#: publishes for that scope.
+REACHABILITY_ZERO_IN_APPLICATION = tuple(
+    pattern
+    for pattern in REACHABILITY_PATTERNS
+    if pattern != PRE_FILTER_EXCLUSION
+)
+
+#: The two directories a reachability match may sit in. The application
+#: package is the scope that bears on reachability; the test tree names the
+#: constructs in order to assert their absence and is installed into no
+#: image. A match anywhere else would be production code.
+REACHABILITY_PERMITTED_ROOTS = ("backend/app", "backend/tests")
+
 
 def _application_modules():
     """Returns every module under the application package."""
@@ -465,3 +503,84 @@ def test_the_register_records_the_semantic_guard():
     assert "test_residual_risk_guards.py" in register
     assert "abstract syntax tree" in register
     assert "Development-only accepted advisories" in register
+
+
+def _matching_files(root):
+    """Returns each reachability pattern's matching files under ``root``.
+
+    Searched the way the register describes it: case-sensitively and
+    literally, over every ``.py`` file, with each path recorded relative to
+    the repository root and with forward slashes so a result reads the same
+    on either platform.
+    """
+    found = dict((pattern, set()) for pattern in REACHABILITY_PATTERNS)
+    for path in sorted(root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        for pattern in REACHABILITY_PATTERNS:
+            if pattern in text:
+                found[pattern].add(relative)
+    return found
+
+
+def test_thirteen_reachability_patterns_are_absent_from_the_application():
+    """Asserts the register's published figure against the tree.
+
+    The register reported thirteen of the fourteen patterns at zero while
+    declaring the scope ``backend/``, where it is not true. The conclusion
+    survived and the evidence as written did not, and nothing compared it to
+    the tree. This case is that comparison at the scope the figure holds
+    for, so the published figure cannot drift from what a reader measures.
+    """
+    matching = _matching_files(APPLICATION_DIR)
+    absent = tuple(
+        pattern for pattern in REACHABILITY_PATTERNS if not matching[pattern]
+    )
+
+    assert absent == REACHABILITY_ZERO_IN_APPLICATION, matching
+    assert len(absent) == 13, absent
+    assert matching[PRE_FILTER_EXCLUSION], PRE_FILTER_EXCLUSION
+
+
+def test_no_reachability_match_sits_outside_the_two_permitted_roots():
+    """Asserts the property the wider scope is reported for.
+
+    No count is published at ``backend/`` and none can be: this module
+    names all fourteen patterns as literals, so any tally over the tree that
+    contains it is changed by asserting it. The stable property is where the
+    matches sit rather than how many there are -- the application package,
+    whose thirteen zeroes the case above asserts, and the test tree, which
+    names the constructs in order to assert their absence and is installed
+    into no image.
+    """
+    stray = sorted(
+        (pattern, path)
+        for pattern, paths in _matching_files(BACKEND_DIR).items()
+        for path in paths
+        if not path.startswith(REACHABILITY_PERMITTED_ROOTS)
+    )
+
+    assert stray == [], stray
+
+
+def test_the_register_names_the_scope_each_reachability_result_holds_for():
+    """Asserts each statement is published with its scope.
+
+    A result published without its scope is the defect: read against the
+    wider scope it is wrong, and read against the narrower one a reader
+    cannot tell which was meant.
+    """
+    flowed = " ".join(RESIDUAL_REGISTER.read_text(encoding="utf-8").split())
+
+    assert (
+        "At `backend/app/`, thirteen of the fourteen return zero" in flowed
+    )
+    assert (
+        "At `backend/`, most of the fourteen match, and no count is "
+        "published for that scope" in flowed
+    )
+    assert (
+        "no match anywhere under `backend/` sits outside `backend/app/` and "
+        "`backend/tests/`" in flowed
+    )
+    assert "test_residual_risk_guards.py" in flowed

@@ -777,9 +777,11 @@ jobs:
       uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
       with:
         # Exact release rather than a range, so the binary this job runs is
-        # the one the configuration is verified with. It satisfies the
-        # required_version constraint infrastructure/terraform/main.tf
-        # declares.
+        # the one the configuration is verified with. It also clears the 1.11
+        # floor the ephemeral input variables and write-only secret arguments
+        # in infrastructure/terraform/main.tf need. That file declares no
+        # required_version of its own; docs/security/DECISION_LOG.md rows
+        # 91.1.1 and 96.1.1 own that.
         terraform_version: 1.15.8
         terraform_wrapper: false
 

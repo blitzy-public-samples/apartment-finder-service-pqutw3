@@ -119,7 +119,7 @@ UNPLANNED_DELIVERED_PATHS = 27
 
 #: Paths the rounds after that one delivered beyond the plan, carried by
 #: the matrix's section 2.9 second table and its section 4.3.
-LATER_ROUND_PATHS = 60
+LATER_ROUND_PATHS = 61
 
 #: Of those, the ones later rounds withdrew: sixteen retired by the
 #: manifest consolidation and one, the provider lock file, withdrawn with

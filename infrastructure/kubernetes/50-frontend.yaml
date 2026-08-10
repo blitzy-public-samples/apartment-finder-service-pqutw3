@@ -8,6 +8,16 @@
 # nginx:alpine writes its process identifier, its temporary bodies and its
 # caches under /var, so those paths are emptyDir volumes and the root
 # filesystem stays read-only.
+#
+# This is the one workload in this directory that runs as uid 0. The image
+# is infrastructure/docker/Dockerfile.frontend, which serves on port 80 with
+# the nginx:alpine default configuration; that file is a read-only reference
+# for this work. runAsNonRoot is therefore declared false rather than left
+# unset, and the container keeps NET_BIND_SERVICE after dropping ALL. Every
+# other workload here declares runAsNonRoot: true and uid 1001.
+# 00-namespace.yaml enforces the baseline Pod Security Admission profile,
+# which admits this pod, and audits and warns against restricted, which does
+# not. docs/security/DECISION_LOG.md rows 96.6.1 and 96.6.2 own both choices.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,6 +46,10 @@ spec:
       serviceAccountName: ${FRONTEND_SERVICE_ACCOUNT}
       terminationGracePeriodSeconds: 30
       securityContext:
+        # Declared rather than omitted, so the one workload that runs as
+        # uid 0 says so. See the file header and rows 96.6.1 and 96.6.2 of
+        # docs/security/DECISION_LOG.md.
+        runAsNonRoot: false
         seccompProfile:
           type: RuntimeDefault
       containers:

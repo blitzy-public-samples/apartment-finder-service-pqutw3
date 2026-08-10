@@ -190,6 +190,69 @@ SUPERSEDED_BEHAVIOUR_ROWS = (
 #: one from.
 WITHDRAWING_SECTION = "## 89."
 
+#: Every published document a reviewer reads, plus the two workflow files
+#: whose comments are read the same way. A claim about the tree is checked
+#: wherever it is made, not only in the two Rule 1 artifacts.
+PUBLISHED_RECORD = (
+    DECISION_LOG,
+    RESIDUAL_RISK,
+    TRACEABILITY,
+    ROTATION,
+    CRITICAL_DECISIONS,
+    README,
+    SECURITY_POLICY,
+    DECK,
+    REPO_ROOT / ".github" / "workflows" / "ci.yml",
+    REPO_ROOT / ".github" / "workflows" / "cd.yml",
+)
+
+#: Constructs the Terraform configuration deliberately does not declare,
+#: because the finding that asks for them is reported for confirmation
+#: rather than closed. Read from the configuration below, so the document
+#: rule that follows is enforced only while the tree matches.
+DEFERRED_TERRAFORM_CONSTRUCTS = (
+    "required_version",
+    "required_providers",
+)
+
+#: The provider lock that would pin the resolution those constructs
+#: constrain. It is untracked and absent.
+DEFERRED_TERRAFORM_LOCK = (
+    REPO_ROOT / "infrastructure" / "terraform" / ".terraform.lock.hcl"
+)
+
+#: Statements that assert the deferred constructs are present. Each was
+#: made by a published document while the tree carried none of them, which
+#: is what makes them the phrasings worth matching rather than a
+#: hypothetical set. Matched against the whitespace-collapsed form of one
+#: statement unit, so a hard-wrapped sentence is read whole.
+TERRAFORM_PRESENCE_CLAIMS = (
+    "The constraint exists",
+    "carries a `terraform` block with",
+    "carries a `terraform` block and",
+    "`.terraform.lock.hcl` is tracked",
+    "keep `.terraform.lock.hcl` tracked",
+    "Keep the `terraform` block",
+    "satisfies the definition's own `required_version",
+    "required_version` constraint `infrastructure/terraform/main.tf` declares",
+    "required_version constraint infrastructure/terraform/main.tf declares",
+    "a provider constraint and a tracked lock were",
+    "and are authorized at row 94.8.3",
+)
+
+#: Words that mark a statement as a record of a position no longer held.
+#: Deliberately narrow: a statement that merely mentions something being
+#: open, reported or no longer true is still asserting its own content,
+#: which is exactly how the defect this case exists for was written.
+WITHDRAWAL_MARKERS = (
+    "withdraw",
+    "Withdraw",
+    "WITHDRAWN",
+    "reverted",
+    "Reverted",
+    "was wrong about the tree",
+)
+
 #: Values an operator must provision that no bootstrap can supply.
 PROVIDER_CREDENTIALS = (
     "ZILLOW_API_KEY",
@@ -305,6 +368,115 @@ HEADING = re.compile(r"(?m)^(#{2,3})\s+(\S+)")
 def _text(path):
     """Return one file's source."""
     return path.read_text(encoding="utf-8")
+
+
+#: A line that begins a statement of its own: a markdown table row or a
+#: list item. A table row is one statement, and so is a bullet -- a
+#: withdrawal marker on one must not exempt the one beside it, which is
+#: how the seventh occurrence of the defect below escaped an earlier
+#: revision of this case that split on blank lines alone.
+STATEMENT_START = re.compile(r"^(\||[*+-]\s|\d+\.\s)")
+
+
+def _statement_units(text):
+    """Return each table row, list item and hard-wrapped paragraph.
+
+    Prose is returned a paragraph at a time, because these documents wrap
+    and a marker opening a paragraph governs the sentences under it. A
+    table row or a list item ends the paragraph before it and starts one of
+    its own, and its own continuation lines are folded into it.
+
+    A leading ``#`` is dropped from each line before the unit is joined, so
+    that a sentence written across the lines of a YAML comment block reads
+    as the sentence it is rather than as fragments separated by markers.
+    """
+    collected = []
+    buffer = []
+
+    def flush():
+        if buffer:
+            collected.append(" ".join(" ".join(buffer).split()))
+            del buffer[:]
+
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        stripped = raw.lstrip()
+        if stripped.startswith("#"):
+            line = stripped.lstrip("#").strip()
+        else:
+            line = raw
+        if not line.strip():
+            flush()
+        elif STATEMENT_START.match(line.lstrip()):
+            flush()
+            buffer.append(line)
+        else:
+            buffer.append(line)
+    flush()
+    return collected
+
+
+def test_the_terraform_constructs_the_tree_defers_are_absent_from_it():
+    """The configuration declares neither construct and locks nothing.
+
+    This is the measurement the case below rests on. Asserting the document
+    rule without it would leave the rule in force after an authorized
+    change had legitimately added the constructs.
+    """
+    configuration = _text(
+        REPO_ROOT / "infrastructure" / "terraform" / "main.tf"
+    )
+
+    for construct in DEFERRED_TERRAFORM_CONSTRUCTS:
+        assert construct not in configuration, construct
+    assert not re.search(r"(?m)^terraform\s*\{", configuration)
+    assert not DEFERRED_TERRAFORM_LOCK.exists(), DEFERRED_TERRAFORM_LOCK
+
+
+@pytest.mark.parametrize(
+    "path", PUBLISHED_RECORD, ids=lambda path: path.name
+)
+def test_no_document_states_the_deferred_constructs_are_present(path):
+    """A presence claim stands only where it is marked withdrawn.
+
+    Four documents asserted that the configuration declared a provider
+    version constraint and that the lock was tracked, while the tree
+    carried neither and two delivered cases asserted their absence. One of
+    those assertions reported half of a confirmation-only finding as
+    closed, which is the shape a reviewer acts on: it invites them to
+    decline authorizing a fix that is still needed.
+
+    What is asserted is not that the phrasings never appear -- the
+    withdrawn rows quote them, and must, because the record of a position
+    held is what makes a correction reviewable. It is that every statement
+    unit making one carries a withdrawal marker of its own.
+    """
+    standing = [
+        (claim, unit[:160])
+        for unit in _statement_units(_text(path))
+        for claim in TERRAFORM_PRESENCE_CLAIMS
+        if claim in unit
+        and not any(marker in unit for marker in WITHDRAWAL_MARKERS)
+    ]
+    assert standing == [], (path.name, standing)
+
+
+def test_the_flagged_terraform_finding_is_recorded_as_fully_open():
+    """Both halves of it are open, and the row says so.
+
+    The row that reports it is the one a reviewer reads to decide whether
+    the finding still needs authorizing, so an understated row there is
+    worse than no row at all.
+    """
+    rows = [
+        line
+        for line in _text(DECISION_LOG).splitlines()
+        if line.startswith("| 5 |")
+        and "remote state backend" in line
+    ]
+
+    assert len(rows) == 1, rows
+    assert "Fully open, both halves" in rows[0]
+    assert "96.1.1" in rows[0]
 
 
 def _generation_commands(path):

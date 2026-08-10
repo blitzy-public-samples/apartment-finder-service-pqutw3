@@ -62,12 +62,12 @@ BASELINE_REVISION = "a26f7fb"
 
 #: Rows the reverse index carries across its three tables: the 69 rows it
 #: renders for the plan's 68 entries, the 26 delivered beyond the plan, and
-#: the 60 delivered by later rounds. 129 of the 155 are paths in the
+#: the 61 delivered by later rounds. 130 of the 156 are paths in the
 #: delivered change set; of the remaining 26, nine are read-only references
 #: confirmed unmodified and seventeen were withdrawn -- sixteen by the
 #: manifest consolidation and one by the provider-pinning revert -- which is
 #: the arithmetic section 2.10 publishes.
-MATRIX_REVERSE_ROWS = 155
+MATRIX_REVERSE_ROWS = 156
 
 #: Paths produced while verifying, never delivered, and removed
 #: before commit. ``blitzy/`` is where the browser-validation
@@ -753,19 +753,22 @@ def test_the_matrix_publishes_a_reconcilable_delivered_total():
     assert "### 2.10 Delivered-path reconciliation" in _text(
         TRACEABILITY_MATRIX
     )
-    #: The identity the document publishes for the index it delivers. Four
-    #: earlier totals were published in succession -- 86, 91, 93 and 141 --
-    #: each correct for the tree it measured and each left standing beside the
-    #: next. Section 2.10 now carries one current measurement and lists those
-    #: four as superseded snapshots, so both halves are asserted: the current
-    #: identity has to be present and each snapshot has to be labelled.
-    assert "`129 + 9 + 17 = 155`" in flat
-    assert "`69 + 26 + 60 = 155`" in flat
-    assert "`59 + 27 + 60 - 17 = 129`" in flat
+    #: The identity the document publishes for the index it delivers. Six
+    #: earlier totals were published in succession -- 86, 91, 93, 141, 125
+    #: and 129 -- each correct for the tree it measured and each left standing
+    #: beside the next. Section 2.10 now carries one current measurement and
+    #: lists those six as superseded snapshots, so both halves are asserted:
+    #: the current identity has to be present and each snapshot has to be
+    #: labelled.
+    assert "`130 + 9 + 17 = 156`" in flat
+    assert "`69 + 26 + 61 = 156`" in flat
+    assert "`59 + 27 + 61 - 17 = 130`" in flat
     assert "Delivered paths absent from the reverse index | **0**" in flat
-    for snapshot in ("**86**", "**91**", "**93**", "**141**"):
+    for snapshot in (
+        "**86**", "**91**", "**93**", "**141**", "**125**", "**129**"
+    ):
         assert snapshot + " " in flat, snapshot
-    assert flat.count("| **Superseded** |") >= 4
+    assert flat.count("| **Superseded** |") >= 6
 
     # The plan's own figure is the one the frozen plan publishes: nine
     # reference entries and 68 in total. The plan additionally renders

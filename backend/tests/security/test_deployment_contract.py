@@ -2468,16 +2468,32 @@ CRITICAL_DECISIONS = (
 def test_the_review_document_qualifies_the_advisory_count():
     """The seven is named as the runtime figure, not as the total.
 
-    Two manifests are audited and fourteen identifiers are suppressed, so
-    an unqualified "seven residual advisories" understates the total by
-    half and points a reviewer at a register that records only one of the
-    two sets.
+    Two manifests are audited and eight identifiers are suppressed across
+    them -- seven against the runtime manifest and one against the
+    development manifest -- so an unqualified "seven residual advisories"
+    understates the total and points a reviewer at a register that records
+    only one of the two sets. The total the pipeline suppresses is read
+    from the suppression sets rather than restated, and each register is
+    named, so a reviewer following the document reaches both.
+
+    The figure was fourteen before the audit instrument was split out of
+    the audited manifests. That history may be recounted, and is, but only
+    in the past tense: a bare "fourteen" would send a reviewer counting
+    rows that no longer exist.
     """
     text = CRITICAL_DECISIONS.read_text(encoding="utf-8")
 
     assert "runtime manifest" in text
     assert "requirements-dev.txt" in text
-    assert "fourteen" in text
+    assert "eight" in text
+    assert "Runtime register" in text
+    assert "Development register" in text
+    assert len(RUNTIME_ADVISORIES) + len(DEVELOPMENT_ADVISORIES) == 8
+
+    for unit in re.split(r"\n\s*\n", text):
+        if "fourteen" not in unit:
+            continue
+        assert "was fourteen until" in " ".join(unit.split()), unit
 
 
 def test_the_review_document_names_both_registers_and_their_authorities():
@@ -2999,14 +3015,86 @@ def test_the_secret_policy_check_covers_all_four_properties():
     assert "REQUIRED_PATHS" in text
 
 
+#: Line-ending policy, and the shell scripts a POSIX shell executes. Row
+#: 96.8.1 of docs/security/DECISION_LOG.md records why the policy is
+#: declared rather than left to each contributor's client configuration.
+LINE_ENDING_POLICY = REPO_ROOT / ".gitattributes"
+
+POSIX_EXECUTED_SCRIPTS = (
+    "scripts/deploy.sh",
+    "scripts/render_kubernetes_manifests.sh",
+    "scripts/setup_dev_environment.sh",
+    ".github/scripts/check_secret_policy.sh",
+)
+
+
+def _git_output(*arguments):
+    """Returns one git command's stdout, or skips when git is unavailable."""
+    if not (REPO_ROOT / ".git").exists():
+        pytest.skip("not a git checkout")
+    completed = subprocess.run(
+        ["git"] + list(arguments),
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("git is unavailable")
+    return completed.stdout
+
+
+def test_the_line_ending_policy_declares_both_of_its_directives():
+    """The repository states its own line endings rather than inheriting.
+
+    With no policy file, what a shell script holds in a working tree is
+    whatever the contributor's client is configured to do, and a carriage
+    return in a `#!` line is not a valid interpreter path.
+    """
+    lines = [
+        line.strip()
+        for line in LINE_ENDING_POLICY.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+    assert lines == ["* text=auto", "*.sh text eol=lf"], lines
+
+
+@pytest.mark.parametrize("script", POSIX_EXECUTED_SCRIPTS)
+def test_every_posix_executed_script_is_checked_out_with_lf(script):
+    """Each script a POSIX shell runs resolves to LF on every platform."""
+    assert (REPO_ROOT / script).is_file(), script
+    resolved = _git_output("check-attr", "text", "eol", "--", script)
+
+    assert "%s: text: set" % script in resolved, resolved
+    assert "%s: eol: lf" % script in resolved, resolved
+
+
+def test_no_committed_blob_carries_a_carriage_return():
+    """The policy changed no blob, and no later commit may change that.
+
+    `git ls-files --eol` reports the index form of every tracked path, so
+    this reads what is committed rather than what a checkout produced. A
+    path with no line ending at all reports `none` and is not a failure.
+    """
+    offenders = [
+        line
+        for line in _git_output("ls-files", "--eol").splitlines()
+        if line and not line.startswith(("i/lf", "i/none"))
+    ]
+
+    assert offenders == [], offenders
+
+
 @pytest.mark.parametrize("advisory", RUNTIME_ADVISORIES)
 def test_each_runtime_advisory_is_recorded_where_the_gate_says(advisory):
     """The runtime register points at the residual-risk document.
 
-    The workflow suppresses fourteen advisories across two manifests, and
-    only these seven are recorded in that document. The comment above each
-    suppression names the right authority for its own set, so a reader
-    following it finds the entry rather than an absence.
+    The workflow suppresses eight advisories across two manifests -- these
+    seven against the runtime manifest and one against the development
+    manifest -- and the register carries a section for each set. The
+    comment above each suppression names the right authority for its own
+    set, so a reader following it finds the entry rather than an absence.
     """
     assert advisory in CI_WORKFLOW.read_text(encoding="utf-8")
     assert advisory in RESIDUAL_RISK_REGISTER.read_text(encoding="utf-8")

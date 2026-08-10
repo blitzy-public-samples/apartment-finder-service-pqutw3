@@ -589,9 +589,13 @@ section: the affected framework constructs are not used by this service at all.
 
 ### The fourteen-pattern reachability measurement
 
-Fourteen patterns were searched across every Python file under `backend/`. This
-is the broad measurement that establishes reachability, and it is deliberately
-wider than the automated guard described further below.
+Fourteen patterns were searched, case-sensitively, across every Python file
+under `backend/`. This is the broad measurement that establishes reachability,
+and it is deliberately wider than the automated guard described further below.
+Two scopes appear in this section and every result below names the one it holds
+for: `backend/` is the application package and the test suite together, and
+`backend/app/` is the application package alone, which is the only one of the two
+the runtime image installs.
 
 | # | Pattern | Advisory it would make reachable |
 |---|---|---|
@@ -617,22 +621,67 @@ in use anywhere in the service.
 ### Re-measured against the delivered tree
 
 The same fourteen patterns were re-run against the delivered tree, and the
-result must be reported precisely rather than restated from the baseline.
-**Thirteen of the fourteen still return zero.** The fourteenth, `TrustedHost`,
-now returns matches.
+result must be reported precisely rather than restated from the baseline. The two
+scopes give different answers, and only one of them bears on reachability, so
+each is reported with the scope it holds for.
 
-That change is the control appearing, not an advisory becoming reachable. Every
-occurrence is the trusted-host middleware that this remediation added — its
-import, its subclass, its registration against the configured allowed-host list
-in `backend/app/main.py`, and the test that asserts the allowed-host list in
+**At `backend/app/`, thirteen of the fourteen return zero.** The fourteenth,
+`TrustedHost`, matches. Nothing an HTTP request can reach names any of the other
+thirteen constructs.
+
+**An earlier revision of this subsection reported that result while declaring the
+scope `backend/`, where it is not true.** The conclusion was sound and the
+evidence as written was not, which is the correction recorded at row 96.2.1 of
+[`docs/security/DECISION_LOG.md`](DECISION_LOG.md).
+
+**At `backend/`, most of the fourteen match, and no count is published for that
+scope.** Every match outside `backend/app/` lies under `backend/tests/`, and
+every one of them is a test naming a construct in order to assert its absence
+rather than a use of it. They are concentrated in
+`backend/tests/security/test_residual_risk_guards.py`, which holds the pattern
+set as string literals and parses sources that use each construct so that its
+detection can be asserted to work; the remainder sit in the modules that assert
+the trusted-host list and the guard wording. A module that names a construct in
+order to prove the application does not use it is evidence for this register
+rather than against it, and none of those modules is installed into the runtime
+image: the backend container installs `backend/requirements.txt` only and copies
+no test tree.
+
+**No count is published at the wider scope because a published one could not
+stay true.** The assertion that holds this section honest necessarily names all
+fourteen patterns as literals, which changes any `backend/`-wide tally the moment
+it is written — as it did: a first attempt published four-of-fourteen at zero and
+was falsified by its own assertion. What is asserted instead is the property this
+register actually rests on, which is stable: thirteen of the fourteen return zero
+across `backend/app/`, and **no match anywhere under `backend/` sits outside
+`backend/app/` and `backend/tests/`.**
+
+`TrustedHost` is the one construct whose matches are a use rather than an
+assertion, and it matches at both scopes. That is the control appearing, not an
+advisory becoming reachable: the occurrences are the trusted-host middleware
+this remediation added — its import, its subclass and its registration against
+the configured allowed-host list in `backend/app/main.py` — plus the test that
+asserts that list in
 `backend/tests/security/test_settings_and_redaction.py`. `TrustedHost` is the
-named compensating control for PYSEC-2026-161 and PYSEC-2026-248, so its presence
-is the register's own requirement being satisfied. The thirteen patterns that
-represent genuine reachability remain at zero.
+named compensating control for PYSEC-2026-161 and PYSEC-2026-248, so its
+presence is the register's own requirement being satisfied.
+
+**What this means for the seven acceptances.** Each rests on the application
+package not using the affected construct, and at `backend/app/` that is exactly
+what the thirteen zeroes say. The wider scope adds no reachable use: it adds the
+guard fixtures that keep the acceptance honest, and they run in no image.
 
 This distinction is the reason the automated guard below does **not** include
 `TrustedHost`: a guard that failed on it would fail precisely when the control it
-is meant to protect was installed.
+is meant to protect was installed. It is also why that guard is scoped to
+`backend/app/` — under the wider scope its own test fixtures would fail it, which
+is the same effect, reported at length in the next section.
+
+`backend/tests/security/test_residual_risk_guards.py` asserts both statements
+above against a live measurement of the tree — the thirteen zeroes at
+`backend/app/`, and that no match anywhere under `backend/` sits outside
+`backend/app/` and `backend/tests/` — so neither can drift from what a reader
+would measure.
 
 ### The two continuous-integration guards
 
@@ -739,7 +788,7 @@ distinction is stated explicitly:
 | When it runs | Taken as evidence for this register | On every build | On every build, inside the security suite |
 | Includes `TrustedHost` | Yes, as a control probe | No, deliberately | No, deliberately |
 | Sees an alias | No | No | Yes |
-| Result | Zero for all fourteen on the pre-remediation tree; zero for the thirteen reachability patterns on the delivered tree | Zero for all eight | No offender for any advisory |
+| Result | Zero for all fourteen on the pre-remediation tree. On the delivered tree, zero for thirteen at `backend/app/`; at `backend/` no count is published, and every match sits under `backend/tests/`, naming a construct to assert its absence | Zero for all eight | No offender for any advisory |
 
 Describing the pre-filter as covering fourteen patterns, or the measurement as
 covering eight, would misstate both. The six patterns in the measurement but not
@@ -1193,7 +1242,7 @@ carried into
 [`../review/CRITICAL_DECISIONS.md`](../review/CRITICAL_DECISIONS.md), which
 assigns each to a named reviewer with the checks that reviewer should perform.
 
-**Two of these eight were restated because the delivered tree contradicted them,
+**Two of these nine were restated because the delivered tree contradicted them,
 and the correction is recorded rather than applied silently.** O-7 claimed that no
 Kubernetes workload object exists for a deployment to update and O-8 that nothing
 schedules the ingestion task. `infrastructure/kubernetes/` carries twelve manifests
@@ -1206,11 +1255,21 @@ can establish. Rows 91.3.1 and 91.3.2 of the decision log record both restatemen
 and row 91.7.1 is the wording rule that keeps delivered, locally verified and
 applied state apart.
 
-**What "open" means for each of the nine.** Seven are wholly open. O-7 is open in
-two narrower senses than when it was written: the workload inventory exists and both
-release paths apply it, but the first cluster still needs one apply out of band, and
-the item's frontend half is untouched. O-8 is open in the sense that no evidence here
-shows the delivered schedule applied anywhere.
+**What "open" means for each of the nine. Nine are registered and nine are open;
+no item is closed in full by delivery, and each needs an operator, a platform
+decision or a provider before it can close.** One *half* of one item is closed by
+delivery &mdash; the Kubernetes half of O-7, as the paragraph above records &mdash;
+and a closed half leaves the item open. Seven are wholly open. The remaining two are open
+in narrower senses than when they were written, and narrower is not closed. O-7:
+the workload inventory exists and both release paths apply it, but the first
+cluster still needs one apply out of band, and the item's frontend half is
+untouched. O-8: the schedule ships as a delivered manifest, no evidence here shows
+it applied anywhere, and an operator must decide not to enable it until O-9 is
+closed. **An earlier revision of this register stated the count as "eight
+registered, seven open", which was true of an eight-row register before &sect;93.7
+carried O-9 on its own line and is true of no revision since.** Row 96.3.1 of
+[`docs/security/DECISION_LOG.md`](DECISION_LOG.md) records the correction, and the
+figure a reader should quote is **nine**.
 
 | # | Open item | Kind | Why this remediation did not close it | Decision log |
 |---|-----------|------|---------------------------------------|--------------|
@@ -1521,8 +1580,15 @@ undocumented commit fails the build.
 The Terraform binary is pinned with it: the `infrastructure` job passes an exact
 `terraform_version` to `hashicorp/setup-terraform`, so the binary that runs
 `terraform validate` is the release the configuration is verified with rather
-than whichever one the action resolves. That version satisfies the
-`required_version` constraint `infrastructure/terraform/main.tf` declares.
+than whichever one the action resolves. That version also clears the 1.11 floor
+the ephemeral input variables and write-only secret arguments in
+`infrastructure/terraform/main.tf` require. **The configuration itself declares no
+`required_version` and no `required_providers`, and no provider lock is tracked**;
+that absence is a finding reported for confirmation rather than closed, it is
+stated in the configuration's own comment block, and
+`docs/security/DECISION_LOG.md` rows 91.1.1 and 96.1.1 own the reasoning. The pin
+above therefore rests on the release this repository verifies against, not on a
+constraint the configuration states.
 
 | Reference | Commit | Release |
 |---|---|---|

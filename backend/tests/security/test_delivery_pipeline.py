@@ -19,6 +19,14 @@ What is asserted:
   deployment rather than by each pod's own startup validation
 * the one manifest inventory both delivery paths apply declares the
   bounds a rollout depends on, and neither path mutates a running object
+* every workload in that inventory declares a pod and container security
+  context, and the one that runs as uid 0 declares that it does rather
+  than omitting the field; the namespace carries the pod-security profile
+  each workload is admitted and audited against
+* the settings-contract gate the ``infrastructure`` job runs accepts the
+  committed inventory, and the containers it exempts from naming the
+  published rate-limit store are exactly the ones the manifests declare
+  without it
 
 The application is the authority for what a rate-limit store must be:
 :mod:`backend.app.core.config` refuses every in-process scheme under any
@@ -33,6 +41,7 @@ restated, so a manifest added to a stage without a decision is reported by
 whose default changed cannot silently invalidate a case here.
 """
 
+import importlib.util
 import inspect
 import io
 import os
@@ -149,6 +158,13 @@ RENDER_SCRIPT = REPO_ROOT / "scripts" / "render_kubernetes_manifests.sh"
 #: Directory holding the one manifest inventory both delivery paths apply.
 MANIFEST_DIR = REPO_ROOT / "infrastructure" / "kubernetes"
 
+#: Gate the ``infrastructure`` job runs the inventory through. It is loaded
+#: from its path rather than imported, because ``.github`` is not an
+#: importable package name.
+MANIFEST_GATE = REPO_ROOT.joinpath(
+    ".github", "scripts", "check_manifest_settings_contract.py"
+)
+
 #: Every declaration in the inventory, as ``file -> ((kind, name), ...)``.
 #: The mapping is compared for equality against what the directory holds,
 #: so a manifest added or removed without a decision is reported here. A
@@ -249,6 +265,73 @@ BACKEND_CONFIGURATION_SOURCES = (
     ("configMapRef", "backend-config"),
     ("secretRef", RATE_LIMIT_STORE_SECRET),
 )
+
+#: Every workload object in the inventory, as
+#: ``manifest -> ((kind, container name), ...)``. Compared for equality
+#: against the objects the inventory declares that carry a pod template, so
+#: a workload added without a decision is reported rather than skipped by
+#: the security-context cases below.
+WORKLOAD_CONTAINERS = {
+    "40-backend.yaml": (("Deployment", "backend"),),
+    "50-frontend.yaml": (("Deployment", "frontend"),),
+    "60-migration-job.yaml": (("Job", "migrate"),),
+    "65-ingestion-cronjob.yaml": (("CronJob", "ingest"),),
+    "70-admin-credential-job.yaml": (("Job", "admin-credential"),),
+}
+
+#: Container-level settings every workload declares identically. A
+#: capability the container adds back is asserted separately, per workload.
+REQUIRED_CONTAINER_SECURITY = {
+    "allowPrivilegeEscalation": False,
+    "readOnlyRootFilesystem": True,
+}
+
+#: The seccomp profile every pod declares.
+REQUIRED_SECCOMP = {"type": "RuntimeDefault"}
+
+#: Pod-level identity every workload declares, keyed by manifest. The
+#: frontend is the one entry that is not the unprivileged shape, and it is
+#: recorded here as what it is rather than omitted from the comparison.
+#: ``docs/security/DECISION_LOG.md`` rows 96.6.1 and 96.6.2 own it.
+WORKLOAD_POD_IDENTITY = {
+    "40-backend.yaml": {
+        "runAsNonRoot": True, "runAsUser": 1001, "runAsGroup": 1001,
+    },
+    "50-frontend.yaml": {"runAsNonRoot": False},
+    "60-migration-job.yaml": {
+        "runAsNonRoot": True, "runAsUser": 1001, "runAsGroup": 1001,
+    },
+    "65-ingestion-cronjob.yaml": {
+        "runAsNonRoot": True, "runAsUser": 1001, "runAsGroup": 1001,
+    },
+    "70-admin-credential-job.yaml": {
+        "runAsNonRoot": True, "runAsUser": 1001, "runAsGroup": 1001,
+    },
+}
+
+#: Capabilities each workload's container adds after dropping ALL, keyed by
+#: manifest. Only the frontend adds one, because it serves on a privileged
+#: port.
+WORKLOAD_ADDED_CAPABILITIES = {
+    "40-backend.yaml": (),
+    "50-frontend.yaml": ("NET_BIND_SERVICE",),
+    "60-migration-job.yaml": (),
+    "65-ingestion-cronjob.yaml": (),
+    "70-admin-credential-job.yaml": (),
+}
+
+#: The pod-security profile the namespace declares, as
+#: ``label suffix -> level``. enforce admits every workload in the
+#: inventory; audit and warn are stricter, so the one workload that is not
+#: unprivileged is recorded and reported rather than passing unremarked.
+NAMESPACE_POD_SECURITY = {
+    "enforce": "baseline",
+    "audit": "restricted",
+    "warn": "restricted",
+}
+
+#: Prefix the three labels above share.
+POD_SECURITY_LABEL_PREFIX = "pod-security.kubernetes.io/"
 
 #: Probes every continuously running workload declares.
 REQUIRED_PROBES = ("startupProbe", "readinessProbe", "livenessProbe")
@@ -497,6 +580,26 @@ def _container(document, name):
 def _raw_text(name):
     """Returns one manifest exactly as it is committed."""
     return (MANIFEST_DIR / name).read_text(encoding="utf-8")
+
+
+def _manifest_gate():
+    """Returns the settings-contract gate, loaded from its path.
+
+    The workflow runs it as a script. Loading it here reads the same
+    constants the workflow enforces rather than restating them, so the gate
+    and the cases below cannot drift apart.
+    """
+    specification = importlib.util.spec_from_file_location(
+        "blitzy_manifest_settings_gate", MANIFEST_GATE
+    )
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def _configuration_sources(manifest, kind, container):
+    """Returns one container's ``envFrom`` entries, or an empty list."""
+    return _container(_one(manifest, kind), container).get("envFrom") or []
 
 
 def _logical_commands(text, program):
@@ -960,6 +1063,117 @@ def test_each_workload_declares_the_bounds_a_rollout_depends_on(workload):
     assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
 
 
+def test_the_workload_security_inventory_covers_every_pod_template():
+    """Asserts the cases below read every workload the inventory declares.
+
+    A security-context case that reads a hand-written list is a case that
+    silently stops covering a workload added later, and the two Deployments
+    were the only ones covered until now. The list is compared for equality
+    against the objects the inventory declares that carry a pod template, so
+    an addition fails here rather than going unasserted.
+    """
+    declared = {}
+    for name in sorted(EXPECTED_MANIFESTS):
+        for document in _manifest(name):
+            if document["kind"] not in ("Deployment", "Job", "CronJob"):
+                continue
+            containers = _pod_spec(document)["containers"]
+            declared.setdefault(name, []).append(
+                (document["kind"], containers[0]["name"])
+            )
+            assert len(containers) == 1, (name, len(containers))
+
+    assert {
+        name: tuple(entries) for name, entries in declared.items()
+    } == WORKLOAD_CONTAINERS
+    assert set(WORKLOAD_POD_IDENTITY) == set(WORKLOAD_CONTAINERS)
+    assert set(WORKLOAD_ADDED_CAPABILITIES) == set(WORKLOAD_CONTAINERS)
+
+
+@pytest.mark.parametrize("name", sorted(WORKLOAD_CONTAINERS))
+def test_every_workload_declares_its_pod_identity_rather_than_omitting_it(
+    name
+):
+    """Asserts each pod states the identity it runs under.
+
+    An absent ``runAsNonRoot`` and an absent ``runAsUser`` leave the image's
+    own user in force, so a pod that runs as uid 0 reads the same as one
+    nobody has considered. The frontend is the one workload here that does
+    run as uid 0, and it declares ``runAsNonRoot: false`` so that the choice
+    is a declaration rather than an omission; rows 96.6.1 and 96.6.2 of
+    ``docs/security/DECISION_LOG.md`` own it.
+    """
+    kind = WORKLOAD_CONTAINERS[name][0][0]
+    pod = _pod_spec(_one(name, kind))
+    identity = WORKLOAD_POD_IDENTITY[name]
+
+    assert "runAsNonRoot" in pod["securityContext"], name
+    for field, value in identity.items():
+        assert pod["securityContext"][field] == value, (name, field)
+    assert pod["securityContext"]["seccompProfile"] == REQUIRED_SECCOMP, name
+
+
+@pytest.mark.parametrize("name", sorted(WORKLOAD_CONTAINERS))
+def test_every_workload_container_drops_all_and_adds_only_what_it_needs(
+    name
+):
+    """Asserts the container context, and each capability added back.
+
+    Dropping ``ALL`` and then adding one capability is a deliberate,
+    reviewable pair. Asserting the drop alone would let an addition through
+    unremarked, which is how the one privileged-port capability in this
+    inventory came to be unowned.
+    """
+    kind, container_name = WORKLOAD_CONTAINERS[name][0]
+    container = _container(_one(name, kind), container_name)
+    context = container["securityContext"]
+
+    for field, value in REQUIRED_CONTAINER_SECURITY.items():
+        assert context[field] is value, (name, field)
+    assert context["capabilities"]["drop"] == ["ALL"], name
+    assert tuple(
+        context["capabilities"].get("add", ())
+    ) == WORKLOAD_ADDED_CAPABILITIES[name], name
+
+
+def test_the_namespace_declares_the_pod_security_profile():
+    """Asserts admission is governed rather than left to the cluster.
+
+    Without these labels every workload is admitted under whatever the
+    cluster default happens to be, so the one pod that runs as uid 0 is
+    neither refused nor recorded. ``enforce`` is the level that admits the
+    inventory as it stands; ``audit`` and ``warn`` are stricter, so that pod
+    is written to the audit log and reported at apply time.
+    """
+    namespace = _one("00-namespace.yaml", "Namespace")
+    labels = namespace["metadata"]["labels"]
+
+    for suffix, level in NAMESPACE_POD_SECURITY.items():
+        key = POD_SECURITY_LABEL_PREFIX + suffix
+        assert labels.get(key) == level, key
+    assert labels["app.kubernetes.io/part-of"] == "apartment-finder"
+
+
+def test_the_frontend_is_the_only_workload_admitted_below_restricted():
+    """Asserts exactly one workload falls short of the audited level.
+
+    ``restricted`` requires ``runAsNonRoot``, so the count of workloads that
+    do not declare it is the count the audit level will report. One is the
+    recorded position; two would mean a workload had been added without the
+    unprivileged shape and without a decision.
+    """
+    privileged = sorted(
+        name
+        for name, identity in WORKLOAD_POD_IDENTITY.items()
+        if identity.get("runAsNonRoot") is not True
+    )
+
+    assert privileged == ["50-frontend.yaml"], privileged
+    assert NAMESPACE_POD_SECURITY["enforce"] == "baseline"
+    assert NAMESPACE_POD_SECURITY["audit"] == "restricted"
+    assert NAMESPACE_POD_SECURITY["warn"] == "restricted"
+
+
 def test_the_api_probes_read_the_routes_it_actually_publishes():
     """Asserts readiness reads the readiness route, not the liveness one.
 
@@ -1050,6 +1264,75 @@ def test_the_api_reads_the_rate_limit_store_the_pipeline_publishes():
     assert (
         'readonly RATE_LIMIT_STORE_SECRET="%s"' % RATE_LIMIT_STORE_SECRET
     ) in manual
+
+
+def test_the_manifest_settings_gate_passes_against_the_inventory(monkeypatch):
+    """Asserts the gate the pipeline runs accepts the committed inventory.
+
+    The gate is a script the ``infrastructure`` job runs and no case here
+    ran it, so it and the manifests could contradict each other with
+    nothing reporting it -- which is what happened. It resolves its
+    directory against the working directory, so the run is anchored at the
+    repository root.
+    """
+    monkeypatch.chdir(REPO_ROOT)
+    _manifest_gate().main()
+
+
+def test_the_gate_exempts_only_the_settings_free_containers():
+    """Asserts the gate's exemption is the one the manifests declare.
+
+    Two one-shot operator containers read the settings map and are given no
+    published secret, because neither constructs ``Settings``. The gate
+    records that pair by name; comparing its record against the manifests
+    for equality reports both an exemption that outlived its manifest and a
+    workload that quietly stopped naming the store.
+    """
+    measured = set()
+    for manifest, declared in sorted(WORKLOAD_CONTAINERS.items()):
+        for kind, container in declared:
+            sources = _configuration_sources(manifest, kind, container)
+            reads_settings = any("configMapRef" in entry for entry in sources)
+            names_secret = any("secretRef" in entry for entry in sources)
+            if reads_settings and not names_secret:
+                measured.add((manifest, container))
+
+    recorded = set(_manifest_gate().SETTINGS_FREE_CONTAINERS)
+    assert recorded == measured, sorted(recorded ^ measured)
+
+
+def test_every_settings_reader_is_given_the_published_store():
+    """Asserts each workload that constructs ``Settings`` receives it.
+
+    The application refuses an in-process rate-limit store outside a local
+    run, so a workload that reads the settings map, constructs ``Settings``
+    and is not given the published address could not start at all. The two
+    containers the gate exempts are asserted to be given no cluster secret
+    rather than skipped, and every source either declares is required.
+    """
+    exempt = set(_manifest_gate().SETTINGS_FREE_CONTAINERS)
+
+    for manifest, declared in sorted(WORKLOAD_CONTAINERS.items()):
+        for kind, container in declared:
+            sources = _configuration_sources(manifest, kind, container)
+            if not any("configMapRef" in entry for entry in sources):
+                continue
+            referenced = [
+                entry["secretRef"]["name"]
+                for entry in sources
+                if "secretRef" in entry
+            ]
+            if (manifest, container) in exempt:
+                assert referenced == [], (manifest, container, referenced)
+            else:
+                assert referenced == [RATE_LIMIT_STORE_SECRET], (
+                    manifest,
+                    container,
+                    referenced,
+                )
+            for entry in sources:
+                for reference in entry.values():
+                    assert reference.get("optional") is False, entry
 
 
 @pytest.mark.parametrize("workload", sorted(WORKLOAD_PORTS))

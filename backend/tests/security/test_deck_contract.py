@@ -174,14 +174,12 @@ def _kind(section):
     return "content"
 
 
-#: Components Rule 2 counts as a slide's non-text visual rather than as its
-#: body text: the metric-card grid, the styled table and the icon row. Rule 2
-#: requires every slide to carry one of these and caps body text at forty
-#: words, so counting a visual's own labels as body text would set the two
-#: requirements against each other -- no table-bearing slide could ever be
-#: within the cap. The heading block, the brand lockup and screen-reader-only
-#: text are excluded for the same reason: none of them is body prose an
-#: audience reads off the slide.
+#: Components removed before body text is counted: the heading block, the
+#: metric-card grid, the styled table, the icon row, the brand lockup and
+#: screen-reader-only text. None of them is body prose an audience reads off
+#: the slide, and the first four are the non-text visuals Rule 2 requires a
+#: slide to carry. ``docs/security/DECISION_LOG.md`` row 96.5.1 holds why
+#: the model is drawn here rather than one element wider.
 VISUAL_COMPONENTS = (
     ("div", "slide-head"),
     ("div", "kpi-grid"),

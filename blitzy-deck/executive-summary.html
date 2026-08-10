@@ -547,8 +547,8 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="file-check" aria-hidden="true"></i></span>
-        <span class="kpi-value">129</span>
-        <span class="kpi-label">files changed: 99 new, 30 updated</span>
+        <span class="kpi-value">130</span>
+        <span class="kpi-label">files changed: 100 new, 30 updated</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="check-circle" aria-hidden="true"></i></span>
@@ -562,7 +562,7 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
       </div>
       <div class="kpi-card">
         <span class="kpi-icon" aria-hidden="true"><i data-lucide="alert-triangle" aria-hidden="true"></i></span>
-        <span class="kpi-value">7</span>
+        <span class="kpi-value">9</span>
         <span class="kpi-label">items awaiting an operator</span>
       </div>
       <div class="kpi-card">
@@ -586,9 +586,10 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   Advisories fell from nineteen across seven packages to seven across three; every one
   of the seven survives because no fix for it runs on the Python version this service
   deliberately pins, and each carries a named compensating control. The single
-  code-scan finding was a network call with no timeout. The seven operator items are
-  listed later in this deck. The forty-five access-control assertions are nine routes
-  tested against five kinds of caller, anonymous included.
+  code-scan finding was a network call with no timeout. The nine operator items are
+  registered in the residual-risk document, all nine open, and the ones that gate a
+  first release are listed later in this deck. The forty-five access-control
+  assertions are nine routes tested against five kinds of caller, anonymous included.
 </aside>
 </section>
 
@@ -1073,8 +1074,11 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
     </div>
 </div>
 <aside class="notes">
-  These are the seven operator items counted on the metrics slide, grouped into four
-  pieces of work, and none of them can be done from inside a commit. Rotation covers a
+  These are the operator items counted on the metrics slide that gate a first
+  release, grouped into four pieces of work, and none of them can be done from inside
+  a commit. Nine are registered in all, every one of them open; the four gates here
+  are the ones that stop a release, and the rest are platform end-of-life dates, a
+  cross-layer contract gap and an unverified provider contract. Rotation covers a
   database connection string, a cloud service-account key, a signing key and a partner
   API key; the runbook orders it revoke, rotate, delete, then review prior access,
   because rewriting history before revoking leaves a live credential in every existing
