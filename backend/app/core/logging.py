@@ -46,6 +46,24 @@ call was made. :func:`mark_audited` records that an exception's rejection
 has already been written to the audit trail, so a generic handler
 downstream can leave it at one record.
 
+:func:`bind_trace_context` binds a W3C trace context the same way, and
+every record emitted while it is bound carries ``context.trace_id`` and
+``context.span_id`` beside the request identifier.
+:func:`parse_traceparent` reads an inbound ``traceparent`` header,
+rejecting a malformed version, an all-zero identifier and a value with
+the wrong field count, so a caller cannot inject a value into a record;
+:func:`current_traceparent` and :func:`outbound_trace_headers` render the
+bound context for an outbound call, which is what carries one trace
+across this service and the providers it calls.
+
+A record the configured handler cannot emit is neither written raw nor
+discarded. :func:`report_emit_failure` replaces the standard library's
+own error path on both handlers this module installs: it counts the
+failure, which :func:`logging_failure_count` reports as a health signal,
+and writes one redacted structured line carrying the logger, the level,
+the record's redacted message and :data:`EMIT_FAILURE_SIGNAL` under
+:data:`SIGNAL_FIELD`.
+
 Alongside the shapes above, a value registered through
 :func:`register_secret_values` is replaced wherever it appears, whatever
 surrounds it. Shape matching needs a credential-shaped key name next to
@@ -67,16 +85,20 @@ more before it leaves the process. A credential-shaped key name is
 matched after percent-decoding, and a mapping is matched whether its
 quotes are plain or backslash-escaped.
 
-The handler is installed on the ``backend`` logger and, at WARNING, on
-the third-party ``python_http_client`` and ``sendgrid`` loggers, whose
-records carry outbound request headers and bodies. Propagation is
-disabled on each, so no record reaches a handler installed elsewhere,
-whatever level the root logger is configured at. Loggers outside those
-namespaces are not governed by this module. Discovery and installation
-run under a lock and are idempotent: repeated or concurrent calls leave
-exactly one handler per logger, and a handler found under the reserved
-name whose type, target, formatter, filter or stream does not match is
-replaced.
+The handler is installed on the ``backend`` logger and on every
+namespace named by :data:`GOVERNED_LOGGER_NAMES`: at WARNING on
+``python_http_client`` and ``sendgrid``, whose records carry outbound
+request headers and bodies, and on ``httpx`` and ``httpcore``, whose
+records carry the full request target of every outbound call; at INFO on
+``alembic``, which carries each migration revision's own record of what
+it changed; and at WARNING on ``sqlalchemy``, whose records carry
+executed statement text. Propagation is disabled on each, so no record
+reaches a handler installed elsewhere, whatever level the root logger is
+configured at. Loggers outside those namespaces are not governed by this
+module. Discovery and installation run under a lock and are idempotent:
+repeated or concurrent calls leave exactly one handler per logger, and a
+handler found under the reserved name whose type, target, formatter,
+filter or stream does not match is replaced.
 
 Governance covers *every* handler each of those loggers carries, not
 only one found under the reserved name: exactly one handler configured
@@ -141,37 +163,73 @@ __all__ = [
     "BASE_LOGGER_NAME",
     "CONTEXT_FIELD",
     "DEFAULT_LOG_LEVEL",
+    "EMIT_FAILURE_MESSAGE",
+    "EMIT_FAILURE_SIGNAL",
     "EXCEPTION_MESSAGE_LIMIT",
     "GOVERNED_LOGGER_NAMES",
     "HANDLER_NAME",
     "MAX_REGISTERED_SECRETS",
+    "MIGRATION_LOGGER_NAMES",
+    "MIGRATION_LOG_LEVEL",
     "MIN_SECRET_VALUE_LENGTH",
+    "LISTENER_JOIN_TIMEOUT_SECONDS",
+    "LISTENER_SENTINEL_TIMEOUT_SECONDS",
     "QUEUE_CAPACITY",
     "QUEUE_DRAIN_TIMEOUT_SECONDS",
     "REDACTION_PLACEHOLDER",
     "REQUEST_ID_FIELD",
+    "SIGNAL_FIELD",
+    "SPAN_ID_FIELD",
+    "SPAN_ID_LENGTH",
+    "SQL_LOG_LEVEL",
+    "STOP_REASON_NOT_DRAINED",
+    "STOP_REASON_SENTINEL_REFUSED",
+    "STOP_REASON_THREAD_ALIVE",
     "THIRD_PARTY_LOGGER_NAMES",
     "THIRD_PARTY_LOG_LEVEL",
+    "TRACEPARENT_HEADER",
+    "TRACEPARENT_VERSION",
+    "TRACESTATE_HEADER",
+    "TRACE_FLAG_NOT_SAMPLED",
+    "TRACE_FLAG_SAMPLED",
+    "TRACE_ID_FIELD",
+    "TRACE_ID_LENGTH",
     "TRACE_MESSAGE",
     "QueueDispatchHandler",
     "RedactingFilter",
     "RedactingJsonFormatter",
+    "RedactingStreamHandler",
     "bind_request_id",
+    "bind_trace_context",
     "configure_logging",
+    "configure_migration_logging",
     "current_request_id",
+    "current_traceparent",
+    "current_trace_context",
     "exception_fields",
     "flush_log_queue",
+    "format_traceparent",
     "get_logger",
     "is_audited",
+    "listener_stop_failures",
     "log_audit_fallback",
     "log_exception",
+    "logging_failure_count",
     "mark_audited",
+    "new_span_id",
+    "new_trace_id",
+    "outbound_trace_headers",
+    "parse_traceparent",
     "redact",
     "redact_structure",
+    "redirect_log_stream",
     "registered_secret_count",
     "register_required_secret_values",
     "register_secret_values",
+    "report_emit_failure",
+    "reset_logging_failure_count",
     "reset_request_id",
+    "reset_trace_context",
     "unredacted_handler_names",
 ]
 
@@ -182,10 +240,27 @@ BASE_LOGGER_NAME = "backend"
 HANDLER_NAME = "redacting-json-stream"
 
 #: Third-party logger namespaces placed under the redacting handler.
-THIRD_PARTY_LOGGER_NAMES = ("python_http_client", "sendgrid")
+THIRD_PARTY_LOGGER_NAMES = (
+    "python_http_client",
+    "sendgrid",
+    "httpx",
+    "httpcore",
+)
 
 #: Level applied to the third-party loggers named above.
 THIRD_PARTY_LOG_LEVEL = logging.WARNING
+
+#: Migration logger namespaces placed under the redacting handler by
+#: :func:`configure_migration_logging`.
+MIGRATION_LOGGER_NAMES = ("alembic", "sqlalchemy")
+
+#: Level applied to the ``alembic`` namespace, which carries each
+#: revision's own record of what it changed.
+MIGRATION_LOG_LEVEL = logging.INFO
+
+#: Level applied to the ``sqlalchemy`` namespace, whose INFO records
+#: carry executed statement text.
+SQL_LOG_LEVEL = logging.WARNING
 
 #: JSON key that carries the fields supplied through ``extra={...}``.
 CONTEXT_FIELD = "context"
@@ -197,10 +272,39 @@ REDACTION_PLACEHOLDER = "[REDACTED]"
 DEFAULT_LOG_LEVEL = logging.INFO
 
 #: Every logger namespace this module governs.
-GOVERNED_LOGGER_NAMES = (BASE_LOGGER_NAME,) + THIRD_PARTY_LOGGER_NAMES
+GOVERNED_LOGGER_NAMES = (
+    (BASE_LOGGER_NAME,) + THIRD_PARTY_LOGGER_NAMES + MIGRATION_LOGGER_NAMES
+)
 
 #: JSON context key carrying the bound request identifier.
 REQUEST_ID_FIELD = "request_id"
+
+#: JSON context key carrying the bound W3C trace identifier.
+TRACE_ID_FIELD = "trace_id"
+
+#: JSON context key carrying the bound W3C span identifier.
+SPAN_ID_FIELD = "span_id"
+
+#: Request header carrying the W3C trace context.
+TRACEPARENT_HEADER = "traceparent"
+
+#: Request header carrying the vendor-specific W3C trace state.
+TRACESTATE_HEADER = "tracestate"
+
+#: Version field of every ``traceparent`` value this module writes.
+TRACEPARENT_VERSION = "00"
+
+#: Trace-flags field marking a sampled trace.
+TRACE_FLAG_SAMPLED = "01"
+
+#: Trace-flags field marking an unsampled trace.
+TRACE_FLAG_NOT_SAMPLED = "00"
+
+#: Hexadecimal digits in a W3C trace identifier.
+TRACE_ID_LENGTH = 32
+
+#: Hexadecimal digits in a W3C span identifier.
+SPAN_ID_LENGTH = 16
 
 #: Message of the record that carries a formatted traceback.
 TRACE_MESSAGE = "Exception traceback"
@@ -210,6 +314,17 @@ EXCEPTION_MESSAGE_LIMIT = 512
 
 #: Attribute set on an exception whose rejection is already audited.
 AUDITED_ATTRIBUTE = "_audit_record_emitted"
+
+#: Message of the record written when a handler could not emit.
+EMIT_FAILURE_MESSAGE = "Log record could not be emitted"
+
+#: Field naming the degradation a record reports, read by the log-based
+#: metric the deployment alerts on.
+SIGNAL_FIELD = "signal"
+
+#: Value of :data:`SIGNAL_FIELD` on a record reporting that a handler
+#: could not emit.
+EMIT_FAILURE_SIGNAL = "log_emit_failed"
 
 #: Shortest value :func:`register_secret_values` accepts. A shorter value
 #: is refused.
@@ -226,6 +341,29 @@ QUEUE_CAPACITY = 4096
 #: Seconds :func:`flush_log_queue` waits for the queue to drain.
 QUEUE_DRAIN_TIMEOUT_SECONDS = 5.0
 
+#: Seconds :func:`_stop_listener` waits to hand the listener thread its
+#: sentinel. ``QueueListener.enqueue_sentinel`` uses ``put_nowait``, which
+#: raises on a queue at capacity, so the sentinel is offered under a
+#: bounded wait instead.
+LISTENER_SENTINEL_TIMEOUT_SECONDS = 1.0
+
+#: Seconds :func:`_stop_listener` waits for the listener thread to exit
+#: after it has been handed the sentinel. ``QueueListener.stop`` joins
+#: without a timeout, so a thread blocked inside a write never returns.
+LISTENER_JOIN_TIMEOUT_SECONDS = 2.0
+
+#: Reason recorded when the queued records did not drain before the
+#: listener was asked to stop.
+STOP_REASON_NOT_DRAINED = "queued records did not drain"
+
+#: Reason recorded when the sentinel could not be handed to the listener
+#: within :data:`LISTENER_SENTINEL_TIMEOUT_SECONDS`.
+STOP_REASON_SENTINEL_REFUSED = "listener sentinel was not accepted"
+
+#: Reason recorded when the listener thread was still alive after
+#: :data:`LISTENER_JOIN_TIMEOUT_SECONDS`.
+STOP_REASON_THREAD_ALIVE = "listener thread did not exit"
+
 # Deepest level of nesting walked when redacting a structured value.
 _MAX_REDACTION_DEPTH = 8
 
@@ -234,6 +372,13 @@ _CONFIGURE_LOCK = threading.RLock()
 
 # Serialises registration of secret values across threads.
 _SECRETS_LOCK = threading.RLock()
+
+# Serialises the emit-failure counter across threads.
+_EMIT_FAILURE_LOCK = threading.Lock()
+
+# Records a handler could not emit. Read through
+# :func:`logging_failure_count`.
+_EMIT_FAILURES = 0
 
 # Values replaced wherever they appear, longest first so a value that
 # contains another is replaced whole. Rebound as a complete tuple under
@@ -246,6 +391,10 @@ _SECRET_VALUES: Tuple[str, ...] = ()
 # :func:`unredacted_handler_names`.
 _REMOVED_HANDLERS: List[str] = []
 
+# Reasons a listener shutdown did not complete, in the order they were
+# first recorded. Read through :func:`listener_stop_failures`.
+_STOP_FAILURES: List[str] = []
+
 # Identifier bound to the current task or thread, or None.
 _REQUEST_ID: "contextvars.ContextVar[Optional[str]]" = (
     contextvars.ContextVar("blitzy_request_id", default=None)
@@ -253,6 +402,28 @@ _REQUEST_ID: "contextvars.ContextVar[Optional[str]]" = (
 
 # Longest identifier accepted by :func:`bind_request_id`.
 _MAX_REQUEST_ID_LENGTH = 128
+
+# Trace identifier, span identifier and trace flags bound to the current
+# task or thread, or None.
+_TRACE_CONTEXT: "contextvars.ContextVar[Optional[Tuple[str, str, str]]]" = (
+    contextvars.ContextVar("blitzy_trace_context", default=None)
+)
+
+# A trace identifier of the required length, which must not be all zeros.
+_TRACE_ID_RE = re.compile(r"^[0-9a-f]{" + str(TRACE_ID_LENGTH) + r"}$")
+
+# A span identifier of the required length, which must not be all zeros.
+_SPAN_ID_RE = re.compile(r"^[0-9a-f]{" + str(SPAN_ID_LENGTH) + r"}$")
+
+# Trace flags: two lower-case hexadecimal digits.
+_TRACE_FLAGS_RE = re.compile(r"^[0-9a-f]{2}$")
+
+# The version field of a traceparent value: two hexadecimal digits that
+# are not the reserved all-ones value.
+_TRACE_VERSION_RE = re.compile(r"^[0-9a-f]{2}$")
+
+# Reserved version value a receiver must reject.
+_TRACE_VERSION_INVALID = "ff"
 
 # Key-name fragments that mark a value as credential-shaped. Matching is
 # case-insensitive and substring-based, and covers compound spellings
@@ -821,6 +992,143 @@ def current_request_id() -> Optional[str]:
         return None
 
 
+def new_trace_id() -> str:
+    """Returns a fresh W3C trace identifier."""
+    return os.urandom(TRACE_ID_LENGTH // 2).hex()
+
+
+def new_span_id() -> str:
+    """Returns a fresh W3C span identifier."""
+    return os.urandom(SPAN_ID_LENGTH // 2).hex()
+
+
+def parse_traceparent(value: Any) -> Optional[Tuple[str, str, str]]:
+    """Returns the trace identifier, span identifier and flags in ``value``.
+
+    ``value`` is a W3C ``traceparent`` header. ``None`` is returned unless
+    every field is well formed: the version is two hexadecimal digits and
+    is not the reserved all-ones value, the trace identifier is
+    :data:`TRACE_ID_LENGTH` hexadecimal digits and not all zeros, the span
+    identifier is :data:`SPAN_ID_LENGTH` hexadecimal digits and not all
+    zeros, and the flags are two hexadecimal digits. A version above the
+    one this module writes may carry further fields, which are ignored.
+    """
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().lower().split("-")
+    if len(parts) < 4:
+        return None
+    version, trace_id, span_id, flags = parts[0], parts[1], parts[2], parts[3]
+    if not _TRACE_VERSION_RE.match(version):
+        return None
+    if version == _TRACE_VERSION_INVALID:
+        return None
+    if version == TRACEPARENT_VERSION and len(parts) != 4:
+        return None
+    if not _TRACE_ID_RE.match(trace_id) or not _TRACE_FLAGS_RE.match(flags):
+        return None
+    if not _SPAN_ID_RE.match(span_id):
+        return None
+    if trace_id == "0" * TRACE_ID_LENGTH:
+        return None
+    if span_id == "0" * SPAN_ID_LENGTH:
+        return None
+    return (trace_id, span_id, flags)
+
+
+def format_traceparent(
+    trace_id: str, span_id: str, flags: str = TRACE_FLAG_SAMPLED
+) -> str:
+    """Returns the ``traceparent`` value for the fields supplied."""
+    return "-".join((TRACEPARENT_VERSION, trace_id, span_id, flags))
+
+
+def bind_trace_context(
+    trace_id: Optional[str] = None,
+    span_id: Optional[str] = None,
+    flags: str = TRACE_FLAG_SAMPLED,
+) -> Any:
+    """Binds a trace context to the current task or thread.
+
+    Every record emitted while the context is bound carries its trace
+    identifier under ``context.trace_id`` and its span identifier under
+    ``context.span_id``. A value that is not a well-formed identifier is
+    replaced by a fresh one, so a caller may pass an inbound value
+    directly. Returns the token :func:`reset_trace_context` restores the
+    previous context with.
+    """
+    resolved_trace = (
+        trace_id
+        if isinstance(trace_id, str) and _TRACE_ID_RE.match(trace_id.lower())
+        else None
+    )
+    resolved_span = (
+        span_id
+        if isinstance(span_id, str) and _SPAN_ID_RE.match(span_id.lower())
+        else None
+    )
+    resolved_flags = (
+        flags.lower()
+        if isinstance(flags, str) and _TRACE_FLAGS_RE.match(flags.lower())
+        else TRACE_FLAG_SAMPLED
+    )
+    return _TRACE_CONTEXT.set(
+        (
+            (resolved_trace or new_trace_id()).lower(),
+            (resolved_span or new_span_id()).lower(),
+            resolved_flags,
+        )
+    )
+
+
+def reset_trace_context(token: Any) -> None:
+    """Restores the trace context bound before ``token`` was issued."""
+    try:
+        _TRACE_CONTEXT.reset(token)
+    except Exception:
+        _TRACE_CONTEXT.set(None)
+
+
+def current_trace_context() -> Optional[Tuple[str, str, str]]:
+    """Returns the trace context bound to the current task, or ``None``."""
+    try:
+        return _TRACE_CONTEXT.get()
+    except Exception:
+        return None
+
+
+def _bound_trace_field(index: int) -> Optional[str]:
+    """Returns one field of the bound trace context, or ``None``."""
+    bound = current_trace_context()
+    if bound is None:
+        return None
+    try:
+        return bound[index]
+    except Exception:
+        return None
+
+
+def current_traceparent() -> Optional[str]:
+    """Returns the ``traceparent`` value for the bound context."""
+    bound = current_trace_context()
+    if bound is None:
+        return None
+    return format_traceparent(bound[0], bound[1], bound[2])
+
+
+def outbound_trace_headers() -> Dict[str, str]:
+    """Returns the trace headers an outbound call carries.
+
+    The mapping holds :data:`TRACEPARENT_HEADER` for the bound context and
+    is empty when no context is bound, so a caller may merge it into its
+    own header mapping unconditionally.
+    """
+    header = current_traceparent()
+    if header is None:
+        return {}
+    return {TRACEPARENT_HEADER: header}
+
+
 def mark_audited(exc: Any) -> Any:
     """Records that ``exc``'s rejection is already in the audit trail.
 
@@ -842,14 +1150,34 @@ def is_audited(exc: Any) -> bool:
         return False
 
 
+def _trim_to_limit(value: str) -> str:
+    """Returns ``value`` cut to :data:`EXCEPTION_MESSAGE_LIMIT`.
+
+    A cut that lands inside a substituted placeholder removes that
+    partial placeholder as well, so the result carries whole
+    placeholders only.
+    """
+    if len(value) <= EXCEPTION_MESSAGE_LIMIT:
+        return value
+    trimmed = value[:EXCEPTION_MESSAGE_LIMIT]
+    tail = trimmed[-(len(REDACTION_PLACEHOLDER) - 1):]
+    for length in range(len(tail), 0, -1):
+        fragment = tail[-length:]
+        if REDACTION_PLACEHOLDER.startswith(fragment):
+            return trimmed[:-length]
+    return trimmed
+
+
 def exception_fields(exc: Any) -> Dict[str, Any]:
     """Returns the discrete, safe fields describing ``exc``.
 
     The fields are the exception's class name, the module that defines
-    it, and its message redacted and truncated to
-    :data:`EXCEPTION_MESSAGE_LIMIT` characters. No traceback, no frame,
-    no source path and no local value is included, so the result is safe
-    to emit at any level.
+    it, and its message. The message is redacted first and cut to
+    :data:`EXCEPTION_MESSAGE_LIMIT` characters afterwards, so a
+    credential straddling the cut is rewritten while the pattern that
+    matches it is still whole. No traceback, no frame, no source path
+    and no local value is included, so the result is safe to emit at any
+    level.
     """
     fields: Dict[str, Any] = {
         "exception_type": None,
@@ -867,9 +1195,7 @@ def exception_fields(exc: Any) -> Dict[str, Any]:
     except Exception:
         return fields
     if rendered:
-        fields["exception_message"] = redact(
-            rendered[:EXCEPTION_MESSAGE_LIMIT]
-        )
+        fields["exception_message"] = _trim_to_limit(redact(rendered))
     return fields
 
 
@@ -946,19 +1272,112 @@ def _emit_fallback(message: str, fields: Dict[str, Any]) -> None:
         return
 
 
-def _attach_request_id(record: logging.LogRecord) -> None:
-    """Attaches the bound request identifier to ``record``.
+def _count_emit_failure() -> None:
+    """Increments the count of records a handler could not emit."""
+    global _EMIT_FAILURES
+    with _EMIT_FAILURE_LOCK:
+        _EMIT_FAILURES += 1
 
-    The identifier is read from the current task or thread, so this must
-    run on the thread that logged rather than on the listener thread. A
-    record already carrying the field keeps its value, and a failure
-    leaves the record untouched.
+
+def logging_failure_count() -> int:
+    """Returns how many records a handler could not emit.
+
+    A non-zero value means at least one record reached the standard-error
+    fallback instead of the configured handler. The record itself was
+    still written; the count reports that the primary sink degraded, and
+    is the signal a deployment alerts on.
+    """
+    with _EMIT_FAILURE_LOCK:
+        return _EMIT_FAILURES
+
+
+def reset_logging_failure_count() -> int:
+    """Clears the emit-failure count and returns the value it held."""
+    global _EMIT_FAILURES
+    with _EMIT_FAILURE_LOCK:
+        previous = _EMIT_FAILURES
+        _EMIT_FAILURES = 0
+        return previous
+
+
+def _safe_record_fields(record: Any) -> Dict[str, Any]:
+    """Returns the stable, redacted fields describing ``record``.
+
+    Only the logger name, the level name and the record's own message are
+    read, and the message is redacted and cut to
+    :data:`EXCEPTION_MESSAGE_LIMIT`. No traceback, no frame, no source
+    path, no ``extra`` value and no interpolated argument is included, so
+    the result carries nothing the record's own formatting would have
+    expanded.
+    """
+    fields: Dict[str, Any] = {
+        "logger": None,
+        "level": None,
+        "original_message": None,
+    }
+    try:
+        fields["logger"] = str(getattr(record, "name", None))
+        fields["level"] = str(getattr(record, "levelname", None))
+    except Exception:
+        return fields
+    try:
+        rendered = str(getattr(record, "msg", ""))
+    except Exception:
+        rendered = ""
+    if rendered:
+        fields["original_message"] = _trim_to_limit(redact(rendered))
+    return fields
+
+
+def report_emit_failure(record: Any) -> None:
+    """Reports that a handler could not emit ``record``.
+
+    Counts the failure and writes one redacted, structured line to
+    standard error carrying the logger, the level, the record's redacted
+    message and the bound correlation identifiers. The failure signal
+    :data:`EMIT_FAILURE_SIGNAL` is carried on that line, so the record is
+    neither dropped silently nor written as a raw traceback. Never
+    raises.
+    """
+    _count_emit_failure()
+    fields = _safe_record_fields(record)
+    fields[SIGNAL_FIELD] = EMIT_FAILURE_SIGNAL
+    try:
+        fields["log_emit_failures"] = logging_failure_count()
+    except Exception:
+        fields["log_emit_failures"] = None
+    for name, value in (
+        (REQUEST_ID_FIELD, current_request_id()),
+        (TRACE_ID_FIELD, _bound_trace_field(0)),
+        (SPAN_ID_FIELD, _bound_trace_field(1)),
+    ):
+        if value is not None:
+            fields[name] = value
+    _emit_fallback(EMIT_FAILURE_MESSAGE, fields)
+
+
+def _attach_request_id(record: logging.LogRecord) -> None:
+    """Attaches the bound correlation identifiers to ``record``.
+
+    The request identifier and the trace context are read from the
+    current task or thread, so this must run on the thread that logged
+    rather than on the listener thread. A record already carrying one of
+    the fields keeps its value, and a failure leaves the record
+    untouched.
     """
     try:
         if getattr(record, REQUEST_ID_FIELD, None) is None:
             bound = current_request_id()
             if bound is not None:
                 setattr(record, REQUEST_ID_FIELD, bound)
+        for name, index in (
+            (TRACE_ID_FIELD, 0),
+            (SPAN_ID_FIELD, 1),
+        ):
+            if getattr(record, name, None) is None:
+                value = _bound_trace_field(index)
+                if value is not None:
+                    setattr(record, name, value)
     except Exception:
         return
 
@@ -1176,6 +1595,17 @@ class QueueDispatchHandler(logging.handlers.QueueHandler):
         except Exception:
             self.handleError(record)
 
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Reports the failure through the sanitized fallback sink.
+
+        The standard-library implementation is replaced: it writes the
+        record's own representation and the raw traceback to standard
+        error when ``logging.raiseExceptions`` is set, and discards the
+        record otherwise. :func:`report_emit_failure` counts the failure
+        and writes one redacted structured line instead.
+        """
+        report_emit_failure(record)
+
 
 # Queue every governed logger dispatches through, and the listener
 # thread and stream handler that drain it. All three are created together
@@ -1185,16 +1615,32 @@ _listener = None  # type: Optional[logging.handlers.QueueListener]
 _stream_handler = None  # type: Optional[logging.Handler]
 
 
+class RedactingStreamHandler(logging.StreamHandler):
+    """Writes a rendered record to a stream, reporting an emit failure.
+
+    The standard-library error path is replaced for the same reason it is
+    replaced on :class:`QueueDispatchHandler`: it writes the record's own
+    representation and the raw traceback to standard error, or discards
+    the record. :func:`report_emit_failure` counts the failure and writes
+    one redacted structured line instead.
+    """
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Reports the failure through the sanitized fallback sink."""
+        report_emit_failure(record)
+
+
 def _is_redacting_stream_handler(handler: Any) -> bool:
     """Reports whether ``handler`` writes redacted JSON to a live stream.
 
-    A handler is accepted only when it is a stream handler carrying an
-    open stream, a :class:`RedactingJsonFormatter` and a
-    :class:`RedactingFilter`. The reserved name belongs to the queue
-    handler installed on a governed logger, not to the stream handler the
-    listener drains to, so no name is required here.
+    A handler is accepted only when it is a
+    :class:`RedactingStreamHandler` carrying an open stream, a
+    :class:`RedactingJsonFormatter` and a :class:`RedactingFilter`. The
+    reserved name belongs to the queue handler installed on a governed
+    logger, not to the stream handler the listener drains to, so no name
+    is required here.
     """
-    if not isinstance(handler, logging.StreamHandler):
+    if not isinstance(handler, RedactingStreamHandler):
         return False
     if not isinstance(handler.formatter, RedactingJsonFormatter):
         return False
@@ -1242,7 +1688,7 @@ def _resolve_level(level: Optional[Union[int, str]]) -> int:
 
 def _build_stream_handler() -> logging.Handler:
     """Creates the redacting stream handler the listener drains to."""
-    handler = logging.StreamHandler(stream=sys.stdout)
+    handler = RedactingStreamHandler(stream=sys.stdout)
     handler.setFormatter(RedactingJsonFormatter())
     handler.addFilter(RedactingFilter())
     return handler
@@ -1283,28 +1729,89 @@ def _ensure_listener() -> None:
     _listener.start()
 
 
+def _record_stop_failure(reason: str) -> None:
+    """Records that a listener shutdown did not complete."""
+    if reason in _STOP_FAILURES:
+        return
+    _STOP_FAILURES.append(reason)
+
+
+def listener_stop_failures() -> Tuple[str, ...]:
+    """Returns the reasons a listener shutdown did not complete.
+
+    Each entry names one step of :func:`_stop_listener` that did not
+    finish within its bound: the queue did not drain, the sentinel was not
+    accepted, or the thread did not exit. A non-empty result means a
+    listener thread was left running with its queue undrained, and a
+    caller may treat that as a shutdown failure.
+    """
+    return tuple(_STOP_FAILURES)
+
+
+def _offer_sentinel(listener: Any, timeout: float) -> bool:
+    """Hands ``listener`` its sentinel, waiting at most ``timeout``.
+
+    ``QueueListener.enqueue_sentinel`` puts the sentinel with
+    ``put_nowait``, which raises ``queue.Full`` on a queue at capacity, so
+    the sentinel is offered here under a bounded wait. Returns True when
+    the queue accepted it.
+    """
+    record_queue = getattr(listener, "queue", None)
+    if record_queue is None:
+        return False
+    sentinel = getattr(listener, "_sentinel", None)
+    try:
+        if timeout > 0:
+            record_queue.put(sentinel, True, timeout)
+        else:
+            record_queue.put_nowait(sentinel)
+    except Exception:
+        return False
+    return True
+
+
 def _stop_listener() -> None:
     """Drains the queue and stops the listener thread, if one is running.
 
     Registered to run at interpreter exit, and called before a listener
     is replaced. Whether a listener is running is read from the saved
     reference, and the drain runs while that listener is still installed,
-    so the records already queued are written. The module reference is
-    then released and the thread stopped, and it stays released even when
-    the thread does not stop cleanly. Leaves the module ready to build a
-    fresh listener.
+    so the records already queued are written.
+
+    Every wait the shutdown makes is bounded: the drain by
+    :data:`QUEUE_DRAIN_TIMEOUT_SECONDS`, the sentinel by
+    :data:`LISTENER_SENTINEL_TIMEOUT_SECONDS` and the thread by
+    :data:`LISTENER_JOIN_TIMEOUT_SECONDS`. A step that does not finish
+    within its bound is recorded by :func:`listener_stop_failures` and
+    leaves the module reference pointing at the still-running listener,
+    so the live thread is neither hidden nor collected while it writes.
+    The reference is released, and the module left ready to build a fresh
+    listener, only once the thread has actually exited.
     """
     global _listener
     listener = _listener
     if not _thread_is_alive(listener):
         _listener = None
         return
-    flush_log_queue()
-    _listener = None
-    try:
-        listener.stop()
-    except Exception:
+    if not flush_log_queue():
+        _record_stop_failure(STOP_REASON_NOT_DRAINED)
+    if not _offer_sentinel(listener, LISTENER_SENTINEL_TIMEOUT_SECONDS):
+        _record_stop_failure(STOP_REASON_SENTINEL_REFUSED)
         return
+    thread = getattr(listener, "_thread", None)
+    if thread is not None:
+        try:
+            thread.join(LISTENER_JOIN_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+    if _thread_is_alive(listener):
+        _record_stop_failure(STOP_REASON_THREAD_ALIVE)
+        return
+    try:
+        listener._thread = None
+    except Exception:
+        pass
+    _listener = None
 
 
 def flush_log_queue(
@@ -1426,18 +1933,44 @@ def _govern_descendants() -> None:
         logger.propagate = True
 
 
-def _configure_third_party_loggers() -> None:
-    """Routes the third-party namespaces through the redacting handler.
+def _governed_namespace_levels() -> Tuple[Tuple[str, int], ...]:
+    """Returns each governed namespace outside the base logger and its level.
 
-    Each logger named in :data:`THIRD_PARTY_LOGGER_NAMES` is held at
-    :data:`THIRD_PARTY_LOG_LEVEL`, given the redacting handler and stopped
-    from propagating, so its records cannot reach a handler installed
+    The outbound HTTP namespaces are held at
+    :data:`THIRD_PARTY_LOG_LEVEL`, which is above the level their request
+    records are written at, so a request target never reaches a handler.
+    ``alembic`` is held at :data:`MIGRATION_LOG_LEVEL` so each revision's
+    own record of what it changed is emitted, and ``sqlalchemy`` at
+    :data:`SQL_LOG_LEVEL`, which is above the level its statement records
+    are written at.
+    """
+    entries: List[Tuple[str, int]] = [
+        (name, THIRD_PARTY_LOG_LEVEL) for name in THIRD_PARTY_LOGGER_NAMES
+    ]
+    for name in MIGRATION_LOGGER_NAMES:
+        entries.append(
+            (
+                name,
+                MIGRATION_LOG_LEVEL
+                if name == "alembic"
+                else SQL_LOG_LEVEL,
+            )
+        )
+    return tuple(entries)
+
+
+def _configure_third_party_loggers() -> None:
+    """Routes every governed namespace through the redacting handler.
+
+    Each logger named by :func:`_governed_namespace_levels` is held at the
+    level recorded there, given the redacting handler and stopped from
+    propagating, so its records cannot reach a handler installed
     elsewhere.
     """
-    for name in THIRD_PARTY_LOGGER_NAMES:
+    for name, level in _governed_namespace_levels():
         logger = logging.getLogger(name)
         _install_handler(logger)
-        logger.setLevel(THIRD_PARTY_LOG_LEVEL)
+        logger.setLevel(level)
         logger.propagate = False
 
 
@@ -1453,10 +1986,16 @@ def configure_logging(
     whose type, queue, target, formatter, filter or stream does not
     match, or whose listener thread has stopped, is replaced.
 
-    Passing ``level`` sets the base logger's level; omitting it keeps the
-    level already in effect, or applies :data:`DEFAULT_LOG_LEVEL` on the
-    first call. The third-party loggers are always held at
-    :data:`THIRD_PARTY_LOG_LEVEL`.
+    Passing ``level`` sets the base logger's level and is the supported
+    way to apply a deployment's configured level: the application passes
+    ``settings.LOG_LEVEL`` on startup. A name and a number are both
+    accepted, and an unrecognised value falls back on
+    :data:`DEFAULT_LOG_LEVEL`. Omitting ``level`` keeps the level already
+    in effect, or applies :data:`DEFAULT_LOG_LEVEL` on the first call.
+    Every governed namespace outside the base logger is always held at
+    the level :func:`_governed_namespace_levels` records for it, so a
+    configured level cannot lower the threshold that keeps an outbound
+    request target or an executed statement out of the log.
 
     Returns the base logger.
     """
@@ -1469,6 +2008,33 @@ def configure_logging(
         _configure_third_party_loggers()
         _govern_descendants()
         return logger
+
+
+def configure_migration_logging() -> logging.Logger:
+    """Installs the dispatching handler for the migration namespaces.
+
+    The Alembic environment calls this in place of applying a logging
+    configuration file, so every record a revision writes is rendered as
+    redacted JSON by the same handler the application uses and reaches no
+    handler installed elsewhere. Returns the ``alembic`` logger.
+    """
+    configure_logging()
+    return logging.getLogger(MIGRATION_LOGGER_NAMES[0])
+
+
+def redirect_log_stream(stream: Any) -> Optional[Any]:
+    """Points the installed handler at ``stream`` and returns the previous.
+
+    Used by a process whose standard output carries a product rather than
+    diagnostics -- an Alembic ``--sql`` run, whose statement stream is
+    that product -- so that its records go elsewhere and the two are not
+    interleaved. ``None`` is returned when no handler is installed.
+    """
+    with _CONFIGURE_LOCK:
+        configure_logging()
+        if _stream_handler is None:
+            return None
+        return _stream_handler.setStream(stream)
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:

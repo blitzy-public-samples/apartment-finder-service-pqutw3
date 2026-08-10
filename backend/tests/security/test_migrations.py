@@ -1,12 +1,13 @@
-"""Execution tests for the two Alembic revisions.
+"""Execution tests for the three Alembic revisions.
 
 Every case here drives Alembic itself -- ``alembic.command.upgrade`` and
 ``alembic.command.downgrade`` through
 :mod:`backend.migrations.env`'s online path -- against an isolated
 database, rather than building the schema from ``Base.metadata``. The
 revisions under test are
-:mod:`backend.migrations.versions.0001_add_rbac_and_subscription_columns`
-and :mod:`backend.migrations.versions.0002_seed_single_admin`.
+:mod:`backend.migrations.versions.0001_add_rbac_and_subscription_columns`,
+:mod:`backend.migrations.versions.0002_seed_single_admin` and
+:mod:`backend.migrations.versions.0003_add_workload_indexes`.
 
 What is asserted:
 
@@ -16,9 +17,10 @@ What is asserted:
   present afterwards, and an account and a subscription row stored before
   the upgrade read the server defaults
 * a repeated upgrade changes no row and no column
-* each revision downgrades on its own: revision 0002 returns the seeded
-  address to the default role and revision 0001 removes exactly what it
-  added, leaving the tables and columns that precede it
+* each revision downgrades on its own: revision 0003 removes exactly the
+  indexes it created, revision 0002 returns the seeded address to the
+  default role and revision 0001 removes exactly what it added, leaving
+  the tables and columns that precede it
 * after every successful upgrade exactly one account holds the
   administrative role and its address is
   ``backend.migrations.versions.0002_seed_single_admin.ADMIN_EMAIL`` --
@@ -38,6 +40,7 @@ Usage::
         command.upgrade(alembic_config(migration_connection), "head")
 """
 
+import hashlib
 import logging
 
 import pytest
@@ -48,10 +51,23 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.core.security import verify_credential, verify_password
+from backend.app.db.models import WORKLOAD_INDEX_NAMES
+from backend.tests.support import migration_records_reach
 from conftest import ALEMBIC_INI
 
 #: Address revision 0002 leaves holding the administrative role.
 ADMIN_EMAIL = "test@blitzy.com"
+
+#: Reference revision 0002 records in place of that address. It is the
+#: leading digits of the SHA-256 digest of the address. This module
+#: recomputes the digest rather than importing the revision's constant so
+#: that a revision that silently reverted to recording the address itself
+#: would fail here; ``test_admin_seed_migration`` holds the companion
+#: assertion that the revision's own constant is that digest and not the
+#: address.
+ADMIN_REFERENCE = hashlib.sha256(
+    ADMIN_EMAIL.encode("utf-8")
+).hexdigest()[:12]
 
 #: Role revision 0002 grants that address.
 ADMIN_ROLE = "admin"
@@ -69,6 +85,10 @@ SCHEMA_REVISION = "0001"
 
 #: Revision identifier of the administrative-grant revision.
 GRANT_REVISION = "0002"
+
+#: Revision identifier of the workload-index revision, the head of the
+#: chain.
+INDEX_REVISION = "0003"
 
 #: Logger the administrative grant records its outcome on.
 GRANT_LOGGER = "alembic.runtime.migration"
@@ -113,6 +133,18 @@ STORED_PASSWORD = "stored-hash-placeholder"
 
 #: Creation timestamp written for a row inserted by a case here.
 STORED_CREATED_AT = "2026-01-01 00:00:00"
+
+
+@pytest.fixture(autouse=True)
+def _migration_records(caplog):
+    """Route the migration namespace's records to the capture handler.
+
+    The namespace carries the redacting handler and does not propagate,
+    so the handler ``caplog`` installs on the root logger receives none
+    of its records unless it is attached to the namespace itself.
+    """
+    with migration_records_reach(caplog.handler):
+        yield
 
 
 def _insert_account(connection, email, role=None):
@@ -200,6 +232,17 @@ def _stored_password(connection, email):
     ).scalar()
 
 
+def _index_names(connection):
+    """Return every index name the database carries, across its tables."""
+    inspector = inspect(connection)
+    names = set()
+    for table in inspector.get_table_names():
+        for index in inspector.get_indexes(table):
+            if index.get("name"):
+                names.add(index["name"])
+    return names
+
+
 def _column_names(connection, table):
     """Return the column names ``table`` carries on ``connection``."""
     return set(
@@ -221,14 +264,18 @@ def _unique_columns(connection, table):
 
 
 def test_the_revision_chain_is_the_schema_revision_then_the_grant():
-    """Assert the two revisions are ordered additive-then-grant."""
+    """Assert the revisions are ordered additive, grant, then indexes."""
     directory = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
     revisions = list(directory.walk_revisions())
 
     assert [revision.revision for revision in revisions] == [
+        INDEX_REVISION,
         GRANT_REVISION,
         SCHEMA_REVISION,
     ]
+    assert directory.get_revision(INDEX_REVISION).down_revision == (
+        GRANT_REVISION
+    )
     assert directory.get_revision(GRANT_REVISION).down_revision == (
         SCHEMA_REVISION
     )
@@ -282,18 +329,27 @@ def test_the_seeded_administrator_holds_no_usable_credential(
 def test_the_grant_records_its_outcome(
     migration_connection, alembic_config, caplog
 ):
-    """Assert the administrative grant emits its audit record."""
+    """Assert the administrative grant emits its audit record.
+
+    The record names the stable account reference rather than the
+    address, so the grant stays independently identifiable without the
+    address reaching an audit sink.
+    """
     with caplog.at_level(logging.INFO, logger=GRANT_LOGGER):
         command.upgrade(alembic_config(migration_connection), "head")
 
-    records = [
+    emitted = [
         record.getMessage()
         for record in caplog.records
         if record.name == GRANT_LOGGER
-        and ADMIN_EMAIL in record.getMessage()
+    ]
+    records = [
+        message for message in emitted if ADMIN_REFERENCE in message
     ]
     assert records
     assert any(ADMIN_ROLE in message for message in records)
+    for message in emitted:
+        assert ADMIN_EMAIL not in message
 
 
 def test_upgrade_promotes_an_account_already_stored(
@@ -476,9 +532,15 @@ def test_a_repeated_upgrade_changes_nothing(
 def test_the_grant_revision_downgrades_to_the_default_role(
     migration_connection, alembic_config
 ):
-    """Assert the grant reverses without touching the added columns."""
+    """Assert the grant reverses without touching the added columns.
+
+    The workload-index revision sits above the grant, so it is reversed
+    first by naming the grant as the target; the grant is then the
+    revision one reversal removes.
+    """
     config = alembic_config(migration_connection)
     command.upgrade(config, "head")
+    command.downgrade(config, GRANT_REVISION)
 
     command.downgrade(config, "-1")
 
@@ -500,8 +562,7 @@ def test_the_schema_revision_downgrades_to_the_preceding_shape(
     config = alembic_config(migration_connection)
     command.upgrade(config, "head")
 
-    command.downgrade(config, "-1")
-    command.downgrade(config, "-1")
+    command.downgrade(config, "base")
 
     users = _column_names(migration_connection, "users")
     for column in USERS_ADDED_COLUMNS:
@@ -522,9 +583,10 @@ def test_the_schema_revision_downgrades_to_the_preceding_shape(
 def test_the_chain_upgrades_again_after_a_full_downgrade(
     migration_connection, alembic_config
 ):
-    """Assert the documented upgrade, twice-down, upgrade cycle holds."""
+    """Assert the documented upgrade, thrice-down, upgrade cycle holds."""
     config = alembic_config(migration_connection)
     command.upgrade(config, "head")
+    command.downgrade(config, "-1")
     command.downgrade(config, "-1")
     command.downgrade(config, "-1")
 
@@ -534,6 +596,9 @@ def test_the_chain_upgrades_again_after_a_full_downgrade(
     users = _column_names(migration_connection, "users")
     for column in USERS_ADDED_COLUMNS:
         assert column in users
+    assert _index_names(migration_connection) >= set(
+        WORKLOAD_INDEX_NAMES
+    )
 
 
 def test_a_second_administrator_fails_the_upgrade(
@@ -550,8 +615,9 @@ def test_a_second_administrator_fails_the_upgrade(
     with pytest.raises(RuntimeError) as refusal:
         command.upgrade(config, "head")
 
-    assert ADMIN_EMAIL in str(refusal.value)
+    assert ADMIN_REFERENCE in str(refusal.value)
     assert ADMIN_ROLE in str(refusal.value)
+    assert ADMIN_EMAIL not in str(refusal.value)
 
 
 def test_every_account_other_than_the_seed_holds_the_default_role(

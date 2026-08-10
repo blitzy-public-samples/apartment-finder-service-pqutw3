@@ -23,15 +23,21 @@ It publishes:
 * :func:`bearer_header` -- the ``Authorization`` header carrying a token
 * :func:`enforce_sqlite_foreign_keys` -- the registration that makes a
   SQLite engine enforce the foreign keys the models declare
+* :data:`MIGRATION_LOGGER_NAMESPACE` and
+  :func:`migration_records_reach` -- the logger namespace the migration
+  revisions record on, and the attachment that lets a capture handler
+  read those records
 
 Usage::
 
     from backend.tests.support import VALID_TEST_PASSWORD
 """
 
+import contextlib
+import logging
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 from sqlalchemy import event
 
@@ -47,6 +53,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_SETTINGS: Dict[str, str] = {
     "ENVIRONMENT": "local",
     "DATABASE_URL": "sqlite://",
+    "DB_CONNECT_TIMEOUT_SECONDS": "3",
+    "DB_STATEMENT_TIMEOUT_SECONDS": "3",
+    "DB_TCP_USER_TIMEOUT_SECONDS": "4",
+    "DB_POOL_TIMEOUT_SECONDS": "10.0",
+    "DB_POOL_RECYCLE_SECONDS": "1800",
     "SECRET_KEY": "tZ4mQ7vK2pR9wB6nD3jS8xF5hL0cY1gA",
     "JWT_ALGORITHMS": "HS256",
     "JWT_ISSUER": "apartment-finder-service",
@@ -62,13 +73,19 @@ TEST_SETTINGS: Dict[str, str] = {
     "RATE_LIMIT_LOGIN": "5/minute",
     "RATE_LIMIT_REGISTER": "3/minute",
     "RATE_LIMIT_WEBHOOK": "60/minute",
+    "RATE_LIMIT_READINESS": "60/minute",
     "RATE_LIMIT_STORAGE_URI": "bounded-memory://",
     "RATE_LIMIT_MAX_TRACKED_KEYS": "4096",
+    "TRUSTED_PROXY_HOPS": "0",
+    "READINESS_CACHE_SECONDS": "5.0",
+    "READINESS_TIMEOUT_SECONDS": "2.0",
     "LOGIN_MAX_ATTEMPTS": "5",
     "LOGIN_LOCKOUT_MINUTES": "15",
     "ZILLOW_API_URL": "https://zillow-api.example.com/v2/listings",
     "ZILLOW_API_KEY": "listing-provider-test-key",
     "HTTP_TIMEOUT_SECONDS": "10.0",
+    "INGESTION_MAX_ZIP_CODES": "1000",
+    "INGESTION_ZIP_CODE_CHUNK": "50",
     "PAYPAL_MODE": "sandbox",
     "PAYPAL_API_BASE": "https://api-m.sandbox.paypal.com",
     "PAYPAL_CLIENT_ID": "paypal-test-client-id",
@@ -88,7 +105,7 @@ TEST_SETTINGS: Dict[str, str] = {
     "SENDGRID_API_KEY": "sendgrid-test-key",
     "FROM_EMAIL": "no-reply@example.com",
     "SECRET_BACKEND": "env",
-    "SENTRY_DSN": "",
+    "LOG_LEVEL": "INFO",
 }
 
 #: Password every seeded row is created with. It satisfies the policy
@@ -150,6 +167,41 @@ def apply_test_settings() -> Dict[str, str]:
 def bearer_header(token: str) -> Dict[str, str]:
     """Return the ``Authorization`` header mapping carrying ``token``."""
     return {"Authorization": "Bearer {0}".format(token)}
+
+
+#: Logger namespace the migration revisions record on. It is the first
+#: entry of ``backend.app.core.logging.MIGRATION_LOGGER_NAMES``, which
+#: ``backend/tests/security/test_settings_and_redaction.py`` asserts, and
+#: it is named here as a literal so this module imports nothing from
+#: ``backend.app``.
+MIGRATION_LOGGER_NAMESPACE = "alembic"
+
+
+@contextlib.contextmanager
+def migration_records_reach(handler: Any) -> Iterator[logging.Logger]:
+    """Attach ``handler`` to the migration namespace for the duration.
+
+    The namespace carries the redacting handler and does not propagate,
+    so a handler installed on the root logger -- which is where pytest's
+    ``caplog`` installs its own -- receives none of its records.
+    Attaching that handler to the namespace itself covers every test
+    phase, because ``caplog`` reuses one handler object across setup,
+    call and teardown.
+
+    This reads the records of a revision driven directly. It does not
+    read the records of a revision driven through the Alembic
+    environment, because that environment installs the governed handlers
+    itself and removes every foreign handler it finds, ``handler``
+    included; a test that runs Alembic reads the stream the governed
+    handler writes instead. Yields the namespace logger and removes
+    ``handler`` afterwards.
+    """
+    logger = logging.getLogger(MIGRATION_LOGGER_NAMESPACE)
+    logger.addHandler(handler)
+    try:
+        yield logger
+    finally:
+        logger.removeHandler(handler)
 
 
 def enforce_sqlite_foreign_keys(engine: Any) -> Any:

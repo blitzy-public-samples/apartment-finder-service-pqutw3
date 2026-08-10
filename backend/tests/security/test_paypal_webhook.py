@@ -16,15 +16,27 @@ Two surfaces are exercised.
   ``webhook_events`` insert whose UNIQUE ``transmission_id`` column
   detects a repeated delivery.
 
-A repeated delivery is covered twice over: once arriving after the first
-has been answered, and once arriving while the first is still in flight
-with its delivery row inserted and uncommitted.
-:class:`ConcurrentDeliveryBarrier` holds the two deliveries in that
-arrangement and resolves the second one's flush the way the constraint
-would -- refusing it once the first commits, admitting it once the first
-rolls back. Both deliveries are driven as tasks on one event loop, and
-every wait the barrier takes is bounded and is recorded with the thread
-it ran on.
+A repeated delivery is covered three times over: once arriving after the
+first has been answered, once arriving while the first is still in flight
+with its delivery row inserted and uncommitted, and once against a real
+PostgreSQL unique index.
+
+:class:`ConcurrentDeliveryBarrier` covers the second of those. It holds
+the two deliveries in that arrangement and **scripts** the second one's
+flush the way the constraint would -- refusing it once the first commits,
+admitting it once the first rolls back. It is therefore a deterministic
+unit barrier over the route's handling of each outcome: it decides the
+outcome itself and shows nothing about whether a database would produce
+it. Both deliveries are driven as tasks on one event loop, and every wait
+the barrier takes is bounded and is recorded with the thread it ran on.
+
+The third is covered by :class:`RealIndexContention` and the cases marked
+``postgres`` at the end of this module. Those hold only the first
+delivery, and hold it after its insert rather than at the constraint; the
+second delivery waits on the unique index the first holds uncommitted,
+that wait is observed in PostgreSQL's own activity view, and the refusal
+or the successful insert that follows is the server's rather than this
+module's.
 
 Every outbound call is answered by :class:`VerifierTransport`, a
 stand-in transport that records each request it is handed and opens no
@@ -63,6 +75,7 @@ from conftest import (
 )
 
 from backend.app.api.endpoints import subscriptions as subscriptions_module
+from backend.app.core.authorization import Role
 from backend.app.core.config import settings
 from backend.app.core.logging import (
     BASE_LOGGER_NAME,
@@ -587,7 +600,13 @@ UNCHECKABLE_ANSWERS = (
 
 
 class ConcurrentDeliveryBarrier(object):
-    """Holds two deliveries of one identifier against each other.
+    """Scripts two deliveries of one identifier against each other.
+
+    This is a deterministic unit barrier: the outcome of the contended
+    insert is decided here rather than by a database, so the cases using
+    it cover the route's handling of each outcome and say nothing about
+    whether a database would produce it.
+    :class:`RealIndexContention` is what leaves that to PostgreSQL.
 
     The first delivery to flush is the *holder*: its insert is performed
     and it is then held inside that flush, its delivery row written and
@@ -1619,3 +1638,245 @@ async def test_a_contended_insert_waits_off_the_event_loop(
     assert second.json()["status"] == (
         subscriptions_module.OUTCOME_DUPLICATE
     )
+
+
+# ---------------------------------------------------------------------
+# The same contention on PostgreSQL 13, the deployed dialect
+#
+# :class:`ConcurrentDeliveryBarrier` above scripts the outcome of the
+# contended insert: it decides when the waiting flush resolves and raises
+# the IntegrityError itself. That makes it a deterministic unit barrier
+# over the route's handling of each outcome, and it is retained for that.
+# It cannot show that a database would produce those outcomes.
+#
+# The cases below hold only the first delivery, and hold it after its
+# insert rather than at the constraint. The second delivery is left to the
+# server: its insert waits on the unique index the first holds
+# uncommitted, the wait is observed in the server's own activity view, and
+# the IntegrityError -- or the successful insert -- is the server's.
+# ---------------------------------------------------------------------
+
+
+class RealIndexContention(object):
+    """Holds the first delivery after its insert and nothing else.
+
+    The first delivery to flush is the *holder*: its insert is performed
+    and it is then held inside that flush, its delivery row written and
+    uncommitted. Every later flush, including the holder's own, is
+    performed unheld -- so the second delivery reaches the unique index
+    and waits there on the server rather than on this object.
+
+    ``holder_commit_fails`` makes the holder's commit raise, which is what
+    drives it down its rollback path and releases the index entry it had
+    inserted.
+    """
+
+    def __init__(self, holder_commit_fails=False):
+        self.holder_commit_fails = holder_commit_fails
+        self.holder_session = None
+        self.holder_inserted = threading.Event()
+        self.release_holder = threading.Event()
+        self.held_flush_threads = []
+        self.overlapped = False
+
+    def interpose(self, operation, perform):
+        """Returns the result of one session operation, held if needed."""
+        session = getattr(operation, "__self__", None)
+        name = getattr(operation, "__name__", "")
+        if session is None or name not in CONTROLLED_OPERATIONS:
+            return perform()
+        if (
+            name == "commit"
+            and session is self.holder_session
+            and self.holder_commit_fails
+        ):
+            raise SQLAlchemyError("the transition could not be recorded")
+        if name != "flush" or self.holder_session is not None:
+            return perform()
+        self.holder_session = session
+        self.held_flush_threads.append(threading.current_thread().ident)
+        result = perform()
+        self.holder_inserted.set()
+        assert self.release_holder.wait(STEP_BOUND_SECONDS), (
+            "the first delivery was never released from its flush"
+        )
+        return result
+
+
+async def deliver_against_the_index(barrier, blocked, body, headers):
+    """Answers two overlapping deliveries, the second held by the server.
+
+    The first delivery is started and held once its delivery row is
+    inserted; the second is started and is waited for until the server
+    reports a backend of this case's database waiting on a lock; the first
+    is then released. The two responses are returned in the order the
+    deliveries were started.
+    """
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=CLIENT_BASE_URL,
+    ) as caller:
+
+        async def post():
+            """Posts one notification to the webhook route."""
+            sent = dict(headers)
+            sent["Content-Type"] = "application/json"
+            return await caller.post(
+                WEBHOOK_PATH, content=body, headers=sent
+            )
+
+        first = asyncio.ensure_future(post())
+        await reached(
+            barrier.holder_inserted,
+            "the first delivery never recorded its delivery row",
+        )
+        second = asyncio.ensure_future(post())
+        loop = asyncio.get_event_loop()
+        waited = await loop.run_in_executor(None, blocked, 1)
+        assert waited, (
+            "the second delivery was never seen waiting on the unique "
+            "index the first holds"
+        )
+        barrier.overlapped = not first.done()
+        barrier.release_holder.set()
+        return await asyncio.wait_for(
+            asyncio.gather(first, second), PAIR_BOUND_SECONDS
+        )
+
+
+@pytest.fixture
+def postgres_subscriber(postgres_db, password_hash):
+    """Returns the account the seeded subscription belongs to."""
+    account = User(
+        email=SUBSCRIBER_EMAIL,
+        hashed_password=password_hash,
+        created_at=datetime.now(timezone.utc),
+        role=Role.REGISTERED.value,
+    )
+    postgres_db.add(account)
+    postgres_db.commit()
+    postgres_db.refresh(account)
+    return account
+
+
+@pytest.fixture
+def postgres_pending_subscription(postgres_db, postgres_subscriber):
+    """Stores the pending row the notifications name by its order."""
+    row = Subscription(
+        user_id=postgres_subscriber.id,
+        start_date=datetime.now(timezone.utc),
+        status=subscriptions_module.PENDING_STATUS,
+        plan_id=PREMIUM_MONTHLY,
+        amount=PLAN.amount,
+        currency=PLAN.currency,
+        paypal_order_id=ORDER_ID,
+    )
+    postgres_db.add(row)
+    postgres_db.commit()
+    return row
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_the_unique_index_makes_the_repeat_wait_on_postgres(
+    monkeypatch,
+    postgres_client,
+    postgres_db,
+    postgres_observer,
+    recorder,
+    postgres_pending_subscription,
+):
+    """A repeat waits on the index, is refused by it, and settles once.
+
+    Both deliveries carry the same ``PAYPAL-TRANSMISSION-ID``. The second
+    is observed waiting on a lock in the server's activity view while the
+    first holds its uncommitted delivery row, and the refusal it receives
+    once the first commits is the unique index's own. Both requests are
+    answered -- one ``processed``, one ``duplicate`` -- one delivery row
+    is stored, and one entitlement was granted.
+    """
+    barrier = RealIndexContention()
+    controlled_deliveries(monkeypatch, barrier)
+
+    first, second = await deliver_against_the_index(
+        barrier,
+        postgres_observer,
+        notification_bytes(capture_completed_event()),
+        webhook_headers(),
+    )
+
+    assert barrier.overlapped is True
+    assert 200 <= first.status_code < 300
+    assert 200 <= second.status_code < 300
+    assert first.json()["status"] == (
+        subscriptions_module.OUTCOME_PROCESSED
+    )
+    assert second.json()["status"] == (
+        subscriptions_module.OUTCOME_DUPLICATE
+    )
+    postgres_db.expire_all()
+    assert (
+        postgres_db.query(WebhookEvent)
+        .filter(WebhookEvent.transmission_id == TRANSMISSION_ID)
+        .count()
+        == 1
+    )
+    assert postgres_db.query(WebhookEvent).count() == 1
+    assert postgres_db.query(Subscription).count() == 1
+    assert (
+        postgres_db.query(Subscription).one().status
+        == subscriptions_module.ACTIVE_STATUS
+    )
+    assert postgres_db.query(User).one().role == PLAN.required_role
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_the_waiting_delivery_settles_when_the_index_frees_on_postgres(
+    monkeypatch,
+    postgres_client,
+    postgres_db,
+    postgres_observer,
+    recorder,
+    postgres_pending_subscription,
+):
+    """The waiting delivery settles when the first releases the index.
+
+    The first delivery cannot record its transition and rolls its
+    transaction back, which releases the index entry it had inserted. The
+    second delivery's insert -- which the server had been holding -- then
+    performs, and the notification is still settled: one delivery row and
+    one active subscription are stored.
+    """
+    barrier = RealIndexContention(holder_commit_fails=True)
+    controlled_deliveries(monkeypatch, barrier)
+
+    first, second = await deliver_against_the_index(
+        barrier,
+        postgres_observer,
+        notification_bytes(capture_completed_event()),
+        webhook_headers(),
+    )
+
+    assert barrier.overlapped is True
+    assert first.status_code == 503
+    assert first.json()["detail"] == (
+        subscriptions_module.RECONCILIATION_DETAIL
+    )
+    assert second.json()["status"] == (
+        subscriptions_module.OUTCOME_PROCESSED
+    )
+    postgres_db.expire_all()
+    assert (
+        postgres_db.query(WebhookEvent)
+        .filter(WebhookEvent.transmission_id == TRANSMISSION_ID)
+        .count()
+        == 1
+    )
+    assert postgres_db.query(WebhookEvent).count() == 1
+    assert postgres_db.query(Subscription).count() == 1
+    assert (
+        postgres_db.query(Subscription).one().status
+        == subscriptions_module.ACTIVE_STATUS
+    )
+    assert postgres_db.query(User).one().role == PLAN.required_role

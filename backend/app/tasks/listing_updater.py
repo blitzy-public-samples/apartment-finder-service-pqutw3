@@ -6,6 +6,19 @@ the listing creation contract, and reconciles it against the stored
 corpus on :data:`IDENTITY_COLUMN`: a record whose value already names a
 stored row updates that row rather than adding another.
 
+Two bounds keep the work one pass does independent of how large the
+corpus of saved filters grows. :func:`tracked_zip_codes` reads at most
+``settings.INGESTION_MAX_ZIP_CODES`` postal codes, recording once when it
+reaches that number, and :func:`zip_code_chunks` splits what it read into
+requests of at most ``settings.INGESTION_ZIP_CODE_CHUNK`` postal codes
+each, so no single provider request carries an unbounded list. Each
+chunk's provider response is bounded in turn by the provider client.
+
+Within one chunk the stored rows every record in it might reconcile
+against are read by :func:`_existing_by_identity` in one statement, so
+the number of read statements a pass issues follows the number of chunks
+rather than the number of records the provider returned.
+
 That reconciliation is a read followed by a write, and the column it
 matches on carries no uniqueness in the mapped table or in revision
 ``0001``, so the database refuses nothing on the strength of it. Two
@@ -58,9 +71,24 @@ from backend.app.services.zillow_service import (
 )
 from backend.app.db.models import Listing, ZipCode
 from backend.app.schema.listing import ListingCreate
-from backend.app.core.logging import get_logger, log_exception
+from backend.app.core.config import settings
+from backend.app.core.logging import (
+    bind_request_id,
+    bind_trace_context,
+    get_logger,
+    log_exception,
+    new_span_id,
+    reset_request_id,
+    reset_trace_context,
+)
 
 UPDATE_INTERVAL = timedelta(hours=1)
+
+#: Prefix identifying a correlation identifier minted for one ingestion
+#: pass rather than for a request. Every record one pass emits carries the
+#: same identifier, so the records of one pass can be read together and
+#: two passes cannot be confused with one another.
+RUN_ID_PREFIX = "ingest-"
 
 #: Column a provider record is reconciled against. It is the only
 #: declared column carrying a value the provider assigns per listing. A
@@ -84,6 +112,14 @@ INGESTION_FAILED_MESSAGE = "An error occurred while updating listings"
 
 #: Message recorded when the database refuses one provider record.
 RECORD_REFUSED_MESSAGE = "Discarded a provider listing the database refused"
+
+#: Message recorded when one pass reads as many postal codes as
+#: ``settings.INGESTION_MAX_ZIP_CODES`` admits, so saved filters may name
+#: more than the pass covered.
+ZIP_CODE_CAP_REACHED_MESSAGE = (
+    "Read the configured maximum number of postal codes, so a pass may "
+    "not cover every postal code saved filters name"
+)
 
 #: Failures :func:`_is_record_failure` examines. Every one of them is
 #: raised for one statement, so the record that statement writes is named
@@ -144,15 +180,83 @@ def tracked_zip_codes(db: Session) -> List[str]:
 
     Blank and non-string values are dropped, and the result is sorted so
     one pass sends the provider a stable list.
+
+    The statement reads at most ``settings.INGESTION_MAX_ZIP_CODES``
+    rows, and the returned list carries at most that many entries, so the
+    memory one pass holds for this list and the work it hands the
+    provider do not follow the number of saved filters. Reaching the cap
+    is recorded once, naming the cap.
     """
-    rows = db.query(ZipCode.code).distinct().all()
-    return sorted(
+    ceiling = int(settings.INGESTION_MAX_ZIP_CODES)
+    rows = (
+        db.query(ZipCode.code)
+        .distinct()
+        .order_by(ZipCode.code)
+        .limit(ceiling)
+        .all()
+    )
+    codes = sorted(
         set(
             code
             for (code,) in rows
             if isinstance(code, str) and code
         )
     )
+    if len(rows) >= ceiling:
+        logger.warning(
+            ZIP_CODE_CAP_REACHED_MESSAGE,
+            extra={
+                "setting": "INGESTION_MAX_ZIP_CODES",
+                "max_zip_codes": ceiling,
+                "zip_codes": len(codes),
+            },
+        )
+    return codes
+
+
+def zip_code_chunks(zip_codes: List[str]) -> List[List[str]]:
+    """Returns ``zip_codes`` split into provider-request sized chunks.
+
+    Each chunk carries at most ``settings.INGESTION_ZIP_CODE_CHUNK``
+    entries, so the number of postal codes one provider request names is
+    bounded whatever the corpus of saved filters holds. An empty input
+    yields no chunk.
+    """
+    size = int(settings.INGESTION_ZIP_CODE_CHUNK)
+    return [
+        zip_codes[start:start + size]
+        for start in range(0, len(zip_codes), size)
+    ]
+
+
+def _existing_by_identity(
+    db: Session, identities: List[str]
+) -> Dict[str, Listing]:
+    """Returns the earliest stored row for each of ``identities``.
+
+    One statement reads every row whose identity column matches any of
+    ``identities``, so the number of statements does not follow the
+    number of records in a payload. The rows are read in primary-key
+    order and the first row carrying a value is the one kept, which is
+    the same row the per-record read resolved to, so a value carried by
+    two rows reconciles to the earliest of them here as well.
+
+    An empty input reads nothing and returns an empty mapping.
+    """
+    if not identities:
+        return {}
+    column = getattr(Listing, IDENTITY_COLUMN)
+    found: Dict[str, Listing] = {}
+    for row in (
+        db.query(Listing)
+        .filter(column.in_(identities))
+        .order_by(Listing.id)
+        .all()
+    ):
+        value = getattr(row, IDENTITY_COLUMN)
+        if value not in found:
+            found[value] = row
+    return found
 
 
 def _new_listing(
@@ -230,24 +334,28 @@ def _write(
     existing_listing: Optional[Listing],
     mapped: ListingCreate,
     moment: datetime,
-) -> bool:
-    """Writes one record inside its own savepoint. Reports whether it was.
+) -> Optional[Listing]:
+    """Writes one record inside its own savepoint. Returns the row.
 
     The row is constructed or refreshed and flushed within a nested
-    transaction. A record the database refuses is rolled back to the
-    savepoint on its own, and the records already written in this pass
-    stay pending. A failure :func:`_is_record_failure` attributes to the
-    record is recorded by exception class, naming no provider value, and
-    False is returned. Every other failure describes the session, the
-    database or this module rather than the record and is raised, ending
-    the pass.
+    transaction, and the row that was written is returned, so a later
+    record in the same payload carrying the same identity reconciles
+    against it rather than adding a second row. A record the database
+    refuses is rolled back to the savepoint on its own, and the records
+    already written in this pass stay pending. A failure
+    :func:`_is_record_failure` attributes to the record is recorded by
+    exception class, naming no provider value, and ``None`` is returned.
+    Every other failure describes the session, the database or this
+    module rather than the record and is raised, ending the pass.
     """
     try:
         with db.begin_nested():
             if existing_listing is None:
-                db.add(_new_listing(mapped, moment))
+                written = _new_listing(mapped, moment)
+                db.add(written)
             else:
-                _refresh_listing(existing_listing, mapped, moment)
+                written = existing_listing
+                _refresh_listing(written, mapped, moment)
             db.flush()
     except RECORD_FAILURES as error:
         if not _is_record_failure(error):
@@ -255,8 +363,8 @@ def _write(
         fields = _failure_fields(error)
         fields["identity_column"] = IDENTITY_COLUMN
         logger.warning(RECORD_REFUSED_MESSAGE, extra=fields)
-        return False
-    return True
+        return None
+    return written
 
 
 @asyncio.coroutine
@@ -267,15 +375,31 @@ async def update_listings():
     identifier -- copying the processed attributes onto an existing row
     or adding a new one -- and commits once at the end of the cycle.
 
-    The provider call is synchronous and is run on a worker thread, so
-    awaiting it yields the event loop for the duration of the provider
-    request rather than holding it until that request's timeout elapses.
+    The postal codes the cycle covers are read under
+    ``settings.INGESTION_MAX_ZIP_CODES`` and issued as one provider
+    request per chunk of at most ``settings.INGESTION_ZIP_CODE_CHUNK``
+    codes. Each chunk's records are reconciled against one read of the
+    stored rows for that chunk, and the number of provider requests the
+    cycle made is reported alongside the record counts.
+
+    Every provider call is synchronous and is run on a worker thread, so
+    awaiting it yields the event loop for the duration of that request
+    rather than holding it until the request's timeout elapses.
 
     Any exception rolls the session back and is recorded through the
     redacting logger rather than propagated, so a failed cycle leaves no
     partial write behind and does not stop the caller. The session is
     closed on every path.
+
+    One correlation identifier and one trace are bound for the whole
+    cycle, so every record the cycle emits -- its own, the provider
+    client's and the statement logger's -- carries them, and the outbound
+    provider call carries the trace onward. Both are unbound on every
+    path, so nothing leaks into the next cycle.
     """
+    run_id = RUN_ID_PREFIX + new_span_id()
+    run_token = bind_request_id(run_id)
+    trace_token = bind_trace_context()
     db: Session = SessionLocal()
     processed = 0
     try:
@@ -286,47 +410,60 @@ async def update_listings():
                 "names a postal code"
             )
             return
-        raw_listings = await asyncio.to_thread(
-            fetch_listings, zip_codes, PROVIDER_FILTERS
-        )
+        chunks = zip_code_chunks(zip_codes)
         moment = datetime.now(timezone.utc)
+        received = 0
         recorded = 0
         refreshed = 0
         discarded = 0
         refused = 0
-        for raw_listing in raw_listings:
-            # Only the counts are carried outside this loop, so a failure
-            # record names how far the pass got and never a listing.
-            mapped = _mapped(raw_listing)
-            if mapped is None:
-                discarded += 1
-                continue
-            processed += 1
-            identity = getattr(mapped, IDENTITY_COLUMN)
-            # Each record is flushed as it is written, so this matches a
-            # row carrying the value -- including one written earlier in
-            # this same pass -- or none at all. The order is by primary
-            # key, so where the corpus holds more than one row carrying
-            # the value the earliest of them is the one reconciled, on
-            # this pass and on every later one.
-            existing_listing = (
-                db.query(Listing)
-                .filter(getattr(Listing, IDENTITY_COLUMN) == identity)
-                .order_by(Listing.id)
-                .first()
+        for chunk in chunks:
+            raw_listings = await asyncio.to_thread(
+                fetch_listings, chunk, PROVIDER_FILTERS
             )
-            if not _write(db, existing_listing, mapped, moment):
-                refused += 1
-            elif existing_listing is None:
-                recorded += 1
-            else:
-                refreshed += 1
+            received += len(raw_listings)
+            mapped_records = []
+            for raw_listing in raw_listings:
+                # Only the counts are carried outside this loop, so a
+                # failure record names how far the pass got and never a
+                # listing.
+                mapped = _mapped(raw_listing)
+                if mapped is None:
+                    discarded += 1
+                    continue
+                mapped_records.append(mapped)
+            processed += len(mapped_records)
+            # One statement reads the stored rows for the whole chunk, so
+            # the number of reads follows the number of chunks rather
+            # than the number of records. Every record written in this
+            # chunk is flushed as it is written, so a value first seen
+            # earlier in the same chunk is reconciled against the row
+            # that write produced rather than against a second insert.
+            existing = _existing_by_identity(
+                db,
+                [
+                    getattr(mapped, IDENTITY_COLUMN)
+                    for mapped in mapped_records
+                ],
+            )
+            for mapped in mapped_records:
+                identity = getattr(mapped, IDENTITY_COLUMN)
+                existing_listing = existing.get(identity)
+                written = _write(db, existing_listing, mapped, moment)
+                if written is None:
+                    refused += 1
+                elif existing_listing is None:
+                    recorded += 1
+                    existing[identity] = written
+                else:
+                    refreshed += 1
         db.commit()
         logger.info(
             "Completed an ingestion pass",
             extra={
                 "zip_codes": len(zip_codes),
-                "received": len(raw_listings),
+                "provider_requests": len(chunks),
+                "received": received,
                 "recorded": recorded,
                 "refreshed": refreshed,
                 "discarded": discarded,
@@ -348,6 +485,8 @@ async def update_listings():
         )
     finally:
         db.close()
+        reset_trace_context(trace_token)
+        reset_request_id(run_token)
 
 
 async def run_listing_updater():

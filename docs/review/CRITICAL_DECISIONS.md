@@ -24,13 +24,24 @@ category or categories it satisfies.
 | # | Decision | Risk | Rule 3 category called out | Reviewer |
 |---|----------|------|----------------------------|----------|
 | 1 | Rotate the exposed credentials rather than only removing them from the working tree | **High** | Irreversible operation | DevOps |
-| 2 | Seed exactly one administrator through a separate migration revision | **High** | Authorization decision | Security |
-| 3 | Restrict `POST /listings/` to administrators | **High** | Authorization decision; breaking change | API/Integration |
-| 4 | Verify PayPal webhook signatures with a certificate-host allowlist | **High** | Authorization decision; ambiguity-resolving assumption | Security |
-| 5 | Accept seven residual dependency advisories to hold the Python 3.9 pin | **Medium** | Ambiguity-resolving assumption | DevOps |
+| 2 | Hold the Python 3.9 pin: abandon the decommissioned managed-functions platform and accept seven residual advisories | **High** | Ambiguity-resolving assumption; authorization decision; operational blocker | DevOps |
+| 3 | Seed exactly one administrator through a separate migration revision | **High** | Authorization decision | Security |
+| 4 | Restrict `POST /listings/` to administrators | **High** | Authorization decision; breaking change | API/Integration |
+| 5 | Verify PayPal webhook signatures with a certificate-host allowlist | **High** | Authorization decision; ambiguity-resolving assumption | Security |
 
 Entries 2 to 5 are reviewed against the change set as delivered. Entry 1 is reviewed
 last, for the reason given in [Section 6](#6-review-sequencing-and-companion-artefacts).
+
+**What changed in this ranking, and why it is recorded rather than silently applied.**
+Entry 2 previously sat fifth at Medium, described only as a trade of dependency
+advisories against a runtime upgrade. That description omitted the same pin's second and
+larger consequence — the provider's retirement of the Python 3.9 managed-functions
+runtime on 5 April 2026, which is a current deployment blocker rather than a library
+trade-off — so the five entries were not in fact the five highest-risk decisions. The
+entry is now expanded to cover both consequences, raised to High, and ranked second; the
+three authorization decisions that follow keep their relative order. Every entry in the
+table is now High, and the ordering within that band runs from the entry that is
+irreversible, through the one that governs deployability, to the three that govern access.
 
 ---
 
@@ -42,14 +53,25 @@ last, for the reason given in [Section 6](#6-review-sequencing-and-companion-art
 
 ### Decision and alternatives
 
-The database credentials and the Google Cloud service-account key exposed by this
-repository are treated as already compromised and are rotated, following the ordered
-runbook at [`../security/CREDENTIAL_ROTATION.md`](../security/CREDENTIAL_ROTATION.md).
-The alternative was to delete the values from the current tree and stop there.
+Every credential this repository exposed is treated as already compromised and is
+rotated, following the ordered runbook at
+[`../security/CREDENTIAL_ROTATION.md`](../security/CREDENTIAL_ROTATION.md). The
+runbook's scope is **five** credentials: the database credentials, the Google Cloud
+service-account key, the JWT signing key, the listing-provider (Zillow) API key, and
+the PayPal webhook identifier, which was not previously exposed but is new secret
+configuration an operator must provision in the same window.
 
-The change set itself performs only the tree removal. Revocation and rotation are
-operator actions, deferred to the runbook and sequenced last. Row 16.6 of the decision
-log owns that reasoning.
+The alternative was to delete the values from the current tree and stop there. A
+second and narrower alternative was to scope the rotation to the credentials that
+were **committed as literals**, which would have covered the first three and omitted
+the listing-provider key. That is rejected: a credential written into a request URL
+and then printed to standard output is disclosed just as effectively as one written
+into a committed file — only the store that holds the disclosure differs, and the
+handling has to differ with it.
+
+The change set itself performs only the tree removal and the code changes that stop
+future exposure. Revocation and rotation are operator actions, deferred to the
+runbook and sequenced last. Row 16.6 of the decision log owns that reasoning.
 
 ### Rationale
 
@@ -69,10 +91,26 @@ string the hardened settings module now refuses at startup. Line `:55` wrote a
 credentialed connection string, and `:69` hardcoded a database password inside a
 `CREATE USER` statement.
 
-Removal addresses only future exposure. Git history is permanent: each value above
-remains in every commit that carried it, and every clone, fork, mirror, backup and
-continuous-integration cache taken since carries that history. Only revocation and
-rotation address the exposure that has already happened.
+Separately again, `backend/app/services/zillow_service.py:15-19` placed the
+listing-provider API key in the request's **query parameters**, so the key
+travelled inside the request URL and was recorded by the provider's access logs and
+by any proxy on the path. Line `:27` then printed the exception text with a bare
+`print()`, and the HTTP library embeds the full request URL in its exception
+messages — so one upstream failure wrote the key to standard output, and from there
+to the container log and to whatever store collects it. There was no logging
+framework, so there was no interception point at which the value could have been
+redacted. The remediation moved the key into a header, added a request timeout and
+replaced the `print()` with the redacting structured logger; none of that reaches
+the records already written.
+
+Removal addresses only future exposure, and **where the exposure lives differs by
+credential.** Git history is permanent: each committed value remains in every commit
+that carried it, and every clone, fork, mirror, backup and continuous-integration
+cache taken since carries that history. The listing-provider key was never
+committed, so its exposure sits in log archives, log-aggregation indexes, proxy logs
+and the provider's own access logs instead — which is why its step 3 is a search of
+the log estate rather than of the repository. Only revocation and rotation address
+the exposure that has already happened, in either shape.
 
 ### Reviewer persona and exactly what to check
 
@@ -94,15 +132,184 @@ rotation address the exposure that has already happened.
 5. Confirm the root `.gitignore` covers every path a secret occupied or was directed
    to — including the `secrets/` directory the bind-mount used and the credential file
    named at `docker-compose.yml:49`.
+6. Confirm the scope is **all five** credentials and not only the three that were
+   committed as literals. Specifically, for the listing-provider (Zillow) API key:
+   that it was revoked in the provider's developer console rather than merely
+   supplemented by a second key; that the replacement is delivered from the secret
+   store and reaches the service as a request **header**, never a query parameter;
+   that the log estate holding the old key — container logs, the aggregation service
+   and its search indexes, proxy access logs, build logs and developer machines — has
+   been purged or has a recorded expiry date; and that the provider's usage logs for
+   the old key were reviewed for volume, source addresses and endpoints that
+   scheduled ingestion cannot explain.
+7. Confirm the date the last log record containing the old listing-provider key
+   leaves the estate. **If that date is in the future, the rotation is complete but
+   the exposure is not**, and the approval record should say so rather than closing
+   the item.
 
 [`../security/CREDENTIAL_ROTATION.md`](../security/CREDENTIAL_ROTATION.md) is the
-authoritative runbook and its Section 4 is the verification checklist; work from that
-rather than from this summary. Record the outcome of every check, because an
-unrecorded verification is indistinguishable from a skipped one.
+authoritative runbook, its Section 4 is the verification checklist and its Section
+4.7 covers check 6 above; work from those rather than from this summary. Record the
+outcome of every check, because an unrecorded verification is indistinguishable from
+a skipped one.
 
 ---
 
-## 2. Seed exactly one administrator through a separate migration revision
+## 2. Hold the Python 3.9 pin: abandon the decommissioned managed-functions platform and accept seven residual advisories
+
+- **Risk level:** High
+- **Rule 3 categories:** ambiguity-resolving assumption; authorization decision (the
+  unrevoked invoker binding described below); operational blocker affecting deployability
+- **Reviewer:** DevOps
+
+### Why this entry is ranked second rather than last
+
+An earlier version of this document ranked this decision **fifth at Medium**, framed
+solely as a trade of seven dependency advisories against a runtime upgrade. That framing
+was incomplete, and the omission mattered: the same pin has a second consequence that is
+a **current deployment blocker**, not a library trade-off. Once that consequence is
+included, this is no longer the least consequential of the five. It is ranked second —
+above three authorization decisions — because it is the only entry that determines
+whether the service can be deployed on a supported platform at all, and because it
+carries a residual authorization exposure that no file in this change set can revoke.
+
+### Decision and alternatives
+
+One decision, two consequences.
+
+**Consequence A — the hosting platform.** The provider retired the Python 3.9 runtime of
+its managed serverless functions product on **5 April 2026**. Under that provider's
+runtime-support policy, a retired runtime can no longer be used to create or update a
+function after that date, and existing deployments on it become liable to be disabled.
+`infrastructure/terraform/main.tf` declared such a function and `scripts/deploy.sh`
+deployed one. Both are **removed**, and the workload they nominally carried is
+re-expressed as a Kubernetes CronJob on the same `python:3.9-slim` backend image, where
+the pin is preserved rather than fought.
+
+The alternatives, all rejected — row 35.1 of the decision log owns the argument:
+
+1. **Advance the function's runtime** and keep the resource. Unavailable: the pin is a
+   hard constraint, and the code itself would break, per the Rationale below.
+2. **Keep the resource on the retired runtime** and record the decommission as a known
+   issue. Rejected: the configuration would then be unappliable, which is the defect
+   rather than a disclosure of it.
+3. **Comment the resource out.** Rejected: the same broken claim in a form no check reads.
+4. **Migrate to a second-generation function or a container-hosted service.** Rejected as
+   a platform introduction this work has no authorization to make — and it would still
+   require the function source that does not exist.
+
+**Consequence B — the dependency advisories.** Seven advisories are accepted as residual
+risk, each with a named compensating control, rather than advancing the interpreter so
+their fixes become installable. The alternative was to advance the runtime.
+
+**The ambiguity this resolved:** the instruction that the dependency audit report zero
+advisories stood against the instruction never to advance the runtime — and, once
+Consequence A surfaced, against the expectation that the documented deployment path
+still works. Row 1.9 of the decision log owns the pin decision, §35.1 owns the platform
+decision, and [`../security/RESIDUAL_RISK.md`](../security/RESIDUAL_RISK.md) is the
+authoritative register for both, carrying the measurement behind every control.
+
+### Rationale
+
+**The pin is a property of the code, not only of its configuration.**
+`backend/app/tasks/listing_updater.py:370` applies `@asyncio.coroutine` to an
+`async def`; that decorator was removed in Python 3.11, so the codebase itself would
+break on a newer interpreter. This is the decisive site and the reason alternative 1
+above does not exist. It was re-verified **by execution** rather than by reading, because
+the CronJob now invokes that coroutine directly: the exact command the job runs was run
+under CPython 3.9.25 and exited 0.
+
+**All five pin sites are still declared, and the pin was not relaxed.** They are
+`infrastructure/docker/Dockerfile.backend:1` (`FROM python:3.9-slim`),
+`.github/workflows/ci.yml:88` (`python-version: '3.9'`),
+`infrastructure/terraform/main.tf:386` (`runtime = "python39"`),
+`scripts/deploy.sh:669` (`--runtime python39`) and the code-level constraint above.
+`SECURITY.md` carries the same five-site table and
+[`../security/DECISION_LOG.md`](../security/DECISION_LOG.md) §35.27.1 reconciles the
+figure; a reviewer should read five sites there and here alike.
+
+**The managed-runtime declarations are withheld rather than deleted.** An earlier revision
+of this entry recorded them as removed, which is not what was delivered and is corrected
+here rather than edited away. Both `google_cloudfunctions_function.function` and its
+invoker binding carry `count = var.cloud_function_deployment_authorized ? 1 : 0`, whose
+default is `false`, and `scripts/deploy.sh` returns from its function step unless
+`CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED=true`. So an apply and a release both reach the
+decommissioned runtime only when a release owner has decided that conflict, which is the
+disclosure alternative 2 lacked: the configuration stays appliable because the resource is
+not created, and the pin stays declared where a reviewer expects to find it.
+
+**The function this gates is real, and the earlier grounds for deleting it no longer
+hold.** `infrastructure/functions/health/main.py` defines the entry point
+`hello_world` that `var.cloud_function_entry_point` names, and the archive is
+content-addressed from that directory by a `data "archive_file"` rather than named as a
+`function-source.zip` that exists nowhere. The placeholder display name is gone. What
+remains true is that `run_listing_updater()` is reached by the Kubernetes CronJob on the
+`python:3.9-slim` backend image and not by this function, so nothing periodic depends on
+the gated resource being created.
+
+**The residual authorization exposure.** Removing a resource from the configuration does
+**not** revoke a binding a previous apply or deploy already granted. If a managed function
+still exists in a live project, an anonymous invoker binding on it may still be live. This
+is why `scripts/deploy.sh` now performs an explicit, idempotent revocation of both
+anonymous principals rather than relying on the resource's absence — and why this entry
+carries the authorization category.
+
+**The dependency position still improves substantially.** Every accepted advisory's fix
+version lies above the highest release installable under the pin, and each defect was
+proven unreachable in this codebase before it was accepted. Five of the seven are against
+`starlette` 0.49.3, one against `python-dotenv` 1.2.1, and one against `click` 8.1.8.
+Advisories fall from 19 across 7 packages to 7 across 3 — a 63% reduction — and
+static-analysis findings at Medium or above fall from 1 to 0.
+
+### Reviewer persona and exactly what to check
+
+**DevOps.** The first four checks concern the platform; the remainder concern the
+advisories.
+
+1. Confirm the managed-runtime function resource is created by neither delivery path
+   without an explicit authorization. `count` on
+   `google_cloudfunctions_function.function` and on its invoker binding must read
+   `var.cloud_function_deployment_authorized ? 1 : 0`, that variable must default to
+   `false`, and the function step of `scripts/deploy.sh` must return before
+   `gcloud functions deploy` unless `CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED=true`. An
+   absence sweep should report zero occurrences of the placeholder display name
+   "My function" and of any source archive that is not produced from
+   `infrastructure/functions/`.
+2. **Confirm, against the live project rather than against this repository, whether a
+   managed function still exists** — and if one does, that its invoker role carries
+   neither `allUsers` nor `allAuthenticatedUsers`. Removing the resource here does not
+   revoke a binding already granted; only the revocation step does. Confirm that step in
+   `scripts/deploy.sh` names both anonymous principals, and that its default function
+   name matches whatever a legacy function in your project is actually called.
+3. Confirm the replacement workload is deployed and running on the pinned interpreter:
+   the CronJob at `infrastructure/kubernetes/65-ingestion-cronjob.yaml`, on the backend image whose
+   base pins CPython 3.9, with a completed run in its history. A configuration that
+   deleted the function without landing the CronJob has lost a capability rather than
+   relocated one.
+4. Confirm all **three** surviving pin sites still carry the pinned runtime, and that no
+   document you are reviewing against still asserts five without pointing at §35.27.1.
+5. Confirm the dependency audit run **against the manifest** — not against the installed
+   environment, which conflates the audit tool's own dependency tree with the
+   application's — reports exactly the seven advisories the register names and nothing
+   further.
+6. Confirm each of the seven has a compensating control that is genuinely in place rather
+   than a stated intention, checking each against the evidence recorded in the register.
+7. Confirm both continuous-integration guards are wired, so that the acceptance cannot
+   silently decay:
+   - **Guard 1**, asserting the omitted `python-multipart` package stays absent. Its
+     reintroduction would return six advisories and silently lapse the control recorded
+     for PYSEC-2026-249.
+   - **Guard 2**, the eight-pattern reachability guard over Python files under
+     `backend/`. It reads zero today.
+8. Confirm both guards fail the build rather than merely report, by inspecting how each
+   step's exit status is handled.
+9. Confirm the register's reproduction instructions still yield the same seven advisories
+   on the pinned interpreter, so that the acceptance rests on a measurement a reviewer can
+   repeat rather than on an assertion.
+
+---
+
+## 3. Seed exactly one administrator through a separate migration revision
 
 - **Risk level:** High
 - **Rule 3 category:** authorization decision
@@ -162,7 +369,7 @@ account on the default role while granting nothing.
 
 ---
 
-## 3. Restrict `POST /listings/` to administrators
+## 4. Restrict `POST /listings/` to administrators
 
 - **Risk level:** High
 - **Rule 3 categories:** authorization decision; breaking change
@@ -230,7 +437,7 @@ explicitly rather than introduced silently.
 
 ---
 
-## 4. Verify PayPal webhook signatures with a certificate-host allowlist
+## 5. Verify PayPal webhook signatures with a certificate-host allowlist
 
 - **Risk level:** High
 - **Rule 3 categories:** authorization decision; ambiguity-resolving assumption
@@ -298,7 +505,11 @@ redirect is retained, so no card number enters or is stored by this service.
 
 ---
 
-## 5. Accept seven residual dependency advisories to hold the Python 3.9 pin
+## Appendix — Accept fourteen residual dependency advisories to hold the Python 3.9 pin
+
+*Detail for entry 2 above, not a sixth decision entry: the summary table fixes the
+count of decisions at five, and this appendix carries the advisory arithmetic that
+entry summarises.*
 
 - **Risk level:** Medium
 - **Rule 3 category:** ambiguity-resolving assumption
@@ -306,49 +517,103 @@ redirect is retained, so no card number enters or is stored by this service.
 
 ### Decision and alternatives
 
-Seven dependency advisories are accepted as residual risk, each with a named
-compensating control, rather than advancing the Python interpreter so that their fixes
-become installable. The alternative was to advance the runtime.
+Seven advisories **against the runtime manifest** — `backend/requirements.txt`, the
+only manifest a deployed image installs — are accepted as residual risk, each with a
+named compensating control, rather than advancing the Python interpreter so that their
+fixes become installable. The alternative was to advance the runtime.
+
+**Read the count precisely: seven is the runtime figure, not the total.** The pipeline
+audits **two** manifests and suppresses **fourteen** identifiers in total, in two
+separate steps with two separate registers:
+
+Read as a total, that is **fourteen accepted advisories**: seven for
+`backend/requirements.txt`, the only manifest a deployed image installs, and
+seven for `backend/requirements-dev.txt`, which reaches no deployed artifact.
+
+| Register | Manifest | Count | Authority | Reaches a deployed artifact? |
+|----------|----------|-------|-----------|------------------------------|
+| Runtime | `backend/requirements.txt` | 7 | [`../security/RESIDUAL_RISK.md`](../security/RESIDUAL_RISK.md) | Yes — the backend image installs this manifest |
+| Development | `backend/requirements-dev.txt` | 7 | the comment block in that manifest, lines 24–30 | No — test, audit and lint tooling only |
+
+The two sets are disjoint and are deliberately documented in different places: the
+residual-risk register covers the deployed artifact alone, so pointing the development
+seven at it would send a reader to a document that records only the other half. Every
+figure quoted elsewhere in this document — the 19-to-7 reduction, the "three packages"
+— is likewise a **runtime** figure.
+
+**They divide into two sets, and a reviewer should not read either as the whole.** Seven
+sit in the runtime manifest, which the deployed image installs, so each carries a control
+arguing that the specific defective code path is never taken. Seven sit in the development
+manifest — test, lint and audit tooling that no deployed process installs — so their
+control is that absence. The register carries a section for each.
 
 **The ambiguity this resolved:** the instruction that the dependency audit report zero
 advisories stood against the instruction never to advance the runtime. Row 1.9 of the
 decision log owns the choice, and
 [`../security/RESIDUAL_RISK.md`](../security/RESIDUAL_RISK.md) is the authoritative
-register, carrying the measurement behind every compensating control.
+register for the runtime seven, carrying the measurement behind every compensating
+control.
 
 ### Rationale
 
 The pin is load-bearing in five independent places, and the decisive one is code
-rather than configuration. `backend/app/tasks/listing_updater.py:10` applies
+rather than configuration. `backend/app/tasks/listing_updater.py:370` applies
 `@asyncio.coroutine` to an `async def`; that decorator was removed in Python 3.11, so
 the codebase itself would break on a newer interpreter. The pin is therefore a
-property of the code and not merely of its configuration. The other four sites are
-`infrastructure/docker/Dockerfile.backend:2`, `.github/workflows/ci.yml:19`,
-`infrastructure/terraform/main.tf:99`, and `scripts/deploy.sh:24`. That last line is
-cited for its retained runtime flag specifically: it is a single line that also carried
-the `--allow-unauthenticated` flag this change removes, so it is not an untouched line.
+property of the code and not merely of its configuration. The other four sites are:
+
+| Site | Line | Construct |
+|------|------|-----------|
+| `infrastructure/docker/Dockerfile.backend` | 1 | `FROM python:3.9-slim` |
+| `.github/workflows/ci.yml` | 88 | `python-version: '3.9'` |
+| `infrastructure/terraform/main.tf` | 386 | `runtime = "python39"` |
+| `scripts/deploy.sh` | 669 | `--runtime python39` |
+
+The deployment script's site is cited for its retained runtime flag specifically. It
+sits inside the `gcloud functions deploy` invocation that this work rewrote, two lines
+above the `--no-allow-unauthenticated` that replaced the `--allow-unauthenticated` this
+change removes — so it is a retained value inside a changed command, not an untouched
+line.
+
+**These five line numbers drift whenever the files around them change, and they have
+drifted before.** They are therefore not maintained by hand:
+`test_the_runtime_pin_is_still_carried_at_every_site` asserts that each file still
+carries its construct, and `test_every_documented_pin_site_line_is_correct` asserts
+that each **line number quoted in this table** still holds it. A future edit that moves
+a pin fails the second of those, so this table cannot silently go stale again.
+
+Every line number above is read from the working tree this document is committed
+against, and `backend/tests/security/test_documentation_citations.py` re-reads each one
+on every test run, so a citation that drifts fails the build instead of misdirecting a
+reviewer. The five references this document previously carried — lines 10, 2, 19, 99 and
+24 — described an earlier tree and are corrected here.
 
 Every accepted advisory's fix version lies above the highest release installable under
 the pin, and each defect was proven unreachable in this codebase before it was
-accepted. Five of the seven are against `starlette` 0.49.3, one against
+accepted. Of the runtime seven, five are against `starlette` 0.49.3, one against
 `python-dotenv` 1.2.1, and one against `click` 8.1.8; the register names each
 identifier with its unreachable fix version and the evidence behind its control.
 
-The dependency position still improves substantially. Advisories fall from 19 across 7
-packages to 7 across 3 — a 63% reduction — and static-analysis findings at Medium or
-above fall from 1 to 0.
+The dependency position still improves substantially. **Runtime** advisories fall from
+19 across 7 packages to 7 across 3 — a 63% reduction — and static-analysis findings at
+Medium or above fall from 1 to 0.
 
 ### Reviewer persona and exactly what to check
 
 **DevOps.**
 
-1. Confirm the dependency audit run against the manifest — not against the installed
-   environment, which conflates the audit tool's own dependency tree with the
-   application's — reports exactly the seven advisories the register names and nothing
-   further.
-2. Confirm each of the seven has a compensating control that is genuinely in place
-   rather than a stated intention, checking each against the evidence recorded in the
-   register.
+1. Confirm the dependency audit run against **each manifest separately** — not against
+   the installed environment, which conflates the audit tool's own dependency tree with
+   the application's. `pip-audit -r backend/requirements.txt` must report exactly the
+   seven the residual-risk register names; `pip-audit -r backend/requirements-dev.txt`
+   must report exactly the seven that manifest's own comment block names. Fourteen
+   suppressions across the two steps is the expected total, and neither step may
+   suppress an identifier belonging to the other's register.
+2. Confirm each of the fourteen has a compensating control or a recorded reason it
+   needs none. Each of the runtime seven has a compensating control that is genuinely
+   in place rather than a stated intention, checked against the evidence recorded in
+   the register. The development seven carry no compensating control by design: they
+   reach no deployed artifact, which is the control.
 3. Confirm both continuous-integration guards are wired, so that the acceptance cannot
    silently decay:
    - **Guard 1**, asserting the omitted `python-multipart` package stays absent. Its
@@ -359,8 +624,11 @@ above fall from 1 to 0.
 4. Confirm both guards fail the build rather than merely report, by inspecting how each
    step's exit status is handled.
 5. Confirm all five pin sites still carry the pinned runtime, including
-   `scripts/deploy.sh:24`, where the runtime flag is retained while
-   `--allow-unauthenticated` is removed.
+   `scripts/deploy.sh:669`, where the runtime flag is retained while
+   `--allow-unauthenticated` is removed in favour of `--no-allow-unauthenticated`. The
+   two assertions named above cover both the construct and the line number quoted for
+   it, so this check is a matter of reading their outcome rather than of counting by
+   hand.
 6. Confirm the register's reproduction instructions still yield the same seven
    advisories on the pinned interpreter, so that the acceptance rests on a measurement
    a reviewer can repeat rather than on an assertion.
@@ -375,15 +643,57 @@ rotation cannot be rolled back, so it is executed only after every other change 
 been deployed and verified, in its own change window. Reviewing it any earlier reviews
 an intention rather than an action.
 
-**The single break in compatibility.** Entry 3 is the only intentional breaking change
+**The single break in compatibility.** Entry 4 is the only intentional breaking change
 in this work. Everything else preserves existing behaviour by construction — the login
 response shape, every route path, every router prefix, the public reachability of the
 listings read endpoint, and the verifiability of every stored password hash.
 
-**Findings outside the stated scope.** Ten security-relevant issues were discovered
-outside the scope of this work. All ten are flagged and awaiting confirmation; none is
-fixed or resolved here, and none is a review item for this document. Row 34.6.3 of the
-decision log enumerates them.
+**Findings outside the stated scope.** Security-relevant issues were discovered outside
+the scope of this work. Every one is flagged and awaiting confirmation or an operator
+action; none is fixed here, and none is a review item for this document. §35.1 of the
+decision log enumerates them item by item and is the only place the inventory lives. It
+supersedes the bare count at row 34.6.3: one of the original items closed because the tree
+changed rather than because anything was decided, and four operator-owned items were added
+by the infrastructure and release-path round. No total is quoted here, because a total held
+in two documents drifts the moment either changes.
+
+**Open items a reviewer must not read as delivered.** Distinct from those ten, and
+listed here because a reviewer signing off on the five decisions above could otherwise
+reasonably infer that everything not named as a risk was delivered and working. Eight
+items were **deliberately left open**, each under a clause of the Agent Action Plan that
+forbade closing it within this scope. None is a defect in delivered code; each is a
+platform date, a cross-layer gap, a missing prerequisite or an operator action. The full
+statement of each — what is open, the governing clause, what an operator must do and how
+it is detectable — is in
+[`../security/RESIDUAL_RISK.md`](../security/RESIDUAL_RISK.md) under *Open items that are
+not dependency advisories*, and the reasoning is logged in §36.6 of the decision log.
+
+| # | Open item | Governing clause | Where it is reviewed |
+|---|-----------|------------------|----------------------|
+| O-1 | The exposed credentials are not rotated and stay reachable in history | AAP §0.10.3 sequences rotation last | **Entry 1 above** |
+| O-2 | CPython 3.9 is end-of-life and stays pinned at five sites | AAP §0.1.2 hard pin | **Entry 5 above** |
+| O-3 | The Cloud Function's `python39` runtime is **already decommissioned**, so that function cannot be created or updated as configured | AAP §0.1.2 hard pin | **Entry 5 above**, check 5 |
+| O-4 | The provisioned database is PostgreSQL 13, past end of life | AAP §0.9.2 held for confirmation | Not a decision here |
+| O-5 | The browser client posts to a login path this backend does not serve and reads fields it does not return | AAP §0.9.2 and §0.1.2 together foreclose both sides | Not a decision here |
+| O-6 | The client drives the provider's subscription product while the backend implements orders | AAP §0.9.2 and §0.1.2 | Not a decision here |
+| O-7 | No Kubernetes workload objects exist for the deployment to update; the frontend builds on an end-of-life Node major with one undeclared dependency | AAP §0.6.1 declares no manifest; §0.9.2 excludes the frontend manifest | Not a decision here |
+| O-8 | The ingestion task has no production trigger, so listings never refresh once deployed | AAP §0.9.2 excludes feature additions | Not a decision here |
+
+Two of these carry consequences sharp enough that a reviewer should confirm them
+explicitly rather than take them on trust, because in both cases the delivered system
+does less than an unqualified reading of this work would suggest.
+
+- **O-3 is a present blocker, not a future deadline.** The decommission date the review
+  recorded has passed. Confirm the Cloud Function is understood as undeployable as
+  configured, and that no runbook or release note implies otherwise. Every other
+  component is unaffected: the backend service carries its own pinned interpreter in its
+  image and has no equivalent lifecycle gate.
+- **O-5 and O-6 together mean the browser client cannot authenticate against this
+  backend or complete a payment through it.** This is the largest unclosed gap in the
+  delivery. It is not a security weakness — the backend refuses those requests rather
+  than mishandling them — but it does mean the system is not end-to-end functional
+  through the browser, and the integration reviewer for entry 3 is the right person to
+  confirm that this is understood and scheduled rather than discovered later.
 
 **Companion artefacts.** Each answers a different question, and none duplicates
 another. Consult them directly rather than relying on the summaries above.
@@ -392,5 +702,5 @@ another. Consult them directly rather than relying on the summaries above.
 |----------|---------------|
 | [`../security/DECISION_LOG.md`](../security/DECISION_LOG.md) | The reasoning behind every decision, the alternatives weighed and the risks accepted. The single source of truth for why |
 | [`../security/TRACEABILITY_MATRIX.md`](../security/TRACEABILITY_MATRIX.md) | Each of the 20 findings mapped to the files that remediate it and the tests that verify it, in both directions |
-| [`../security/RESIDUAL_RISK.md`](../security/RESIDUAL_RISK.md) | The seven accepted advisories, their unreachable fix versions, and the measurement behind each compensating control |
+| [`../security/RESIDUAL_RISK.md`](../security/RESIDUAL_RISK.md) | The seven accepted advisories, their unreachable fix versions, and the measurement behind each compensating control. Also the eight open items above, stated in full and kept outside every advisory count |
 | [`../security/CREDENTIAL_ROTATION.md`](../security/CREDENTIAL_ROTATION.md) | The ordered operational runbook for the exposed credentials |

@@ -6,8 +6,11 @@ record the role the caller claimed alongside the role the row carries,
 and an ownership refusal must not disclose whether the row exists.
 """
 
+import inspect
 import logging
+import threading
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 from fastapi import FastAPI, Depends, Request
@@ -118,6 +121,63 @@ class TestInvalidRoleSatisfiesNoMinimum:
     @pytest.mark.parametrize("stored", ["guest", " Admin ", "PREMIUM"])
     def test_recognised_roles_still_resolve(self, stored):
         assert resolve_role(Principal(stored)) is parse_role(stored)
+
+
+class TestTheDependencyRunsOffTheEventLoop:
+    """The guard issues its session statement on a worker thread.
+
+    The framework runs a synchronous dependency in a worker thread and a
+    coroutine dependency on the event loop, so declaring the guard
+    synchronously is what keeps the entitlement lookup -- a blocking
+    session statement -- off the loop for every guarded route, including
+    the two declared with ``async def``.
+    """
+
+    @pytest.mark.parametrize("minimum", list(Role))
+    def test_the_dependency_is_not_a_coroutine_function(self, minimum):
+        dependency = require_role(minimum)
+
+        assert not inspect.iscoroutinefunction(dependency)
+        assert not inspect.isasyncgenfunction(dependency)
+
+    def test_the_entitlement_lookup_runs_off_the_loop_thread(self):
+        """The lookup never runs on the thread the event loop runs on.
+
+        A coroutine dependency declared ahead of the guard records the
+        thread the loop is driven from, and the recorded lookup threads
+        are required to be disjoint from it.
+        """
+        app = FastAPI()
+        loop_threads = []
+        lookup_threads = []
+        original = authorization.effective_role
+
+        def recording(db, user, moment=None):
+            lookup_threads.append(threading.get_ident())
+            return original(db, user, moment)
+
+        async def note_the_loop_thread():
+            loop_threads.append(threading.get_ident())
+
+        @app.get("/guarded")
+        def guarded(
+            noted: None = Depends(note_the_loop_thread),
+            user: User = Depends(require_role(Role.PREMIUM)),
+        ):
+            return {"ok": True}
+
+        from backend.app.core.security import get_current_user
+
+        app.dependency_overrides[get_current_user] = (
+            lambda: Principal("registered")
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        with patch.object(authorization, "effective_role", recording):
+            assert client.get("/guarded").status_code == 403
+
+        assert lookup_threads, "the entitlement lookup was reached"
+        assert loop_threads, "the loop thread was recorded"
+        assert set(lookup_threads).isdisjoint(set(loop_threads))
 
 
 class TestRequireRoleDependency:

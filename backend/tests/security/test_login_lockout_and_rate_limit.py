@@ -23,24 +23,33 @@ Every request body is posted as JSON keyed on ``email`` and
 ``password``.
 """
 
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.api.endpoints import auth as auth_module
+from backend.app.api.endpoints.auth import DUPLICATE_EMAIL_DETAIL
 from backend.app.core import security
 from backend.app.core.config import settings
+from backend.app.core.logging import BASE_LOGGER_NAME, configure_logging
+from backend.app.db.database import get_db
 from backend.app.db.models import User
 from backend.app.main import (
     INVALID_REQUEST_DETAIL,
     REQUEST_ID_HEADER,
     TOO_MANY_REQUESTS_DETAIL,
+    TRACEPARENT_HEADER,
     app,
     limiter,
 )
 from backend.tests.support import VALID_TEST_PASSWORD
+
+#: Route a registration is posted to.
+REGISTER_PATH = "/auth/register"
 
 #: Clears the shared per-address limiter counters around every case in
 #: this module.
@@ -74,8 +83,12 @@ PASSWORD_OVER_CEILING_ASCII = PASSWORD_AT_BYTE_CEILING + "z"
 PASSWORD_OVER_CEILING_MULTIBYTE = _POLICY_FRAGMENT + "\u00e9" * 30
 
 #: Headers whose value changes between two requests independently of
-#: the credentials those requests carried.
-VOLATILE_HEADERS = frozenset({REQUEST_ID_HEADER.lower(), "date"})
+#: the credentials those requests carried. Each is a correlation or
+#: timing value minted per request, so a difference between two refusals
+#: discloses nothing about which credential either one carried.
+VOLATILE_HEADERS = frozenset(
+    {REQUEST_ID_HEADER.lower(), TRACEPARENT_HEADER.lower(), "date"}
+)
 
 
 def _allowance(expression):
@@ -126,7 +139,7 @@ def _post_registration(test_client, email, password, reset=True):
     if reset:
         limiter.reset()
     return test_client.post(
-        "/auth/register", json={"email": email, "password": password}
+        REGISTER_PATH, json={"email": email, "password": password}
     )
 
 
@@ -673,3 +686,195 @@ def test_a_password_failing_the_policy_floor_is_refused(
     assert response.status_code == 422
     assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
     assert not _account_exists(db, address)
+
+
+@pytest.fixture
+def application_records():
+    """Collect every record the application logger emits.
+
+    The namespace carries the redacting handler and does not propagate, so
+    a collector is attached to it rather than to the root logger.
+    """
+    configure_logging()
+    collected = []
+
+    class Collector(logging.Handler):
+        def emit(self, record):
+            collected.append(record)
+
+    handler = Collector(level=logging.DEBUG)
+    logger = logging.getLogger(BASE_LOGGER_NAME)
+    logger.addHandler(handler)
+    try:
+        yield collected
+    finally:
+        logger.removeHandler(handler)
+
+
+def _refusals(records):
+    """Return the login-refusal records among ``records``."""
+    return [
+        record
+        for record in records
+        if record.getMessage() == auth_module.LOGIN_REFUSED_MESSAGE
+    ]
+
+
+class TestEveryRefusalIsRecordedUnderAStableCode:
+    """A refused login is recorded, and the code says which refusal it was.
+
+    The response is deliberately identical for every refusal, so without a
+    record there is no way to tell a password-guessing run against one
+    account from a spray across many, and no way to count refusals at all.
+    The record carries a stable code rather than prose, so a detection rule
+    selects it by field, and it carries the account identifier rather than
+    the submitted address, so reading the log discloses no address that was
+    tried.
+    """
+
+    def test_an_unknown_address_is_recorded_with_no_identifier(
+        self, client, login_json, application_records
+    ):
+        response = login_json(client, UNKNOWN_EMAIL, WRONG_PASSWORD)
+        assert response.status_code == 401
+
+        refusals = _refusals(application_records)
+        assert len(refusals) == 1
+        record = refusals[0]
+        assert record.levelno == logging.WARNING
+        assert record.decision == auth_module.DECISION_UNKNOWN_ACCOUNT
+        assert record.user_id is None
+
+    def test_a_wrong_password_is_recorded_against_the_account(
+        self, client, login_json, registered_user, application_records
+    ):
+        response = login_json(
+            client, registered_user.email, WRONG_PASSWORD
+        )
+        assert response.status_code == 401
+
+        refusals = _refusals(application_records)
+        assert len(refusals) == 1
+        record = refusals[0]
+        assert record.decision == auth_module.DECISION_INVALID_PASSWORD
+        assert record.user_id == registered_user.id
+
+    def test_a_locked_account_is_recorded_under_its_own_code(
+        self, client, login_json, registered_user, application_records
+    ):
+        """The lock refusal is distinguishable from a wrong password."""
+        _drive_to_threshold(login_json, client, registered_user.email)
+        application_records.clear()
+
+        response = login_json(client, registered_user.email)
+        assert response.status_code == 401
+
+        refusals = _refusals(application_records)
+        assert refusals
+        assert [record.decision for record in refusals] == [
+            auth_module.DECISION_ACCOUNT_LOCKED
+        ]
+
+    def test_the_applied_lock_carries_its_own_code(
+        self, client, login_json, registered_user, application_records
+    ):
+        _drive_to_threshold(login_json, client, registered_user.email)
+
+        applied = [
+            record
+            for record in application_records
+            if getattr(record, "decision", None)
+            == auth_module.DECISION_LOCK_APPLIED
+        ]
+        assert len(applied) == 1
+        assert applied[0].user_id == registered_user.id
+        assert applied[0].failed_login_attempts == (
+            settings.LOGIN_MAX_ATTEMPTS
+        )
+
+    def test_each_code_is_distinct(self):
+        """No two refusals share a code, so a query can separate them."""
+        codes = [
+            auth_module.DECISION_UNKNOWN_ACCOUNT,
+            auth_module.DECISION_ACCOUNT_LOCKED,
+            auth_module.DECISION_INVALID_PASSWORD,
+            auth_module.DECISION_LOCK_APPLIED,
+            auth_module.DECISION_ADDRESS_CONFLICT,
+        ]
+
+        assert len(set(codes)) == len(codes)
+        for code in codes:
+            assert code == code.lower()
+            assert " " not in code
+
+    def test_no_refusal_record_carries_a_submitted_value(
+        self, client, login_json, registered_user, application_records
+    ):
+        """Neither address nor password reaches any record."""
+        login_json(client, UNKNOWN_EMAIL, WRONG_PASSWORD)
+        login_json(client, registered_user.email, WRONG_PASSWORD)
+
+        assert application_records
+        for record in application_records:
+            rendered = repr(vars(record))
+            assert UNKNOWN_EMAIL not in rendered
+            assert registered_user.email not in rendered
+            assert WRONG_PASSWORD not in rendered
+
+    def test_a_successful_login_records_no_refusal(
+        self, client, login_json, registered_user, application_records
+    ):
+        response = login_json(
+            client, registered_user.email, VALID_TEST_PASSWORD
+        )
+
+        assert response.status_code == 200
+        assert _refusals(application_records) == []
+
+    def test_a_lost_registration_race_is_recorded_with_context(
+        self, client, session_factory, application_records
+    ):
+        """The race refusal names its code and the path it refused.
+
+        The record previously carried neither, so a run of concurrent
+        registrations could not be told apart from the ordinary
+        already-registered response -- which the pre-check answers without
+        recording anything at all. The unique constraint is driven
+        directly, because the two committing requests cannot be
+        interleaved from a single-threaded client.
+        """
+        address = "race.candidate@example.com"
+
+        def override_get_db():
+            session = session_factory()
+
+            def conflict():
+                raise IntegrityError(
+                    "INSERT INTO users", {}, Exception("duplicate key")
+                )
+
+            session.commit = conflict
+            try:
+                yield session
+            finally:
+                session.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        response = _post_registration(
+            client, address, VALID_TEST_PASSWORD
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {"detail": DUPLICATE_EMAIL_DETAIL}
+
+        conflicts = [
+            record
+            for record in application_records
+            if getattr(record, "decision", None)
+            == auth_module.DECISION_ADDRESS_CONFLICT
+        ]
+        assert len(conflicts) == 1
+        record = conflicts[0]
+        assert record.levelno == logging.WARNING
+        assert record.path == REGISTER_PATH
+        assert address not in repr(vars(record))

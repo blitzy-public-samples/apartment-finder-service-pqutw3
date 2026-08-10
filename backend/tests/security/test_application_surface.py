@@ -9,10 +9,14 @@ hold the values bound into the statement being run.
 """
 
 import logging
+import os
+import subprocess
+import sys
+import time
 import uuid
 
 import pytest
-from conftest import CLIENT_BASE_URL
+from conftest import CLIENT_BASE_URL, REPO_ROOT
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -20,8 +24,23 @@ from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.app import main as main_module
+from backend.app.core import authorization
+from backend.app.core.authorization import (
+    audit_failure_count,
+    reset_audit_failure_count,
+)
 from backend.app.core.config import LOCAL_ENVIRONMENT, settings
-from backend.app.core.logging import BASE_LOGGER_NAME, configure_logging
+from backend.app.db import database as database_module
+from backend.app.core.logging import (
+    BASE_LOGGER_NAME,
+    SIGNAL_FIELD,
+    SPAN_ID_FIELD,
+    TRACE_ID_FIELD,
+    configure_logging,
+    current_trace_context,
+    parse_traceparent,
+    reset_logging_failure_count,
+)
 from backend.app.db.database import engine, get_db
 
 # Imported here rather than inside the test that uses it: the first
@@ -34,6 +53,122 @@ from backend.app.tasks import listing_updater  # noqa: E402
 PII_ADDRESS = "resident@example.com"
 
 PII_STREET = "42 Sensitive Street, Apartment 9"
+
+#: Both of the above, as the set every record is asserted not to carry.
+PII_VALUES = (PII_ADDRESS, PII_STREET)
+
+#: Seconds the driver of the unreachable engine waits for a connection.
+#: The address is a port nothing listens on, so the refusal is immediate
+#: on a loopback interface; the bound is what stops a filtered network
+#: from turning the refusal into a stall.
+UNREACHABLE_CONNECT_TIMEOUT_SECONDS = 2
+
+#: Attribute of ``Base.metadata`` that would create the schema at import.
+SCHEMA_CREATION_ATTRIBUTE = "create_all"
+
+#: Name of the installed cross-origin middleware.
+CORS_MIDDLEWARE_NAME = "CORSMiddleware"
+
+#: The value that must never appear in any cross-origin allowlist or in
+#: any cross-origin response header, because it is what a credentialed
+#: response may not be shared under.
+CORS_WILDCARD = "*"
+
+#: An origin outside ``settings.ALLOWED_ORIGINS``.
+DISALLOWED_ORIGIN = "http://evil.example.com"
+
+#: A method outside :data:`main_module.CORS_ALLOW_METHODS`.
+DISALLOWED_METHOD = "DELETE"
+
+#: A request header outside :data:`main_module.CORS_ALLOW_HEADERS`.
+DISALLOWED_HEADER = "X-Sneaky-Header"
+
+#: A method inside the allowed set, used as the preflight subject.
+PREFLIGHT_METHOD = "POST"
+
+#: Route the preflight cases negotiate against.
+PREFLIGHT_PATH = "/listings/"
+
+#: Request headers a browser sends on a preflight.
+PREFLIGHT_METHOD_HEADER = "Access-Control-Request-Method"
+
+PREFLIGHT_HEADERS_HEADER = "Access-Control-Request-Headers"
+
+#: Response header naming the methods a preflight approves.
+CORS_ALLOW_METHODS_HEADER = "Access-Control-Allow-Methods"
+
+#: Response header naming the request headers a preflight approves.
+CORS_ALLOW_HEADERS_HEADER = "Access-Control-Allow-Headers"
+
+#: Module whose import must not create the schema.
+APPLICATION_MODULE = "backend.app.main"
+
+#: Message the stand-in raises when the schema creation is reached.
+SCHEMA_CREATION_MESSAGE = (
+    "the application created the schema at import time"
+)
+
+#: Printed by the child interpreter once it has imported the application
+#: and served one request without the creation having been reached.
+NO_DDL_CONFIRMATION = "no schema was created"
+
+#: Seconds the child interpreter is allowed.
+NO_DDL_TIMEOUT_SECONDS = 180.0
+
+#: Program the child interpreter runs. It replaces the schema creation
+#: with a stand-in that raises, then imports the application, enters its
+#: lifespan through a client and serves one liveness request.
+NO_DDL_PROGRAM = """
+import sys
+
+from backend.app.db.models import Base
+
+
+def refuse(*arguments, **keywords):
+    raise AssertionError({message!r})
+
+
+Base.metadata.create_all = refuse
+
+from backend.app.main import app  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+with TestClient(app, base_url={base_url!r}) as client:
+    answered = client.get("/health")
+
+if answered.status_code != 200:
+    sys.stderr.write(
+        "the liveness route answered %s\\n" % answered.status_code
+    )
+    raise SystemExit(1)
+
+print({confirmation!r})
+""".format(
+    message=SCHEMA_CREATION_MESSAGE,
+    confirmation=NO_DDL_CONFIRMATION,
+    base_url=CLIENT_BASE_URL,
+)
+
+
+def _values_in_records(collected, values):
+    """Returns each of ``values`` a record carries anywhere.
+
+    Every attribute of every record is rendered, together with the
+    formatted message, so a value reaching a structured field is found as
+    well as one reaching the message text.
+    """
+    found = []
+    for value in values:
+        for record in collected:
+            rendered = repr(vars(record))
+            try:
+                message = record.getMessage()
+            except Exception:  # pragma: no cover - defensive
+                message = ""
+            if value in rendered or value in message:
+                found.append(value)
+                break
+    return found
 
 
 @pytest.fixture
@@ -128,9 +263,17 @@ def unreachable_client():
 
     The engine addresses a port nothing listens on, so the probe
     statement raises the same class of error a stopped database raises.
-    No credential is written into the URL.
+    No credential is written into the URL, and the driver is given a
+    connect timeout of :data:`UNREACHABLE_CONNECT_TIMEOUT_SECONDS` so the
+    refusal is bounded rather than left to the platform's own default,
+    which on a filtered network is tens of seconds.
     """
-    down = create_engine("postgresql://127.0.0.1:1/unreachable")
+    down = create_engine(
+        "postgresql://127.0.0.1:1/unreachable",
+        connect_args={
+            "connect_timeout": UNREACHABLE_CONNECT_TIMEOUT_SECONDS
+        },
+    )
 
     def override_get_db():
         session = Session(bind=down)
@@ -239,6 +382,174 @@ class TestReadinessProbe:
         assert recorded.levelno == logging.ERROR
         assert getattr(recorded, "exception_type", "")
         assert not recorded.exc_info
+
+
+class TestTheReadinessProbeIsBounded:
+    """The probe reads the database, so its cost is capped four ways.
+
+    The route is reachable without a credential, so an unbounded read
+    behind it is work any caller can spend on the service's behalf --
+    and it is spent hardest during the very outage the probe exists to
+    report. These cases assert each cap independently: one outcome is
+    reused, one caller at a time reads, the read carries a transaction
+    bound where the dialect supports one, and the route counts its
+    requests.
+    """
+
+    def test_one_outcome_serves_every_probe_in_its_window(
+        self, client, monkeypatch
+    ):
+        """A burst costs one read, not one read each."""
+        reads = []
+        original = main_module._read_database
+        monkeypatch.setattr(
+            main_module,
+            "_read_database",
+            lambda db: (reads.append(db), original(db))[1],
+        )
+
+        answers = [
+            client.get(main_module.READINESS_PATH) for _ in range(5)
+        ]
+
+        assert [answer.status_code for answer in answers] == [200] * 5
+        assert len(reads) == 1
+
+    def test_a_lapsed_window_reads_the_database_again(
+        self, client, monkeypatch
+    ):
+        """The report is current: a stale outcome is not reused."""
+        reads = []
+        original = main_module._read_database
+        monkeypatch.setattr(
+            main_module,
+            "_read_database",
+            lambda db: (reads.append(db), original(db))[1],
+        )
+        monkeypatch.setattr(
+            main_module.settings, "READINESS_CACHE_SECONDS", 0.01
+        )
+
+        assert client.get(main_module.READINESS_PATH).status_code == 200
+        time.sleep(0.05)
+        assert client.get(main_module.READINESS_PATH).status_code == 200
+
+        assert len(reads) == 2
+
+    def test_only_one_caller_at_a_time_reads_the_database(
+        self, client, monkeypatch
+    ):
+        """A probe arriving mid-read answers without a second read.
+
+        The guard is held for the length of the read, so the number of
+        connections this route holds never grows with the number of
+        callers. Holding it here stands in for that in-flight read.
+        """
+        reads = []
+        original = main_module._read_database
+        monkeypatch.setattr(
+            main_module,
+            "_read_database",
+            lambda db: (reads.append(db), original(db))[1],
+        )
+
+        monkeypatch.setattr(
+            main_module.settings, "READINESS_CACHE_SECONDS", 0.01
+        )
+
+        assert client.get(main_module.READINESS_PATH).status_code == 200
+        assert len(reads) == 1
+        time.sleep(0.05)
+
+        acquired = main_module._readiness_probe_lock.acquire(
+            blocking=False
+        )
+        assert acquired
+        try:
+            answer = client.get(main_module.READINESS_PATH)
+        finally:
+            main_module._readiness_probe_lock.release()
+
+        assert answer.status_code == 200
+        assert answer.json() == {"status": main_module.READINESS_STATUS}
+        assert len(reads) == 1
+
+    def test_no_recorded_outcome_refuses_rather_than_waiting(
+        self, client
+    ):
+        """With nothing recorded, a probe mid-read refuses at once."""
+        main_module.reset_readiness_cache()
+
+        acquired = main_module._readiness_probe_lock.acquire(
+            blocking=False
+        )
+        assert acquired
+        try:
+            answer = client.get(main_module.READINESS_PATH)
+        finally:
+            main_module._readiness_probe_lock.release()
+
+        assert answer.status_code == 503
+        assert answer.json() == {"status": main_module.NOT_READY_STATUS}
+
+    def test_the_read_is_bounded_where_the_dialect_supports_it(self):
+        """PostgreSQL receives a transaction-local timeout, SQLite none.
+
+        Each bound is transaction-local, so nothing else that uses the
+        shared engine -- the Alembic revisions included -- inherits it.
+        """
+        issued = []
+
+        class RecordingSession:
+            def __init__(self, dialect_name):
+                self._dialect_name = dialect_name
+
+            def get_bind(self):
+                dialect = type("Dialect", (), {})()
+                dialect.name = self._dialect_name
+                bind = type("Bind", (), {})()
+                bind.dialect = dialect
+                return bind
+
+            def execute(self, statement, params=None):
+                issued.append((str(statement), params))
+
+        main_module._bound_readiness_transaction(
+            RecordingSession("postgresql")
+        )
+
+        assert len(issued) == len(
+            main_module.READINESS_BOUND_STATEMENTS
+        )
+        expected = str(
+            int(settings.READINESS_TIMEOUT_SECONDS * 1000)
+        )
+        for statement, params in issued:
+            assert "set_config" in statement
+            assert params == {"milliseconds": expected}
+        assert "statement_timeout" in issued[0][0]
+        assert "lock_timeout" in issued[1][0]
+
+        issued.clear()
+        main_module._bound_readiness_transaction(
+            RecordingSession("sqlite")
+        )
+
+        assert issued == []
+
+    def test_the_route_counts_its_requests_against_a_limit(self, client):
+        """A burst past the configured limit is refused."""
+        permitted = int(settings.RATE_LIMIT_READINESS.split("/")[0])
+
+        answers = [
+            client.get(main_module.READINESS_PATH)
+            for _ in range(permitted + 1)
+        ]
+
+        assert [
+            answer.status_code for answer in answers[:permitted]
+        ] == [200] * permitted
+        assert answers[-1].status_code == 429
 
 
 class TestShutdownDrainReporting:
@@ -572,9 +883,9 @@ class TestErrorRecordsCarryNoUserData:
     def test_the_record_carries_no_frame_or_bound_value(self, records):
         """The finding was a traceback holding bound statement values.
 
-        The record names the failure by class, module and redacted
-        message: no traceback, no frame, no source path and no local
-        value, so nothing a statement bound can travel with it.
+        The record names the failure by class and module alone: no
+        traceback, no frame, no source path and no local value, so
+        nothing a statement bound can travel with it.
         """
         self.build().get("/boom")
         assert records
@@ -582,6 +893,23 @@ class TestErrorRecordsCarryNoUserData:
             rendered = repr(vars(record))
             assert "Traceback" not in rendered
             assert __file__ not in rendered
+
+    def test_no_record_carries_the_injected_user_data(self, records):
+        """Neither sentinel reaches a record, in any field or message.
+
+        The route raises with both sentinels embedded in its text, so a
+        record that carried the exception message would carry them. Every
+        attribute of every record is rendered and the message is
+        formatted, so a sentinel reaching a structured field is caught as
+        well as one reaching the message text.
+        """
+        self.build().get("/boom")
+        assert records
+        assert _values_in_records(records, PII_VALUES) == []
+        for record in records:
+            for field, value in vars(record).items():
+                for sentinel in PII_VALUES:
+                    assert sentinel not in str(value), field
 
     def test_the_record_carries_no_traceback(self, records):
         self.build().get("/boom")
@@ -649,6 +977,131 @@ class TestErrorRecordsCarryNoUserData:
             assert response.headers[name] == value
 
 
+class TestCrossOriginPolicy:
+    """The cross-origin allowlist is explicit and preflight enforces it.
+
+    Two layers are covered. The first reads the configuration the
+    middleware was installed with, so a wildcard or an added method or
+    header fails here even when no request would reveal it. The second
+    negotiates real preflights through the assembled application, so a
+    change that keeps the configuration intact but stops enforcing it
+    fails too.
+    """
+
+    def installed(self):
+        """Returns the keywords the cross-origin middleware carries."""
+        found = [
+            entry
+            for entry in main_module.app.user_middleware
+            if entry.cls.__name__ == CORS_MIDDLEWARE_NAME
+        ]
+        assert len(found) == 1
+        return found[0].kwargs
+
+    def client(self):
+        """Returns a client whose host the trusted-host gate admits."""
+        return TestClient(main_module.app, base_url=CLIENT_BASE_URL)
+
+    def preflight(self, origin, method=PREFLIGHT_METHOD, header=None):
+        """Negotiates one preflight and returns the response."""
+        headers = {
+            "Origin": origin,
+            PREFLIGHT_METHOD_HEADER: method,
+        }
+        if header is not None:
+            headers[PREFLIGHT_HEADERS_HEADER] = header
+        return self.client().options(PREFLIGHT_PATH, headers=headers)
+
+    def test_the_middleware_is_installed_once(self):
+        assert self.installed() is not None
+
+    def test_the_installed_methods_are_the_explicit_list(self):
+        assert self.installed()["allow_methods"] == list(
+            main_module.CORS_ALLOW_METHODS
+        )
+
+    def test_the_installed_headers_are_the_explicit_list(self):
+        assert self.installed()["allow_headers"] == list(
+            main_module.CORS_ALLOW_HEADERS
+        )
+
+    def test_the_installed_origins_are_the_configured_list(self):
+        assert self.installed()["allow_origins"] == list(
+            settings.ALLOWED_ORIGINS
+        )
+
+    def test_the_installed_configuration_is_credentialed(self):
+        assert self.installed()["allow_credentials"] is True
+
+    def test_no_installed_value_is_a_wildcard(self):
+        """A wildcard alongside credentials is what M-3 removed."""
+        keywords = self.installed()
+        for name in ("allow_origins", "allow_methods", "allow_headers"):
+            entries = keywords[name]
+            assert entries
+            assert CORS_WILDCARD not in entries, name
+            for entry in entries:
+                assert CORS_WILDCARD not in entry, (name, entry)
+
+    def test_an_allowed_preflight_is_approved(self):
+        origin = list(settings.ALLOWED_ORIGINS)[0]
+        response = self.preflight(
+            origin, header=main_module.CORS_ALLOW_HEADERS[0]
+        )
+        assert response.status_code == 200
+        assert response.headers[
+            main_module.CORS_ALLOW_ORIGIN_HEADER
+        ] == origin
+        assert response.headers[
+            main_module.CORS_ALLOW_CREDENTIALS_HEADER
+        ] == "true"
+        approved = response.headers[CORS_ALLOW_METHODS_HEADER]
+        for method in main_module.CORS_ALLOW_METHODS:
+            assert method in approved
+        assert DISALLOWED_METHOD not in approved
+        granted = response.headers[CORS_ALLOW_HEADERS_HEADER]
+        for header in main_module.CORS_ALLOW_HEADERS:
+            assert header in granted
+        assert DISALLOWED_HEADER not in granted
+
+    def test_a_preflight_from_an_unlisted_origin_is_refused(self):
+        response = self.preflight(DISALLOWED_ORIGIN)
+        assert response.status_code == 400
+        assert (
+            main_module.CORS_ALLOW_ORIGIN_HEADER not in response.headers
+        )
+
+    def test_a_preflight_for_an_unlisted_method_is_refused(self):
+        origin = list(settings.ALLOWED_ORIGINS)[0]
+        response = self.preflight(origin, method=DISALLOWED_METHOD)
+        assert response.status_code == 400
+
+    def test_a_preflight_for_an_unlisted_header_is_refused(self):
+        origin = list(settings.ALLOWED_ORIGINS)[0]
+        response = self.preflight(origin, header=DISALLOWED_HEADER)
+        assert response.status_code == 400
+
+    def test_a_credentialed_response_names_one_origin(self):
+        """The shared origin is echoed exactly, never as a wildcard."""
+        origin = list(settings.ALLOWED_ORIGINS)[0]
+        response = self.client().get("/health", headers={"Origin": origin})
+        assert response.status_code == 200
+        shared = response.headers[main_module.CORS_ALLOW_ORIGIN_HEADER]
+        assert shared == origin
+        assert shared != CORS_WILDCARD
+        assert response.headers[
+            main_module.CORS_ALLOW_CREDENTIALS_HEADER
+        ] == "true"
+
+    def test_an_unlisted_origin_is_shared_with_nothing(self):
+        response = self.client().get(
+            "/health", headers={"Origin": DISALLOWED_ORIGIN}
+        )
+        assert (
+            main_module.CORS_ALLOW_ORIGIN_HEADER not in response.headers
+        )
+
+
 class TestBoundParametersAreHidden:
     """A failing statement's values do not reach its error text."""
 
@@ -672,6 +1125,99 @@ class TestBoundParametersAreHidden:
         shown.dispose()
         assert outcomes["hidden"] is False
         assert outcomes["shown"] is True
+
+
+class TestEveryDatabaseWaitIsBounded:
+    """A PostgreSQL connection carries three finite bounds.
+
+    libpq waits indefinitely for a connection whose ``connect_timeout``
+    is omitted or zero, and a statement the client has stopped waiting
+    for keeps running on the server unless ``statement_timeout`` bounds
+    it. A cancellation cannot reach a client whose packets are no longer
+    acknowledged either, so ``tcp_user_timeout`` bounds the socket as
+    well. The readiness handler reads through this same engine, so its
+    worker inherits all three.
+    """
+
+    POSTGRES_URLS = (
+        "postgresql://user:pw@db.internal:5432/apartment_finder",
+        "postgresql+psycopg2://user:pw@db.internal:5432/apartment_finder",
+    )
+
+    @pytest.mark.parametrize("url", POSTGRES_URLS)
+    def test_a_connection_attempt_is_bounded(self, url):
+        arguments = database_module._connect_args(url)
+        assert arguments["connect_timeout"] == (
+            settings.DB_CONNECT_TIMEOUT_SECONDS
+        )
+        assert arguments["connect_timeout"] >= 1
+
+    @pytest.mark.parametrize("url", POSTGRES_URLS)
+    def test_one_statement_is_bounded_on_the_server(self, url):
+        arguments = database_module._connect_args(url)
+        expected = settings.DB_STATEMENT_TIMEOUT_SECONDS * 1000
+        assert "-c statement_timeout=%d" % expected in arguments["options"]
+
+    @pytest.mark.parametrize("url", POSTGRES_URLS)
+    def test_an_established_socket_is_bounded(self, url):
+        arguments = database_module._connect_args(url)
+        assert arguments["tcp_user_timeout"] == (
+            settings.DB_TCP_USER_TIMEOUT_SECONDS * 1000
+        )
+
+    @pytest.mark.parametrize("url", POSTGRES_URLS)
+    def test_the_session_is_still_pinned_to_utc(self, url):
+        arguments = database_module._connect_args(url)
+        assert "-c timezone=utc" in arguments["options"]
+
+    def test_the_options_string_is_built_from_the_configured_value(self):
+        rendered = database_module.postgresql_session_options()
+        assert rendered == (
+            "-c timezone=utc -c statement_timeout=%d"
+            % (settings.DB_STATEMENT_TIMEOUT_SECONDS * 1000)
+        )
+
+    def test_a_sqlite_url_carries_no_postgresql_parameter(self):
+        arguments = database_module._connect_args("sqlite://")
+        assert arguments == {"check_same_thread": False}
+
+    def test_every_bound_is_below_the_container_probe_timeout(self):
+        """Each bound sits under the health check's own client timeout."""
+        probe_timeout_seconds = 5
+        assert settings.DB_CONNECT_TIMEOUT_SECONDS < probe_timeout_seconds
+        assert (
+            settings.DB_STATEMENT_TIMEOUT_SECONDS < probe_timeout_seconds
+        )
+        assert (
+            settings.DB_TCP_USER_TIMEOUT_SECONDS < probe_timeout_seconds
+        )
+
+    def test_a_timeout_above_the_ceiling_is_refused(self):
+        from pydantic import ValidationError
+
+        from backend.app.core.config import (
+            DB_TIMEOUT_CEILING_SECONDS,
+            Settings,
+        )
+
+        for name in (
+            "DB_CONNECT_TIMEOUT_SECONDS",
+            "DB_STATEMENT_TIMEOUT_SECONDS",
+            "DB_TCP_USER_TIMEOUT_SECONDS",
+        ):
+            for rejected in (0, -1, DB_TIMEOUT_CEILING_SECONDS + 1):
+                overrides = dict(settings.dict())
+                overrides[name] = rejected
+                with pytest.raises(ValidationError):
+                    Settings(**overrides)
+
+    def test_the_readiness_handler_runs_off_the_event_loop(self):
+        """A synchronous handler is offloaded to a worker thread."""
+        import inspect
+
+        assert not inspect.iscoroutinefunction(
+            main_module.readiness_check
+        )
 
 
 class TestIngestionFailureRecord:
@@ -717,3 +1263,427 @@ class TestIngestionFailureRecord:
         assert fields["processed_listings"] == 0
         assert session.rollback.call_count == 1
         assert session.close.call_count == 1
+        # Neither sentinel reaches a record, in any field or message.
+        assert _values_in_records(records, PII_VALUES) == []
+        for record in records:
+            for field, value in vars(record).items():
+                for sentinel in PII_VALUES:
+                    assert sentinel not in str(value), field
+
+
+class TestTheSchemaIsNotCreatedByTheApplication:
+    """The revisions own the schema, so importing creates nothing.
+
+    ``Base.metadata.create_all`` was called at import time before this
+    remediation, which meant the running code built its own schema and the
+    revisions were not the authority for it. Its absence was previously
+    asserted by nobody, so a reintroduction would have gone unreported.
+    """
+
+    def test_the_application_source_calls_no_schema_creation(self):
+        """Asserts the assembled application names no DDL call."""
+        source = (
+            REPO_ROOT / "backend" / "app" / "main.py"
+        ).read_text(encoding="utf-8")
+
+        assert SCHEMA_CREATION_ATTRIBUTE not in source
+
+    def test_a_fresh_interpreter_creates_no_schema_on_import(self):
+        """Asserts a fresh import and startup issue no DDL.
+
+        The stand-in raises when the creation is reached, so a call from
+        the module body, from a startup handler or from anything either of
+        them imports ends the child interpreter. The child also serves one
+        liveness request, so the lifespan of the application is entered
+        rather than only its module body being executed.
+        """
+        completed = subprocess.run(
+            [sys.executable, "-c", NO_DDL_PROGRAM],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            env=dict(os.environ),
+            timeout=NO_DDL_TIMEOUT_SECONDS,
+        )
+
+        assert completed.returncode == 0, (
+            completed.stdout + completed.stderr
+        )
+        assert NO_DDL_CONFIRMATION in completed.stdout, (
+            completed.stdout + completed.stderr
+        )
+
+
+class TestRouteMatchingFailsClosed:
+    """A route that cannot answer a match call is not silently skipped.
+
+    The rate-limit gate resolves a request's endpoint from the scope so it
+    can evaluate the limit that endpoint declares before any body is read.
+    A candidate swallowed silently there would leave the request running
+    without the governance its route carries, so the two outcomes are
+    separated: a failure a route genuinely raises for a scope it cannot
+    read is recorded and skipped, and anything else propagates.
+    """
+
+    class _Raising:
+        """A route candidate whose match call raises ``error``."""
+
+        name = "raising-candidate"
+
+        def __init__(self, error):
+            self.error = error
+            self.endpoint = None
+
+        def matches(self, scope):
+            raise self.error
+
+    @staticmethod
+    def _scope(routes):
+        """Returns a scope whose application publishes ``routes``."""
+        from unittest.mock import MagicMock
+
+        application = MagicMock()
+        application.routes = routes
+        return {
+            "type": "http",
+            "method": "POST",
+            "path": "/auth/login",
+            "app": application,
+        }
+
+    @pytest.mark.parametrize(
+        "error_type", list(main_module.UNMATCHABLE_ROUTE_ERRORS)
+    )
+    def test_an_unreadable_scope_skips_the_candidate(
+        self, error_type, records
+    ):
+        """Each declared failure is recorded and the candidate skipped."""
+        candidate = self._Raising(error_type("unreadable scope"))
+
+        matched = main_module._matched_endpoint(self._scope([candidate]))
+
+        assert matched is None
+        warnings = [
+            record
+            for record in records
+            if record.levelno >= logging.WARNING
+            and getattr(record, "candidate", None) == candidate.name
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].error == error_type.__name__
+        assert warnings[0].path == "/auth/login"
+        assert warnings[0].method == "POST"
+
+    def test_a_skipped_candidate_does_not_stop_the_search(self):
+        """A later route still resolves after an earlier one is skipped."""
+
+        def endpoint():
+            return None
+
+        class _Matching:
+            name = "matching-candidate"
+
+            def __init__(self):
+                self.endpoint = endpoint
+
+            def matches(self, scope):
+                return main_module.Match.FULL, {}
+
+        routes = [self._Raising(KeyError("method")), _Matching()]
+
+        assert main_module._matched_endpoint(self._scope(routes)) is (
+            endpoint
+        )
+
+    def test_an_unexpected_failure_propagates(self):
+        """Anything outside the declared set is not swallowed.
+
+        The caller depends on the match to decide which limit applies, so
+        an unexpected failure must surface rather than resolve to "no
+        endpoint" and let the request through ungoverned.
+        """
+        candidate = self._Raising(RuntimeError("router is inconsistent"))
+
+        with pytest.raises(RuntimeError):
+            main_module._matched_endpoint(self._scope([candidate]))
+
+    def test_the_declared_set_excludes_the_base_exception(self):
+        """The set names specific failures rather than everything."""
+        assert Exception not in main_module.UNMATCHABLE_ROUTE_ERRORS
+        assert BaseException not in main_module.UNMATCHABLE_ROUTE_ERRORS
+        for error_type in main_module.UNMATCHABLE_ROUTE_ERRORS:
+            assert issubclass(error_type, Exception)
+
+    def test_a_scope_without_an_application_resolves_nothing(self):
+        """No application means no routes to consider."""
+        assert main_module._matched_endpoint({"type": "http"}) is None
+
+    def test_every_real_route_answers_the_match_call(self, records):
+        """The live router skips nothing, so nothing is recorded.
+
+        The recording exists for a candidate that cannot answer. The
+        application's own routes all can, so a normal lookup must produce
+        no warning at all.
+        """
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/auth/login",
+            "app": main_module.app,
+        }
+
+        matched = main_module._matched_endpoint(scope)
+
+        assert matched is not None
+        assert [
+            record
+            for record in records
+            if getattr(record, "candidate", None) is not None
+        ] == []
+
+
+class TestRequestCorrelation:
+    """Every response carries the identifiers its records were written with.
+
+    Without them a record cannot be tied to the request that produced it,
+    which is what makes a security record actionable: a caller reporting
+    a refusal can name the trace, and the operator can find every record
+    of that request without searching by content. The trace identifier is
+    adopted from the caller when the caller supplies valid W3C trace
+    context, so one identifier spans the caller and this process, and a
+    fresh span is always minted for this process's own work.
+    """
+
+    #: Trace context a caller supplies. Fixed local test values.
+    CALLER_TRACE = "4bf92f3577b34da6a3ce929d0e0e4736"
+    CALLER_SPAN = "00f067aa0ba902b7"
+
+    def caller_header(self, trace=None, span=None):
+        return "00-{0}-{1}-01".format(
+            trace or self.CALLER_TRACE, span or self.CALLER_SPAN
+        )
+
+    def test_a_response_carries_a_traceparent(self, client):
+        response = client.get("/health")
+
+        returned = response.headers.get(main_module.TRACEPARENT_HEADER)
+        assert returned
+        assert parse_traceparent(returned) is not None
+
+    def test_the_caller_trace_is_adopted(self, client):
+        response = client.get(
+            "/health",
+            headers={
+                main_module.TRACEPARENT_HEADER: self.caller_header()
+            },
+        )
+
+        parsed = parse_traceparent(
+            response.headers[main_module.TRACEPARENT_HEADER]
+        )
+        assert parsed is not None
+        assert parsed[0] == self.CALLER_TRACE
+
+    def test_the_caller_span_is_not_reused(self, client):
+        """This process reports its own span beneath the caller's trace."""
+        response = client.get(
+            "/health",
+            headers={
+                main_module.TRACEPARENT_HEADER: self.caller_header()
+            },
+        )
+
+        parsed = parse_traceparent(
+            response.headers[main_module.TRACEPARENT_HEADER]
+        )
+        assert parsed is not None
+        assert parsed[1] != self.CALLER_SPAN
+
+    @pytest.mark.parametrize(
+        "supplied",
+        [
+            "",
+            "nonsense",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e473Z-00f067aa0ba902b7-01",
+        ],
+    )
+    def test_an_unusable_caller_value_starts_a_fresh_trace(
+        self, client, supplied
+    ):
+        """A malformed header is replaced, never propagated."""
+        response = client.get(
+            "/health",
+            headers={main_module.TRACEPARENT_HEADER: supplied},
+        )
+
+        returned = response.headers[main_module.TRACEPARENT_HEADER]
+        assert parse_traceparent(returned) is not None
+        assert returned != supplied
+
+    def test_two_requests_carry_two_traces(self, client):
+        first = client.get("/health").headers[
+            main_module.TRACEPARENT_HEADER
+        ]
+        second = client.get("/health").headers[
+            main_module.TRACEPARENT_HEADER
+        ]
+
+        assert first != second
+
+    def test_a_refusal_carries_the_identifiers_too(self, client):
+        """A response the request never reached a handler for still
+        correlates."""
+        response = client.get("/health", headers={"host": "elsewhere"})
+
+        assert response.status_code == 400
+        assert response.headers.get(main_module.REQUEST_ID_HEADER)
+        assert response.headers.get(main_module.TRACEPARENT_HEADER)
+
+    def test_the_record_carries_what_the_response_returned(
+        self, unreachable_client, records
+    ):
+        """The identifiers on the record are the ones the caller was
+        given, so the two can be joined.
+
+        The unreadable database is what makes the request record
+        anything: it drives one record out of a handler, inside the
+        request, which is where the identifiers are bound.
+        """
+        response = unreachable_client.get(
+            main_module.READINESS_PATH,
+            headers={
+                main_module.TRACEPARENT_HEADER: self.caller_header()
+            },
+        )
+        assert response.status_code == 503
+
+        returned = parse_traceparent(
+            response.headers[main_module.TRACEPARENT_HEADER]
+        )
+        assert returned is not None
+        emitted = [
+            record
+            for record in records
+            if record.getMessage()
+            == main_module.READINESS_FAILURE_MESSAGE
+        ]
+        assert emitted
+        for record in emitted:
+            assert getattr(record, TRACE_ID_FIELD) == self.CALLER_TRACE
+            assert getattr(record, TRACE_ID_FIELD) == returned[0]
+            assert getattr(record, SPAN_ID_FIELD) == returned[1]
+            assert getattr(record, main_module.REQUEST_ID_FIELD)
+
+    def test_the_context_is_unbound_once_the_request_ends(self, client):
+        """No identifier leaks into work outside a request."""
+        client.get("/health")
+
+        assert current_trace_context() is None
+
+
+class TestDegradedSinkReporting:
+    """A record the process could not write is reported on the probe.
+
+    Both counters name records this process produced and failed to write
+    through its primary sink, so a non-zero value means the evidence
+    trail is incomplete while the process still serves. The probe is
+    where a deployment already looks, and the counts are reported as a
+    record rather than in the body, because the body is a probe contract
+    and a probe is not an authenticated reader.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cleared_counters(self):
+        reset_audit_failure_count()
+        reset_logging_failure_count()
+        yield
+        reset_audit_failure_count()
+        reset_logging_failure_count()
+
+    def degradation_records(self, records):
+        return [
+            record
+            for record in records
+            if record.getMessage() == main_module.SINK_DEGRADED_MESSAGE
+        ]
+
+    def test_nothing_is_recorded_while_every_sink_writes(
+        self, client, records
+    ):
+        response = client.get(main_module.READINESS_PATH)
+
+        assert response.status_code == 200
+        assert self.degradation_records(records) == []
+
+    def test_a_rejected_audit_record_is_reported(
+        self, client, records, monkeypatch
+    ):
+        monkeypatch.setattr(
+            main_module, "audit_failure_count", lambda: 3
+        )
+        response = client.get(main_module.READINESS_PATH)
+
+        assert response.status_code == 200
+        reported = self.degradation_records(records)
+        assert reported
+        fields = reported[-1].__dict__
+        assert reported[-1].levelno == logging.WARNING
+        assert fields[SIGNAL_FIELD] == main_module.SINK_DEGRADED_SIGNAL
+        assert fields["audit_failures"] == 3
+        assert fields["log_emit_failures"] == 0
+
+    def test_an_unemitted_record_is_reported(
+        self, client, records, monkeypatch
+    ):
+        monkeypatch.setattr(
+            main_module, "logging_failure_count", lambda: 2
+        )
+        client.get(main_module.READINESS_PATH)
+
+        reported = self.degradation_records(records)
+        assert reported
+        assert reported[-1].__dict__["log_emit_failures"] == 2
+
+    def test_the_body_gains_no_field(self, client, monkeypatch):
+        """The probe contract is unchanged by the signal."""
+        monkeypatch.setattr(
+            main_module, "audit_failure_count", lambda: 1
+        )
+        monkeypatch.setattr(
+            main_module, "logging_failure_count", lambda: 1
+        )
+        response = client.get(main_module.READINESS_PATH)
+
+        assert set(response.json()) == {"status"}
+        assert response.json() == {
+            "status": main_module.READINESS_STATUS
+        }
+
+    def test_an_unreadable_database_is_still_reported_degraded(
+        self, unreachable_client, records, monkeypatch
+    ):
+        """The two conditions are independent and both are recorded."""
+        monkeypatch.setattr(
+            main_module, "audit_failure_count", lambda: 1
+        )
+        response = unreachable_client.get(main_module.READINESS_PATH)
+
+        assert response.status_code == 503
+        assert self.degradation_records(records)
+        assert [
+            record
+            for record in records
+            if record.getMessage()
+            == main_module.READINESS_FAILURE_MESSAGE
+        ]
+
+    def test_the_counter_the_probe_reads_is_the_exported_one(self):
+        """The probe reads the authorization module's own counter."""
+        assert (
+            main_module.audit_failure_count is audit_failure_count
+        )
+        assert "audit_failure_count" in authorization.__all__

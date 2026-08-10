@@ -139,50 +139,96 @@ def webhook_headers(cert_url=CERT_URL, transmission_id=TRANSMISSION_ID):
     }
 
 
-class StubResponse:
-    """A successful httpx-like response carrying ``payload``.
+def padded_body(payload, size, filler_key="_filler"):
+    """Returns ``size`` bytes of JSON, and the object they decode to.
 
-    ``content`` and the declared length are derived from the payload, so a
-    stand-in is measured against the service's response-size cap exactly
-    as a real response is. ``content`` may be given directly to serve a
-    body larger than its payload declares.
+    The object is ``payload`` with one filler field whose value is grown
+    until the encoding is exactly ``size`` bytes long, so a body of an
+    exact measured size is still valid JSON and still decodes to a known
+    object. Used to serve a body at, or one byte either side of, the
+    service's response-size cap.
+    """
+    body = dict(payload)
+    body[filler_key] = ""
+    overhead = len(json.dumps(body).encode("utf-8"))
+    if overhead > size:
+        raise ValueError("payload is already longer than the target size")
+    body[filler_key] = "x" * (size - overhead)
+    encoded = json.dumps(body).encode("utf-8")
+    assert len(encoded) == size
+    return encoded, body
+
+
+class StubResponse:
+    """A successful httpx-like response streaming ``payload``.
+
+    ``content`` is what ``aiter_bytes`` yields and defaults to the
+    payload's JSON encoding, so a stand-in is streamed and measured
+    against the service's response-size cap exactly as a real response is.
+    ``content`` may be given directly to stream bytes the payload does not
+    describe, ``declared`` to announce a length the bytes do not match,
+    and ``chunk_size`` to stream the body in more than one piece.
+    ``streamed`` counts the bytes handed over and ``decoded`` the number
+    of times the buffered decoder was called.
     """
 
-    def __init__(self, payload, status_code=200, content=None):
+    #: ``declared`` value that leaves the response with no length header.
+    NO_LENGTH = "no-length"
+
+    def __init__(
+        self,
+        payload,
+        status_code=200,
+        content=None,
+        declared=None,
+        chunk_size=None,
+    ):
         self._payload = payload
         self.status_code = status_code
         if content is None:
             content = json.dumps(payload).encode("utf-8")
         self.content = content
-        self.headers = {"Content-Length": str(len(content))}
+        self.chunk_size = chunk_size
+        self.streamed = 0
+        self.decoded = 0
+        if declared == self.NO_LENGTH:
+            self.headers = {}
+        else:
+            if declared is None:
+                declared = len(content)
+            self.headers = {"Content-Length": str(declared)}
 
     def raise_for_status(self):
         return None
 
+    async def aiter_bytes(self):
+        """Yields the body in one chunk, or in ``chunk_size`` pieces."""
+        body = self.content or b""
+        step = self.chunk_size or len(body)
+        if step <= 0:
+            return
+        for start in range(0, len(body), step):
+            chunk = body[start:start + step]
+            self.streamed += len(chunk)
+            yield chunk
+
     def json(self):
+        self.decoded += 1
         return self._payload
 
 
 class CountedResponse(StubResponse):
-    """A response that declares ``declared`` bytes and counts decodes."""
+    """A response declaring ``declared`` bytes over a valid body."""
 
     def __init__(self, payload, declared):
-        super().__init__(payload)
-        self.headers = {"Content-Length": str(declared)}
-        self.decoded = 0
-
-    def json(self):
-        self.decoded += 1
-        return super().json()
+        super().__init__(payload, declared=declared)
 
 
 class UnmeasuredResponse(StubResponse):
-    """A response declaring no length and exposing no bytes."""
+    """A response declaring no length at all."""
 
     def __init__(self, payload):
-        super().__init__(payload)
-        self.headers = {}
-        self.content = None
+        super().__init__(payload, declared=StubResponse.NO_LENGTH)
 
 
 class BoundedClient:
@@ -192,13 +238,25 @@ class BoundedClient:
         self._response = response
         self.calls = 0
 
-    async def post(self, *args, **kwargs):
+    def stream(self, *args, **kwargs):
+        """Returns the response as the streaming context manager."""
         self.calls += 1
-        return self._response
+        return _streaming(self._response)
 
-    async def request(self, *args, **kwargs):
-        self.calls += 1
-        return self._response
+
+def _streaming(response):
+    """Returns ``response`` as an asynchronous context manager.
+
+    The service issues every call through ``client.stream``, which is an
+    asynchronous context manager over the response, so a stand-in serves
+    its response the same way.
+    """
+
+    @asynccontextmanager
+    async def opened():
+        yield response
+
+    return opened()
 
 
 def stub_client(client):
@@ -268,6 +326,25 @@ def denied_event(order_id=ORDER_ID):
         "event_type": "PAYMENT.CAPTURE.DENIED",
         "resource": {
             "id": CAPTURE_ID,
+            "supplementary_data": {
+                "related_ids": {"order_id": order_id}
+            },
+        },
+    }
+
+
+def revoking_event(event_type, order_id=ORDER_ID, identifier="WH-5"):
+    """Returns a notification of ``event_type`` naming ``order_id``.
+
+    The resource carries the order identifier under both the capture
+    shape and the order shape, so one helper serves the ``PAYMENT.*``
+    notifications and the ``CHECKOUT.*`` ones alike.
+    """
+    return {
+        "id": identifier,
+        "event_type": event_type,
+        "resource": {
+            "id": order_id,
             "supplementary_data": {
                 "related_ids": {"order_id": order_id}
             },
@@ -735,10 +812,11 @@ class TestPaymentIntegrity:
         sent = {}
 
         class Client:
-            async def post(self, path, **kwargs):
+            def stream(self, method, path, **kwargs):
+                sent["method"] = method
                 sent["path"] = path
                 sent["headers"] = kwargs.get("headers", {})
-                return StubResponse(capture_response())
+                return _streaming(StubResponse(capture_response()))
 
         async def run():
             with patch(
@@ -763,9 +841,9 @@ class TestPaymentIntegrity:
         sent = {}
 
         class Client:
-            async def post(self, path, **kwargs):
+            def stream(self, method, path, **kwargs):
                 sent["json"] = kwargs.get("json")
-                return StubResponse(order_response())
+                return _streaming(StubResponse(order_response()))
 
         async def run():
             with patch(
@@ -877,11 +955,13 @@ class TestWebhookAuthenticity:
         sent = {}
 
         class Client:
-            async def post(self, path, **kwargs):
+            def stream(self, method, path, **kwargs):
                 sent["path"] = path
                 sent["content"] = kwargs.get("content")
                 sent["json"] = kwargs.get("json")
-                return StubResponse({"verification_status": "SUCCESS"})
+                return _streaming(
+                    StubResponse({"verification_status": "SUCCESS"})
+                )
 
         with patch(
             SERVICE + "._client", new=stub_client(Client())
@@ -919,9 +999,11 @@ class TestWebhookAuthenticity:
         sent = {}
 
         class Client:
-            async def post(self, path, **kwargs):
+            def stream(self, method, path, **kwargs):
                 sent["content"] = kwargs.get("content")
-                return StubResponse({"verification_status": "SUCCESS"})
+                return _streaming(
+                    StubResponse({"verification_status": "SUCCESS"})
+                )
 
         with patch(
             SERVICE + "._client", new=stub_client(Client())
@@ -961,7 +1043,7 @@ class TestWebhookAuthenticity:
         client_used = {"called": False}
 
         class Client:
-            async def post(self, path, **kwargs):
+            def stream(self, method, path, **kwargs):
                 client_used["called"] = True
                 raise AssertionError("no request may be made")
 
@@ -1005,7 +1087,7 @@ class TestWebhookAuthenticity:
         reached = {"called": False}
 
         class Client:
-            async def post(self, path, **kwargs):
+            def stream(self, method, path, **kwargs):
                 reached["called"] = True
                 raise AssertionError("no request may be made")
 
@@ -1040,8 +1122,10 @@ class TestWebhookAuthenticity:
 
     def test_a_failing_verification_status_is_refused(self):
         class Client:
-            async def post(self, path, **kwargs):
-                return StubResponse({"verification_status": "FAILURE"})
+            def stream(self, method, path, **kwargs):
+                return _streaming(
+                    StubResponse({"verification_status": "FAILURE"})
+                )
 
         with patch(
             SERVICE + "._client", new=stub_client(Client())
@@ -1610,6 +1694,171 @@ class TestTerminalStatusTakesPrecedence:
             amount=format_amount(PLAN.amount),
             currency=PLAN.currency,
             capture_id=CAPTURE_ID,
+        )
+
+    def test_the_recognised_events_are_derived_from_the_status_map(self):
+        """One declaration governs both recognition and outcome.
+
+        ``REVOKING_EVENTS`` is the keys of the status map rather than a
+        second list beside it, so a notification cannot be recognised
+        without an outcome or given an outcome without being recognised.
+        """
+        assert subscriptions_module.REVOKING_EVENTS == tuple(
+            subscriptions_module._REVOKED_STATUSES
+        )
+        for event_type in subscriptions_module.REVOKING_EVENTS:
+            assert event_type in subscriptions_module._REVOKED_STATUSES
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "CHECKOUT.PAYMENT-APPROVAL.REVERSED",
+            "PAYMENT.CAPTURE.DECLINED",
+        ],
+    )
+    def test_a_reversal_or_decline_is_recognised_as_revoking(
+        self, event_type
+    ):
+        """Each names a settlement the provider withdrew.
+
+        Both were previously answered as notifications no transition
+        applies to, so a payer whose approval was reversed and a capture
+        the provider declined each kept the entitlement the notification
+        withdrew.
+        """
+        assert event_type in subscriptions_module.REVOKING_EVENTS
+        assert subscriptions_module._REVOKED_STATUSES[event_type] in (
+            subscriptions_module.TERMINAL_STATUSES
+        )
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "CHECKOUT.PAYMENT-APPROVAL.REVERSED",
+            "PAYMENT.CAPTURE.DECLINED",
+        ],
+    )
+    def test_a_reversal_withdraws_the_entitlement_and_the_role(
+        self, client, db, subscriber, event_type
+    ):
+        """The notification closes the window and demotes the account."""
+        open_subscription(client, subscriber)
+        with patch(
+            MODULE + ".capture_order",
+            new=AsyncMock(return_value=capture_response()),
+        ):
+            deliver(client, approved_event())
+        db.expire_all()
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == PLAN.required_role
+        )
+
+        response = deliver(
+            client,
+            revoking_event(event_type),
+            headers=webhook_headers(transmission_id="revoke-1"),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == (
+            subscriptions_module.OUTCOME_PROCESSED
+        )
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == (
+            subscriptions_module._REVOKED_STATUSES[event_type]
+        )
+        assert stored.end_date <= datetime.now(timezone.utc).replace(
+            tzinfo=None
+        ) + timedelta(seconds=5)
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "CHECKOUT.PAYMENT-APPROVAL.REVERSED",
+            "PAYMENT.CAPTURE.DECLINED",
+        ],
+    )
+    def test_a_replayed_reversal_changes_nothing_further(
+        self, client, db, subscriber, event_type
+    ):
+        """The same delivery twice is recorded once and applied once."""
+        open_subscription(client, subscriber)
+        with patch(
+            MODULE + ".capture_order",
+            new=AsyncMock(return_value=capture_response()),
+        ):
+            deliver(client, approved_event())
+
+        headers = webhook_headers(transmission_id="revoke-replay")
+        first = deliver(
+            client, revoking_event(event_type), headers=headers
+        )
+        db.expire_all()
+        settled = db.query(Subscription).one()
+        status_after_first = settled.status
+        end_after_first = settled.end_date
+
+        second = deliver(
+            client, revoking_event(event_type), headers=headers
+        )
+
+        assert first.json()["status"] == (
+            subscriptions_module.OUTCOME_PROCESSED
+        )
+        assert second.status_code == 200
+        assert second.json()["status"] == (
+            subscriptions_module.OUTCOME_DUPLICATE
+        )
+        db.expire_all()
+        stored = db.query(Subscription).one()
+        assert stored.status == status_after_first
+        assert stored.end_date == end_after_first
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == "registered"
+        )
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "CHECKOUT.PAYMENT-APPROVAL.REVERSED",
+            "PAYMENT.CAPTURE.DECLINED",
+        ],
+    )
+    def test_a_reversal_naming_an_unknown_order_changes_nothing(
+        self, client, db, subscriber, event_type
+    ):
+        """A notification for another order leaves this one alone."""
+        open_subscription(client, subscriber)
+        with patch(
+            MODULE + ".capture_order",
+            new=AsyncMock(return_value=capture_response()),
+        ):
+            deliver(client, approved_event())
+        db.expire_all()
+        before = db.query(Subscription).one().status
+
+        response = deliver(
+            client,
+            revoking_event(event_type, order_id="ORDER-NOT-OURS"),
+            headers=webhook_headers(transmission_id="revoke-unknown"),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == (
+            subscriptions_module.OUTCOME_IGNORED
+        )
+        db.expire_all()
+        assert db.query(Subscription).one().status == before
+        assert (
+            db.query(User).filter(User.id == subscriber.id).one().role
+            == PLAN.required_role
         )
 
     def test_the_terminal_statuses_are_the_revoked_ones(self):
@@ -2372,11 +2621,14 @@ class TestOutboundCallsDoNotBlockTheEventLoop:
 class TestProviderResponsesAreBounded:
     """No provider body past the accepted size is read into memory.
 
-    Every REST helper measures the body before decoding it, so a
-    provider or an intermediary answering with an unbounded body cannot
-    exhaust the process. The declared length is read first, so a body
-    announcing itself as oversized is refused without being parsed at
-    all.
+    Every REST helper streams its response and accumulates the bytes under
+    the cap rather than buffering the whole body first, so a provider or an
+    intermediary answering with an unbounded body cannot exhaust the
+    process -- and cannot do so once per connection in the pool. The
+    declared length is read first, so a body announcing itself as
+    oversized is refused without any of it being read; a body that
+    declares nothing, or under-declares, is stopped as soon as the bytes
+    received pass the cap.
     """
 
     @staticmethod
@@ -2441,10 +2693,10 @@ class TestProviderResponsesAreBounded:
     @pytest.mark.parametrize(
         "call", ["_post", "_read", "_exchange"]
     )
-    def test_a_declared_length_past_the_cap_is_refused_unparsed(
+    def test_a_declared_length_past_the_cap_is_refused_unread(
         self, call
     ):
-        """A body announcing itself as oversized is never parsed."""
+        """A body announcing itself as oversized is never read."""
         response = CountedResponse(
             order_response(),
             declared=paypal_service.MAX_RESPONSE_BYTES + 1,
@@ -2454,23 +2706,73 @@ class TestProviderResponsesAreBounded:
         assert raised.value.category == (
             paypal_service.CATEGORY_MALFORMED_RESPONSE
         )
+        assert response.streamed == 0
+        assert response.decoded == 0
+
+    @pytest.mark.parametrize(
+        "call", ["_post", "_read", "_exchange"]
+    )
+    def test_an_under_declared_body_is_stopped_while_it_streams(
+        self, call
+    ):
+        """A body longer than it declares is stopped at the cap.
+
+        The declaration cannot be trusted, so the accumulated bytes are
+        the control. The read stops one chunk past the cap rather than
+        continuing to the end of an unbounded body.
+        """
+        cap = paypal_service.MAX_RESPONSE_BYTES
+        chunk = 64 * 1024
+        response = StubResponse(
+            order_response(),
+            content=b"x" * (cap + 4 * chunk),
+            declared=8,
+            chunk_size=chunk,
+        )
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(getattr(self, call), response)
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
+        assert response.streamed <= cap + chunk
+        assert response.streamed < len(response.content)
         assert response.decoded == 0
 
     def test_a_body_at_the_cap_is_accepted(self):
         """The cap is the largest body accepted, not the first refused."""
+        cap = paypal_service.MAX_RESPONSE_BYTES
+        encoded, expected = padded_body(order_response(), cap)
         response = StubResponse(
-            order_response(),
-            content=b"x" * paypal_service.MAX_RESPONSE_BYTES,
+            expected, content=encoded, chunk_size=32 * 1024
         )
         payload, client = self._run(self._post, response)
-        assert payload == order_response()
+        assert payload == expected
+        assert response.streamed == cap
         assert client.calls == 1
 
+    def test_a_body_one_byte_past_the_cap_is_refused(self):
+        """The first refused body is one byte past the cap."""
+        cap = paypal_service.MAX_RESPONSE_BYTES
+        encoded, expected = padded_body(order_response(), cap + 1)
+        response = StubResponse(
+            expected,
+            content=encoded,
+            declared=StubResponse.NO_LENGTH,
+            chunk_size=32 * 1024,
+        )
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(self._post, response)
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
+        assert response.decoded == 0
+
     def test_an_unmeasurable_body_is_still_decoded(self):
-        """A body declaring no length and carrying no bytes still reads."""
+        """A body declaring no length is accumulated and read."""
         response = UnmeasuredResponse(order_response())
         payload, client = self._run(self._post, response)
         assert payload == order_response()
+        assert response.streamed == len(response.content)
         assert client.calls == 1
 
     def test_a_refusal_names_the_reason_and_the_cap(self):
@@ -2501,12 +2803,629 @@ class TestProviderResponsesAreBounded:
             paypal_service.MAX_RESPONSE_BYTES + 2
         )
 
+    def test_no_refusal_record_carries_any_of_the_body(self):
+        """A refusal names sizes, never bytes."""
+        marker = "s3cret-body-marker"
+        cap = paypal_service.MAX_RESPONSE_BYTES
+        response = StubResponse(
+            order_response(),
+            content=marker.encode("utf-8") + b"x" * (cap + 1),
+            declared=StubResponse.NO_LENGTH,
+            chunk_size=32 * 1024,
+        )
+        with patch.object(paypal_service.logger, "error") as noted:
+            with pytest.raises(paypal_service.PayPalAPIError):
+                self._run(self._post, response)
+        rendered = repr(noted.call_args_list)
+        assert marker not in rendered
+
+    def test_every_helper_streams_rather_than_buffering(self):
+        """No helper awaits a fully buffered response."""
+        for name in ("_post_json", "_get_json", "_exchange_credentials"):
+            source = inspect.getsource(getattr(paypal_service, name))
+            assert "client.stream(" in source
+            assert "_bounded_body(response" in source
+            assert "await client.post(" not in source
+            assert "await client.request(" not in source
+
     def test_no_provider_body_is_decoded_before_it_is_measured(self):
         """Every helper reaches the decoder through the measured path."""
         for name in ("_post_json", "_get_json", "_exchange_credentials"):
             source = inspect.getsource(getattr(paypal_service, name))
             assert "_decoded_object(response" in source
             assert "response.json()" not in source
+
+    def test_every_helper_reads_through_the_bounded_reader(self):
+        """No helper calls the transport directly.
+
+        Calling the client's own method would buffer the whole body before
+        anything measured it, which is what the bounded reader exists to
+        prevent, so the source is asserted rather than only the outcome.
+        """
+        for name in ("_post_json", "_get_json", "_exchange_credentials"):
+            source = inspect.getsource(getattr(paypal_service, name))
+            # Either bounded reader satisfies the claim: _bounded_body()
+            # accumulates an already-opened stream under the cap, and
+            # _read_bounded() opens the stream itself under the same cap.
+            assert (
+                "_bounded_body(" in source or "_read_bounded(" in source
+            ), name
+            assert "client.post(" not in source
+            assert "client.request(" not in source
+
+
+class TestProviderRecordsCarryBothSidesOfTheJoin:
+    """One record names the local request and the provider case.
+
+    A provider support case is opened with the provider's own debug
+    identifier, and a local investigation starts from the request
+    identifier. A record carrying only one of the two leaves the join to be
+    guessed from timestamps, so the completion record, the read record and
+    the failure record each carry the provider order alongside the
+    identifier the logger binds.
+    """
+
+    @staticmethod
+    def _run(coroutine_factory, response, request_id="req-join-1"):
+        """Awaits the factory with ``response`` stood in and an id bound."""
+        import asyncio
+
+        client = BoundedClient(response)
+        token = bind_request_id(request_id)
+
+        async def run():
+            paypal_service.reset_access_token_cache()
+            with patch(SERVICE + "._client", new=stub_client(client)), patch(
+                SERVICE + "._bearer_credential",
+                new=AsyncMock(return_value="bearer-token"),
+            ):
+                return await coroutine_factory()
+
+        try:
+            return asyncio.get_event_loop().run_until_complete(run())
+        finally:
+            reset_request_id(token)
+            paypal_service.reset_access_token_cache()
+
+    @staticmethod
+    def _extras(recorded):
+        """Returns the extras of every record the patch captured."""
+        return [
+            call.kwargs["extra"]
+            for call in recorded.call_args_list
+            if "extra" in call.kwargs
+        ]
+
+    def test_the_field_is_named_once(self):
+        assert paypal_service.PROVIDER_ORDER_FIELD == "provider_order_id"
+
+    def test_a_read_records_the_order_it_was_about(self):
+        response = StubResponse(order_response())
+
+        with patch.object(paypal_service.logger, "debug") as noted:
+            self._run(
+                lambda: paypal_service.fetch_order(ORDER_ID), response
+            )
+
+        carried = [
+            extra
+            for extra in self._extras(noted)
+            if extra.get(paypal_service.PROVIDER_ORDER_FIELD) == ORDER_ID
+        ]
+        assert carried
+
+    def test_a_failed_read_records_the_order_it_was_about(self):
+        import httpx
+
+        class Refusing(StubResponse):
+            """A response whose status check raises, as httpx's does."""
+
+            def raise_for_status(self):
+                raise httpx.HTTPStatusError(
+                    "server error",
+                    request=httpx.Request("GET", "https://x/y"),
+                    response=httpx.Response(500),
+                )
+
+        with patch.object(paypal_service.logger, "error") as noted:
+            with pytest.raises(paypal_service.PayPalAPIError):
+                self._run(
+                    lambda: paypal_service.fetch_order(ORDER_ID),
+                    Refusing(order_response()),
+                )
+
+        carried = [
+            extra
+            for extra in self._extras(noted)
+            if extra.get(paypal_service.PROVIDER_ORDER_FIELD) == ORDER_ID
+        ]
+        assert carried
+
+    def test_the_local_identifier_reaches_the_same_record(self):
+        """The logger adds the bound identifier, so one record has both.
+
+        The record is rendered through the real formatter rather than
+        inspected as keyword arguments, because the rendered line is what
+        an operator joins on.
+        """
+        import io
+        import json
+        import logging
+
+        from backend.app.core.logging import (
+            RedactingFilter,
+            RedactingJsonFormatter,
+        )
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(RedactingJsonFormatter())
+        handler.addFilter(RedactingFilter())
+        service_logger = paypal_service.logger
+        previous = list(service_logger.handlers)
+        propagated = service_logger.propagate
+        service_logger.handlers = [handler]
+        service_logger.propagate = False
+        service_logger.setLevel(logging.DEBUG)
+        try:
+            self._run(
+                lambda: paypal_service.fetch_order(ORDER_ID),
+                StubResponse(order_response()),
+                request_id="req-join-2",
+            )
+        finally:
+            service_logger.handlers = previous
+            service_logger.propagate = propagated
+
+        joined = []
+        for line in stream.getvalue().splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            context = entry.get("context") or {}
+            if (
+                context.get("request_id") == "req-join-2"
+                and context.get(paypal_service.PROVIDER_ORDER_FIELD)
+                == ORDER_ID
+            ):
+                joined.append(entry)
+
+        assert joined
+
+
+class TestTheReadStopsAtTheCap:
+    """A body past the cap is abandoned mid-transfer, not buffered.
+
+    The cases above measure a response that has already been received. The
+    cases here drive the reader against a real transport, so the question
+    they answer is different: how much of an oversized body reaches this
+    process before the read gives up. A reader that buffered first and
+    measured afterwards would pass every case above while still holding
+    the whole body, which is the defect these cases close.
+
+    The transport is a real client over
+    :class:`httpx.MockTransport`, so the streaming path runs rather than
+    the direct-call path a test double takes.
+    """
+
+    CHUNK_BYTES = 65536
+
+    def _chunks_beyond_the_cap(self):
+        """Returns how many chunks carry the cap, plus a margin."""
+        return (
+            paypal_service.MAX_RESPONSE_BYTES // self.CHUNK_BYTES
+        ) + 4
+
+    def _read(self, handler):
+        """Returns the response the bounded reader produces for ``handler``."""
+        import asyncio
+
+        import httpx
+
+        async def run():
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                assert hasattr(client, "stream")
+                return await paypal_service._read_bounded(
+                    client,
+                    "GET",
+                    "https://api-m.sandbox.paypal.com/v2/checkout/orders",
+                    operation="fetch_order",
+                )
+
+        return asyncio.get_event_loop().run_until_complete(run())
+
+    def _streaming_handler(self, served, total_chunks):
+        """Returns a handler streaming ``total_chunks`` chunks."""
+        import httpx
+
+        def handler(request):
+            async def body():
+                for _ in range(total_chunks):
+                    served.append(1)
+                    yield b"y" * self.CHUNK_BYTES
+
+            return httpx.Response(
+                200,
+                content=body(),
+                headers={paypal_service.DEBUG_ID_HEADER: "DBG-STREAM"},
+            )
+
+        return handler
+
+    def test_a_body_within_the_cap_is_read_and_decoded(self):
+        """The bounded read is transparent for a normal response."""
+        import httpx
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                json=order_response(),
+                headers={paypal_service.DEBUG_ID_HEADER: "DBG-SMALL"},
+            )
+
+        response = self._read(handler)
+
+        assert response.status_code == 200
+        assert response.json() == order_response()
+        assert paypal_service._debug_id(response) == "DBG-SMALL"
+
+    def test_an_oversized_body_stops_the_transfer_early(self):
+        """The read gives up before the provider finishes sending."""
+        served = []
+        total = self._chunks_beyond_the_cap()
+
+        response = self._read(self._streaming_handler(served, total))
+
+        assert len(response.content) == (
+            paypal_service.MAX_RESPONSE_BYTES + 1
+        )
+        assert len(served) < total
+        assert len(served) * self.CHUNK_BYTES < (
+            total * self.CHUNK_BYTES
+        )
+
+    def test_the_bytes_held_are_one_past_the_cap_not_the_whole_body(self):
+        """What is kept is the smallest amount that proves the refusal."""
+        served = []
+        total = self._chunks_beyond_the_cap()
+
+        response = self._read(self._streaming_handler(served, total))
+
+        assert len(response.content) < total * self.CHUNK_BYTES
+        assert len(response.content) > (
+            paypal_service.MAX_RESPONSE_BYTES
+        )
+
+    def test_the_held_body_is_then_refused_by_the_decoder(self):
+        """The truncated body is refused rather than parsed."""
+        served = []
+        response = self._read(
+            self._streaming_handler(served, self._chunks_beyond_the_cap())
+        )
+
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            paypal_service._decoded_object(
+                response, "fetch_order", response.content
+            )
+
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
+
+    def test_a_declared_oversized_length_reads_no_chunk_at_all(self):
+        """A transfer announcing itself oversized is refused unread."""
+        import httpx
+
+        served = []
+
+        def handler(request):
+            async def body():
+                served.append(1)
+                yield b"y" * self.CHUNK_BYTES
+
+            return httpx.Response(
+                200,
+                content=body(),
+                headers={
+                    paypal_service.CONTENT_LENGTH_HEADER: str(
+                        paypal_service.MAX_RESPONSE_BYTES + 1
+                    ),
+                    paypal_service.DEBUG_ID_HEADER: "DBG-DECLARED",
+                },
+            )
+
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._read(handler)
+
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
+        assert raised.value.debug_id == "DBG-DECLARED"
+        assert served == []
+
+    def test_the_reconstructed_response_carries_the_provider_metadata(self):
+        """Status, debug identifier and request survive the read."""
+        import httpx
+
+        def handler(request):
+            return httpx.Response(
+                404,
+                json={"name": "RESOURCE_NOT_FOUND"},
+                headers={paypal_service.DEBUG_ID_HEADER: "DBG-META"},
+            )
+
+        response = self._read(handler)
+
+        assert response.status_code == 404
+        assert paypal_service._debug_id(response) == "DBG-META"
+        assert response.request is not None
+
+    def test_a_double_exposing_no_stream_is_called_directly(self):
+        """A client without a stream method still answers.
+
+        The suite's own doubles expose only the verb methods, so the
+        reader falls back to calling them. Without that fallback every
+        payment case would have to grow a streaming double.
+        """
+        import asyncio
+
+        class Double:
+            def __init__(self):
+                self.calls = []
+
+            async def get(self, url, **kwargs):
+                self.calls.append(("get", url))
+                return StubResponse(order_response())
+
+        double = Double()
+
+        async def run():
+            return await paypal_service._read_bounded(
+                double, "GET", "https://x/y", operation="fetch_order"
+            )
+
+        response = asyncio.get_event_loop().run_until_complete(run())
+
+        assert response.json() == order_response()
+        assert double.calls == [("get", "https://x/y")]
+
+
+class TestTheBoundHoldsAgainstTheRealClient:
+    """The cap holds against ``httpx`` itself, not only a stand-in.
+
+    The cases above install a stand-in in place of the client. These drive
+    a real ``httpx.AsyncClient`` over a mock transport, so the streaming
+    call, the chunked read, the status check and the error classification
+    are the library's own.
+    """
+
+    @staticmethod
+    def _run(coroutine_factory, handler):
+        """Awaits ``coroutine_factory`` against a real client."""
+        import asyncio
+
+        import httpx
+
+        served = {"requests": 0}
+
+        def respond(request):
+            served["requests"] += 1
+            return handler(request)
+
+        async def run():
+            paypal_service.reset_access_token_cache()
+            client = httpx.AsyncClient(
+                transport=httpx.MockTransport(respond)
+            )
+
+            @asynccontextmanager
+            async def lend():
+                yield client
+
+            try:
+                with patch(SERVICE + "._client", new=lend), patch(
+                    SERVICE + "._bearer_credential",
+                    new=AsyncMock(return_value="bearer-token"),
+                ):
+                    return await coroutine_factory()
+            finally:
+                await client.aclose()
+
+        try:
+            return (
+                asyncio.get_event_loop().run_until_complete(run()),
+                served,
+            )
+        finally:
+            paypal_service.reset_access_token_cache()
+
+    @staticmethod
+    def _post():
+        return paypal_service._post_json(
+            "/v2/checkout/orders", {}, operation="create_order"
+        )
+
+    def test_a_real_oversized_stream_is_refused(self):
+        """An unbounded chunked body is stopped by the accumulator."""
+        import httpx
+
+        cap = paypal_service.MAX_RESPONSE_BYTES
+        chunk = b"x" * (64 * 1024)
+        pieces = (cap // len(chunk)) + 8
+        sent = {"pieces": 0}
+
+        async def unbounded():
+            for _ in range(pieces):
+                sent["pieces"] += 1
+                yield chunk
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/json"},
+                content=unbounded(),
+            )
+
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(self._post, handler)
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
+        assert sent["pieces"] < pieces
+
+    def test_a_real_declared_length_past_the_cap_is_refused(self):
+        """A declaration past the cap is refused before the read."""
+        import httpx
+
+        cap = paypal_service.MAX_RESPONSE_BYTES
+        read = {"bytes": 0}
+
+        async def stream():
+            read["bytes"] += 8
+            yield b"x" * 8
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(cap + 1),
+                },
+                content=stream(),
+            )
+
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(self._post, handler)
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
+        assert read["bytes"] == 0
+
+    def test_a_real_body_within_the_cap_is_decoded(self):
+        """A body under the cap streams through and decodes."""
+        import httpx
+
+        expected = order_response()
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                json=expected,
+                headers={"PayPal-Debug-Id": "DBG-1"},
+            )
+
+        payload, served = self._run(self._post, handler)
+        assert payload == expected
+        assert served["requests"] == 1
+
+    def test_a_real_failure_still_carries_its_issue_code(self):
+        """The bounded error body is what the issue code is read from."""
+        import httpx
+
+        def handler(request):
+            return httpx.Response(
+                422,
+                json={
+                    "name": "UNPROCESSABLE_ENTITY",
+                    "details": [{"issue": "INSTRUMENT_DECLINED"}],
+                },
+                headers={"PayPal-Debug-Id": "DBG-2"},
+            )
+
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(self._post, handler)
+        assert raised.value.status_code == 422
+        assert raised.value.issue == "INSTRUMENT_DECLINED"
+        assert raised.value.debug_id == "DBG-2"
+
+    def test_a_streamed_failure_body_still_carries_its_issue_code(self):
+        """A streamed error body is read once, and that read is the one.
+
+        A streamed response holds no buffered content, so the issue code
+        can only come from the bytes the bounded read already accumulated.
+        Reading the response a second time would yield nothing.
+        """
+        import httpx
+
+        async def stream():
+            yield b'{"name": "UNPROCESSABLE_ENTITY", "details": '
+            yield b'[{"issue": "INSTRUMENT_DECLINED"}]}'
+
+        def handler(request):
+            return httpx.Response(
+                422,
+                headers={
+                    "Content-Type": "application/json",
+                    "PayPal-Debug-Id": "DBG-4",
+                },
+                content=stream(),
+            )
+
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(self._post, handler)
+        assert raised.value.status_code == 422
+        assert raised.value.issue == "INSTRUMENT_DECLINED"
+        assert raised.value.debug_id == "DBG-4"
+
+    def test_a_real_failure_body_past_the_cap_yields_no_issue_code(self):
+        """A refused error body contributes no issue code.
+
+        The status still classifies the failure, so the caller keeps the
+        provider status and the debug identifier; only the issue code,
+        which would have required reading the refused body, is absent.
+        """
+        import httpx
+
+        cap = paypal_service.MAX_RESPONSE_BYTES
+
+        async def stream():
+            yield b"{}"
+
+        def handler(request):
+            return httpx.Response(
+                500,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(cap + 1),
+                    "PayPal-Debug-Id": "DBG-3",
+                },
+                content=stream(),
+            )
+
+        with patch.object(paypal_service.logger, "error") as noted:
+            with pytest.raises(paypal_service.PayPalAPIError) as raised:
+                self._run(self._post, handler)
+        assert raised.value.issue is None
+        assert raised.value.status_code == 500
+        assert raised.value.debug_id == "DBG-3"
+        assert raised.value.category == (
+            paypal_service.CATEGORY_PROVIDER_SERVER
+        )
+        reasons = [
+            call.kwargs["extra"].get("reason")
+            for call in noted.call_args_list
+            if "extra" in call.kwargs
+        ]
+        assert paypal_service.REASON_RESPONSE_TOO_LARGE in reasons
+
+    def test_a_real_undecodable_body_is_classified_malformed(self):
+        """A body that is not JSON raises rather than propagating."""
+        import httpx
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/json"},
+                content=b"not json at all",
+            )
+
+        with pytest.raises(paypal_service.PayPalAPIError) as raised:
+            self._run(self._post, handler)
+        assert raised.value.category == (
+            paypal_service.CATEGORY_MALFORMED_RESPONSE
+        )
 
 
 class TestRequestContractStaysPlanOnly:

@@ -37,6 +37,15 @@ keeps the path its own router declares. An unauthenticated liveness
 endpoint is exposed at ``/health``, and error handlers return bodies
 that carry no internal detail.
 
+A readiness endpoint is exposed at :data:`READINESS_PATH`. It reads the
+database, and the work it may perform is bounded four ways: the request
+is counted against ``settings.RATE_LIMIT_READINESS``, one outcome is
+reused for ``settings.READINESS_CACHE_SECONDS``, one caller at a time
+performs the read, and the read is bounded by
+``settings.READINESS_TIMEOUT_SECONDS``. A burst of probes during an
+outage therefore costs one bounded read per window and holds at most one
+connection.
+
 The request identifier is carried on every structured record emitted
 while the request is being served, including the records the outbound
 PayPal calls and the authorization decisions emit, so one transaction is
@@ -70,6 +79,8 @@ Usage::
 import base64
 import hashlib
 import re
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from types import MappingProxyType
@@ -103,17 +114,29 @@ from starlette.responses import Response
 from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from backend.app.core.authorization import audit_failure_count
 from backend.app.core.config import LOCAL_ENVIRONMENT, settings
 from backend.app.core.logging import (
     QUEUE_DRAIN_TIMEOUT_SECONDS,
+    SIGNAL_FIELD,
+    SPAN_ID_FIELD,
+    TRACEPARENT_HEADER,
+    TRACE_ID_FIELD,
     bind_request_id,
+    bind_trace_context,
+    configure_logging,
     current_request_id,
+    current_trace_context,
+    current_traceparent,
     flush_log_queue,
     get_logger,
     is_audited,
     log_audit_fallback,
     log_exception,
+    logging_failure_count,
+    parse_traceparent,
     reset_request_id,
+    reset_trace_context,
     unredacted_handler_names,
 )
 
@@ -132,6 +155,7 @@ __all__ = [
     "DOCUMENTATION_PATHS",
     "DOCUMENTATION_VIEWER_ORIGIN",
     "DOCUMENTATION_WORKER_SOURCE",
+    "HEALTH_PATH",
     "HEALTH_STATUS",
     "INVALID_HOST_DETAIL",
     "INVALID_REQUEST_DETAIL",
@@ -139,6 +163,9 @@ __all__ = [
     "NOT_READY_STATUS",
     "OAUTH2_REDIRECT_PATH",
     "OPENAPI_PATH",
+    "READINESS_BOUND_DIALECTS",
+    "READINESS_BOUND_STATEMENTS",
+    "READINESS_CONCURRENT_MESSAGE",
     "READINESS_FAILURE_MESSAGE",
     "READINESS_PATH",
     "READINESS_STATEMENT",
@@ -147,6 +174,8 @@ __all__ = [
     "REQUEST_ID_FIELD",
     "REQUEST_ID_HEADER",
     "REQUEST_ID_MAX_LENGTH",
+    "SINK_DEGRADED_MESSAGE",
+    "SINK_DEGRADED_SIGNAL",
     "MIN_BODY_MESSAGES",
     "MIN_CHUNK_BYTES",
     "REASON_BYTE_COUNT",
@@ -167,9 +196,16 @@ __all__ = [
     "limiter",
     "rate_limit_exceeded_handler",
     "readiness_check",
+    "readiness_outcome",
+    "reset_readiness_cache",
     "unhandled_exception_handler",
     "validation_exception_handler",
 ]
+
+# The configured level is applied before the first record is emitted, so
+# every record this process writes -- including the ones the assembly
+# below produces -- is filtered at the level the deployment set.
+configure_logging(settings.LOG_LEVEL)
 
 logger = get_logger(__name__)
 
@@ -233,7 +269,14 @@ INVALID_HOST_DETAIL = "Invalid host header"
 
 HEALTH_STATUS = "ok"
 
-#: Path the readiness probe is published at.
+#: Path the liveness probe is published at. It answers as soon as the
+#: process serves requests and reads no dependency, so it reports that the
+#: process is alive rather than that it can serve traffic.
+HEALTH_PATH = "/health"
+
+#: Path the readiness probe is published at. It is prefixed by
+#: :data:`HEALTH_PATH`, so a caller matching on a prefix would reach
+#: either one and the full path is named wherever a probe is configured.
 READINESS_PATH = "/health/ready"
 
 #: Status reported when every dependency the probe reads answered.
@@ -245,8 +288,39 @@ NOT_READY_STATUS = "unavailable"
 #: Statement the readiness probe reads the database with.
 READINESS_STATEMENT = text("SELECT 1")
 
+#: Statements that bound the probe's own transaction on PostgreSQL. Each
+#: calls ``set_config`` with its local flag set, so the bound lasts for
+#: that transaction only and no other caller of the shared engine --
+#: including the Alembic revisions -- inherits it. ``:milliseconds`` is
+#: bound from ``settings.READINESS_TIMEOUT_SECONDS``, and is passed as a
+#: parameter rather than interpolated because ``SET`` accepts no
+#: parameter while ``set_config`` does.
+READINESS_BOUND_STATEMENTS = (
+    text("SELECT set_config('statement_timeout', :milliseconds, true)"),
+    text("SELECT set_config('lock_timeout', :milliseconds, true)"),
+)
+
+#: Dialect names :data:`READINESS_BOUND_STATEMENTS` is issued against.
+READINESS_BOUND_DIALECTS = frozenset(("postgresql",))
+
 #: Message recorded when the readiness probe cannot read the database.
 READINESS_FAILURE_MESSAGE = "readiness probe could not read the database"
+
+#: Message recorded when a record-writing sink this process depends on
+#: has degraded. The readiness probe emits it; the response body carries
+#: the readiness outcome only.
+SINK_DEGRADED_MESSAGE = "A record-writing sink degraded"
+
+#: Value carried on :data:`backend.app.core.logging.SIGNAL_FIELD` of the
+#: degradation record, so an alerting rule can select it by field rather
+#: than by matching the message text.
+SINK_DEGRADED_SIGNAL = "record_sink_degraded"
+#: Message recorded when a probe answers from the last recorded outcome
+#: because another probe already holds the one database read this route
+#: performs at a time.
+READINESS_CONCURRENT_MESSAGE = (
+    "readiness probe answered from the last recorded outcome"
+)
 
 #: Path the interactive documentation is published at.
 DOCS_PATH = "/docs"
@@ -332,6 +406,17 @@ REASON_BYTE_COUNT = "byte_count"
 
 #: Rejection reason: the body message count exceeded its allowance.
 REASON_MESSAGE_COUNT = "message_count"
+
+#: Failures a route raises for a scope it cannot read, such as one
+#: carrying no method or no path, or a candidate that answers no match
+#: call at all. Each is recorded and the candidate skipped. Anything else
+#: propagates, so a caller relying on the match fails closed.
+UNMATCHABLE_ROUTE_ERRORS = (
+    AttributeError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
 
 # Request header carrying the body size the client declares.
 _CONTENT_LENGTH_HEADER = "content-length"
@@ -585,15 +670,38 @@ def _scoped_request_id(request: Request) -> Optional[str]:
     return current_request_id()
 
 
-class RequestIdMiddleware:
-    """Binds an identifier to the request and returns it on the response.
+def _accepted_trace_id(scope: Scope) -> Optional[str]:
+    """Returns the trace the request asks to be correlated with.
 
-    The identifier is taken from :data:`REQUEST_ID_HEADER` when the
-    request supplies an acceptable one and generated otherwise. It is
-    bound for the duration of the request, so every structured record the
-    request produces carries it, is placed on ``request.state`` and is set
-    on :data:`REQUEST_ID_HEADER` of the outgoing response, whatever status
-    that response carries.
+    The value is read from :data:`TRACEPARENT_HEADER` and parsed as W3C
+    trace context. A header that is absent, malformed, carries the
+    invalid version or names an all-zero identifier yields ``None``, and
+    a fresh trace is started instead. Only the trace identifier is
+    adopted: the caller's span identifier is its own and this process
+    mints a new one beneath it.
+    """
+    raw = Headers(scope=scope).get(TRACEPARENT_HEADER)
+    parsed = parse_traceparent(raw)
+    if parsed is None:
+        return None
+    return parsed[0]
+
+
+class RequestIdMiddleware:
+    """Binds the correlation identifiers and returns them on the response.
+
+    The request identifier is taken from :data:`REQUEST_ID_HEADER` when
+    the request supplies an acceptable one and generated otherwise. The
+    trace identifier is taken from :data:`TRACEPARENT_HEADER` when the
+    request carries valid W3C trace context and generated otherwise, and
+    a span identifier is minted for this process's own work either way.
+
+    All three are bound for the duration of the request, so every
+    structured record the request produces carries them, and all three
+    are placed on ``request.state``. :data:`REQUEST_ID_HEADER` and
+    :data:`TRACEPARENT_HEADER` are set on the outgoing response, whatever
+    status that response carries, so a caller can correlate its own
+    records with this process's.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -608,18 +716,27 @@ class RequestIdMiddleware:
 
         request_id = _accepted_request_id(scope) or uuid.uuid4().hex
         token = bind_request_id(request_id)
+        trace_token = bind_trace_context(_accepted_trace_id(scope))
+        traceparent = current_traceparent()
+        context = current_trace_context()
         scope.setdefault("state", {})
         scope["state"][REQUEST_ID_FIELD] = request_id
+        if context is not None:
+            scope["state"][TRACE_ID_FIELD] = context[0]
+            scope["state"][SPAN_ID_FIELD] = context[1]
 
-        async def send_with_request_id(message: Message) -> None:
+        async def send_with_correlation(message: Message) -> None:
             if message["type"] == _RESPONSE_START_MESSAGE:
                 headers = MutableHeaders(scope=message)
                 headers[REQUEST_ID_HEADER] = request_id
+                if traceparent:
+                    headers[TRACEPARENT_HEADER] = traceparent
             await send(message)
 
         try:
-            await self.app(scope, receive, send_with_request_id)
+            await self.app(scope, receive, send_with_correlation)
         finally:
+            reset_trace_context(trace_token)
             reset_request_id(token)
 
 
@@ -768,6 +885,11 @@ def _matched_endpoint(scope: Scope) -> Optional[Callable]:
     """Returns the endpoint the request routes to, or ``None``.
 
     Only a full match, on path and method both, resolves an endpoint.
+
+    A candidate that cannot answer the question is skipped and recorded:
+    :data:`UNMATCHABLE_ROUTE_ERRORS` names the failures a route raises for
+    a scope it cannot read, such as one carrying no method. Any other
+    failure propagates, so the caller fails closed.
     """
     application = scope.get("app")
     if application is None:
@@ -775,7 +897,19 @@ def _matched_endpoint(scope: Scope) -> Optional[Callable]:
     for candidate in getattr(application, "routes", ()):
         try:
             match, _ = candidate.matches(scope)
-        except Exception:
+        except UNMATCHABLE_ROUTE_ERRORS as error:
+            logger.warning(
+                "Route candidate could not be matched",
+                extra={
+                    "path": scope.get("path"),
+                    "method": scope.get("method"),
+                    "candidate": getattr(
+                        candidate, "name", type(candidate).__name__
+                    ),
+                    "candidate_type": type(candidate).__name__,
+                    "error": type(error).__name__,
+                },
+            )
             continue
         if match == Match.FULL:
             endpoint = getattr(candidate, "endpoint", None)
@@ -993,16 +1127,21 @@ async def unhandled_exception_handler(
 
     The response carries no exception text, no traceback and no
     identifier of the code that raised. The error itself is recorded
-    through the redacting logger. This handler runs outside the
-    middleware stack, so it sets :data:`SECURITY_HEADERS` and the
-    cross-origin headers of :func:`_cors_headers` on the response it
-    builds.
+    through the redacting logger as its class, the module that defines
+    it, the route and method that reached it and the request identifier
+    that correlates the two; ``exception_message`` is suppressed, so no
+    message text travels with the record. The formatted traceback is
+    still emitted at ``DEBUG``, which production levels suppress. This
+    handler runs outside the middleware stack, so it sets
+    :data:`SECURITY_HEADERS` and the cross-origin headers of
+    :func:`_cors_headers` on the response it builds.
     """
     request_id = _scoped_request_id(request)
     log_exception(
         logger,
         "Unhandled application error",
         exc,
+        exception_message=None,
         path=request.scope.get("path"),
         method=request.scope.get("method"),
         request_id=request_id,
@@ -1118,28 +1257,179 @@ app.add_middleware(RequestIdMiddleware)
 app.include_router(api_router)
 
 
-@app.get("/health")
+#: Guards the recorded outcome below, for the length of one assignment
+#: or one read.
+_readiness_state_lock = threading.Lock()
+
+#: Guards the one database read the readiness route performs at a time.
+#: It is held for the length of that read and is never held while
+#: :data:`_readiness_state_lock` is.
+_readiness_probe_lock = threading.Lock()
+
+#: The last recorded readiness outcome and the monotonic instant it stops
+#: being reused, or ``None`` while no outcome has been recorded.
+_readiness_cache: Optional[Tuple[bool, float]] = None
+
+
+def reset_readiness_cache() -> None:
+    """Discards the recorded readiness outcome.
+
+    The next call to :func:`readiness_outcome` reads the database again.
+    """
+    global _readiness_cache
+    with _readiness_state_lock:
+        _readiness_cache = None
+
+
+def _recorded_readiness() -> Optional[Tuple[bool, float]]:
+    """Returns the recorded outcome and its expiry, or ``None``."""
+    with _readiness_state_lock:
+        return _readiness_cache
+
+
+def _record_readiness(ready: bool) -> None:
+    """Records one outcome and the instant it stops being reused."""
+    global _readiness_cache
+    expiry = time.monotonic() + settings.READINESS_CACHE_SECONDS
+    with _readiness_state_lock:
+        _readiness_cache = (ready, expiry)
+
+
+def _reusable_readiness() -> Optional[bool]:
+    """Returns the recorded outcome while it may still be reused."""
+    recorded = _recorded_readiness()
+    if recorded is not None and time.monotonic() < recorded[1]:
+        return recorded[0]
+    return None
+
+
+def _bound_readiness_transaction(db: Session) -> None:
+    """Bounds the probe's own transaction where the dialect supports it.
+
+    Each bound is set with its local flag, so it applies to this
+    transaction alone and no other user of the shared engine inherits it.
+    A dialect outside :data:`READINESS_BOUND_DIALECTS` is left alone.
+    """
+    if db.get_bind().dialect.name not in READINESS_BOUND_DIALECTS:
+        return
+    milliseconds = str(int(settings.READINESS_TIMEOUT_SECONDS * 1000))
+    for statement in READINESS_BOUND_STATEMENTS:
+        db.execute(statement, {"milliseconds": milliseconds})
+
+
+def _read_database(db: Session) -> bool:
+    """Reads :data:`READINESS_STATEMENT` under a bounded transaction."""
+    try:
+        _bound_readiness_transaction(db)
+        db.execute(READINESS_STATEMENT)
+    except Exception as error:
+        log_exception(logger, READINESS_FAILURE_MESSAGE, error)
+        return False
+    finally:
+        try:
+            db.rollback()
+        except Exception as error:  # pragma: no cover - driver dependent
+            log_exception(logger, READINESS_FAILURE_MESSAGE, error)
+    return True
+
+
+def readiness_outcome(db: Session) -> bool:
+    """Returns whether the database answered, reading it at most once.
+
+    A recorded outcome younger than ``settings.READINESS_CACHE_SECONDS``
+    is returned without touching the database, so a burst of probes costs
+    one read rather than one read each. The session is opened lazily, so a
+    reused outcome checks out no connection at all.
+
+    Only one caller performs the read. A caller arriving while that read
+    is in flight answers from the last recorded outcome, and refuses when
+    there is none, so the number of connections this route holds never
+    exceeds one however many callers arrive.
+    """
+    reusable = _reusable_readiness()
+    if reusable is not None:
+        return reusable
+
+    if not _readiness_probe_lock.acquire(blocking=False):
+        logger.warning(READINESS_CONCURRENT_MESSAGE)
+        recorded = _recorded_readiness()
+        return recorded[0] if recorded is not None else False
+
+    try:
+        reusable = _reusable_readiness()
+        if reusable is not None:
+            return reusable
+        ready = _read_database(db)
+        _record_readiness(ready)
+    finally:
+        _readiness_probe_lock.release()
+    return ready
+
+
+@app.get(HEALTH_PATH)
 def health_check() -> Dict[str, str]:
     """Reports that the process is able to serve requests."""
     return {"status": HEALTH_STATUS}
 
 
+def _report_degraded_sinks() -> None:
+    """Records the counts of records a sink failed to write, if any.
+
+    Two counters are read: the refusals the audit sink rejected, and the
+    records the logging handler could not emit. Each is a count of
+    records this process produced and could not write through its
+    primary sink, so a non-zero value means the evidence trail is
+    incomplete even though the process is serving. When both are zero
+    nothing is recorded.
+
+    The record carries the counts as discrete fields and no request
+    content. It is emitted rather than returned, so the readiness
+    response body is unchanged.
+    """
+    audit_failures = audit_failure_count()
+    emit_failures = logging_failure_count()
+    if not audit_failures and not emit_failures:
+        return
+    logger.warning(
+        SINK_DEGRADED_MESSAGE,
+        extra={
+            SIGNAL_FIELD: SINK_DEGRADED_SIGNAL,
+            "audit_failures": audit_failures,
+            "log_emit_failures": emit_failures,
+        },
+    )
+
+
 @app.get(READINESS_PATH)
+@limiter.limit(settings.RATE_LIMIT_READINESS)
 def readiness_check(
+    request: Request,
     response: Response,
     db: Session = Depends(get_db),
 ) -> Dict[str, str]:
     """Reports whether the database this process reads is reachable.
 
-    Reads one statement through the session dependency and answers
-    ``503`` when it does not complete. The body names the outcome and
-    nothing else, and a failure is recorded through the redacting
-    logger.
+    Answers ``503`` when the database did not answer. The body names the
+    outcome and nothing else, and a failure is recorded through the
+    redacting logger. A sink that failed to write a record is reported on
+    the same path, as a record rather than as a response field.
+
+    The work behind the answer is bounded four ways: the request is
+    counted against ``settings.RATE_LIMIT_READINESS`` at the transport
+    boundary, an outcome is reused for
+    ``settings.READINESS_CACHE_SECONDS`` without reading the database
+    again, only one caller at a time performs that read, and the read
+    itself is bounded by ``settings.READINESS_TIMEOUT_SECONDS``.
+
+    The handler is synchronous, so it runs on a worker thread rather than
+    the event loop, and every wait it can make is bounded by the engine's
+    connect, statement and socket timeouts in
+    :mod:`backend.app.db.database`. Each of those sits below the client
+    timeout a probe waits under, so a probe that gives up leaves no work
+    running on the worker behind it.
     """
-    try:
-        db.execute(READINESS_STATEMENT)
-    except Exception as error:
-        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        log_exception(logger, READINESS_FAILURE_MESSAGE, error)
-        return {"status": NOT_READY_STATUS}
-    return {"status": READINESS_STATUS}
+    _report_degraded_sinks()
+    if readiness_outcome(db):
+        return {"status": READINESS_STATUS}
+    response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"status": NOT_READY_STATUS}

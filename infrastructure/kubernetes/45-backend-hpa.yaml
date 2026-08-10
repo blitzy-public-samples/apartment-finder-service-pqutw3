@@ -1,0 +1,34 @@
+# Replica range the API scales between, and the signal it scales on.
+#
+# The minimum is the same token 40-backend.yaml declares its replica count
+# from, so applying both does not immediately scale the workload down.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: apartment-finder
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: ${BACKEND_REPLICAS}
+  maxReplicas: ${BACKEND_MAX_REPLICAS}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # Seconds of history the controller considers before adding capacity.
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      # A longer window on the way down, so a brief lull does not remove
+      # capacity the next minute needs.
+      stabilizationWindowSeconds: 300

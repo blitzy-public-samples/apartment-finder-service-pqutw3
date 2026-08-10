@@ -12,9 +12,11 @@ The properties covered are:
   :data:`REVISION.ADMIN_EMAIL` provisions that address and grants it
   :data:`REVISION.ADMIN_ROLE`, so the sole administrator afterwards is
   that address
-* the credential the provisioning stores matches no password, is a
-  bcrypt hash of the cost the application configures, and appears in no
-  log record
+* the credential the provisioning stores is
+  :data:`REVISION.LOCKED_CREDENTIAL`, a sentinel that is deliberately
+  **not** a bcrypt hash of any cost, so no candidate can ever match it
+  and the account cannot be signed in to until a password is set outside
+  the revision; and it appears in no log record
 * ``upgrade`` against a database already carrying that address promotes
   it, leaves its stored credential byte-identical, and leaves every
   other account on the role it already held
@@ -31,13 +33,13 @@ The properties covered are:
 * ``downgrade`` returns that one address to
   :data:`REVISION.REGISTERED_ROLE`, deletes no row, and touches no other
   account; a following ``upgrade`` promotes it again
-* the revision is the head of the chain, revises the additive revision,
-  and imports no module of the application
+* the revision sits in the chain ``upgrade head`` reaches, revises the
+  additive revision, and imports no module of the application
 
 The schema each case starts from is built from ``Base.metadata``, and
 only revision ``0002`` is driven against it. The chain itself is
 asserted structurally by
-:func:`test_the_revision_is_the_head_and_revises_the_additive_revision`.
+:func:`test_the_revision_sits_in_the_chain_the_head_reaches`.
 
 Design rationale is recorded in ``docs/security/DECISION_LOG.md``.
 """
@@ -53,7 +55,10 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from conftest import REPO_ROOT, VALID_TEST_PASSWORD
-from backend.tests.support import enforce_sqlite_foreign_keys
+from backend.tests.support import (
+    enforce_sqlite_foreign_keys,
+    migration_records_reach,
+)
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
@@ -74,6 +79,10 @@ REVISION_ID = "0002"
 #: Identifier of the additive revision it follows.
 ADDITIVE_REVISION_ID = "0001"
 
+#: Identifier of the workload-index revision that follows it, which is
+#: the head of the chain.
+INDEX_REVISION_ID = "0003"
+
 #: The revision module under test, loaded through Alembic so the
 #: identifier, the filename and the chain are the ones
 #: ``alembic upgrade head`` would use.
@@ -81,6 +90,9 @@ REVISION = SCRIPT_DIRECTORY.get_revision(REVISION_ID).module
 
 #: Address the revision provisions and promotes.
 TARGET_EMAIL = REVISION.ADMIN_EMAIL
+
+#: Reference the revision records in place of that address.
+TARGET_REFERENCE = REVISION.ADMIN_REFERENCE
 
 #: Role it grants that address.
 ADMIN_ROLE = REVISION.ADMIN_ROLE
@@ -142,6 +154,18 @@ SNAPSHOT_TABLE = sa.table(
 SNAPSHOT_COLUMNS = tuple(
     column.name for column in SNAPSHOT_TABLE.columns
 )
+
+
+@pytest.fixture(autouse=True)
+def _migration_records(caplog):
+    """Route the migration namespace's records to the capture handler.
+
+    The namespace carries the redacting handler and does not propagate,
+    so the handler ``caplog`` installs on the root logger receives none
+    of its records unless it is attached to the namespace itself.
+    """
+    with migration_records_reach(caplog.handler):
+        yield
 
 
 @pytest.fixture
@@ -463,10 +487,16 @@ def test_a_conflicting_administrator_refuses_an_absent_target(
     assert administrators(migration_connection) == [INTRUDER_EMAIL]
 
 
-def test_the_refusal_names_the_count_and_the_target_only(
+def test_the_refusal_names_the_count_and_the_reference_only(
     migration_connection
 ):
-    """Assert the refusal discloses no other account's address."""
+    """Assert the refusal discloses no address at all.
+
+    The raised message reaches an operator's terminal and a deployment
+    log without passing through the redacting handler, so it names the
+    stable account reference rather than the address it stands for, and
+    names no other account either.
+    """
     seed_account(migration_connection, TARGET_EMAIL)
     seed_account(migration_connection, INTRUDER_EMAIL, ADMIN_ROLE)
 
@@ -474,10 +504,22 @@ def test_the_refusal_names_the_count_and_the_target_only(
         run_upgrade(migration_connection)
 
     message = str(raised.value)
-    assert TARGET_EMAIL in message
+    assert TARGET_REFERENCE in message
     assert ADMIN_ROLE in message
     assert "2" in message
+    assert TARGET_EMAIL not in message
     assert INTRUDER_EMAIL not in message
+
+
+def test_the_account_reference_is_stable_and_not_the_address(
+    migration_connection
+):
+    """Assert the reference identifies the account without naming it."""
+    assert TARGET_REFERENCE == REVISION.account_reference(TARGET_EMAIL)
+    assert TARGET_EMAIL not in TARGET_REFERENCE
+    assert len(TARGET_REFERENCE) == REVISION.ACCOUNT_REFERENCE_LENGTH
+    assert TARGET_REFERENCE != REVISION.account_reference(INTRUDER_EMAIL)
+    assert int(TARGET_REFERENCE, 16) >= 0
 
 
 def test_the_provisioning_and_the_grant_are_recorded(
@@ -485,8 +527,9 @@ def test_the_provisioning_and_the_grant_are_recorded(
 ):
     """Assert both records reach the ``alembic`` logger at INFO.
 
-    The rendered messages are asserted to name the address, the role and
-    the resulting count, and to carry no part of the stored credential.
+    The rendered messages are asserted to name the account reference, the
+    role and the resulting count, to name no address, and to carry no
+    part of the stored credential.
     """
     with caplog.at_level(logging.INFO, logger="alembic"):
         run_upgrade(migration_connection)
@@ -498,16 +541,17 @@ def test_the_provisioning_and_the_grant_are_recorded(
     grant = [message for message in messages if "Seeded" in message]
 
     assert len(provisioning) == 1
-    assert TARGET_EMAIL in provisioning[0]
+    assert TARGET_REFERENCE in provisioning[0]
     assert REGISTERED_ROLE in provisioning[0]
 
     assert len(grant) == 1
-    assert TARGET_EMAIL in grant[0]
+    assert TARGET_REFERENCE in grant[0]
     assert ADMIN_ROLE in grant[0]
     assert "administrator count is 1" in grant[0]
 
     stored = stored_account(migration_connection, TARGET_EMAIL)
     for message in messages:
+        assert TARGET_EMAIL not in message
         assert stored["hashed_password"] not in message
         assert EXPECTED_HASH_PREFIX not in message
 
@@ -572,7 +616,7 @@ def test_the_downgrade_leaves_another_administrator_alone(
 
 
 def test_the_downgrade_is_recorded(migration_connection, caplog):
-    """Assert the demotion names the address, role and count."""
+    """Assert the demotion names the reference, role and count."""
     run_upgrade(migration_connection)
 
     with caplog.at_level(logging.INFO, logger="alembic"):
@@ -583,7 +627,8 @@ def test_the_downgrade_is_recorded(migration_connection, caplog):
         message for message in messages if "Returned" in message
     ]
     assert len(demotion) == 1
-    assert TARGET_EMAIL in demotion[0]
+    assert TARGET_REFERENCE in demotion[0]
+    assert TARGET_EMAIL not in demotion[0]
     assert REGISTERED_ROLE in demotion[0]
     assert "administrator count is 0" in demotion[0]
 
@@ -611,9 +656,18 @@ def test_the_round_trip_promotes_the_target_again(
     assert len(snapshot(migration_connection)) == 1
 
 
-def test_the_revision_is_the_head_and_revises_the_additive_revision():
-    """Assert the chain that puts this revision in ``upgrade head``."""
-    assert SCRIPT_DIRECTORY.get_heads() == [REVISION_ID]
+def test_the_revision_sits_in_the_chain_the_head_reaches():
+    """Assert the chain that puts this revision in ``upgrade head``.
+
+    The head is the workload-index revision, which revises this one,
+    which in turn revises the additive revision, so ``upgrade head``
+    applies all three in that order.
+    """
+    assert SCRIPT_DIRECTORY.get_heads() == [INDEX_REVISION_ID]
+    assert (
+        SCRIPT_DIRECTORY.get_revision(INDEX_REVISION_ID).down_revision
+        == REVISION_ID
+    )
     assert (
         SCRIPT_DIRECTORY.get_revision(REVISION_ID).down_revision
         == ADDITIVE_REVISION_ID

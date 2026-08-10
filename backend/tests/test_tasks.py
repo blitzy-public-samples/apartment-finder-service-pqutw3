@@ -12,7 +12,14 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.app.core.logging import flush_log_queue
+from backend.app.core.logging import (
+    REQUEST_ID_FIELD,
+    SPAN_ID_FIELD,
+    TRACE_ID_FIELD,
+    current_request_id,
+    current_trace_context,
+    flush_log_queue,
+)
 from backend.tests.support import enforce_sqlite_foreign_keys
 from backend.app.db.models import Base, Filter, Listing, User, ZipCode
 from backend.app.tasks import listing_updater
@@ -289,6 +296,246 @@ def test_tracked_zip_codes_reads_saved_filters(db, saved_zip_code):
 
 def test_tracked_zip_codes_is_empty_without_a_saved_filter(db):
     assert tracked_zip_codes(db) == []
+
+
+def _seed_zip_codes(db, codes):
+    """Stores one saved filter naming every code in ``codes``."""
+    user = User(
+        email='bulk-ingest@example.com',
+        hashed_password='x',
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(user)
+    db.flush()
+    db.add(
+        Filter(
+            user_id=user.id,
+            name='Bulk filter',
+            created_at=datetime.now(timezone.utc),
+            zip_codes=[ZipCode(code=code) for code in codes],
+        )
+    )
+    db.commit()
+
+
+class TestThePostalCodeInputIsBounded:
+    """No pass reads or sends an unbounded list of postal codes.
+
+    The number of saved filters is caller-controlled and unbounded, so
+    the read is capped and what it read is split into requests of a
+    bounded size. Both bounds are read from settings, so the assertions
+    derive their expected counts from the settings rather than from
+    literals.
+    """
+
+    def test_the_read_stops_at_the_configured_maximum(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listing_updater.settings, 'INGESTION_MAX_ZIP_CODES', 4
+        )
+        _seed_zip_codes(
+            db, ['1000{0}'.format(index) for index in range(9)]
+        )
+
+        codes = tracked_zip_codes(db)
+
+        assert len(codes) == 4
+        assert codes == sorted(codes)
+
+    def test_reaching_the_maximum_is_recorded_once(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listing_updater.settings, 'INGESTION_MAX_ZIP_CODES', 3
+        )
+        _seed_zip_codes(
+            db, ['2000{0}'.format(index) for index in range(7)]
+        )
+
+        with _collected_task_records() as records:
+            tracked_zip_codes(db)
+
+        capped = _record_named(
+            records, listing_updater.ZIP_CODE_CAP_REACHED_MESSAGE
+        )
+        assert capped.__dict__['max_zip_codes'] == 3
+        assert capped.__dict__['setting'] == 'INGESTION_MAX_ZIP_CODES'
+
+    def test_a_read_below_the_maximum_records_nothing(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listing_updater.settings, 'INGESTION_MAX_ZIP_CODES', 50
+        )
+        _seed_zip_codes(db, ['30001', '30002'])
+
+        with _collected_task_records() as records:
+            assert tracked_zip_codes(db) == ['30001', '30002']
+
+        assert [
+            record
+            for record in records
+            if record.getMessage()
+            == listing_updater.ZIP_CODE_CAP_REACHED_MESSAGE
+        ] == []
+
+    @pytest.mark.parametrize('total', [0, 1, 5, 6, 7, 12])
+    def test_every_chunk_stays_within_the_configured_size(
+        self, monkeypatch, total
+    ):
+        monkeypatch.setattr(
+            listing_updater.settings, 'INGESTION_ZIP_CODE_CHUNK', 3
+        )
+        codes = ['4000{0}'.format(index) for index in range(total)]
+
+        chunks = listing_updater.zip_code_chunks(codes)
+
+        assert sum(len(chunk) for chunk in chunks) == total
+        assert [code for chunk in chunks for code in chunk] == codes
+        for chunk in chunks:
+            assert 1 <= len(chunk) <= 3
+
+    @pytest.mark.asyncio
+    async def test_one_provider_request_is_issued_per_chunk(
+        self, mock_db_session, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listing_updater.settings, 'INGESTION_ZIP_CODE_CHUNK', 2
+        )
+        codes = ['5000{0}'.format(index) for index in range(5)]
+
+        with patch(
+            TASK_MODULE + '.SessionLocal', return_value=mock_db_session
+        ):
+            with patch(
+                TASK_MODULE + '.tracked_zip_codes', return_value=codes
+            ):
+                with patch(
+                    TASK_MODULE + '.fetch_listings', return_value=[]
+                ) as mock_fetch:
+                    await update_listings()
+
+        assert mock_fetch.call_count == 3
+        sent = [call.args[0] for call in mock_fetch.call_args_list]
+        assert [len(chunk) for chunk in sent] == [2, 2, 1]
+        assert [code for chunk in sent for code in chunk] == codes
+        assert mock_db_session.commit.call_count == 1
+
+
+class TestReconciliationReadsOneStatementPerChunk:
+    """The number of read statements follows chunks, not records."""
+
+    @pytest.mark.asyncio
+    async def test_one_identity_read_serves_a_whole_chunk(
+        self, session_factory, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listing_updater.settings, 'INGESTION_ZIP_CODE_CHUNK', 50
+        )
+        payload = [
+            _provider_listing(
+                listing_url='https://www.zillow.com/homedetails/{0}'.format(
+                    index
+                )
+            )
+            for index in range(6)
+        ]
+        reads = []
+        original = listing_updater._existing_by_identity
+
+        def recording(db, identities):
+            reads.append(list(identities))
+            return original(db, identities)
+
+        with patch(TASK_MODULE + '.SessionLocal', session_factory):
+            with patch(
+                TASK_MODULE + '.tracked_zip_codes', return_value=[ZIP_CODE]
+            ):
+                with patch(
+                    TASK_MODULE + '.fetch_listings', return_value=payload
+                ):
+                    monkeypatch.setattr(
+                        listing_updater,
+                        '_existing_by_identity',
+                        recording,
+                    )
+                    await update_listings()
+
+        assert len(reads) == 1
+        assert len(reads[0]) == 6
+
+        session = session_factory()
+        try:
+            assert session.query(Listing).count() == 6
+        finally:
+            session.close()
+
+    def test_the_read_resolves_each_identity_to_its_earliest_row(
+        self, db
+    ):
+        moment = datetime.now(timezone.utc)
+        for _ in range(2):
+            db.add(
+                Listing(
+                    created_at=moment,
+                    updated_at=moment,
+                    rent=2400.0,
+                    zillow_url=LISTING_URL,
+                )
+            )
+        db.add(
+            Listing(
+                created_at=moment,
+                updated_at=moment,
+                rent=1800.0,
+                zillow_url=SECOND_LISTING_URL,
+            )
+        )
+        db.commit()
+
+        found = listing_updater._existing_by_identity(
+            db, [LISTING_URL, SECOND_LISTING_URL, 'absent']
+        )
+
+        stored = (
+            db.query(Listing)
+            .filter(Listing.zillow_url == LISTING_URL)
+            .order_by(Listing.id)
+            .all()
+        )
+        assert found[LISTING_URL].id == stored[0].id
+        assert set(found) == {LISTING_URL, SECOND_LISTING_URL}
+
+    def test_an_empty_identity_list_reads_nothing(self, db):
+        assert listing_updater._existing_by_identity(db, []) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_repeated_identity_inside_one_chunk_stores_one_row(
+        self, session_factory
+    ):
+        """The second copy refreshes the row the first copy wrote."""
+        payload = [
+            _provider_listing(price=2400),
+            _provider_listing(price=2600),
+        ]
+
+        with patch(TASK_MODULE + '.SessionLocal', session_factory):
+            with patch(
+                TASK_MODULE + '.tracked_zip_codes', return_value=[ZIP_CODE]
+            ):
+                with patch(
+                    TASK_MODULE + '.fetch_listings', return_value=payload
+                ):
+                    await update_listings()
+
+        session = session_factory()
+        try:
+            rows = session.query(Listing).all()
+            assert len(rows) == 1
+            assert rows[0].rent == 2600
+        finally:
+            session.close()
 
 
 @pytest.mark.asyncio
@@ -652,3 +899,109 @@ async def test_the_event_loop_runs_while_the_provider_is_waiting(
             )
 
     assert release_observed == [True]
+
+
+@pytest.mark.asyncio
+async def test_every_record_of_one_pass_shares_a_run_identifier(
+    session_factory, saved_zip_code
+):
+    """One pass binds one identifier and one trace to all its records.
+
+    A scheduled pass answers no request, so without an identifier of its
+    own its records carry nothing to group them by: two passes running
+    minutes apart are indistinguishable in the log, and a failure cannot
+    be tied to the pass that produced it. The identifier is prefixed, so a
+    pass is never mistaken for a request.
+    """
+    with _collected_task_records() as records:
+        with patch(TASK_MODULE + '.SessionLocal', session_factory):
+            with patch(TASK_MODULE + '.fetch_listings') as fetch:
+                fetch.return_value = [_provider_listing()]
+                await update_listings()
+
+    assert records
+    identifiers = {
+        getattr(record, REQUEST_ID_FIELD, None) for record in records
+    }
+    assert len(identifiers) == 1
+    run_id = identifiers.pop()
+    assert run_id
+    assert run_id.startswith(listing_updater.RUN_ID_PREFIX)
+
+    traces = {getattr(record, TRACE_ID_FIELD, None) for record in records}
+    assert len(traces) == 1
+    assert traces.pop()
+    spans = {getattr(record, SPAN_ID_FIELD, None) for record in records}
+    assert len(spans) == 1
+    assert spans.pop()
+
+
+@pytest.mark.asyncio
+async def test_two_passes_carry_two_run_identifiers(
+    session_factory, saved_zip_code
+):
+    """Consecutive passes are told apart by their identifiers."""
+    collected = []
+    for _ in range(2):
+        with _collected_task_records() as records:
+            with patch(TASK_MODULE + '.SessionLocal', session_factory):
+                with patch(TASK_MODULE + '.fetch_listings') as fetch:
+                    fetch.return_value = []
+                    await update_listings()
+        assert records
+        collected.append(
+            getattr(records[0], REQUEST_ID_FIELD, None)
+        )
+
+    assert all(collected)
+    assert collected[0] != collected[1]
+
+
+@pytest.mark.asyncio
+async def test_the_identifiers_are_unbound_after_a_pass(
+    session_factory, saved_zip_code
+):
+    """Nothing a pass bound survives it, on the failing path too."""
+    with patch(TASK_MODULE + '.SessionLocal', session_factory):
+        with patch(TASK_MODULE + '.fetch_listings') as fetch:
+            fetch.return_value = []
+            await update_listings()
+
+    assert current_request_id() is None
+    assert current_trace_context() is None
+
+    with patch(TASK_MODULE + '.SessionLocal', session_factory):
+        with patch(
+            TASK_MODULE + '.fetch_listings',
+            side_effect=RuntimeError('provider down'),
+        ):
+            await update_listings()
+
+    assert current_request_id() is None
+    assert current_trace_context() is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_pass_records_under_its_run_identifier(
+    session_factory, saved_zip_code
+):
+    """A failure is correlated with the pass that produced it."""
+    with _collected_task_records() as records:
+        with patch(TASK_MODULE + '.SessionLocal', session_factory):
+            with patch(
+                TASK_MODULE + '.fetch_listings',
+                side_effect=RuntimeError('provider down'),
+            ):
+                await update_listings()
+
+    failures = [
+        record
+        for record in records
+        if record.getMessage() == INGESTION_FAILED_MESSAGE
+    ]
+    assert failures
+    for record in failures:
+        run_id = getattr(record, REQUEST_ID_FIELD, None)
+        assert run_id
+        assert run_id.startswith(listing_updater.RUN_ID_PREFIX)
+        assert getattr(record, TRACE_ID_FIELD, None)

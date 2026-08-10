@@ -1,11 +1,29 @@
 from sqlalchemy import (
-    Column, Integer, String, Float, DateTime, ForeignKey, Numeric,
+    Column, Index, Integer, String, Float, DateTime, ForeignKey, Numeric,
     UniqueConstraint, func, text,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
+
+#: Names of the non-unique indexes these models declare, each supporting
+#: a predicate the application issues. Revision
+#: ``0003_add_workload_indexes`` creates the same set under the same
+#: names, so the mapped tables and the migrated tables agree.
+#:
+#: A column already covered by a uniqueness -- ``users.email``,
+#: ``subscriptions.paypal_order_id`` and
+#: ``webhook_events.transmission_id`` -- carries an index from that
+#: uniqueness and is not listed again here.
+WORKLOAD_INDEX_NAMES = (
+    "ix_filters_user_id_id",
+    "ix_zip_codes_filter_id",
+    "ix_criteria_filter_id",
+    "ix_subscriptions_user_id_status_end_date",
+    "ix_subscriptions_user_id_plan_id_status",
+    "ix_listings_zillow_url",
+)
 
 
 class User(Base):
@@ -30,6 +48,11 @@ class User(Base):
 
 class Listing(Base):
     __tablename__ = 'listings'
+    # The index over the provider address is non-unique, so it supports
+    # the reconciliation lookup without refusing a repeated address.
+    __table_args__ = (
+        Index("ix_listings_zillow_url", "zillow_url"),
+    )
 
     id = Column(Integer, primary_key=True)
     created_at = Column(DateTime, nullable=False)
@@ -52,6 +75,11 @@ class Listing(Base):
 
 class Filter(Base):
     __tablename__ = 'filters'
+    # Supports the owner-scoped page the filters endpoint reads, whose
+    # predicate is user_id and whose order and offset follow id.
+    __table_args__ = (
+        Index("ix_filters_user_id_id", "user_id", "id"),
+    )
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
@@ -66,6 +94,11 @@ class Filter(Base):
 
 class ZipCode(Base):
     __tablename__ = 'zip_codes'
+    # Supports the page-wide load of the postal codes belonging to a
+    # page of filters, whose predicate is filter_id.
+    __table_args__ = (
+        Index("ix_zip_codes_filter_id", "filter_id"),
+    )
 
     id = Column(Integer, primary_key=True)
     filter_id = Column(Integer, ForeignKey('filters.id'), nullable=False)
@@ -76,6 +109,11 @@ class ZipCode(Base):
 
 class Criteria(Base):
     __tablename__ = 'criteria'
+    # Supports the page-wide load of the predicates belonging to a page
+    # of filters, whose predicate is filter_id.
+    __table_args__ = (
+        Index("ix_criteria_filter_id", "filter_id"),
+    )
 
     id = Column(Integer, primary_key=True)
     filter_id = Column(Integer, ForeignKey('filters.id'), nullable=False)
@@ -91,9 +129,24 @@ class Subscription(Base):
     # The uniqueness over the provider order identifier is declared
     # under the name revision 0001 gives it, so the mapped table and the
     # migrated table carry the same constraint under the same name.
+    # The two indexes support the predicates the entitlement decision
+    # and the subscription routes issue: the owner with the status and
+    # the entitlement window, and the owner with the plan and the status.
     __table_args__ = (
         UniqueConstraint(
             'paypal_order_id', name='uq_subscriptions_paypal_order_id'
+        ),
+        Index(
+            "ix_subscriptions_user_id_status_end_date",
+            "user_id",
+            "status",
+            "end_date",
+        ),
+        Index(
+            "ix_subscriptions_user_id_plan_id_status",
+            "user_id",
+            "plan_id",
+            "status",
         ),
     )
 

@@ -112,9 +112,9 @@ UNKNOWN_PLAN_IDS = (
 class StandInResponse(object):
     """One provider response served at the transport boundary.
 
-    ``content`` and the declared length are derived from the payload, so
-    the service's response-size cap is applied to this stand-in exactly as
-    it is to a real response.
+    ``content`` is what ``aiter_bytes`` yields and the declared length is
+    derived from it, so the service's response-size cap is applied to this
+    stand-in exactly as it is to a real streamed response.
     """
 
     def __init__(self, status_code=200, payload=None):
@@ -122,6 +122,10 @@ class StandInResponse(object):
         self._payload = {} if payload is None else payload
         self.content = json.dumps(self._payload).encode("utf-8")
         self.headers = {"Content-Length": str(len(self.content))}
+
+    async def aiter_bytes(self):
+        """Yields the body this response streams, in one chunk."""
+        yield self.content
 
     def json(self):
         """Returns the decoded body this response carries."""
@@ -143,9 +147,8 @@ class RecordingTransport(object):
     last queued response is served repeatedly once the queue is down to
     it.
 
-    Only the two call shapes the service makes are served: ``post`` and
-    ``request``. The service reads an order through ``request`` with an
-    explicit method, so no ``get`` shape exists here to answer one.
+    The service issues every call through ``stream`` with an explicit
+    method, so that is the only call shape served here.
     """
 
     def __init__(self, responses):
@@ -161,13 +164,15 @@ class RecordingTransport(object):
             return self._responses.pop(0)
         return self._responses[0]
 
-    async def post(self, url, **kwargs):
-        """Records one write and returns the response due for it."""
-        return self._serve('POST', url, kwargs)
+    def stream(self, method, url, **kwargs):
+        """Records one call of ``method`` and streams its response."""
+        response = self._serve(method, url, kwargs)
 
-    async def request(self, method, url, **kwargs):
-        """Records one call of ``method`` and returns its response."""
-        return self._serve(method, url, kwargs)
+        @asynccontextmanager
+        async def opened():
+            yield response
+
+        return opened()
 
 
 @contextmanager

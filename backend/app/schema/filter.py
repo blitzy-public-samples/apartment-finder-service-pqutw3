@@ -45,10 +45,8 @@ _ZIP_CODE_REGEX = r"^\d{5}(?:-\d{4})?$"
 # or underscores.
 _CRITERIA_FIELD_REGEX = r"^[A-Za-z][A-Za-z0-9_]*$"
 
-# Characters refused in a text field. A text column stores no NUL, so a
-# value carrying one cannot be written and is refused by the contract
-# instead of by the driver. This set is held equal to the one
-# backend.app.schema.listing declares.
+# Characters refused in every text field. A text column stores no NUL. This
+# set is held equal to the one backend.app.schema.listing declares.
 FORBIDDEN_TEXT_CHARACTERS = ("\x00",)
 
 # Refusal reported for a text value a text column cannot store.

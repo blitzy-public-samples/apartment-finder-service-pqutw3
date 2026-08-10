@@ -1,0 +1,114 @@
+# Frontend workload and the service that fronts it.
+#
+# The image serves a built bundle with nginx and reads no credential, so
+# the pod mounts no secret and its service account carries no workload
+# identity annotation. The port matches the EXPOSE of
+# infrastructure/docker/Dockerfile.frontend.
+#
+# nginx:alpine writes its process identifier, its temporary bodies and its
+# caches under /var, so those paths are emptyDir volumes and the root
+# filesystem stays read-only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: apartment-finder
+spec:
+  replicas: ${FRONTEND_REPLICAS}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/part-of: apartment-finder
+    spec:
+      serviceAccountName: ${FRONTEND_SERVICE_ACCOUNT}
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          image: ${FRONTEND_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Gives the container its own window to bind before liveness
+          # can restart it, on the same route liveness reads.
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: apartment-finder
+spec:
+  type: ${FRONTEND_SERVICE_TYPE}
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

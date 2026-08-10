@@ -1,0 +1,158 @@
+# Backend workload and the service that fronts it.
+#
+# The container starts as the unprivileged appuser the backend image
+# creates, on a read-only root filesystem, with every capability dropped
+# and privilege escalation refused.
+#
+# The start command reads each credential from the Secret Manager CSI
+# mount declared by 30-backend-secrets.yaml, exports it, and replaces the
+# shell with the application process. A credential whose file is missing
+# or empty stops the container with the name of the file, so a mount
+# failure is reported rather than starting an application with an absent
+# setting. The uvicorn invocation and the port match the CMD and the
+# EXPOSE of infrastructure/docker/Dockerfile.backend.
+#
+# Liveness is GET /health, which answers while the process is running.
+# Readiness is GET /health/ready, which answers 503 while the database is
+# unreachable, so a replica that cannot serve is taken out of the service
+# endpoints instead of receiving traffic.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: apartment-finder
+spec:
+  replicas: ${BACKEND_REPLICAS}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/part-of: apartment-finder
+    spec:
+      serviceAccountName: ${BACKEND_SERVICE_ACCOUNT}
+      # Declared rather than inherited, so a rollout drains in-flight
+      # requests the same way wherever it is run from.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backend
+          image: ${BACKEND_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              for name in SECRET_KEY DATABASE_URL ZILLOW_API_KEY \
+                          PAYPAL_CLIENT_SECRET PAYPAL_WEBHOOK_ID \
+                          SENDGRID_API_KEY; do
+                file="/var/run/secrets/backend/$name"
+                if [ ! -s "$file" ]; then
+                  echo "secret $name was not mounted at $file" >&2
+                  exit 1
+                fi
+                export "$name=$(cat "$file")"
+              done
+              exec uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: backend-config
+                optional: false
+            # The shared rate-limit store's address, published from Secret
+            # Manager by the deployment. Required: a workload that started
+            # without it would fall back on the in-process default, which
+            # config.py refuses outside a local run.
+            - secretRef:
+                name: backend-rate-limit-store
+                optional: false
+          env:
+            - name: ENV_FILE
+              value: ""
+          volumeMounts:
+            - name: backend-secrets
+              mountPath: /var/run/secrets/backend
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: backend-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: backend-secrets
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: apartment-finder
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

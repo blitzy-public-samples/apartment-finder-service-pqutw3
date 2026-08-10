@@ -40,12 +40,16 @@ from backend.app.core.logging import (
     MIN_SECRET_VALUE_LENGTH,
     REDACTION_PLACEHOLDER,
     REQUEST_ID_FIELD,
+    TRACEPARENT_HEADER,
     RedactingFilter,
     RedactingJsonFormatter,
     bind_request_id,
+    bind_trace_context,
+    current_traceparent,
     redact,
     register_required_secret_values,
     reset_request_id,
+    reset_trace_context,
     flush_log_queue,
 )
 from backend.app.api.endpoints import (
@@ -107,8 +111,13 @@ EMAIL_CONTENT = '<p>This is a test notification.</p>'
 #: Status the provider reports for an accepted message.
 EMAIL_ACCEPTED_STATUS = 202
 
-#: Every status the service reports as a delivery.
-EMAIL_DELIVERED_STATUSES = (200, 201, 202)
+#: The only status the service reports as a delivery.
+EMAIL_DELIVERED_STATUSES = (EMAIL_ACCEPTED_STATUS,)
+
+#: Statuses in the success range that the Mail Send endpoint does not
+#: report for a queued message. Reaching one means the request reached
+#: something other than that endpoint, so the service reports a failure.
+EMAIL_UNEXPECTED_SUCCESS_STATUSES = (200, 201, 203, 204)
 
 #: Status the rejection case reports.
 EMAIL_REJECTED_STATUS = 400
@@ -119,8 +128,13 @@ EMAIL_UNAVAILABLE_STATUS = 503
 #: Body the rejection case carries.
 EMAIL_REJECTION_BODY = b'{"errors":[{"message":"bad request"}]}'
 
-#: Message the service records when a delivery fails.
-EMAIL_FAILURE_MESSAGE = 'Failed to send email'
+#: Message the service records when a delivery fails. Read from the
+#: module, so a message the module changes cannot leave these cases
+#: silently matching nothing.
+EMAIL_FAILURE_MESSAGE = email_service_module.EMAIL_FAILURE_MESSAGE
+
+#: Reason the service records beside that message.
+REASON_SEND_FAILED = email_service_module.REASON_SEND_FAILED
 
 #: Detail carried by the bound transport failure below. It is plain
 #: prose naming no credential and no key.
@@ -403,6 +417,81 @@ class TestZillowService(unittest.TestCase):
             settings.ZILLOW_API_KEY, str(recorder.sent.url)
         )
 
+    def test_the_bound_request_identifier_is_sent_to_the_provider(self):
+        """The provider receives the identifier the local record carries.
+
+        Without it a provider-side record can only be matched to a local
+        one by timestamp, which is a guess. Sending it makes the join
+        exact from either side.
+        """
+        token = bind_request_id('req-corr-1')
+        try:
+            with _provider(_answering({'listings': []})) as recorder:
+                _fetch()
+        finally:
+            reset_request_id(token)
+
+        self.assertEqual(
+            recorder.sent.headers[zillow_service_module.REQUEST_ID_HEADER],
+            'req-corr-1',
+        )
+
+    def test_no_correlation_header_is_sent_when_none_is_bound(self):
+        """An unbound call sends no empty identifier.
+
+        A blank header would be indistinguishable from a real one on the
+        provider's side, so the header is omitted instead.
+        """
+        token = bind_request_id(None)
+        try:
+            with _provider(_answering({'listings': []})) as recorder:
+                _fetch()
+        finally:
+            reset_request_id(token)
+
+        self.assertNotIn(
+            zillow_service_module.REQUEST_ID_HEADER,
+            recorder.sent.headers,
+        )
+
+    def test_the_correlation_header_carries_no_credential(self):
+        """The identifier is not a place a secret can leak into."""
+        token = bind_request_id('req-corr-2')
+        try:
+            with _provider(_answering({'listings': []})) as recorder:
+                _fetch()
+        finally:
+            reset_request_id(token)
+
+        sent = recorder.sent.headers[
+            zillow_service_module.REQUEST_ID_HEADER
+        ]
+        self.assertNotIn(settings.ZILLOW_API_KEY, sent)
+
+    def test_the_configured_endpoint_is_not_a_reserved_example_host(self):
+        """A deployed configuration cannot address the shipped default.
+
+        The endpoint this repository ships is a reserved documentation
+        domain, which stands in for a provider contract this repository
+        never verified against a real service. The settings refuse it
+        outside a local environment, so a deployment must name a real
+        endpoint before any call is made. This asserts that refusal from
+        the service's own side.
+        """
+        from backend.app.core.config import (
+            LOCAL_ENVIRONMENT,
+            Settings,
+            _is_reserved_host,
+            _value_host,
+        )
+
+        shipped = Settings.__fields__['ZILLOW_API_URL'].default
+        host = _value_host(shipped)
+
+        self.assertIsNotNone(host)
+        self.assertTrue(_is_reserved_host(host))
+        self.assertEqual(settings.ENVIRONMENT, LOCAL_ENVIRONMENT)
+
     def test_api_key_is_absent_from_the_query_string(self):
         """The credential appears in no query parameter, name or value.
 
@@ -448,6 +537,51 @@ class TestZillowService(unittest.TestCase):
             self.assertEqual(
                 client.timeout.connect, settings.HTTP_TIMEOUT_SECONDS
             )
+
+    def test_a_chunk_past_the_configured_size_is_refused_unsent(self):
+        """More postal codes than one request accepts issues no call.
+
+        The caller chunks to the same setting, so an oversized list is a
+        caller defect rather than provider input, and it is refused
+        before a request is assembled.
+        """
+        ceiling = int(settings.INGESTION_ZIP_CODE_CHUNK)
+        oversized = [
+            '9{0:04d}'.format(index) for index in range(ceiling + 1)
+        ]
+
+        with _collecting_application_logs() as collector:
+            with _provider(_answering({'listings': []})) as recorder:
+                self.assertEqual(_fetch(zip_codes=oversized), [])
+
+        self.assertEqual(recorder.requests, [])
+        self.assertIn(
+            zillow_service.REASON_CHUNK_TOO_LARGE, _reasons(collector)
+        )
+
+    def test_a_chunk_at_the_configured_size_is_sent(self):
+        """The configured size is the largest chunk accepted."""
+        ceiling = int(settings.INGESTION_ZIP_CODE_CHUNK)
+        allowed = ['9{0:04d}'.format(index) for index in range(ceiling)]
+
+        with _provider(_answering({'listings': []})) as recorder:
+            self.assertEqual(_fetch(zip_codes=allowed), [])
+
+        self.assertEqual(len(recorder.requests), 1)
+
+    def test_a_refused_chunk_carries_no_credential_into_the_record(self):
+        """The refusal names counts only, never the key or the codes."""
+        ceiling = int(settings.INGESTION_ZIP_CODE_CHUNK)
+        oversized = [
+            '9{0:04d}'.format(index) for index in range(ceiling + 1)
+        ]
+
+        with _collecting_application_logs() as collector:
+            with _provider(_answering({'listings': []})):
+                _fetch(zip_codes=oversized)
+
+        for line in _rendered_log_lines(collector):
+            self.assertNotIn(settings.ZILLOW_API_KEY, line)
 
     def test_provider_failure_yields_an_empty_list(self):
         with _provider(
@@ -812,6 +946,41 @@ class TestEmailService(unittest.TestCase):
                         RECIPIENT_EMAIL, EMAIL_SUBJECT, EMAIL_CONTENT
                     ))
 
+    def test_the_accepted_status_is_the_one_the_endpoint_reports(self):
+        """The service names one status, and it is the documented one."""
+        self.assertEqual(email_service_module.ACCEPTED_STATUS, 202)
+        self.assertEqual(
+            EMAIL_DELIVERED_STATUSES, (email_service_module.ACCEPTED_STATUS,)
+        )
+
+    def test_send_email_refuses_another_success_status(self):
+        """Another 2xx is a failure, not a delivery.
+
+        The Mail Send endpoint reports one status for a queued message.
+        Another success status means the request was answered by something
+        else -- a redirect target, a proxy or an error page returning 200 --
+        so treating it as a delivery would report a message as sent that
+        the provider never queued.
+        """
+        for status_code in EMAIL_UNEXPECTED_SUCCESS_STATUSES:
+            with self.subTest(status_code):
+                boundary = _SendGridBoundary(status_code=status_code)
+
+                with _collecting_application_logs() as collector:
+                    with boundary.install():
+                        self.assertFalse(send_email(
+                            RECIPIENT_EMAIL, EMAIL_SUBJECT, EMAIL_CONTENT
+                        ))
+
+                self.assertEqual(len(boundary.calls), 1)
+                lines = _rendered_log_lines(collector)
+                self.assertTrue(any(
+                    EMAIL_FAILURE_MESSAGE in line for line in lines
+                ))
+                self.assertTrue(any(
+                    str(status_code) in line for line in lines
+                ))
+
     def test_send_email_reports_a_rejected_message(self):
         """A non-2xx delivery raises in the package and is reported.
 
@@ -885,10 +1054,17 @@ class TestEmailService(unittest.TestCase):
     def test_a_failed_send_records_the_failure_on_the_logger(self):
         """A failed send emits one structured record naming the module.
 
-        The record is asserted to carry the failure as exception
-        information, and that information is asserted to hold the
-        credential, so the redaction cases below are known to be
-        exercising a record that carries it.
+        The record carries the failure as discrete fields -- the class,
+        the defining module and the redacted message -- and carries **no**
+        exception information at error level, because attaching the
+        exception makes the handler render the whole traceback, and a
+        traceback of a provider client call embeds the request it was
+        making and the local frames it was making it from.
+
+        The provider's own message travels as a field, redacted as the
+        field is built rather than as the line is written, so the
+        credential is absent from the record object itself and not only
+        from the rendered output.
         """
         with _collecting_application_logs() as collector:
             self.assertFalse(_send_failing_with(EMAIL_FAILURE_DETAIL))
@@ -902,18 +1078,48 @@ class TestEmailService(unittest.TestCase):
         record = failures[0]
         self.assertEqual(record.levelno, logging.ERROR)
         self.assertEqual(record.name, EMAIL_MODULE)
-        self.assertIsNotNone(record.exc_info)
-        self.assertIn(
-            settings.SENDGRID_API_KEY, repr(record.exc_info)
+        self.assertIsNone(record.exc_info)
+        self.assertEqual(record.exception_type, 'RuntimeError')
+        self.assertTrue(record.exception_module)
+        self.assertEqual(record.reason, REASON_SEND_FAILED)
+        self.assertIn(REDACTION_PLACEHOLDER, record.exception_message)
+        self.assertNotIn(
+            settings.SENDGRID_API_KEY, record.exception_message
+        )
+        self.assertNotIn(
+            settings.SENDGRID_API_KEY, repr(vars(record))
         )
 
+    def test_no_error_level_record_carries_a_traceback(self):
+        """No record at error level renders a traceback.
+
+        A traceback of the provider client names the request it was
+        issuing and every local frame, so it belongs at DEBUG -- where the
+        configured level suppresses it outside a local run -- and never at
+        the level a deployment collects.
+        """
+        with _collecting_application_logs() as collector:
+            self.assertFalse(_send_failing_with(EMAIL_FAILURE_DETAIL))
+
+        errors = [
+            record
+            for record in collector.records
+            if record.levelno >= logging.ERROR
+        ]
+        self.assertTrue(errors)
+        for record in errors:
+            self.assertIsNone(record.exc_info)
+            self.assertNotIn('Traceback', repr(vars(record)))
+
     def test_a_failed_send_reaches_no_rendered_line_with_the_key(self):
-        """No rendered line carries the provider credential.
+        """Neither the record nor any rendered line carries the key.
 
         Two failures are driven. The first quotes the credential in free
         prose, and the second names it beside a credential-shaped key.
-        Each case asserts the raw record carries the credential and that
-        no rendered line does.
+        Each case asserts the provider message was carried, that the
+        placeholder stands where the credential stood, and that the
+        credential appears in no field of the record and in no rendered
+        line.
         """
         for label, detail in (
             ('quoted in free prose', EMAIL_FAILURE_DETAIL),
@@ -925,9 +1131,14 @@ class TestEmailService(unittest.TestCase):
 
                 self.assertTrue(collector.records)
                 self.assertTrue(any(
-                    settings.SENDGRID_API_KEY in repr(record.exc_info)
+                    REDACTION_PLACEHOLDER
+                    in getattr(record, 'exception_message', '')
                     for record in collector.records
                 ))
+                for record in collector.records:
+                    self.assertNotIn(
+                        settings.SENDGRID_API_KEY, repr(vars(record))
+                    )
                 rendered = _rendered_log_lines(collector)
                 for line in rendered:
                     self.assertNotIn(settings.SENDGRID_API_KEY, line)
@@ -972,15 +1183,25 @@ def test_a_failed_send_emits_one_redacted_structured_record():
     failure = failures[0]
     assert failure['level'] == 'ERROR'
     assert failure['logger'] == EMAIL_MODULE
-    assert REDACTION_PLACEHOLDER in failure['exception']
-    assert settings.SENDGRID_API_KEY not in failure['exception']
+    # The failure travels as discrete fields under the record's context,
+    # and no rendered traceback is emitted at this level.
+    assert 'exception' not in failure
+    context = failure['context']
+    assert context['exception_type'] == 'RuntimeError'
+    assert context['reason'] == REASON_SEND_FAILED
+    assert REDACTION_PLACEHOLDER in context['exception_message']
+    assert settings.SENDGRID_API_KEY not in context['exception_message']
+    for entry in entries:
+        assert 'Traceback' not in json.dumps(entry)
 
 
-def test_a_rejected_send_emits_no_record():
-    """A send the provider refuses records nothing.
+def test_a_rejected_send_records_the_status_it_was_refused_with():
+    """A send the provider refuses is recorded with its status.
 
-    The refusal is a reported status rather than a raised failure, so no
-    line is emitted at all.
+    The refusal arrives as a reported status rather than as a raised
+    failure, so it carries no exception to record. One line is emitted
+    naming the status received and the status expected, which is what
+    makes a silent non-delivery visible.
     """
     client = MagicMock()
     client.send.return_value = MagicMock(status_code=400)
@@ -993,7 +1214,23 @@ def test_a_rejected_send_emits_no_record():
                 EMAIL_RECIPIENT, EMAIL_SUBJECT, EMAIL_BODY
             ) is False
 
-    assert lines == []
+    entries = [json.loads(line) for line in lines]
+    failures = [
+        entry
+        for entry in entries
+        if entry.get('message') == EMAIL_FAILURE_MESSAGE
+    ]
+    assert len(failures) == 1
+
+    failure = failures[0]
+    assert failure['level'] == 'ERROR'
+    assert failure['logger'] == EMAIL_MODULE
+    assert failure['context']['status_code'] == 400
+    assert failure['context']['expected_status_code'] == (
+        email_service_module.ACCEPTED_STATUS
+    )
+    assert 'exception' not in failure
+    assert settings.SENDGRID_API_KEY not in json.dumps(failure)
 
 
 def test_a_failed_send_writes_no_failure_detail_to_a_stream(capsys):
@@ -2157,6 +2394,187 @@ class TestProviderCredentialRegistration(unittest.TestCase):
         """A non-string value raises rather than being ignored."""
         with self.assertRaises(ValueError):
             register_required_secret_values(None)
+
+
+class TestProviderEventTaxonomy(unittest.TestCase):
+    """A partial success is a warning, and a routine success is not news.
+
+    Level is what a deployment alerts and pages on, so a record's level is
+    a claim about whether a human is needed. A discarded entry and a
+    truncated page are both partial successes -- the pass completed and
+    the corpus was written -- so they warn. A completed REST call is
+    routine, so it is not collected at all unless a run is being
+    debugged. Each partial success also carries a stable ``reason``, so a
+    query selects it by field rather than by matching its prose.
+    """
+
+    def test_a_discarded_entry_warns_under_a_stable_reason(self):
+        payload = {'listings': [{'id': 1}, 'not-an-object']}
+        with _collecting_application_logs() as collector:
+            with _provider(_answering(payload)):
+                self.assertEqual(len(_fetch()), 1)
+
+        discards = [
+            record
+            for record in collector.records
+            if getattr(record, 'reason', None)
+            == zillow_service.REASON_LISTING_NOT_OBJECT
+        ]
+        self.assertEqual(len(discards), 1)
+        self.assertEqual(discards[0].levelno, logging.WARNING)
+        self.assertEqual(discards[0].received, 2)
+        self.assertEqual(discards[0].discarded, 1)
+
+    def test_a_truncated_page_warns_under_a_stable_reason(self):
+        over = zillow_service.MAX_PROVIDER_LISTINGS + 3
+        payload = {'listings': [{'id': index} for index in range(over)]}
+        with _collecting_application_logs() as collector:
+            with _provider(_answering(payload)):
+                returned = _fetch()
+
+        self.assertEqual(
+            len(returned), zillow_service.MAX_PROVIDER_LISTINGS
+        )
+        truncations = [
+            record
+            for record in collector.records
+            if getattr(record, 'reason', None)
+            == zillow_service.REASON_TOO_MANY_LISTINGS
+        ]
+        self.assertEqual(len(truncations), 1)
+        self.assertEqual(truncations[0].levelno, logging.WARNING)
+
+    def test_no_partial_success_is_recorded_at_error_level(self):
+        payload = {
+            'listings': ['not-an-object']
+            + [{'id': index} for index in range(3)]
+        }
+        with _collecting_application_logs() as collector:
+            with _provider(_answering(payload)):
+                self.assertEqual(len(_fetch()), 3)
+
+        for record in collector.records:
+            self.assertLess(record.levelno, logging.ERROR)
+
+    def test_a_whole_refused_call_is_still_an_error(self):
+        """A pass that returned nothing keeps its error level."""
+        with _collecting_application_logs() as collector:
+            with _provider(_answering({'listings': []}, status_code=500)):
+                self.assertEqual(_fetch(), [])
+
+        self.assertTrue([
+            record
+            for record in collector.records
+            if record.levelno >= logging.ERROR
+        ])
+
+    def test_a_completed_rest_call_is_not_collected_at_information(self):
+        """The two PayPal success records sit below the collected level.
+
+        A record per completed call at information level makes the
+        provider's routine traffic the bulk of the log, which is what
+        pushes the refusals and the failures out of a retention window.
+        """
+        source = inspect.getsource(paypal_service)
+        for message in (
+            'PayPal REST call completed',
+            'PayPal REST read completed',
+        ):
+            with self.subTest(message):
+                index = source.index(message)
+                emitter = source.rindex('logger.', 0, index)
+                self.assertTrue(
+                    source.startswith('logger.debug(', emitter),
+                    source[emitter:index],
+                )
+
+
+class TestOutboundCorrelation(unittest.TestCase):
+    """An outbound provider call carries the trace it was made under.
+
+    Without it the provider's own record of the call cannot be joined to
+    this service's record of the request that caused it, which is what
+    makes a provider-side investigation possible at all.
+    """
+
+    def test_the_provider_call_carries_the_bound_trace(self):
+        token = bind_trace_context()
+        try:
+            expected = current_traceparent()
+            with _provider(_answering({'listings': []})) as recorder:
+                _fetch()
+        finally:
+            reset_trace_context(token)
+
+        self.assertTrue(expected)
+        self.assertEqual(
+            recorder.sent.headers[TRACEPARENT_HEADER], expected
+        )
+
+    def test_no_header_is_sent_when_no_trace_is_bound(self):
+        """An unbound call sends no correlation header at all."""
+        with _provider(_answering({'listings': []})) as recorder:
+            _fetch()
+
+        self.assertNotIn(TRACEPARENT_HEADER, recorder.sent.headers)
+
+    def test_the_credential_header_survives_the_addition(self):
+        token = bind_trace_context()
+        try:
+            with _provider(_answering({'listings': []})) as recorder:
+                _fetch()
+        finally:
+            reset_trace_context(token)
+
+        self.assertEqual(
+            recorder.sent.headers[API_KEY_HEADER],
+            settings.ZILLOW_API_KEY,
+        )
+
+
+class TestOutboundClientRecordsAreGoverned(unittest.TestCase):
+    """A record the HTTP client writes discloses no search value.
+
+    The client logs its request target at information level, and that
+    target carries every postal code and filter value the caller
+    supplied. The record has to travel through the redacting handler, or
+    the search terms this service takes care never to log itself arrive in
+    the log by another route.
+    """
+
+    def test_a_client_record_naming_the_target_loses_its_query(self):
+        postal_code = '90210'
+        neighbourhood = 'PRIVATEFILTERVALUE'
+        target = '%s?zip_codes=%s&neighborhood=%s&api_key=%s' % (
+            settings.ZILLOW_API_URL,
+            postal_code,
+            neighbourhood,
+            settings.ZILLOW_API_KEY,
+        )
+        with _collecting_emitted_lines() as lines:
+            with _provider(_answering({'listings': []})):
+                _fetch(
+                    zip_codes=(postal_code,),
+                    filters={'neighborhood': neighbourhood},
+                )
+            logging.getLogger('httpx').warning(
+                'HTTP Request: GET %s', target
+            )
+            logging.getLogger('httpcore.connection').warning(
+                'connect_tcp.started for %s', target
+            )
+
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertNotIn(postal_code, line)
+            self.assertNotIn(neighbourhood, line)
+            self.assertNotIn(settings.ZILLOW_API_KEY, line)
+        entries = _structured_entries(lines)
+        self.assertTrue([
+            entry
+            for entry in entries
+            if str(entry.get('logger', '')).startswith('httpx')
+        ])
 
 
 if __name__ == '__main__':

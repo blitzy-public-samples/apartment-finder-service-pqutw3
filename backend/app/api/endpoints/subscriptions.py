@@ -259,14 +259,6 @@ EVENT_ORDER_APPROVED = "CHECKOUT.ORDER.APPROVED"
 #: Notification reporting that PayPal settled a capture.
 EVENT_CAPTURE_COMPLETED = "PAYMENT.CAPTURE.COMPLETED"
 
-#: Notifications reporting that a settled payment was undone.
-REVOKING_EVENTS = (
-    "PAYMENT.CAPTURE.DENIED",
-    "PAYMENT.CAPTURE.REFUNDED",
-    "PAYMENT.CAPTURE.REVERSED",
-    "CHECKOUT.ORDER.DECLINED",
-)
-
 #: Outcome reported for a notification that drove a transition.
 OUTCOME_PROCESSED = "processed"
 
@@ -276,13 +268,21 @@ OUTCOME_DUPLICATE = "duplicate"
 #: Outcome reported for a notification no transition applies to.
 OUTCOME_IGNORED = "ignored"
 
-# Statuses each revoking notification maps the subscription to.
+# Statuses each revoking notification maps the subscription to. This is
+# the single declaration of which notifications revoke: REVOKING_EVENTS
+# below is its keys, so a notification added here is recognised by the
+# route.
 _REVOKED_STATUSES = {
     "PAYMENT.CAPTURE.DENIED": CANCELLED_STATUS,
+    "PAYMENT.CAPTURE.DECLINED": CANCELLED_STATUS,
     "PAYMENT.CAPTURE.REFUNDED": REFUNDED_STATUS,
     "PAYMENT.CAPTURE.REVERSED": REFUNDED_STATUS,
     "CHECKOUT.ORDER.DECLINED": CANCELLED_STATUS,
+    "CHECKOUT.PAYMENT-APPROVAL.REVERSED": CANCELLED_STATUS,
 }
+
+#: Notifications reporting that a settled payment was undone.
+REVOKING_EVENTS = tuple(_REVOKED_STATUSES)
 
 # Statuses a subscription may still be moved out of.
 _OPEN_STATUSES = (PENDING_STATUS, FAILED_STATUS)
@@ -423,17 +423,26 @@ def _refuse_provider(
     message: str,
     **context: Any
 ) -> HTTPException:
-    """Records one provider failure and returns the response for it.
+    """Records the business context of one provider failure and answers it.
+
+    The failure itself is recorded at ``ERROR`` by
+    :mod:`backend.app.services.paypal_service`, which is the one owner of
+    a provider event. This record adds what that module cannot see -- the
+    subscription, the plan, the event type -- and is emitted at
+    ``WARNING``, so one provider failure produces one error-level record
+    and one context record rather than two error-level records for the
+    same event.
 
     The record carries the provider category, status, debug identifier
-    and retryability. The returned response carries a generic detail and
-    is marked audited, so it is not recorded a second time further out.
+    and retryability alongside the supplied context. The returned
+    response carries a generic detail and is marked audited, so it is not
+    recorded a second time further out.
     """
     response_status = _provider_status(error)
     fields = _provider_fields(error)
     fields.update(context)
     fields["status_code"] = response_status
-    logger.error(message, extra=fields)
+    logger.warning(message, extra=fields)
     return mark_audited(
         HTTPException(
             status_code=response_status,
@@ -999,10 +1008,8 @@ async def receive_paypal_webhook(
                 "reason": REASON_REPLAY,
                 "path": request.scope.get("path"),
                 "event_type": event_type,
-                # Identity of the delivery, taken from the verified
-                # headers, so the repeat is correlated with the delivery
-                # that was processed. The order identifier is the
-                # provider's own and is present when the notification
+                # Delivery identity from the verified headers, and the
+                # provider's own order identifier when the notification
                 # names one.
                 "transmission_id": verification.transmission_id,
                 "paypal_order_id": _order_id_from(notification),

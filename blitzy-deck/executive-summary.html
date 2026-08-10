@@ -7,13 +7,58 @@
 
 <link rel="icon" href="data:,">
 
+<!--
+  Asset delivery. Four assets are fetched from two content delivery networks.
+  Subresource integrity pins each script and stylesheet to the exact bytes
+  reviewed; the three taggable assets carry an integrity attribute, and the
+  mermaid ES module carries its hash in the import map below. crossorigin and
+  referrerpolicy accompany each one.
+
+  The policy below restricts the origins this document may reach at all:
+  connect-src is none, base-uri is none and form-action is none.
+  'unsafe-inline' is declared for style and script, and the theme and the
+  initialisation are inline in this file.
+
+  Two residuals are recorded here and are not closed. The typeface stylesheet
+  carries no integrity attribute. Its response is negotiated per browser, so
+  its bytes are not fixed and no hash describes it; it delivers no script and
+  is constrained by origin alone. The mermaid module's hash is declared in the
+  import map, and import-map integrity is a recent addition that older
+  browsers ignore. Where it is ignored the module loads unpinned from the one
+  origin the policy permits.
+
+  One expected console message. With developer tools open, the browser fetches
+  the .map source-map side-files that reveal.js and lucide.min.js name, and
+  connect-src 'none' blocks both. Those fetches come from the debugger; this
+  deck contains no fetch, XMLHttpRequest, WebSocket or EventSource call.
+  Verified in a real browser: both diagrams draw, every icon renders, all
+  eighteen slides are reachable, and no integrity check fails. With developer
+  tools closed the console is silent.
+
+  Every choice above, and the alternatives weighed against it, is recorded in
+  docs/security/DECISION_LOG.md.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+
 <!-- typefaces -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Space+Grotesk:wght@500;600;700&amp;family=Fira+Code:wght@400;500&amp;display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Space+Grotesk:wght@500;600;700&amp;family=Fira+Code:wght@400;500&amp;display=swap" referrerpolicy="no-referrer">
 
 <!-- reveal.js framework stylesheet -->
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" integrity="sha384-YgvgKeZJykuztG+iQPoZHNZENTFZvOcOJ/uRzmJTje6GHYN9zAw+y5rx/L8MQKA/" crossorigin="anonymous" referrerpolicy="no-referrer">
+
+<!-- Module integrity for the diagram renderer, declared where a module's hash belongs -->
+<script type="importmap">
+{
+  "imports": {
+    "mermaid": "https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.esm.min.mjs"
+  },
+  "integrity": {
+    "https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.esm.min.mjs": "sha384-HbZodwcydhFoeJkM8JD85LgJ4EGrGW8p7/jgYlNNjwawbrvYc5jzWjzs8Z8Lgsvo"
+  }
+}
+</script>
 
 <style>
 :root {
@@ -98,10 +143,30 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   white-space: nowrap;
 }
 
+/* Muted text is distinguished by size and weight, not by lightness.
+   --blitzy-text-muted (#999999) is declared above, as the theme
+   specifies, and is applied to borders and rules only. Measured against
+   the 4.5:1 normal-text threshold it is 2.85:1 on #FFFFFF and 2.51:1 on
+   the light surfaces. Recorded at docs/security/DECISION_LOG.md. */
 .lede {
   font-size: 0.6em;
-  color: var(--blitzy-text-muted);
+  color: var(--blitzy-text);
   max-width: 1500px;
+}
+
+/* Screen-reader-only content. Used for table captions and diagram
+   descriptions, which name a visual for assistive technology without
+   adding rendered text to the slide. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 .emphasis { font-weight: 600; color: var(--blitzy-primary-deep); }
 
@@ -132,6 +197,19 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 .slide-title {
   background: var(--gradient-hero) !important;
   color: var(--blitzy-text-invert);
+}
+/* The hero gradient's light stop (#7A6DEC) carries white at only 4.02:1
+   and the teal eyebrow at 3.23:1. A navy scrim inside the slide keeps
+   the mandated gradient visible beneath it while raising every pair
+   above the 4.5:1 normal-text threshold: measured across all three
+   gradient stops, white lands at 6.13:1 or better and teal at 4.93:1 or
+   better at the scrim's lightest point. */
+.slide-title .slide-body {
+  background: linear-gradient(
+    90deg,
+    rgba(26, 16, 95, 0.55) 0%,
+    rgba(26, 16, 95, 0.30) 100%
+  );
 }
 .slide-title h1 { color: var(--blitzy-text-invert); max-width: 1560px; }
 .slide-title p { color: rgba(255, 255, 255, 0.92); }
@@ -166,7 +244,8 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   font-family: var(--ff-mono);
   font-size: 0.42em;
   letter-spacing: 0.16em;
-  color: rgba(255, 255, 255, 0.78);
+  /* 4.45:1 at 0.78 over the gradient's light stop; 5.08:1 at 0.86. */
+  color: rgba(255, 255, 255, 0.86);
   margin-top: 26px;
   text-transform: uppercase;
 }
@@ -235,7 +314,7 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   font-weight: 500;
   font-size: 0.42em;
   line-height: 1.38;
-  color: var(--blitzy-text-muted);
+  color: var(--blitzy-text);
 }
 
 .icon-row {
@@ -284,6 +363,13 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   stroke: var(--blitzy-accent-teal);
   stroke-width: 2;
 }
+/* Separation between these two lines is set by an explicit margin on
+   .brand-sub below, not by a line-height here. A line-height was tried
+   and measured: the inherited unitless ratio resolves against this
+   element's own font-size and leaves the descender of "Blitzy" touching
+   the cap-height of the line beneath it, while a value large enough to
+   help depends on the display face's own ascent-plus-descent, which a
+   font substitution would change. A margin is the deterministic control. */
 .brand-lockup .brand-word {
   font-family: var(--ff-display);
   font-weight: 700;
@@ -297,6 +383,7 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   font-size: 0.36em;
   letter-spacing: 0.18em;
   text-transform: uppercase;
+  margin-top: 8px;
   color: var(--blitzy-accent-teal);
 }
 
@@ -322,6 +409,7 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   padding: 15px 20px;
   vertical-align: top;
   line-height: 1.38;
+  overflow-wrap: anywhere;
 }
 .data-table tbody tr:nth-child(even) td { background: var(--blitzy-surface-3); }
 .data-table tbody tr.row-flag td {
@@ -384,7 +472,7 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   font-size: 0.38em;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--blitzy-text-muted);
+  color: var(--blitzy-primary-dark);
 }
 .callout {
   display: flex;
@@ -416,6 +504,70 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   gap: 40px;
   margin-top: 44px;
 }
+
+/* Responsive behaviour.
+
+   reveal.js scales the 1920x1080 canvas with a transform: every length
+   above shrinks proportionally on a smaller viewport and nothing reflows
+   on its own. The breakpoints below reflow the card and table grids at
+   three widths, and the height rules give a slide taller than the canvas
+   its own scroll. Recorded at docs/security/DECISION_LOG.md. */
+
+@media (max-width: 1400px) {
+  .kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .slide-body { padding: 64px 76px; }
+}
+
+@media (max-width: 1024px) {
+  .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+  .icon-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+  .kpi-card { padding: 24px 20px; }
+  .slide-body { padding: 52px 56px; }
+  .data-table { font-size: 0.40em; }
+  .closing-foot { flex-direction: column; align-items: flex-start; gap: 24px; }
+}
+
+@media (max-width: 720px) {
+  .kpi-grid,
+  .icon-row { grid-template-columns: minmax(0, 1fr); }
+  .callout { flex-direction: column; align-items: flex-start; gap: 12px; }
+  .reveal li { padding-left: 34px; }
+  /* A single column is the tallest layout the deck produces, so the same
+     top-aligned scrolling the short-viewport rule applies is needed here
+     regardless of viewport height. */
+  .slide-body {
+    padding: 26px 36px;
+    justify-content: flex-start;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  /* Scrolling stops content being lost, but a reader should not have to
+     scroll to reach the fifth metric. Stacked into one column the card
+     grid measured 1310 against the 1080-unit slide box, so the card's
+     own spacing is tightened here to bring all five back inside it. */
+  .kpi-grid { gap: 12px; margin-top: 14px; }
+  .kpi-card { padding: 14px 16px; gap: 8px; }
+  .kpi-value { font-size: 1.4em; }
+}
+
+/* A slide taller than the canvas gets its own scroll. */
+@media (max-height: 820px) {
+  .slide-body {
+    justify-content: flex-start;
+    min-height: 0;
+    overflow-y: auto;
+    padding-top: 48px;
+    padding-bottom: 48px;
+  }
+  .reveal pre.mermaid svg { max-height: 560px; }
+}
+
+/* Honour a reduced-motion preference over the configured slide
+   transition, which reveal.js applies as a CSS transform. */
+@media (prefers-reduced-motion: reduce) {
+  .reveal .slides section,
+  .reveal .slides section > * { transition: none !important; }
+}
 </style>
 </head>
 <body>
@@ -426,12 +578,21 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 <section class="slide-title">
 <div class="slide-body">
 
-    <span class="hero-icon"><i data-lucide="shield-check"></i></span>
+    <span class="hero-icon" aria-hidden="true"><i data-lucide="shield-check" aria-hidden="true"></i></span>
     <span class="eyebrow">Security Remediation</span>
     <h1>apartment-finder-service</h1>
-    <p class="scope">Twenty security findings closed across authentication, authorization, payments and secrets. No new product functionality, and one deliberate breaking change.</p>
+    <p class="scope">Twenty security findings remediated in code across authentication, authorization, payments and secrets, each covered by an automated test. No new product functionality. Deployment and credential rotation remain for an operator.</p>
     <p class="audience">Prepared for executive leadership and the change-approval reviewers</p>
 </div>
+<aside class="notes">
+  Remediated in code is the honest verb, not closed. Every one of the twenty findings
+  has its fix delivered and a test that proves it, but three kinds of work cannot be
+  done from inside this repository: rotating the credentials that were exposed,
+  mounting the provisioned secrets into the running pods, and provisioning the new
+  deployment inputs. Those are the operator items, and the slide near the end of this
+  deck lists them. The breaking change is that writing to the listings corpus now
+  requires the administrator role.
+</aside>
 </section>
 
 <!-- 2. headline metrics -->
@@ -439,38 +600,68 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 <div class="slide-body">
 
     <div class="slide-head">
-      <span class="eyebrow eyebrow-ink">Outcome at a glance</span>
+      <span class="eyebrow eyebrow-ink">Outcome</span>
       <h2>What the work delivered</h2>
     </div>
-    <p class="lede">Before this work the service could not start and its test suite collected no tests at all. Every figure below is measured, not estimated.</p>
+    <p class="lede">Before this work the service could not start and its test suite collected no tests. Every figure below is measured in code and tests. None of it is a statement about a deployed environment: nothing here has been released yet.</p>
     <div class="kpi-grid">
       <div class="kpi-card">
-        <span class="kpi-icon"><i data-lucide="shield-check"></i></span>
+        <span class="kpi-icon" aria-hidden="true"><i data-lucide="shield-check" aria-hidden="true"></i></span>
         <span class="kpi-value">20</span>
-        <span class="kpi-label">findings closed, spanning four vulnerability clusters</span>
+        <span class="kpi-label">findings remediated in code and covered by tests, across four vulnerability clusters</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-icon"><i data-lucide="git-branch"></i></span>
+        <span class="kpi-icon"><i data-lucide="git-branch" aria-hidden="true"></i></span>
         <span class="kpi-value">19 &rarr; 7</span>
-        <span class="kpi-label">dependency advisories, falling from seven packages to three</span>
+        <span class="kpi-label">dependency advisories in the deployed service, falling from seven packages to three</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-icon"><i data-lucide="terminal"></i></span>
+        <span class="kpi-icon"><i data-lucide="terminal" aria-hidden="true"></i></span>
         <span class="kpi-value">1 &rarr; 0</span>
-        <span class="kpi-label">automated code-scan findings at medium severity or above</span>
+        <span class="kpi-label">medium-severity scan findings</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-icon"><i data-lucide="file-check"></i></span>
-        <span class="kpi-value">68</span>
-        <span class="kpi-label">entries in the change map: 30 created, 29 updated, none deleted, 9 read-only references</span>
+        <span class="kpi-icon"><i data-lucide="file-check" aria-hidden="true"></i></span>
+        <span class="kpi-value">91</span>
+        <span class="kpi-label">files changed: 61 new, 30 updated</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-icon"><i data-lucide="check-circle"></i></span>
+        <span class="kpi-icon"><i data-lucide="check-circle" aria-hidden="true"></i></span>
+        <span class="kpi-value">15</span>
+        <span class="kpi-label">proven by automated test</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-icon"><i data-lucide="alert-triangle" aria-hidden="true"></i></span>
+        <span class="kpi-value">5</span>
+        <span class="kpi-label">with a named operational step</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-icon" aria-hidden="true"><i data-lucide="alert-triangle" aria-hidden="true"></i></span>
+        <span class="kpi-value">7</span>
+        <span class="kpi-label">items awaiting an operator</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-icon" aria-hidden="true"><i data-lucide="check-circle" aria-hidden="true"></i></span>
         <span class="kpi-value">45</span>
-        <span class="kpi-label">access-control assertions, covering nine routes across five kinds of caller</span>
+        <span class="kpi-label">access-control assertions</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-icon" aria-hidden="true"><i data-lucide="map" aria-hidden="true"></i></span>
+        <span class="kpi-value">69</span>
+        <span class="kpi-label">planned changes mapped end to end: 30 created, 29 updated, 10 read-only</span>
       </div>
     </div>
 </div>
+<aside class="notes">
+  Before this work the service could not start at all and its test suite collected no
+  tests. The twenty findings are the agreed register, and each has a fix and a test.
+  Advisories fell from nineteen across seven packages to seven across three; every one
+  of the seven survives because no fix for it runs on the Python version this service
+  deliberately pins, and each carries a named compensating control. The single
+  code-scan finding was a network call with no timeout. The seven operator items are
+  listed later in this deck. The forty-five access-control assertions are nine routes
+  tested against five kinds of caller, anonymous included.
+</aside>
 </section>
 
 <!-- 3. architecture overview -->
@@ -478,39 +669,66 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 <div class="slide-body">
 
     <div class="slide-head">
-      <span class="eyebrow eyebrow-ink">What changed architecturally</span>
+      <span class="eyebrow eyebrow-ink">Architecture</span>
       <h2>Where the new controls sit</h2>
     </div>
-    <p class="lede">Hardened boundaries are highlighted. Every other component keeps the role it already had.</p>
+    <p class="lede">The delivered request path, with hardened boundaries highlighted. Secrets reach each workload through a per-secret read grant and a workload identity. Two components are drawn unconnected: nothing uses them.</p>
   <pre class="mermaid">
   graph LR
-    BROWSER["Renter&lt;br/&gt;Browser"] --&gt; LB["Load&lt;br/&gt;Balancer"]
-    LB --&gt; WEB["Web Server"]
-    WEB --&gt; UI["Renter Web&lt;br/&gt;Application"]
-    WEB --&gt; API["Backend&lt;br/&gt;Service"]
-    API --&gt; AUTHZ["Central&lt;br/&gt;Authorization&lt;br/&gt;Check"]
-    AUTHZ --&gt; DB["Listings and&lt;br/&gt;Accounts&lt;br/&gt;Database"]
-    API --&gt; HDR["Protective&lt;br/&gt;Response&lt;br/&gt;Headers"]
-    API --&gt; FILES["Static Asset&lt;br/&gt;Storage"]
-    API --&gt; ZILLOW["Listings Data&lt;br/&gt;Provider"]
-    API --&gt; PAY["Payment&lt;br/&gt;Provider"]
-    INGEST["Listing&lt;br/&gt;Ingestion&lt;br/&gt;Service"] --&gt; ZILLOW
+    accTitle: Delivered request path and secret delivery chain
+    accDescr {
+      A renter's request enters through a host check that applies protective
+      headers, a size cap and a rate limit, reaches the backend service, and
+      passes through one central authorization check before the listings and
+      accounts database is read or written. The backend also calls the
+      listings data provider, the payment provider and the email provider. A
+      separate listing ingestion task calls the listings data provider and
+      writes to the same database. Managed per-secret containers grant read
+      access to a workload identity, and that identity is what the backend
+      service, the ingestion task and the schema upgrade job read their
+      secrets through. Two components are drawn unconnected: the browser
+      client, which is not operational, and object storage, which is
+      provisioned and unused.
+    }
+    RENTER["Renter&lt;br/&gt;request"] --&gt; HDR["Host check,&lt;br/&gt;protective headers,&lt;br/&gt;size cap, rate limit"]
+    HDR --&gt; API["Backend&lt;br/&gt;Service"]
+    API --&gt; AUTHZ["Central&lt;br/&gt;authorization&lt;br/&gt;check"]
+    AUTHZ --&gt; DB["Listings and&lt;br/&gt;accounts&lt;br/&gt;database"]
+    API --&gt; ZILLOW["Listings data&lt;br/&gt;provider"]
+    API --&gt; PAY["Payment&lt;br/&gt;provider"]
+    API --&gt; MAIL["Email&lt;br/&gt;provider"]
+    INGEST["Listing&lt;br/&gt;ingestion&lt;br/&gt;task"] --&gt; ZILLOW
     INGEST --&gt; DB
-    STREAM["Event Stream"] --&gt; API
-    STREAM --&gt; INGEST
-    VAULT["Managed Secret&lt;br/&gt;Storage"] --&gt; API
-    VAULT --&gt; INGEST
+    VAULT["Managed Secret&lt;br/&gt;Containers,&lt;br/&gt;Per-Secret"] --&gt; GRANT["Read Grant"]
+    GRANT --&gt; IDENT["Workload&lt;br/&gt;Identity"]
+    IDENT --&gt; API
+    IDENT --&gt; INGEST
+    IDENT --&gt; MIG["Schema&lt;br/&gt;Upgrade Job"]
+    CLIENT["Browser client&lt;br/&gt;not operational"]
+    PLATFORM["Object storage&lt;br/&gt;provisioned, unused"]
     classDef hardened fill:#F2F0FE,stroke:#5B39F3,stroke-width:4px,color:#1A105F;
-    class AUTHZ,HDR,VAULT hardened;
+    classDef pending fill:#F4EFF6,stroke:#2D1C77,stroke-width:4px,stroke-dasharray:6 4,color:#1A105F;
+    class HDR,AUTHZ,VAULT,GRANT,IDENT hardened;
+    class CLIENT,PLATFORM pending;
   </pre>
 </div>
+<aside class="notes">
+  Three boxes deliberately have no arrows. Managed secret storage is provisioned and
+  the running service is authorized to read all six secrets, but mounting them into the
+  pod is a change to deployment manifests that live outside this repository, so no
+  delivery flow is drawn. The event stream and object storage are provisioned by the
+  infrastructure definitions and no application code reads or writes either. The React
+  client cannot currently consume this API; those defects predate this work and
+  repairing them needs an authorized frontend change. An earlier version of this
+  diagram drew all three as working flows.
+</aside>
 </section>
 
 <!-- 4. divider: authentication -->
 <section class="slide-divider">
 <div class="slide-body">
 
-    <span class="divider-icon"><i data-lucide="key-round"></i></span>
+    <span class="divider-icon" aria-hidden="true"><i aria-hidden="true" data-lucide="key-round"></i></span>
     <h2>Authentication</h2>
     <p class="divider-note">Cluster one of four</p>
 </div>
@@ -521,29 +739,41 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 <div class="slide-body">
 
     <div class="slide-head">
-      <span class="eyebrow eyebrow-ink">Who the service believes you are</span>
+      <span class="eyebrow eyebrow-ink">Identity</span>
       <h2>Sign-in can no longer be talked into trusting a stranger</h2>
     </div>
     <ul>
-      <li>Only approved signing methods are accepted; forged tokens are refused.</li>
-      <li>A weak signing secret stops startup rather than issuing tokens.</li>
-      <li>Sign-in no longer reveals whether an address has an account.</li>
-      <li>Password checking repaired; no user must reset.</li>
+      <li>Only approved signing methods are accepted.</li>
+      <li>A weak signing secret stops startup.</li>
+      <li>Sign-in no longer reveals who has an account.</li>
+      <li>Password checking repaired; nobody must reset.</li>
     </ul>
     <div class="icon-row">
-      <div><i data-lucide="key-round"></i><span>Approved methods only</span></div>
-      <div><i data-lucide="lock"></i><span>Startup validation</span></div>
-      <div><i data-lucide="fingerprint"></i><span>Full claim checks</span></div>
-      <div><i data-lucide="check-circle"></i><span>Passwords still verify</span></div>
+      <div><i data-lucide="key-round" aria-hidden="true"></i><span>Approved methods</span></div>
+      <div><i data-lucide="lock" aria-hidden="true"></i><span>Startup validation</span></div>
+      <div><i data-lucide="fingerprint" aria-hidden="true"></i><span>Full claim checks</span></div>
+      <div><i data-lucide="check-circle" aria-hidden="true"></i><span>Passwords verify</span></div>
     </div>
 </div>
+<aside class="notes">
+  The accepted signing methods are now a fixed allow-list held in validated
+  configuration, so a deployment can no longer be configured to accept an unsigned
+  token. A signing secret that is too short, or that matches the placeholder the old
+  developer-setup script wrote, now fails startup instead of quietly issuing forgeable
+  tokens. Sign-in used to answer differently for an unknown address than for a wrong
+  password, which let an attacker enumerate accounts; both paths now do the same work
+  and return the same answer, and repeated failures lock the account for a short
+  window. Password hashing was not merely unmaintained, it had stopped working
+  altogether; every password already on file still verifies, so no user is forced to
+  reset.
+</aside>
 </section>
 
 <!-- 6. divider: authorization -->
 <section class="slide-divider">
 <div class="slide-body">
 
-    <span class="divider-icon"><i data-lucide="user-check"></i></span>
+    <span class="divider-icon" aria-hidden="true"><i aria-hidden="true" data-lucide="user-check"></i></span>
     <h2>Authorization</h2>
     <p class="divider-note">Cluster two of four</p>
 </div>
@@ -554,34 +784,52 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 <div class="slide-body">
 
     <div class="slide-head">
-      <span class="eyebrow eyebrow-ink">Realizing documented design intent</span>
+      <span class="eyebrow eyebrow-ink">Access</span>
       <h2>Four roles, one central decision, denied by default</h2>
     </div>
     <ul>
-      <li>These four roles are the project's own documented design intent.</li>
-      <li>One central check decides access and denies by default.</li>
-      <li>Roles come from the account record, not the browser.</li>
-      <li>Exactly one administrator exists, via a separate auditable step.</li>
+      <li>Four documented roles, ordered.</li>
+      <li>One central check; denied by default.</li>
+      <li>Role read from the account record.</li>
+      <li>One administrator, granted separately.</li>
     </ul>
     <table class="data-table">
-      <thead>
-        <tr><th>Role</th><th>What an account of this kind may do</th></tr>
+      <caption class="sr-only">Role capabilities</caption>
+      <thead scope="col">
+        <tr><th scope="col">Role</th><th scope="col">May do</th></tr>
       </thead>
       <tbody>
-        <tr><td class="role-cell">Guest</td><td>Browse listings. No account required, and page sizes are now bounded.</td></tr>
-        <tr><td class="role-cell">Registered</td><td>Save search filters and take out a subscription. Sees only its own records.</td></tr>
-        <tr><td class="role-cell">Premium</td><td>Everything a registered account may do, carrying a paid entitlement.</td></tr>
-        <tr><td class="role-cell">Admin</td><td>Everything above, plus writing to the shared listings corpus. Held by one account.</td></tr>
+        <tr><td class="role-cell">Guest</td><td>Browse listings</td></tr>
+        <tr><td class="role-cell">Registered</td><td>Save filters, subscribe</td></tr>
+        <tr><td class="role-cell">Premium</td><td>Paid entitlement</td></tr>
+        <tr><td class="role-cell">Admin</td><td>Write the corpus</td></tr>
       </tbody>
     </table>
+    <div class="icon-row">
+      <div><i data-lucide="user-check" aria-hidden="true"></i><span>Roles from records</span></div>
+      <div><i data-lucide="lock" aria-hidden="true"></i><span>Denied by default</span></div>
+      <div><i data-lucide="shield-check" aria-hidden="true"></i><span>One administrator</span></div>
+    </div>
 </div>
+<aside class="notes">
+  These four roles are not new scope; they are the project's own documented design
+  intent, specified in its requirements and never built. Before this work every
+  protected route asked only whether the caller was signed in at all. Two design points
+  matter. The check denies by default, so an absent, unrecognised or oddly cased role
+  satisfies no minimum and the request is refused rather than allowed through. And the
+  role is read from the account record loaded during sign-in, never from the token the
+  caller presents, because a value the client supplies cannot be trusted to describe the
+  client's own privileges. Exactly one administrator exists, created by a separate
+  migration step that logs the grant and asserts the count, and no other code path can
+  write that value.
+</aside>
 </section>
 
 <!-- 8. divider: payments -->
 <section class="slide-divider">
 <div class="slide-body">
 
-    <span class="divider-icon"><i data-lucide="credit-card"></i></span>
+    <span class="divider-icon" aria-hidden="true"><i aria-hidden="true" data-lucide="credit-card"></i></span>
     <h2>Payments</h2>
     <p class="divider-note">Cluster three of four</p>
 </div>
@@ -592,29 +840,41 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 <div class="slide-body">
 
     <div class="slide-head">
-      <span class="eyebrow eyebrow-ink">Who decides what is charged</span>
+      <span class="eyebrow eyebrow-ink">Payments</span>
       <h2>The buyer can no longer name its own price</h2>
     </div>
     <ul>
       <li>Price and period come from a server catalogue.</li>
       <li>Client amount and date fields no longer exist.</li>
-      <li>Payment capture is bound to the originating account.</li>
-      <li>Hosted redirect retained: no card number enters or is stored here.</li>
+      <li>Capture is bound to the paying account.</li>
+      <li>Hosted redirect kept: no card data here.</li>
     </ul>
     <div class="icon-row">
-      <div><i data-lucide="credit-card"></i><span>Server-owned pricing</span></div>
-      <div><i data-lucide="user-check"></i><span>Capture bound to buyer</span></div>
-      <div><i data-lucide="shield-check"></i><span>Notifications verified</span></div>
-      <div><i data-lucide="lock"></i><span>Repeats refused</span></div>
+      <div><i data-lucide="credit-card" aria-hidden="true"></i><span>Server pricing</span></div>
+      <div><i data-lucide="user-check" aria-hidden="true"></i><span>Bound capture</span></div>
+      <div><i data-lucide="shield-check" aria-hidden="true"></i><span>Verified notices</span></div>
+      <div><i data-lucide="lock" aria-hidden="true"></i><span>Repeats refused</span></div>
     </div>
 </div>
+<aside class="notes">
+  The amount and the access dates were previously taken from the request body, so a
+  buyer could name its own price and grant itself any length of access. Those fields are
+  now absent from the contract rather than merely validated, which makes tampering
+  structurally impossible: there is nothing to tamper with. Capture now resolves the
+  order to its stored row and checks that the row belongs to the caller. Incoming
+  payment notifications are cryptographically verified before anything is read from
+  them, the certificate host is checked against an allow-list first because that address
+  arrives in an attacker-controllable header, and a repeated notification is refused so
+  each event is processed once. The hosted redirect is unchanged, so no card number ever
+  enters this system.
+</aside>
 </section>
 
 <!-- 10. divider: secrets and infrastructure -->
 <section class="slide-divider">
 <div class="slide-body">
 
-    <span class="divider-icon"><i data-lucide="lock"></i></span>
+    <span class="divider-icon" aria-hidden="true"><i aria-hidden="true" data-lucide="lock"></i></span>
     <h2>Secrets and Infrastructure</h2>
     <p class="divider-note">Cluster four of four</p>
 </div>
@@ -626,21 +886,33 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 
     <div class="slide-head">
       <span class="eyebrow eyebrow-ink">Keeping secrets out of the wrong places</span>
-      <h2>Credentials no longer travel with the code</h2>
+      <h2>Credentials are out of the code, and still need replacing</h2>
     </div>
     <ul>
-      <li>Credentials left version control; the repository's first ignore rules prevent return.</li>
+      <li>Removed from the code, but readable in past versions.</li>
       <li>A partner key left web addresses and logs.</li>
-      <li>Managed secret storage now exists where there was none.</li>
+      <li>Containers, read grants and workload identity are declared; delivery still pending.</li>
       <li>Protective headers and a narrowed cross-origin policy apply.</li>
     </ul>
     <div class="icon-row">
-      <div><i data-lucide="git-branch"></i><span>Out of version control</span></div>
-      <div><i data-lucide="terminal"></i><span>Out of logs</span></div>
-      <div><i data-lucide="server"></i><span>Managed secret storage</span></div>
-      <div><i data-lucide="shield-check"></i><span>Protective headers</span></div>
+      <div><i data-lucide="git-branch" aria-hidden="true"></i><span>Out of git</span></div>
+      <div><i data-lucide="terminal" aria-hidden="true"></i><span>Out of logs</span></div>
+      <div><i data-lucide="server" aria-hidden="true"></i><span>Provisioned</span></div>
+      <div><i data-lucide="shield-check" aria-hidden="true"></i><span>Headers</span></div>
     </div>
 </div>
+<aside class="notes">
+  This repository had no ignore rules at all, which is why committed credentials are
+  treated as a critical rather than a high finding. A database connection string and a
+  cloud service-account key were committed, and the signing key every developer
+  environment used was a published placeholder. Separately, the listings-provider key
+  travelled in web addresses and was printed into logs when a call failed. All are out of
+  the code now and cannot return, but removal only stops future exposure: anything
+  already exposed stays live until it is rotated, which is the operator step this deck
+  returns to. Managed secret storage is provisioned and the service is authorized to read
+  it; mounting it into the running pods is a manifest change made outside this
+  repository.
+</aside>
 </section>
 
 <!-- 12. before and after request authorization -->
@@ -648,36 +920,46 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 <div class="slide-body">
 
     <div class="slide-head">
-      <span class="eyebrow eyebrow-ink">Data flow, before and after</span>
-      <h2>How a paid request is decided now</h2>
+      <span class="eyebrow eyebrow-ink">Data flow</span>
+      <h2>Deciding a paid request</h2>
     </div>
-    <p class="lede">The client no longer supplies an amount or the access dates.</p>
+    <p class="lede">Access is granted only after the payment provider confirms the charge settled.</p>
   <pre class="mermaid">
   graph LR
+    accTitle: How a paid request is decided, before and after
+    accDescr {
+      Before, a request reached the backend service, which asked only whether the
+      caller was signed in at all, and if so the amount and access dates the client
+      sent were saved exactly as received. After, the request reaches a central
+      authorization check whose role is read from the account record. If the role is
+      insufficient the request is denied by default. If it is sufficient, a server
+      catalogue sets the amount, currency and period, and the server clock sets the
+      access dates, so the subscription is saved entirely from server-owned values
+      while the client sends no amount and no dates.
+    }
     subgraph AFTER["After"]
       direction LR
-      RQ2["Request"] --&gt; API2["Backend&lt;br/&gt;Service"]
-      API2 --&gt; AZ["Central&lt;br/&gt;authorization&lt;br/&gt;check"]
+      RQ2["Request names&lt;br/&gt;a plan only"] --&gt; AZ["Central&lt;br/&gt;authorization&lt;br/&gt;check"]
       ROLE["Role read from&lt;br/&gt;the account record"] --&gt; AZ
-      AZ --&gt; Q2{"Role&lt;br/&gt;sufficient?"}
-      Q2 --&gt;|"no"| DENY["Denied by&lt;br/&gt;default"]
-      Q2 --&gt;|"yes"| CAT["Server catalogue&lt;br/&gt;sets amount,&lt;br/&gt;currency and period"]
-      CL2["Client sends&lt;br/&gt;no amount&lt;br/&gt;and no dates"] --&gt; CAT
-      CAT --&gt; CLK["Server clock sets&lt;br/&gt;the access dates"]
-      CLK --&gt; SAVE2["Saved from&lt;br/&gt;server-owned&lt;br/&gt;values"]
+      AZ --&gt; CAT["Server catalogue&lt;br/&gt;sets amount,&lt;br/&gt;currency, period"]
+      CAT --&gt; PEND["Order recorded,&lt;br/&gt;access still&lt;br/&gt;pending"]
+      PEND --&gt; HOST["Payer approves on&lt;br/&gt;the provider's&lt;br/&gt;own pages"]
+      HOST --&gt; HOOK["Provider notifies;&lt;br/&gt;signature verified,&lt;br/&gt;repeats refused"]
+      HOOK --&gt; CAPT["Charge taken,&lt;br/&gt;bound to the&lt;br/&gt;owning account"]
+      CAPT --&gt; CHK{"Settled for the&lt;br/&gt;catalogue amount?"}
+      CHK --&gt;|"no"| NOGO["No access&lt;br/&gt;granted"]
+      CHK --&gt;|"yes"| ACT["Access granted;&lt;br/&gt;server clock sets&lt;br/&gt;the dates"]
     end
-    subgraph BEFORE["Before"]
+    subgraph BEFORE["1 - Before"]
       direction LR
-      RQ1["Request"] --&gt; API1["Backend&lt;br/&gt;Service"]
-      API1 --&gt; Q1{"Signed in&lt;br/&gt;at all?"}
-      Q1 --&gt;|"yes"| GO1["Proceed"]
-      CL1["Client sends&lt;br/&gt;its own amount&lt;br/&gt;and access dates"] --&gt; GO1
-      GO1 --&gt; SAVE1["Saved exactly&lt;br/&gt;as sent"]
+      RQ1["Request carries&lt;br/&gt;its own amount&lt;br/&gt;and access dates"] --&gt; Q1{"Signed in&lt;br/&gt;at all?"}
+      Q1 --&gt;|"yes"| SAVE1["Access granted&lt;br/&gt;immediately, exactly&lt;br/&gt;as sent"]
+      SAVE1 --&gt; NEV["Payment never&lt;br/&gt;confirmed"]
     end
     classDef risk fill:#F4EFF6,stroke:#999999,stroke-width:2px,color:#333333;
     classDef good fill:#F2F0FE,stroke:#5B39F3,stroke-width:4px,color:#1A105F;
-    class CL1,SAVE1,Q1 risk;
-    class AZ,ROLE,CAT,CLK,CL2 good;
+    class RQ1,SAVE1,Q1,NEV risk;
+    class AZ,ROLE,CAT,PEND,HOOK,CAPT,CHK,ACT good;
   </pre>
 </div>
 </section>
@@ -688,117 +970,255 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 
     <div class="slide-head">
       <span class="eyebrow eyebrow-ink">Supply chain</span>
-      <h2>Three building blocks replaced, not patched</h2>
+      <h2>Three building blocks replaced, for three different reasons</h2>
     </div>
     <ul>
-      <li>Three packages were replaced rather than upgraded: no patched release existed.</li>
-      <li>Several advisories closed by removing or omitting a package, not upgrading one.</li>
-      <li>Fewer packages now reach the running service.</li>
+      <li>Own flaws fixed; a bundled part has no fix.</li>
+      <li>All three replaced rather than upgraded.</li>
     </ul>
     <table class="data-table">
-      <thead>
-        <tr><th>Replaced</th><th>Now in use</th><th>Security outcome</th></tr>
+      <caption class="sr-only">Replacement reasons</caption>
+      <thead scope="col">
+        <tr><th scope="col">Replaced</th><th scope="col">Now in use</th><th scope="col">Why it had to go</th></tr>
       </thead>
       <tbody>
         <tr>
           <td class="role-cell">Token library</td>
-          <td>A maintained token library</td>
-          <td>Removed a bundled component whose known flaw has no planned fix from anyone.</td>
+          <td>Maintained token library</td>
+          <td>Needs a component nobody will fix</td>
         </tr>
         <tr>
-          <td class="role-cell">Password-hashing wrapper</td>
-          <td>The hashing library, called directly</td>
-          <td>Sign-in repaired, and every password already on file still verifies.</td>
+          <td class="role-cell">Hashing wrapper</td>
+          <td>Hashing library, called directly</td>
+          <td>Unmaintained; had stopped working</td>
         </tr>
         <tr>
-          <td class="role-cell">Archived payment kit</td>
-          <td>Direct calls to the payment provider</td>
-          <td>Made verification of incoming payment notifications possible at all.</td>
+          <td class="role-cell">Payment kit</td>
+          <td>Direct provider calls</td>
+          <td>Archived; cannot verify notifications</td>
         </tr>
         <tr class="row-flag">
           <td class="role-cell">Overall</td>
           <td>19 &rarr; 7 advisories</td>
-          <td>Carried by seven packages before this work and three after it.</td>
+          <td>Four closed by removal alone</td>
         </tr>
       </tbody>
     </table>
 </div>
+<aside class="notes">
+  The three reasons are genuinely different. An earlier version of this slide
+  applied one reason to all three, which was wrong. The token library's own two
+  published vulnerabilities were fixed by its maintainers; what has no fix is a
+  cryptography component it requires, whose maintainers have stated publicly that the
+  flaw is out of scope for their project and no fix is planned. So upgrading the token
+  library would not have helped, and removing it was the only remediation. The hashing
+  wrapper has no vulnerability at all: it was last released in 2020 and had stopped
+  working against the current hashing library, so sign-in was broken. The payment kit is
+  archived by its vendor and never implemented notification verification, so no version
+  of it could deliver the control this work needed. Several advisories were also closed
+  by removing or simply omitting a package rather than upgrading one.
+</aside>
 </section>
 
-<!-- 14. risk and mitigation -->
+<!-- 14. what the pipeline verifies -->
 <section>
 <div class="slide-body">
 
     <div class="slide-head">
-      <span class="eyebrow eyebrow-ink">What to decide</span>
+      <span class="eyebrow eyebrow-ink">How it stays fixed</span>
+      <h2>What the pipeline checks on every change</h2>
+    </div>
+    <table class="data-table">
+      <caption class="sr-only">Summary summary</caption>
+      <thead scope="col">
+        <tr><th scope="col">Check</th><th scope="col">What it covers, exactly</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="role-cell">Dependency audit</td><td>Both package lists</td></tr>
+        <tr><td class="role-cell">Code scan</td><td>No medium or high findings</td></tr>
+        <tr><td class="role-cell">Security suite</td><td>Forty-five access-control assertions</td></tr>
+        <tr class="row-flag"><td class="role-cell">Two guards</td><td>One package stays absent; eight code patterns stay unused</td></tr>
+      </tbody>
+    </table>
+    <div class="icon-row">
+      <div><i data-lucide="git-branch" aria-hidden="true"></i><span>Audit both lists</span></div>
+      <div><i data-lucide="terminal" aria-hidden="true"></i><span>Scan the code</span></div>
+      <div><i data-lucide="check-circle" aria-hidden="true"></i><span>Prove access control</span></div>
+      <div><i data-lucide="lock" aria-hidden="true"></i><span>Two narrow guards</span></div>
+    </div>
+</div>
+</section>
+
+<!-- 15. risk and mitigation -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Risk</span>
       <h2>Residual risk, and what holds it in check</h2>
     </div>
     <div class="callout">
-      <i data-lucide="alert-triangle"></i>
-      <p>One deliberate breaking change: <span class="mono">POST /listings/</span> now requires the administrator role.</p>
+      <i data-lucide="alert-triangle" aria-hidden="true"></i>
+      <p>One deliberate breaking change needs sign-off.</p>
     </div>
     <table class="data-table">
-      <thead>
-        <tr><th>Risk</th><th>How it is held in check</th></tr>
+      <caption class="sr-only">Accepted risks</caption>
+      <thead scope="col">
+        <tr><th scope="col">Risk</th><th scope="col">Control</th></tr>
       </thead>
       <tbody>
         <tr class="row-flag">
-          <td><span class="mono">POST /listings/</span> is now restricted to the administrator role. Deliberate, and the one breaking change in this release.</td>
-          <td>Impact was measured, not estimated: no browser client calls it, and the listing ingestion service writes straight to the database, so that workflow is unaffected. Stated in the project readme and in the review document, never introduced silently.</td>
+          <td><span class="mono">POST /listings/</span> is admin-only</td>
+          <td>Measured impact; announced, not silent</td>
         </tr>
         <tr>
-          <td>Seven dependency advisories are accepted as residual risk.</td>
-          <td>No fix for any of them is installable on the runtime this service deliberately pins. Each one carries a named compensating control, and an automated pipeline guard fails the build if a control ever stops holding, so the acceptance cannot lapse quietly.</td>
+          <td>Fourteen dependency advisories are accepted as residual risk: seven in the deployed service, seven more in test and audit tooling that is never deployed.</td>
+          <td>No fix for any of them is installable on the runtime this service deliberately pins. Each one carries a named compensating control, both sets are registered, and two automated guards run on every change.</td>
         </tr>
         <tr>
-          <td>The credentials that were exposed stay live until they are rotated.</td>
-          <td>An ordered rotation runbook is delivered with the change. Rotation is the required next step and is sequenced last, because it cannot be reversed.</td>
+          <td>Credentials live until rotated</td>
+          <td>Announced as the next step; credential rotation still to run, and it cannot be undone</td>
         </tr>
         <tr>
-          <td>New required settings must be present before the service will start.</td>
-          <td>Startup refuses a weak or placeholder value by design rather than degrading quietly, and every setting ships documented with a safe local default.</td>
+          <td>New required settings must be present before the service will start, and the shipped configuration template will not start it as delivered.</td>
+          <td>Every setting is documented, and the non-secret ones carry a working local default. The signing key ships as a placeholder that startup refuses outright, and the remaining secrets are refused anywhere but a local run, so they must be replaced first.</td>
         </tr>
       </tbody>
     </table>
+    <h3>What still needs an owner</h3>
+    <div class="icon-row">
+      <div><i data-lucide="key-round" aria-hidden="true"></i><span>Rotate the exposed credentials</span></div>
+      <div><i data-lucide="server" aria-hidden="true"></i><span>Mount the provisioned secrets</span></div>
+      <div><i data-lucide="mail" aria-hidden="true"></i><span>Enable private reporting</span></div>
+    </div>
+    <p class="slide-foot">Detail in docs/security</p>
 </div>
+<aside class="notes">
+  On the breaking change: the impact was measured rather than estimated. No client in
+  this repository calls that route, and the ingestion task writes to the database
+  directly, so that workflow is untouched. It is stated in the readme, the review
+  document and the decision log, never introduced silently, and it needs a sign-off.
+  On the seven advisories: each has a named compensating control, and two automated
+  guards run on every change. Be precise about what those guards prove. One asserts a
+  package stays absent. The other has two layers, and the first layer is a text search
+  that an aliased import or a dynamic call would evade, which is why a second layer
+  parses the code and follows aliases. Together they detect the realistic ways an
+  acceptance could lapse; they are not a proof that it cannot. On credentials: removal
+  stops future exposure only. Rotation is the required next step, is irreversible, and
+  is therefore sequenced last.
+</aside>
 </section>
 
-<!-- 15. onboarding and continuity -->
+<!-- 16. what stands between this and a first release -->
 <section>
 <div class="slide-body">
 
     <div class="slide-head">
-      <span class="eyebrow eyebrow-ink">How the team continues</span>
-      <h2>Everything needed to pick this up on day one</h2>
+      <span class="eyebrow eyebrow-ink">Before this can be released</span>
+      <h2>Four things an operator must settle first</h2>
     </div>
-    <ul>
-      <li>Copy the committed <span class="mono">.env.example</span>; every setting has a safe local default.</li>
-      <li>A dependency audit, a code scan and a security suite run in the pipeline.</li>
-      <li>The <span class="mono">docs/</span> set records decisions, traceability, residual risk and rotation.</li>
-    </ul>
+    <div class="callout">
+      <i data-lucide="alert-triangle" aria-hidden="true"></i>
+      <p>The code is remediated and tested. <span class="mono">No part of this has been deployed</span>, and these four gates are why.</p>
+    </div>
+    <table class="data-table">
+      <caption class="sr-only">Summary summary</caption>
+      <thead scope="col">
+        <tr><th scope="col">Gate</th><th scope="col">What it needs, and what happens until then</th></tr>
+      </thead>
+      <tbody>
+        <tr class="row-flag">
+          <td>The cluster's control plane is private, and the release now reaches it over an authorized path rather than a public one.</td>
+          <td>Access is granted by permission, not by network location, so the deploying identity needs that permission granted. Until it is, no release path can reach the cluster at all &mdash; which was already true before this work, silently.</td>
+        </tr>
+        <tr>
+          <td>Images now publish to a newly defined registry, because the previous one stopped accepting them.</td>
+          <td>The registry must be created and the release identity given write access to it. The release refuses to reuse a version label and verifies which image is actually running, so a release that changes nothing can no longer report success.</td>
+        </tr>
+        <tr class="row-flag">
+          <td>One small cloud function runs on a language version its platform no longer accepts for new or updated deployments.</td>
+          <td>The version is a fixed constraint of this work and was not raised. That function is therefore left out of the deployment until an owner decides between raising the constraint and retiring the function. Everything else releases normally; this step reports itself blocked rather than failing the release or quietly weakening the constraint.</td>
+        </tr>
+        <tr>
+          <td>The cluster objects the release updates are defined outside this repository.</td>
+          <td>Both release paths check that each one exists before changing anything, and stop naming whatever is missing. Nothing is created implicitly, so a misnamed target fails early instead of half-way through.</td>
+        </tr>
+      </tbody>
+    </table>
     <div class="icon-row">
-      <div><i data-lucide="file-check"></i><span>Example environment file</span></div>
-      <div><i data-lucide="terminal"></i><span>Pipeline verification</span></div>
-      <div><i data-lucide="book-open"></i><span>Security documentation</span></div>
-      <div><i data-lucide="check-circle"></i><span>Traced to tests</span></div>
+      <div><i data-lucide="lock" aria-hidden="true"></i><span>Cluster access by permission</span></div>
+      <div><i data-lucide="server" aria-hidden="true"></i><span>New image registry</span></div>
+      <div><i data-lucide="alert-triangle" aria-hidden="true"></i><span>One function blocked</span></div>
+      <div><i data-lucide="check-circle" aria-hidden="true"></i><span>Targets verified first</span></div>
     </div>
 </div>
+<aside class="notes">
+  These are the seven operator items counted on the metrics slide, grouped into four
+  pieces of work, and none of them can be done from inside a commit. Rotation covers a
+  database connection string, a cloud service-account key, a signing key and a partner
+  API key; the runbook orders it revoke, rotate, delete, then review prior access,
+  because rewriting history before revoking leaves a live credential in every existing
+  clone. Secret delivery and the Kubernetes manifests live outside this repository.
+  The deployment inputs include a renamed cluster-location secret, federated identity
+  replacing a long-lived key that must be deleted rather than left unused, and a runner
+  with a network path to the now-private control plane. The disclosure channel needs
+  private reporting switched on and a mailbox someone is accountable for reading; until
+  then the security policy publishes no address and commits to no response times, which
+  it says plainly. Every item is listed in the decision log's reconciliation section.
+</aside>
 </section>
 
-<!-- 16. closing -->
+<!-- 17. onboarding and continuity -->
+<section>
+<div class="slide-body">
+
+    <div class="slide-head">
+      <span class="eyebrow eyebrow-ink">Day one</span>
+      <h2>Everything needed to pick this up</h2>
+    </div>
+    <ul>
+      <li>Copy the committed <span class="mono">.env.example</span>; its placeholder secrets must be replaced before startup.</li>
+      <li>Seven required values include five provider credentials.</li>
+      <li>Audit, code scan and security suite run in the pipeline.</li>
+      <li>The <span class="mono">docs/</span> set records decisions, traceability, risk and rotation.</li>
+    </ul>
+    <div class="icon-row">
+      <div><i data-lucide="file-check" aria-hidden="true"></i><span>Example env</span></div>
+      <div><i data-lucide="terminal" aria-hidden="true"></i><span>Gated pipeline</span></div>
+      <div><i data-lucide="book-open" aria-hidden="true"></i><span>Docs set</span></div>
+      <div><i data-lucide="check-circle" aria-hidden="true"></i><span>Traced to tests</span></div>
+    </div>
+</div>
+<aside class="notes">
+  Two clarifications a new developer needs. The example configuration file starts the
+  local profile as it stands, but it does not carry a working default for everything:
+  the listings provider, payment and email keys are non-functional placeholders, accepted
+  only while the environment is local, and the cloud profile additionally needs a real
+  database instance name. Startup refuses a weak or placeholder value rather than
+  degrading quietly, so a missing setting fails loudly and names itself. On the pipeline:
+  the dependency audit, the code scan, the full test suite, the security suite and both
+  guards do gate every change, and the deployment workflow calls that same pipeline
+  rather than repeating part of it. Two checks are not gated and must be run locally,
+  the infrastructure validation and the container build. One job, the frontend check, is
+  expected to fail and deliberately gates nothing.
+</aside>
+</section>
+
+<!-- 18. closing -->
 <section class="slide-closing">
 <div class="slide-body">
 
     <span class="eyebrow">Where this leaves us</span>
-    <h2>Secured, verifiable, ready to review</h2>
+    <h2>Ready for review</h2>
+    <p class="lede">Remediated and tested. Ready for your review, not yet released.</p>
     <ul>
-      <li>Every finding maps to a fix and a verifying test.</li>
-      <li>Rotating the exposed credentials is the required next step.</li>
-      <li>One deliberate breaking change awaits your sign-off.</li>
+      <li>Each fix carries a test that proves it.</li>
+      <li>Rotating the exposed credentials and settling the four release gates come next.</li>
+      <li>One breaking change awaits your sign-off.</li>
     </ul>
     <div class="closing-foot">
       <div class="brand-lockup">
-        <i data-lucide="shield-check"></i>
+        <i data-lucide="shield-check" aria-hidden="true"></i>
         <div>
           <div class="brand-word">Blitzy</div>
           <div class="brand-sub">Security Remediation</div>
@@ -813,14 +1233,14 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </div>
 
 <!-- reveal.js framework -->
-<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js" integrity="sha384-M/JtqCVlLcK9lwVnBnMXP0V577CBULkjodKsR/PITOe4MSKNbbwqCemEyluOw0+5" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 
 <!-- lucide icon runtime -->
-<script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js" integrity="sha384-ieG+IKD0d/ZPXyCBTMVAbqsQdns8QGJR/e26WMw7M4fkaI/rHcS/YIoi+ah9WGge" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 
-<!-- mermaid + lucide render cycle -->
+<!-- mermaid + lucide render cycle; the specifier resolves through the import map, which carries the module's integrity hash -->
 <script type="module">
-import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.4.0/dist/mermaid.esm.min.mjs';
+import mermaid from 'mermaid';
 
 window.mermaid = mermaid;
 
@@ -839,12 +1259,12 @@ mermaid.initialize({
   }
 });
 
-/* original diagram source, keyed by node */
+/* Diagram source text, keyed by node. */
 var diagramSource = new WeakMap();
 
 var FONT_GATE_TIMEOUT_MS = 4000;
 
-/* webfont metrics must be available before any diagram is measured */
+/* Resolves when the webfonts report ready or the timeout elapses. */
 function fontsSettled() {
   var loading = (document.fonts && document.fonts.ready)
     ? document.fonts.ready
@@ -855,12 +1275,12 @@ function fontsSettled() {
   return Promise.race([loading, deadline]);
 }
 
-/* a node with no layout box sits on a slide reveal.js has not laid out yet */
+/* True when the node reports a non-zero layout box. */
 function hasLayout(node) {
   return node.offsetWidth > 0 && node.offsetHeight > 0;
 }
 
-/* diagrams awaiting a first draw */
+/* Nodes that have a layout box and no completed render, with their source restored. */
 function pendingDiagrams() {
   var nodes = Array.prototype.slice.call(document.querySelectorAll('pre.mermaid'));
   var pending = [];
@@ -881,6 +1301,7 @@ function pendingDiagrams() {
   return pending;
 }
 
+/* Marks every unrendered diagram node with a notice and logs the reason. */
 function markDiagramFailure(error) {
   var reason = (error && error.message) ? error.message : 'diagram could not be drawn';
   var nodes = document.querySelectorAll('pre.mermaid:not([data-processed="true"])');
@@ -891,6 +1312,7 @@ function markDiagramFailure(error) {
   window.console.error('Mermaid render failed: ' + reason);
 }
 
+/* Substitutes a marking-only icon runtime when the loaded script exposes none. */
 if (!window.lucide || typeof window.lucide.createIcons !== 'function') {
   window.console.error('Lucide runtime unavailable; icon placeholders cannot be drawn.');
   window.lucide = {

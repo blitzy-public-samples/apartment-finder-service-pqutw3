@@ -77,6 +77,13 @@ This module installs no middleware and guards no route on its own: a
 route is guarded where it declares the dependency, and a route
 declaring none stays reachable.
 
+The dependency :func:`require_role` returns is a synchronous callable,
+so the framework runs it in a worker thread rather than on the event
+loop. Every session statement this module issues -- the entitlement
+lookup in :func:`entitled_role` and the ownership lookup in
+:func:`load_owned` -- therefore runs off the loop, whether the guarded
+route is declared with ``def`` or with ``async def``.
+
 Usage::
 
     @router.post('/')
@@ -144,6 +151,7 @@ __all__ = [
     "ROLE_RANKS",
     "SUBSCRIPTION_DERIVED_ROLES",
     "Role",
+    "audit_failure_count",
     "effective_role",
     "entitled_role",
     "load_owned",
@@ -613,10 +621,17 @@ def require_role(minimum: Any) -> Callable[..., User]:
 
     The request is read only to build that record, and no value carried
     by the request takes part in the decision.
+
+    The dependency is declared with ``def`` rather than ``async def``,
+    so the framework runs it in a worker thread. The session statement
+    :func:`effective_role` may issue therefore never runs on the event
+    loop, and it runs on whichever worker thread serves the dependency,
+    sequentially and never concurrently with another statement on the
+    same session.
     """
     required = _coerce_minimum(minimum)
 
-    async def dependency(
+    def dependency(
         request: Request,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user),

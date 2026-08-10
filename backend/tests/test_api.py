@@ -25,6 +25,7 @@ import logging as stdlib_logging
 import os
 import subprocess
 import sys
+import threading
 from contextlib import asynccontextmanager, contextmanager
 from itertools import count
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,7 @@ from conftest import (
 from fastapi import HTTPException
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Query as SqlAlchemyQuery
 from sqlalchemy.orm import Session as SqlAlchemySession
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from starlette.exceptions import (
@@ -120,6 +122,9 @@ from backend.tests.support import REPO_ROOT, VALID_TEST_PASSWORD
 
 
 AUTH_MODULE = 'backend.app.api.endpoints.auth'
+
+#: Seconds one held or waiting attempt is allowed in the contention case.
+CONTENTION_BOUND_SECONDS = 30.0
 
 SUBSCRIPTIONS_MODULE = 'backend.app.api.endpoints.subscriptions'
 
@@ -510,21 +515,67 @@ def test_a_stored_admin_role_is_never_lowered_by_derivation(
     assert authorization.effective_role(db, registered_user) is Role.ADMIN
 
 
-def test_the_failed_attempt_write_takes_a_row_lock(registered_user, db):
-    """The counter's read-modify-write is serialized by a row lock.
+def test_the_failed_attempt_write_takes_a_row_lock(
+    registered_user, db, monkeypatch
+):
+    """The lock is taken by the production helper, not by this case.
 
-    The statement is compiled against the PostgreSQL dialect, which is
-    the dialect that renders the locking clause.
+    ``_lock_row`` is called as the endpoint calls it, and the query it
+    builds is captured where it asks for the lock. The captured statement
+    is compiled against the PostgreSQL dialect, which is the dialect that
+    renders the locking clause; SQLite accepts the request and renders
+    nothing, so compiling for it would assert nothing.
+
+    A helper that stopped asking for the lock would leave nothing to
+    capture and fail here.
     """
-    statement = (
-        db.query(User)
-        .filter(User.id == registered_user.id)
-        .populate_existing()
-        .with_for_update()
-        .statement
+    locking_queries = []
+    request_lock = SqlAlchemyQuery.with_for_update
+
+    def capture(query, *args, **kwargs):
+        """Records the query that asked for a row lock."""
+        locked = request_lock(query, *args, **kwargs)
+        locking_queries.append(locked)
+        return locked
+
+    monkeypatch.setattr(SqlAlchemyQuery, 'with_for_update', capture)
+
+    row = auth_module._lock_row(db, registered_user.id)
+
+    assert row is not None
+    assert row.id == registered_user.id
+    assert len(locking_queries) == 1, locking_queries
+    compiled = str(
+        locking_queries[0].statement.compile(
+            dialect=postgresql.dialect()
+        )
     )
-    compiled = str(statement.compile(dialect=postgresql.dialect()))
     assert 'FOR UPDATE' in compiled
+
+
+def test_the_counted_failure_reaches_that_helper(
+    registered_user, db, monkeypatch
+):
+    """The counting path resolves its row through ``_lock_row``.
+
+    The two cases together state the property: the count is written to a
+    row this helper returned, and this helper asks for the lock.
+    """
+    calls = []
+    resolve = auth_module._lock_row
+
+    def record(session, user_id):
+        """Records one call and returns what the helper returns."""
+        calls.append(user_id)
+        return resolve(session, user_id)
+
+    monkeypatch.setattr(auth_module, '_lock_row', record)
+
+    auth_module._record_failed_attempt(
+        db, registered_user, datetime.now(timezone.utc)
+    )
+
+    assert calls == [registered_user.id]
 
 
 def test_repeated_failures_lock_the_account(registered_user, db):
@@ -579,6 +630,99 @@ def test_a_successful_attempt_clears_the_count_and_the_lock(
     row = db.query(User).filter(User.id == registered_user.id).one()
     assert row.failed_login_attempts == 0
     assert row.locked_until is None
+
+
+@pytest.mark.postgres
+def test_two_concurrent_failures_are_both_counted_on_postgres(
+    postgres_session_factory, postgres_observer, password_hash, monkeypatch
+):
+    """Two independent transactions take the count from zero to two.
+
+    The first attempt is held inside ``_lock_row``, after the lock has
+    been taken and before the count is written. The second attempt is
+    then made from a session of its own, on a connection of its own, and
+    is observed waiting on a lock the server holds -- which is the
+    property SQLite cannot exhibit, since it serialises writers itself
+    and never has two transactions contending for one row.
+
+    Releasing the first lets both complete. The stored count is two: the
+    second read the value the first had written rather than the value it
+    read before the first began, so no increment was lost.
+    """
+    moment = datetime.now(timezone.utc)
+    seeding = postgres_session_factory()
+    try:
+        account = User(
+            email='contended@example.com',
+            hashed_password=password_hash,
+            created_at=moment,
+            role=Role.REGISTERED.value,
+        )
+        seeding.add(account)
+        seeding.commit()
+        account_id = account.id
+    finally:
+        seeding.close()
+
+    holder_locked = threading.Event()
+    release_holder = threading.Event()
+    held = []
+    resolve = auth_module._lock_row
+
+    def hold_the_first(session, user_id):
+        """Holds the first caller inside the lock it just took."""
+        row = resolve(session, user_id)
+        if not held:
+            held.append(session)
+            holder_locked.set()
+            assert release_holder.wait(CONTENTION_BOUND_SECONDS), (
+                'the first attempt was never released'
+            )
+        return row
+
+    monkeypatch.setattr(auth_module, '_lock_row', hold_the_first)
+
+    def count_one_failure():
+        """Counts one failed attempt from a session of its own."""
+        session = postgres_session_factory()
+        try:
+            auth_module._record_failed_attempt(
+                session, session.query(User).get(account_id), moment
+            )
+        finally:
+            session.close()
+
+    first = threading.Thread(target=count_one_failure)
+    first.start()
+    try:
+        assert holder_locked.wait(CONTENTION_BOUND_SECONDS), (
+            'the first attempt never took the lock'
+        )
+        second = threading.Thread(target=count_one_failure)
+        second.start()
+        try:
+            assert postgres_observer(1), (
+                'the second attempt was never seen waiting on the lock '
+                'the first holds'
+            )
+        finally:
+            release_holder.set()
+            second.join(CONTENTION_BOUND_SECONDS)
+    finally:
+        release_holder.set()
+        first.join(CONTENTION_BOUND_SECONDS)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+
+    reading = postgres_session_factory()
+    try:
+        stored = reading.query(User).get(account_id)
+        assert stored.failed_login_attempts == 2, (
+            stored.failed_login_attempts
+        )
+    finally:
+        reading.close()
 
 
 def test_a_failed_persistence_is_recorded_rather_than_raised(
@@ -1643,9 +1787,9 @@ def test_throttling_is_audited_and_answered_429(client):
 class FakeResponse:
     """Stands in for a provider response at the transport boundary.
 
-    ``content`` and the declared length are derived from the payload, so
-    the service's response-size cap is applied to this stand-in exactly as
-    it is to a real response.
+    ``content`` is what ``aiter_bytes`` yields and the declared length is
+    derived from it, so the service's response-size cap is applied to this
+    stand-in exactly as it is to a real streamed response.
     """
 
     def __init__(self, status_code=200, payload=None):
@@ -1653,6 +1797,9 @@ class FakeResponse:
         self._payload = payload if payload is not None else {}
         self.content = json.dumps(self._payload).encode("utf-8")
         self.headers = {"Content-Length": str(len(self.content))}
+
+    async def aiter_bytes(self):
+        yield self.content
 
     def json(self):
         return self._payload
@@ -1668,8 +1815,8 @@ class FakeClient:
     response is served, so a call carrying the wrong method, host, path,
     authentication, headers, body or timeout raises rather than receiving
     a plausible answer. ``routes`` holds the contract route each recorded
-    call addressed. Only the two call shapes the service makes are
-    served: ``post`` and ``request``.
+    call addressed. The service issues every call through ``stream``, so
+    that is the only call shape served.
     """
 
     def __init__(self, responses):
@@ -1684,11 +1831,14 @@ class FakeClient:
             return self._responses.pop(0)
         return self._responses[0]
 
-    async def post(self, url, **kwargs):
-        return self._serve('POST', url, kwargs)
+    def stream(self, method, url, **kwargs):
+        response = self._serve(method, url, kwargs)
 
-    async def request(self, method, url, **kwargs):
-        return self._serve(method, url, kwargs)
+        @asynccontextmanager
+        async def opened():
+            yield response
+
+        return opened()
 
 
 @contextmanager

@@ -27,15 +27,26 @@ column, no row's existence, and no table or column definition, so an
 account another grant made an administrator is left as it stands.
 
 Each outcome is recorded on the ``alembic`` logger with the counts it was
-decided from, and no record carries a credential. ``--sql`` emits both
-statements of each direction with their values inline; no count is read,
-so no post-condition is checked in a statement stream.
+decided from. The logger is governed by
+:mod:`backend.app.core.logging`, which renders every record as redacted
+JSON, and no record and no raised message names the address: each carries
+:data:`ADMIN_REFERENCE` instead, the non-reversible reference
+:func:`account_reference` derives from it. A record therefore carries no
+credential and no personal datum, and stays correlatable across runs
+because the reference is stable.
+
+``--sql`` emits both statements of each direction with their values
+inline, so the emitted stream does carry the address the ``WHERE`` clause
+matches on: a statement stream has to be complete on its own to be
+applicable. ``backend/migrations/env.py`` marks that stream accordingly.
+No count is read in that mode, so no post-condition is checked there.
 
 Revision ID: 0002
 Revises: 0001
 Create Date: 2026-08-08 09:31:48.204617
 
 """
+import hashlib
 import logging
 
 import sqlalchemy as sa
@@ -67,21 +78,27 @@ LOCKED_CREDENTIAL = "!locked-no-password-set"
 #: Failed-attempt count an account this revision stores begins with.
 FAILED_ATTEMPTS_START = 0
 
+#: Hexadecimal digits of the account reference this revision records in
+#: place of the address it promotes.
+ACCOUNT_REFERENCE_LENGTH = 12
+
 #: Message of the failure raised when the addresses holding the
 #: administrator role after the promotion are not exactly one entry
-#: naming :data:`ADMIN_EMAIL`.
+#: naming :data:`ADMIN_EMAIL`. It names the count, the role and the
+#: account reference, and no address.
 COUNT_MESSAGE = (
     "Administrator seed post-condition failed: {count} accounts hold "
-    "the role {role} and {email} is {among}among them, exactly one is "
-    "required and at most one is permitted"
+    "the role {role} and account {reference} is {among}among them, "
+    "exactly one is required and at most one is permitted"
 )
 
-#: Message of the failure raised when the named address still holds the
-#: administrator role after ``downgrade``.
+#: Message of the failure raised when the seeded account still holds the
+#: administrator role after ``downgrade``. It names the account reference
+#: and no address.
 DEMOTION_MESSAGE = (
-    "Administrator seed reversal post-condition failed: {email} still "
-    "holds the role {role}, none is permitted for that address once the "
-    "reversal has run"
+    "Administrator seed reversal post-condition failed: account "
+    "{reference} still holds the role {role}, none is permitted for that "
+    "account once the reversal has run"
 )
 
 #: Logger carrying this revision's records. The name sits in the
@@ -98,6 +115,22 @@ users = sa.table(
     sa.column("role"),
     sa.column("failed_login_attempts"),
 )
+
+
+def account_reference(email: str = ADMIN_EMAIL) -> str:
+    """Return the stable, non-reversible reference for ``email``.
+
+    The value is the leading :data:`ACCOUNT_REFERENCE_LENGTH` hexadecimal
+    digits of the SHA-256 digest of the address. It is the same on every
+    run and for every environment, so a record is correlated across runs
+    without the address appearing in one.
+    """
+    digest = hashlib.sha256(email.encode("utf-8")).hexdigest()
+    return digest[:ACCOUNT_REFERENCE_LENGTH]
+
+
+#: Reference recorded in place of :data:`ADMIN_EMAIL`.
+ADMIN_REFERENCE = account_reference()
 
 
 def _emitting_statements() -> bool:
@@ -203,17 +236,17 @@ def _upgrade_offline() -> None:
     op.execute(_seed())
     op.execute(_promotion())
     logger.info(
-        "Provisioned %s at the role %s; its stored credential matches "
-        "no password, so the account cannot be signed in to until that "
-        "password is reset outside this revision",
-        ADMIN_EMAIL,
+        "Provisioned account %s at the role %s; its stored credential "
+        "matches no password, so the account cannot be signed in to "
+        "until that password is reset outside this revision",
+        ADMIN_REFERENCE,
         REGISTERED_ROLE,
     )
     logger.info(
-        "Seeded the role %s for %s; a statement stream reads no count, "
-        "so no administrator count is checked here",
+        "Seeded the role %s for account %s; a statement stream reads no "
+        "count, so no administrator count is checked here",
         ADMIN_ROLE,
-        ADMIN_EMAIL,
+        ADMIN_REFERENCE,
     )
 
 
@@ -224,10 +257,11 @@ def _upgrade_online() -> None:
     stored = _rows_written(connection.execute(_seed()))
     if stored > 0:
         logger.info(
-            "Provisioned %s at the role %s; its stored credential "
-            "matches no password, so the account cannot be signed in "
-            "to until that password is reset outside this revision",
-            ADMIN_EMAIL,
+            "Provisioned account %s at the role %s; its stored "
+            "credential matches no password, so the account cannot be "
+            "signed in to until that password is reset outside this "
+            "revision",
+            ADMIN_REFERENCE,
             REGISTERED_ROLE,
         )
 
@@ -239,15 +273,16 @@ def _upgrade_online() -> None:
             COUNT_MESSAGE.format(
                 count=len(administrators),
                 role=ADMIN_ROLE,
-                email=ADMIN_EMAIL,
+                reference=ADMIN_REFERENCE,
                 among="" if ADMIN_EMAIL in administrators else "not ",
             )
         )
 
     logger.info(
-        "Seeded the role %s for %s; %s, administrator count is %d",
+        "Seeded the role %s for account %s; %s, administrator count "
+        "is %d",
         ADMIN_ROLE,
-        ADMIN_EMAIL,
+        ADMIN_REFERENCE,
         _grant_outcome(stored, promoted),
         len(administrators),
     )
@@ -270,9 +305,9 @@ def _downgrade_offline() -> None:
     """Emit the demotion as one statement carrying its values."""
     op.execute(_demotion())
     logger.info(
-        "Returned %s to the role %s; a statement stream reads no "
+        "Returned account %s to the role %s; a statement stream reads no "
         "count, so no administrator count is checked here",
-        ADMIN_EMAIL,
+        ADMIN_REFERENCE,
         REGISTERED_ROLE,
     )
 
@@ -286,23 +321,25 @@ def _downgrade_online() -> None:
 
     if ADMIN_EMAIL in administrators:
         raise RuntimeError(
-            DEMOTION_MESSAGE.format(email=ADMIN_EMAIL, role=ADMIN_ROLE)
+            DEMOTION_MESSAGE.format(
+                reference=ADMIN_REFERENCE, role=ADMIN_ROLE
+            )
         )
 
     if demoted > 0:
         logger.info(
-            "Returned %s to the role %s; %d row changed, administrator "
-            "count is %d",
-            ADMIN_EMAIL,
+            "Returned account %s to the role %s; %d row changed, "
+            "administrator count is %d",
+            ADMIN_REFERENCE,
             REGISTERED_ROLE,
             demoted,
             len(administrators),
         )
     else:
         logger.info(
-            "Left %s unchanged; it did not hold the role %s, "
+            "Left account %s unchanged; it did not hold the role %s, "
             "administrator count is %d",
-            ADMIN_EMAIL,
+            ADMIN_REFERENCE,
             ADMIN_ROLE,
             len(administrators),
         )

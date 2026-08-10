@@ -1,0 +1,6 @@
+# Dependencies of infrastructure/functions/health/main.py.
+#
+# The module imports json, os and typing only, each part of the Python 3.9
+# standard library, so this manifest declares no package. The file is kept
+# present rather than absent so that the Python 3.9 Cloud Functions build
+# resolves an explicit empty dependency set instead of inferring one.

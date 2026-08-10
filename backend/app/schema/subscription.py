@@ -66,8 +66,8 @@ class SubscriptionCreated(Subscription):
     approved order has been captured and reconciled.
 
     ``approval_url`` is required. An order carrying no allowlisted
-    approval target is refused rather than returned, and this response is
-    never produced without one.
+    approval target is refused, and this response is never produced
+    without one.
     """
 
     approval_url: str

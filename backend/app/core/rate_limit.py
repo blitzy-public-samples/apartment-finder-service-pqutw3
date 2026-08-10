@@ -1,10 +1,19 @@
 """Rate-limit storage with bounded state, and the limiter factory.
 
-The credential endpoints are rate limited per remote address, so the
+The credential endpoints are rate limited per client address, so the
 number of counters the limiter holds follows the number of distinct
 addresses seen inside a window -- a quantity no client is required to
-keep small. This module supplies the storage that bounds it and the
-factory that builds the limiter against the configured store.
+keep small. This module supplies the storage that bounds it, the function
+that resolves which address a request is counted against, and the factory
+that builds the limiter against the configured store.
+
+:func:`client_address` resolves that address.
+``settings.TRUSTED_PROXY_HOPS`` states how many proxies of our own a
+request passes through before it reaches this process, and the address is
+taken that many entries from the right-hand end of the forwarded chain --
+the last entry no caller could have written. With the default of zero
+hops the chain is not read and the peer address of the connection is
+used.
 
 :class:`BoundedMemoryStorage` registers the
 ``bounded-memory`` scheme and holds its counters in this process. It caps
@@ -44,12 +53,13 @@ Usage::
     limiter = build_limiter()
 """
 
+import ipaddress
 import time
 from typing import Any, Optional, Union
 
 from limits.storage import MemoryStorage
 from slowapi import Limiter
-from slowapi.util import get_remote_address
+from starlette.requests import Request
 from starlette.responses import Response
 
 from backend.app.core.config import (
@@ -62,6 +72,8 @@ from backend.app.core.config import (
 from backend.app.core.logging import get_logger
 
 __all__ = [
+    "FALLBACK_CLIENT_ADDRESS",
+    "FORWARDED_FOR_HEADER",
     "IN_PROCESS_STORE_MESSAGE",
     "RATE_LIMIT_HEADERS",
     "RETAINED_KEY_RATIO",
@@ -70,6 +82,7 @@ __all__ = [
     "BoundedMemoryStorage",
     "HeaderWritingLimiter",
     "build_limiter",
+    "client_address",
 ]
 
 logger = get_logger(__name__)
@@ -103,6 +116,74 @@ IN_PROCESS_STORE_MESSAGE = (
 
 # Smallest number of keys an eviction pass leaves in place.
 _MIN_RETAINED_KEYS = 1
+
+#: Header a proxy appends the address it accepted the connection from to.
+FORWARDED_FOR_HEADER = "X-Forwarded-For"
+
+#: Key used when the connection reports no peer address at all, so a
+#: request is still counted rather than being admitted uncounted.
+FALLBACK_CLIENT_ADDRESS = "unknown"
+
+
+def _normalised_address(entry: str) -> Optional[str]:
+    """Returns ``entry`` as a bare IP address, or ``None``.
+
+    A proxy may write an entry as a bare address, as an address with a
+    port, or as a bracketed IPv6 address with or without a port. Each form
+    is reduced to the address itself and parsed. An entry that does not
+    parse as an IP address returns ``None``.
+    """
+    candidate = entry.strip()
+    if not candidate:
+        return None
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        if closing == -1:
+            return None
+        candidate = candidate[1:closing]
+    elif candidate.count(":") == 1:
+        candidate = candidate.split(":", 1)[0]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def client_address(request: Request) -> str:
+    """Returns the address a request is counted against.
+
+    ``settings.TRUSTED_PROXY_HOPS`` states how many proxies of our own the
+    request passes through before it reaches this process. The address is
+    then taken that many entries from the right-hand end of
+    :data:`FORWARDED_FOR_HEADER`, which is the entry the outermost proxy
+    we operate wrote and therefore the last entry no caller could set.
+    Entries to the left of it arrive from the caller and are ignored.
+
+    With the default of zero hops the header is not read at all and the
+    peer address of the connection is used.
+
+    The peer address is also used when the header carries fewer entries
+    than the configured hop count, and when the selected entry is not an
+    address.
+    """
+    peer = None
+    if request.client is not None:
+        peer = _normalised_address(request.client.host or "")
+    hops = settings.TRUSTED_PROXY_HOPS
+    if hops < 1:
+        return peer or FALLBACK_CLIENT_ADDRESS
+    entries = [
+        entry
+        for entry in request.headers.get(FORWARDED_FOR_HEADER, "").split(
+            ","
+        )
+        if entry.strip()
+    ]
+    if len(entries) < hops:
+        return peer or FALLBACK_CLIENT_ADDRESS
+    return _normalised_address(entries[-hops]) or (
+        peer or FALLBACK_CLIENT_ADDRESS
+    )
 
 
 class BoundedMemoryStorage(MemoryStorage):
@@ -274,10 +355,11 @@ def _resolve_key_cap(override: Any) -> int:
 def build_limiter() -> Limiter:
     """Return the limiter the credential endpoints are decorated against.
 
-    The limiter is keyed by remote address and counts in the store named
-    by ``settings.RATE_LIMIT_STORAGE_URI``. One record naming the setting
-    is emitted when that store counts inside a single process outside a
-    local environment.
+    The limiter is keyed by :func:`client_address`, which resolves the
+    caller through ``settings.TRUSTED_PROXY_HOPS`` proxies of our own, and
+    counts in the store named by ``settings.RATE_LIMIT_STORAGE_URI``. One
+    record naming the setting is emitted when that store counts inside a
+    single process outside a local environment.
 
     Rate-limit response headers are enabled, so a refused request carries
     :data:`RATE_LIMIT_HEADERS` together with ``Retry-After`` expressed in
@@ -302,7 +384,7 @@ def build_limiter() -> Limiter:
             },
         )
     return HeaderWritingLimiter(
-        key_func=get_remote_address,
+        key_func=client_address,
         storage_uri=storage_uri,
         headers_enabled=True,
         retry_after=RETRY_AFTER_FORMAT,

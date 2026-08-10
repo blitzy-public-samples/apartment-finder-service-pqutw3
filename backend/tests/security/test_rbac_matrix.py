@@ -32,6 +32,13 @@ inside that comparison rather than outside it:
   accounted for by name in the comparison and asserted separately by
   :func:`test_the_health_route_answers_every_principal`, which sends it
   every principal's credential and requires the same answer from each.
+* :data:`READINESS_PATH` is published and is governed by no role either,
+  but it reads the database, so what is asserted of it is a bounded
+  contract rather than unrestricted availability:
+  :func:`test_the_readiness_route_is_bounded_for_every_principal`
+  requires, for each principal, that a burst past
+  ``settings.RATE_LIMIT_READINESS`` is refused and that the whole burst
+  costs one database read.
 * The framework's own documentation routes -- the four paths in
   :data:`DOCUMENTATION_PATHS` -- are excluded, by the
   ``include_in_schema`` flag each carries rather than by path matching.
@@ -65,11 +72,13 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from backend.app import main as main_module
 from backend.app.core.authorization import (
     Role,
     effective_role,
     resolve_role,
 )
+from backend.app.core.config import settings
 from backend.app.core.plans import (
     PREMIUM_MONTHLY,
     STATUS_ACTIVE,
@@ -122,6 +131,9 @@ FORBIDDEN = 403
 
 #: Status the notification route answers a delivery it could not verify.
 WEBHOOK_REFUSED = 400
+
+#: Status a request over its route's rate limit is answered.
+THROTTLED = 429
 
 #: Expectation recorded for the route admitted on a signature alone: an
 #: unverifiable delivery is answered :data:`WEBHOOK_REFUSED` and a
@@ -184,20 +196,18 @@ HEALTH_PATH = "/health"
 #: The liveness route, as ``app.routes`` reports it.
 HEALTH_ROUTE = ("GET", HEALTH_PATH)
 
-#: Slug the liveness cases report under. It is deliberately outside the
-#: numbered sequence :data:`ROUTE_MATRIX` uses, because the route is
-#: governed by no role.
+#: Slug the liveness cases report under. It sits outside the numbered
+#: sequence :data:`ROUTE_MATRIX` uses.
 HEALTH_ROUTE_SLUG = "health"
 
-#: Body the liveness route answers. Written out here rather than read
-#: from :data:`backend.app.main.HEALTH_STATUS`, so the assertion states
-#: an independent expectation instead of comparing the application with
-#: itself; a route that merely answers ``200`` cannot pass for a
-#: liveness report.
+#: Body the liveness route answers, declared independently of
+#: :data:`backend.app.main.HEALTH_STATUS`.
 HEALTH_BODY = {"status": "ok"}
 
 #: Path of the readiness route, mounted directly like the liveness route
-#: and likewise governed by no role.
+#: and likewise governed by no role. Unlike the liveness route it reads
+#: the database, so what it answers to a principal is bounded rather than
+#: unconditional -- see :data:`READINESS_BOUNDS`.
 READINESS_PATH = "/health/ready"
 
 #: The readiness route, as ``app.routes`` reports it.
@@ -206,22 +216,38 @@ READINESS_ROUTE = ("GET", READINESS_PATH)
 #: Slug the readiness cases report under.
 READINESS_ROUTE_SLUG = "readiness"
 
-#: Body the readiness route answers while the database answers. Written
-#: out here for the same reason :data:`HEALTH_BODY` is.
+#: Body the readiness route answers while the database answers, stated
+#: here as :data:`HEALTH_BODY` is.
 READINESS_BODY = {"status": "ready"}
 
 #: Body the readiness route answers while the database does not.
 NOT_READY_BODY = {"status": "unavailable"}
 
+#: The bounds that must hold on the readiness route, named independently
+#: of the application: the request is counted against a rate limit, one
+#: outcome is reused for a bounded window, and the database read that
+#: produces it is itself bounded. Each is asserted by
+#: :func:`test_the_readiness_route_is_bounded_for_every_principal`.
+READINESS_BOUNDS = (
+    "RATE_LIMIT_READINESS",
+    "READINESS_CACHE_SECONDS",
+    "READINESS_TIMEOUT_SECONDS",
+)
+
+#: Number of consecutive probes one recorded outcome must serve. It
+#: exceeds one, so a case that sends this many and counts one database
+#: read proves the reuse rather than assuming it.
+READINESS_REUSED_PROBES = 4
+
 #: The routes the application mounts outside the router. Neither is
-#: governed by a role, so neither contributes a cell to the matrix and
-#: the matrix stays at :data:`EXPECTED_CELL_COUNT` exactly.
+#: governed by a role and neither contributes a cell to the matrix, which
+#: stays at :data:`EXPECTED_CELL_COUNT` exactly.
 OPERATIONAL_ROUTES = frozenset((HEALTH_ROUTE, READINESS_ROUTE))
 
 #: Paths the framework mounts for its own documentation. Each is
 #: registered with ``include_in_schema`` cleared, which is the property
-#: :func:`published_routes` filters on; they are named here so the
-#: exclusion is deliberate and asserted rather than incidental.
+#: :func:`published_routes` filters on. They are named here so the
+#: exclusion is asserted by path.
 DOCUMENTATION_PATHS = frozenset(
     (
         "/openapi.json",
@@ -635,14 +661,12 @@ def clear_throttle_counters(reset_rate_limits):
 def test_the_matrix_covers_every_route_the_application_publishes():
     """Asserts the grid is the application's own published route set.
 
-    The comparison is against ``app.routes``, so the grid can no longer
-    agree only with itself: a route the application gains without a row
-    here fails, and a row here naming a route the application does not
+    The comparison is against ``app.routes``: a route the application
+    gains without a row here fails, and a row naming a route it does not
     serve fails too. :data:`OPERATIONAL_ROUTES` is accounted for
-    explicitly because those routes are deliberately outside the grid —
-    no role governs either — and the framework's documentation routes
-    are excluded deliberately too, by the ``include_in_schema`` flag
-    each carries, with the paths that exclusion covers asserted by name.
+    separately, and the framework's documentation routes are excluded by
+    the ``include_in_schema`` flag each carries, with the paths that
+    exclusion covers asserted by name.
     """
     recorded = set(
         (method, path) for _slug, method, path, _cells in ROUTE_MATRIX
@@ -687,24 +711,60 @@ def test_the_health_route_answers_every_principal(
 
 
 @pytest.mark.parametrize("principal", PRINCIPALS)
-def test_the_readiness_route_answers_every_principal(
+def test_the_readiness_route_is_bounded_for_every_principal(
     principal, client, seeded_users, auth_header_factory
 ):
-    """Asserts the readiness route is public, deliberately and for all.
+    """Asserts the readiness answer costs the same bounded work for all.
 
-    It is governed by no role for the same reason the liveness route is
-    not, and it is likewise recorded here rather than as a tenth grid
-    row so the grid stays the nine routes the role model governs.
+    The route is governed by no role, for the same reason the liveness
+    route is not, so it is recorded here rather than as a tenth grid row.
+    But it reads the database, and an operational report that any caller
+    can make the service work for is a resource the caller controls. What
+    is asserted here is therefore not that every principal may call it
+    without limit -- it is that whoever calls it, the work behind the
+    answer is bounded: the request is counted against a rate limit, the
+    outcome is reused rather than re-read, and the read is bounded.
+
+    The reuse is measured, not assumed: :data:`READINESS_REUSED_PROBES`
+    probes are sent and the database read is counted.
     """
     headers = headers_for(principal, seeded_users, auth_header_factory)
     method, path = READINESS_ROUTE
 
-    response = _send(client, method, path, headers, None)
+    for name in READINESS_BOUNDS:
+        assert name in type(settings).__fields__, name
 
-    assert response.status_code == ALLOWED, _report(
-        READINESS_ROUTE_SLUG, principal, ALLOWED, response
+    permitted = int(settings.RATE_LIMIT_READINESS.split("/")[0])
+    assert permitted >= READINESS_REUSED_PROBES
+
+    reads = []
+    original = main_module._read_database
+
+    def counted(db):
+        reads.append(db)
+        return original(db)
+
+    main_module.reset_readiness_cache()
+    with patch.object(main_module, "_read_database", counted):
+        answers = [
+            _send(client, method, path, headers, None)
+            for _ in range(permitted + 1)
+        ]
+
+    for response in answers[:permitted]:
+        assert response.status_code == ALLOWED, _report(
+            READINESS_ROUTE_SLUG, principal, ALLOWED, response
+        )
+        assert response.json() == READINESS_BODY
+
+    assert answers[-1].status_code == THROTTLED, _report(
+        READINESS_ROUTE_SLUG, principal, THROTTLED, answers[-1]
     )
-    assert response.json() == READINESS_BODY
+
+    assert len(reads) == 1, (
+        "one recorded outcome must serve every probe inside its window, "
+        f"but the database was read {len(reads)} times"
+    )
 
 
 def test_the_matrix_is_nine_routes_by_five_principals():

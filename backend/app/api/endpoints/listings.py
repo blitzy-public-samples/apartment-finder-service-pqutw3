@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from backend.app.core.authorization import Role, require_role
 from backend.app.core.config import settings
-from backend.app.core.logging import get_logger
+from backend.app.core.logging import get_logger, log_exception
 from backend.app.db.database import get_db
 from backend.app.schema.listing import ListingCreate, Listing
 from backend.app.db.models import Listing as ListingModel, User
@@ -29,6 +29,12 @@ LISTING_NOT_PROJECTABLE_DETAIL = "Listing page could not be served"
 
 #: Reason recorded for a stored row the response contract cannot carry.
 REASON_UNPROJECTABLE_ROW = "listing_not_projectable"
+
+#: Message recorded when the database refuses a listing write.
+LISTING_NOT_STORED_MESSAGE = "Failed to store a listing"
+
+#: Reason recorded with that message.
+REASON_NOT_STORED = "listing_not_stored"
 
 
 @router.get("/")
@@ -143,11 +149,14 @@ def create_listing(
     # against the caller, and is answered with one fixed detail.
     try:
         db.commit()
-    except SQLAlchemyError:
+    except SQLAlchemyError as error:
         db.rollback()
-        logger.exception(
-            "Failed to store a listing",
-            extra={"user_id": current_user.id},
+        log_exception(
+            logger,
+            LISTING_NOT_STORED_MESSAGE,
+            error,
+            user_id=current_user.id,
+            reason=REASON_NOT_STORED,
         )
         raise HTTPException(
             status_code=500, detail=LISTING_NOT_STORED_DETAIL

@@ -63,8 +63,16 @@ from backend.app.schema.user import UserCreate, UserLogin
 from backend.app.db.models import User
 
 __all__ = [
+    "DECISION_ACCOUNT_LOCKED",
+    "DECISION_ADDRESS_CONFLICT",
+    "DECISION_FAILED_ATTEMPT",
+    "DECISION_INVALID_PASSWORD",
+    "DECISION_LOCK_APPLIED",
+    "DECISION_SUCCESSFUL_ATTEMPT",
+    "DECISION_UNKNOWN_ACCOUNT",
     "DUPLICATE_EMAIL_DETAIL",
     "INVALID_CREDENTIALS_DETAIL",
+    "LOGIN_REFUSED_MESSAGE",
     "REGISTRATION_FAILED_DETAIL",
     "limiter",
     "login_user",
@@ -89,6 +97,31 @@ DECISION_FAILED_ATTEMPT = "failed_attempt"
 
 #: Outcome recorded when a cleared count does not persist.
 DECISION_SUCCESSFUL_ATTEMPT = "successful_attempt"
+
+#: Decision recorded when the address carries no account. The record
+#: carries no address and no identifier, because there is no account to
+#: name; the code is what distinguishes this refusal from the others in a
+#: query, and the response is identical to every other refusal.
+DECISION_UNKNOWN_ACCOUNT = "login_unknown_account"
+
+#: Decision recorded when the account lock is still in force.
+DECISION_ACCOUNT_LOCKED = "login_account_locked"
+
+#: Decision recorded when the account exists and the password does not
+#: match it.
+DECISION_INVALID_PASSWORD = "login_invalid_password"
+
+#: Decision recorded when a counted failure reaches the threshold and the
+#: lock is applied.
+DECISION_LOCK_APPLIED = "login_lock_applied"
+
+#: Decision recorded when a registration loses the address to a
+#: concurrent request that committed first.
+DECISION_ADDRESS_CONFLICT = "registration_address_conflict"
+
+#: Message carried by every login refusal record. The record is told
+#: apart by its ``decision`` field, not by its text.
+LOGIN_REFUSED_MESSAGE = "Refused a login"
 
 #: Rate limiter keyed by remote address, counting in the store named by
 #: ``settings.RATE_LIMIT_STORAGE_URI`` and holding a bounded number of
@@ -171,6 +204,34 @@ def _abandon(db: Session, decision: str, user: User) -> None:
     )
 
 
+def _record_refusal(
+    request: Request,
+    decision: str,
+    user_id: Optional[int],
+) -> None:
+    """Record one refused login under a stable decision code.
+
+    Every refusal is recorded, so a run of them against one account can be
+    counted and told apart from a run spread across many. The record
+    carries the decision code, the path and the account identifier when an
+    account was found -- never the submitted address, the submitted
+    password or the stored credential. ``user_id`` is ``None`` for an
+    address carrying no account, because there is no account to name.
+
+    The record is emitted before the response is built, so the equalized
+    refusal the caller receives is unchanged by it: every refusal returns
+    one detail whatever the decision was.
+    """
+    logger.warning(
+        LOGIN_REFUSED_MESSAGE,
+        extra={
+            "decision": decision,
+            "user_id": user_id,
+            "path": request.scope.get("path"),
+        },
+    )
+
+
 def _record_failed_attempt(
     db: Session,
     user: User,
@@ -209,6 +270,7 @@ def _record_failed_attempt(
             logger.warning(
                 "Locked an account on reaching the failed-attempt limit",
                 extra={
+                    "decision": DECISION_LOCK_APPLIED,
                     "user_id": row.id,
                     "failed_login_attempts": attempts,
                     "lockout_minutes": settings.LOGIN_LOCKOUT_MINUTES,
@@ -284,7 +346,11 @@ def register_user(
         db.rollback()
         logger.warning(
             "Refused a registration that lost the address to a "
-            "concurrent request"
+            "concurrent request",
+            extra={
+                "decision": DECISION_ADDRESS_CONFLICT,
+                "path": request.scope.get("path"),
+            },
         )
         raise HTTPException(
             status_code=400, detail=DUPLICATE_EMAIL_DETAIL
@@ -323,16 +389,15 @@ def login_user(
     attempted_at = datetime.now(timezone.utc)
     if db_user is None:
         verify_credential(user.password, None)
+        _record_refusal(request, DECISION_UNKNOWN_ACCOUNT, None)
         raise _invalid_credentials(started)
     if _is_locked(db_user, attempted_at):
         verify_credential(user.password, db_user.hashed_password)
-        logger.warning(
-            "Refused a login while the account lock was in force",
-            extra={"user_id": db_user.id},
-        )
+        _record_refusal(request, DECISION_ACCOUNT_LOCKED, db_user.id)
         raise _invalid_credentials(started)
     if not verify_credential(user.password, db_user.hashed_password):
         _record_failed_attempt(db, db_user, attempted_at)
+        _record_refusal(request, DECISION_INVALID_PASSWORD, db_user.id)
         raise _invalid_credentials(started)
     _record_successful_attempt(db, db_user)
 

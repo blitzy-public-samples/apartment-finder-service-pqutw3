@@ -114,6 +114,7 @@ from typing import (
     Any,
     AsyncIterator,
     Dict,
+    List,
     Mapping,
     NamedTuple,
     Optional,
@@ -131,6 +132,7 @@ from backend.app.core.config import TLS_SCHEME, settings
 from backend.app.core.logging import (
     exception_fields,
     get_logger,
+    outbound_trace_headers,
     register_required_secret_values,
 )
 from backend.app.core.plans import format_amount, get_plan
@@ -394,6 +396,12 @@ FAILURE_BACKOFF_SECONDS = 5.0
 #: response can be made to occupy is bounded whatever the provider sends.
 MAX_RESPONSE_BYTES = 1048576
 
+#: Field naming the provider order a record is about. It is emitted
+#: alongside the request identifier the logger binds and the provider's
+#: own debug identifier, so one record carries the local identifier and
+#: both provider identifiers for the same call.
+PROVIDER_ORDER_FIELD = "provider_order_id"
+
 #: Rejection reason: the response body exceeds :data:`MAX_RESPONSE_BYTES`.
 REASON_RESPONSE_TOO_LARGE = "response_body_too_large"
 
@@ -462,10 +470,13 @@ _CALL_FAILED = "The PayPal REST API call did not succeed."
 # Request method named in the record of a read call.
 _GET_METHOD = "GET"
 
+# Request method every write call is issued with.
+_POST_METHOD = "POST"
+
 # Failures translated into a module error. httpx.InvalidURL,
 # httpx.CookieConflict and httpx.StreamError sit outside the
 # httpx.HTTPError hierarchy, and ValueError covers the JSON decode
-# error raised by Response.json().
+# error raised while a body is parsed.
 _TRANSPORT_ERRORS = (
     httpx.HTTPError,
     httpx.InvalidURL,
@@ -562,8 +573,7 @@ async def open_http_client() -> None:
 
     Called once while the application starts. The client is recorded
     against the loop it was opened on, and :func:`_client` yields it only
-    to a call running on that same loop, because a connection pool
-    belongs to the loop that created it. Calling this again while a client
+    to a call running on that same loop. Calling this again while a client
     is already open leaves that client in place.
     """
     global _shared_client, _shared_client_loop
@@ -722,50 +732,180 @@ def _declared_length(response: Any) -> Optional[int]:
         return None
 
 
+def _refuse_size(
+    measured: int, operation: Optional[str], response: Any
+) -> None:
+    """Records a body refused for its size, with the cap it passed.
+
+    The record names the operation, the reason, the size measured, the cap
+    and the provider's debug identifier. No part of the body is recorded.
+    """
+    logger.error(
+        "PayPal REST call returned a body past the accepted size",
+        extra={
+            "provider_operation": operation,
+            "reason": REASON_RESPONSE_TOO_LARGE,
+            "response_bytes": measured,
+            "max_response_bytes": MAX_RESPONSE_BYTES,
+            "paypal_debug_id": _debug_id(response),
+        },
+    )
+
+
+async def _bounded_body(
+    response: Any, operation: Optional[str]
+) -> Optional[bytes]:
+    """Returns the streamed body, or ``None`` when it passes the cap.
+
+    The declared length is read first, so a body announcing itself as past
+    :data:`MAX_RESPONSE_BYTES` is refused before any of it is read. The
+    bytes received are then accumulated one chunk at a time and the read
+    stops as soon as they pass that cap, so a body declaring no length, or
+    under-declaring one, is bounded as well. At most
+    :data:`MAX_RESPONSE_BYTES` plus one chunk is ever held.
+    """
+    declared = _declared_length(response)
+    if declared is not None and declared > MAX_RESPONSE_BYTES:
+        _refuse_size(declared, operation, response)
+        return None
+    received = 0
+    chunks = []
+    async for chunk in response.aiter_bytes():
+        received += len(chunk)
+        if received > MAX_RESPONSE_BYTES:
+            _refuse_size(received, operation, response)
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _oversized(response: Any, operation: Optional[str]) -> bool:
     """Report whether a response body is past :data:`MAX_RESPONSE_BYTES`.
 
-    The declared length is read first, so a body that announces itself as
-    oversized is refused without its bytes being examined. The bytes
-    actually received are measured next, which covers a body that declares
-    no length or under-declares one.
+    Applies to a response whose body is already held in memory, which is
+    the error responses :func:`_provider_issue` is handed when no streamed
+    body was captured. The declared length is read first, so a body that
+    announces itself as oversized is refused without its bytes being
+    examined. The bytes actually received are measured next, which covers
+    a body that declares no length or under-declares one.
     """
     for measured in (_declared_length(response), _body_length(response)):
         if measured is not None and measured > MAX_RESPONSE_BYTES:
-            logger.error(
-                "PayPal REST call returned a body past the accepted size",
-                extra={
-                    "provider_operation": operation,
-                    "reason": REASON_RESPONSE_TOO_LARGE,
-                    "response_bytes": measured,
-                    "max_response_bytes": MAX_RESPONSE_BYTES,
-                    "paypal_debug_id": _debug_id(response),
-                },
-            )
+            _refuse_size(measured, operation, response)
             return True
     return False
 
 
 def _body_length(response: Any) -> Optional[int]:
-    """Returns the number of bytes a response carries, or ``None``."""
-    body = getattr(response, "content", None)
+    """Returns the number of bytes a response carries, or ``None``.
+
+    ``None`` is returned for a response whose body has not been read,
+    which is the state of a streamed response before its chunks are
+    taken. Reading the attribute raises in that state, so the failure is
+    answered with ``None`` and the declared length carries the check.
+    """
+    try:
+        body = getattr(response, "content", None)
+    except Exception:
+        return None
     if isinstance(body, (bytes, bytearray)):
         return len(body)
     return None
 
 
+def _without_declared_length(headers: Any) -> List[Tuple[str, str]]:
+    """Returns ``headers`` without the length of the original body.
+
+    The reconstructed response carries fewer bytes than the transfer
+    declared whenever the read was stopped, so the declared length is
+    dropped and the client states the length of what is actually held.
+    """
+    return [
+        (name, value)
+        for name, value in headers.items()
+        if name.lower() != CONTENT_LENGTH_HEADER.lower()
+    ]
+
+
+async def _read_bounded(
+    client: Any,
+    method: str,
+    url: str,
+    operation: Optional[str] = None,
+    **arguments: Any
+) -> Any:
+    """Returns a response whose body was never held past the cap.
+
+    The body is read in chunks and the read stops as soon as the total
+    reaches one byte past :data:`MAX_RESPONSE_BYTES`, so a body larger
+    than the cap is abandoned mid-transfer. The bytes kept are the one
+    past the cap that :func:`_decoded_object` then measures and refuses.
+
+    A transfer declaring a ``Content-Length`` past the cap is refused
+    before a single chunk is taken, raising :class:`PayPalAPIError`
+    carrying :data:`CATEGORY_MALFORMED_RESPONSE`, which is the error a
+    body measured past the cap raises as well.
+
+    The response returned carries the status, the headers and the request
+    of the real one, so status handling, debug-identifier extraction and
+    decoding all behave as they do for a buffered response.
+
+    A client offering no ``stream`` method is called directly, through its
+    method named for the verb where it has one and through ``request``
+    otherwise.
+    """
+    opener = getattr(client, "stream", None)
+    if opener is None:
+        verb = getattr(client, method.lower(), None)
+        if verb is not None:
+            return await verb(url, **arguments)
+        return await client.request(method, url, **arguments)
+
+    limit = MAX_RESPONSE_BYTES + 1
+    async with opener(method, url, **arguments) as streamed:
+        if _oversized(streamed, operation):
+            raise PayPalAPIError(
+                _CALL_FAILED,
+                category=CATEGORY_MALFORMED_RESPONSE,
+                status_code=getattr(streamed, "status_code", None),
+                debug_id=_debug_id(streamed),
+                operation=operation,
+            )
+        chunks = []  # type: List[bytes]
+        held = 0
+        async for chunk in streamed.aiter_bytes():
+            chunks.append(chunk)
+            held += len(chunk)
+            if held >= limit:
+                break
+        return httpx.Response(
+            status_code=streamed.status_code,
+            headers=_without_declared_length(streamed.headers),
+            content=b"".join(chunks)[:limit],
+            request=streamed.request,
+        )
+
+
 def _decoded_object(
-    response: Any, operation: Optional[str]
+    response: Any, operation: Optional[str], body: Optional[bytes]
 ) -> Dict[str, Any]:
     """Returns the decoded object a response carries.
 
-    The body is measured against :data:`MAX_RESPONSE_BYTES` before it is
-    decoded, and a body past that size raises
+    ``body`` is the bytes a bounded reader accumulated for this response,
+    so nothing is decoded that was not measured first. ``None`` means
+    :func:`_bounded_body` refused the body for its size, and raises
     :class:`PayPalAPIError` carrying
-    :data:`CATEGORY_MALFORMED_RESPONSE` rather than being parsed. A body
-    that decodes to anything other than an object raises the same error.
+    :data:`CATEGORY_MALFORMED_RESPONSE` rather than anything being
+    parsed.
+
+    The bytes handed over are measured again before they are parsed, which
+    is what refuses the body :func:`_read_bounded` stops mid-transfer: that
+    reader keeps one byte past :data:`MAX_RESPONSE_BYTES` precisely so the
+    excess is provable here. Whichever reader produced the bytes, a body
+    past the cap is therefore never parsed. A body that decodes to
+    anything other than an object raises the same error.
     """
-    if _oversized(response, operation):
+    if body is None:
         raise PayPalAPIError(
             _CALL_FAILED,
             category=CATEGORY_MALFORMED_RESPONSE,
@@ -773,7 +913,16 @@ def _decoded_object(
             debug_id=_debug_id(response),
             operation=operation,
         )
-    payload = response.json()
+    if len(body) > MAX_RESPONSE_BYTES:
+        _refuse_size(len(body), operation, response)
+        raise PayPalAPIError(
+            _CALL_FAILED,
+            category=CATEGORY_MALFORMED_RESPONSE,
+            status_code=getattr(response, "status_code", None),
+            debug_id=_debug_id(response),
+            operation=operation,
+        )
+    payload = json.loads(bytes(body).decode("utf-8"))
     if not isinstance(payload, dict):
         logger.error(
             "PayPal REST call returned a body that is not an object",
@@ -832,25 +981,33 @@ def _issue_code(value: Any) -> Optional[str]:
 
 
 def _provider_issue(
-    response: Any, operation: Optional[str] = None
+    response: Any,
+    operation: Optional[str] = None,
+    body: Optional[bytes] = None,
 ) -> Optional[str]:
     """Returns the provider's issue code for a failed call, or ``None``.
 
-    The body is decoded only when it is within
-    :data:`MAX_RESPONSE_BYTES`, and only the fields named by
-    :data:`PROVIDER_ISSUE_FIELDS` are consulted: the first
-    :data:`MAX_PROVIDER_ISSUE_DETAILS` entries of ``details`` for their
-    ``issue``, then the body's own ``name``. Every candidate is passed
-    through :func:`_issue_code`, so no other field, and no value of any
-    other shape, is retained or returned. Any failure to read the body
+    ``body``, when supplied, is the bytes :func:`_bounded_body` already
+    measured and accumulated for this response, and is decoded in place of
+    reading the response again. Without it the body is decoded through the
+    response, and only when it is within :data:`MAX_RESPONSE_BYTES`.
+
+    Only the fields named by :data:`PROVIDER_ISSUE_FIELDS` are consulted:
+    the first :data:`MAX_PROVIDER_ISSUE_DETAILS` entries of ``details``
+    for their ``issue``, then the body's own ``name``. Every candidate is
+    passed through :func:`_issue_code`, so no other field, and no value of
+    any other shape, is retained or returned. Any failure to read the body
     returns ``None``.
     """
     if response is None:
         return None
     try:
-        if _oversized(response, operation):
-            return None
-        payload = response.json()
+        if body is not None:
+            payload = json.loads(bytes(body).decode("utf-8"))
+        else:
+            if _oversized(response, operation):
+                return None
+            payload = response.json()
     except Exception:
         return None
     if not isinstance(payload, dict):
@@ -870,14 +1027,22 @@ def _api_error(
     error: Exception,
     path: str,
     operation: Optional[str],
+    body: Optional[bytes] = None,
+    order_id: Optional[str] = None,
 ) -> PayPalAPIError:
     """Classifies ``error`` and records it as one structured failure.
 
+    ``body``, when supplied, is the bytes :func:`_bounded_body` measured
+    for the failing response, and is what the provider's issue code is
+    read from, so a failure carries its issue code without the response
+    being read a second time or without a bound.
+
     The record carries the path, the operation, the failure category, the
-    provider status, the provider's debug identifier and the provider's
-    issue code. No response body, no URL and no credential is recorded,
-    and the returned exception carries the same fields for its caller to
-    translate.
+    provider status, the provider's debug identifier, the provider's issue
+    code and, when the call named one, the provider order the call was
+    about. The bound request identifier is added by the logger. No response
+    body, no URL and no credential is recorded, and the returned exception
+    carries the same fields for its caller to translate.
     """
     status_code = None  # type: Optional[int]
     debug_id = None  # type: Optional[str]
@@ -887,7 +1052,7 @@ def _api_error(
     elif isinstance(error, httpx.HTTPStatusError):
         status_code = error.response.status_code
         debug_id = _debug_id(error.response)
-        issue = _provider_issue(error.response, operation)
+        issue = _provider_issue(error.response, operation, body)
         category = _status_category(status_code)
     elif isinstance(error, ValueError):
         category = CATEGORY_MALFORMED_RESPONSE
@@ -903,6 +1068,7 @@ def _api_error(
     )
     fields = failure.audit_fields()
     fields["path"] = path
+    fields[PROVIDER_ORDER_FIELD] = order_id
     fields.update(exception_fields(error))
     logger.error("PayPal REST call failed", extra=fields)
     return failure
@@ -950,24 +1116,32 @@ async def _exchange_credentials() -> Tuple[str, float]:
 
     The client identifier and secret are sent as HTTP Basic credentials
     and appear in no return value, no exception message and no log
-    record. Raises :class:`PayPalAPIError` when the grant does not
-    return a usable token.
+    record. The response is streamed and measured against
+    :data:`MAX_RESPONSE_BYTES` before any of it is decoded. Raises
+    :class:`PayPalAPIError` when the grant does not return a usable token.
     """
+    response_body = None  # type: Optional[bytes]
+    grant_headers = {"Accept": "application/json"}
+    grant_headers.update(outbound_trace_headers())
     try:
         async with _client() as client:
-            response = await client.post(
+            async with client.stream(
+                _POST_METHOD,
                 settings.PAYPAL_API_BASE + _OAUTH_PATH,
                 data={"grant_type": _GRANT_TYPE},
                 auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
-                headers={"Accept": "application/json"},
+                headers=grant_headers,
                 timeout=settings.HTTP_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            payload = _decoded_object(response, _OPERATION_TOKEN)
+            ) as response:
+                response_body = await _bounded_body(response, _OPERATION_TOKEN)
+                response.raise_for_status()
+        payload = _decoded_object(response, _OPERATION_TOKEN, response_body)
     except PayPalAPIError:
         raise
     except _TRANSPORT_ERRORS as error:
-        raise _api_error(error, _OAUTH_PATH, _OPERATION_TOKEN) from None
+        raise _api_error(
+            error, _OAUTH_PATH, _OPERATION_TOKEN, response_body
+        ) from None
 
     granted = payload.get("access_token")
     if not isinstance(granted, str) or not granted:
@@ -1152,6 +1326,7 @@ async def _post_json(
     allow_refresh: bool = True,
     extra_headers: Optional[Mapping[str, str]] = None,
     document: Optional[bytes] = None,
+    order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return the decoded object from a Bearer-authenticated POST.
 
@@ -1166,9 +1341,13 @@ async def _post_json(
     alongside the headers built here and cannot displace the
     authorization, content or idempotency headers.
 
+    The response is streamed and measured against
+    :data:`MAX_RESPONSE_BYTES` before any of it is decoded.
+
     A ``401`` discards the cached access token and repeats the call once
     with a fresh grant; the repeat runs with ``allow_refresh`` cleared,
-    so it cannot recurse. Every other failure raises
+    so it cannot recurse, and the body of the rejected call is closed
+    without being read. Every other failure raises
     :class:`PayPalAPIError` carrying the failure category, the provider
     status and the provider's debug identifier. No response body, URL or
     credential reaches the raised message or a log record.
@@ -1178,6 +1357,7 @@ async def _post_json(
         for name, value in extra_headers.items():
             if isinstance(name, str) and isinstance(value, str):
                 headers[name] = value
+    headers.update(outbound_trace_headers())
     headers["Authorization"] = "Bearer " + await _bearer_credential()
     headers["Content-Type"] = "application/json"
     headers["Accept"] = "application/json"
@@ -1189,18 +1369,24 @@ async def _post_json(
     else:
         content = {"content": document}
 
+    response_body = None  # type: Optional[bytes]
     try:
         async with _client() as client:
-            response = await client.post(
+            async with client.stream(
+                _POST_METHOD,
                 settings.PAYPAL_API_BASE + path,
                 headers=headers,
                 timeout=settings.HTTP_TIMEOUT_SECONDS,
                 **content
-            )
-        if (
-            response.status_code == _UNAUTHORIZED_STATUS
-            and allow_refresh
-        ):
+            ) as response:
+                retrying = (
+                    response.status_code == _UNAUTHORIZED_STATUS
+                    and allow_refresh
+                )
+                if not retrying:
+                    response_body = await _bounded_body(response, operation)
+                    response.raise_for_status()
+        if retrying:
             reset_access_token_cache()
             logger.warning(
                 "PayPal rejected the access token; repeating the call "
@@ -1211,6 +1397,7 @@ async def _post_json(
                     "provider_status": response.status_code,
                     "paypal_debug_id": _debug_id(response),
                     "paypal_request_id": idempotency_key,
+                    PROVIDER_ORDER_FIELD: order_id,
                 },
             )
             return await _post_json(
@@ -1221,17 +1408,19 @@ async def _post_json(
                 allow_refresh=False,
                 extra_headers=extra_headers,
                 document=document,
+                order_id=order_id,
             )
-        response.raise_for_status()
-        payload = _decoded_object(response, operation)
+        payload = _decoded_object(response, operation, response_body)
     except PayPalAPIError:
         raise
     except _TRANSPORT_ERRORS as error:
-        raise _api_error(error, path, operation) from None
+        raise _api_error(
+            error, path, operation, response_body, order_id
+        ) from None
 
     debug_id = _debug_id(response)
 
-    logger.info(
+    logger.debug(
         "PayPal REST call completed",
         extra={
             "path": path,
@@ -1239,6 +1428,7 @@ async def _post_json(
             "provider_status": response.status_code,
             "paypal_debug_id": debug_id,
             "paypal_request_id": idempotency_key,
+            PROVIDER_ORDER_FIELD: order_id,
         },
     )
     return payload
@@ -1248,33 +1438,43 @@ async def _get_json(
     path: str,
     operation: Optional[str] = None,
     allow_refresh: bool = True,
+    order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return the decoded object from a Bearer-authenticated GET.
 
     Reads a resource without changing it. ``path`` is appended to
     ``settings.PAYPAL_API_BASE`` and the call carries
-    ``settings.HTTP_TIMEOUT_SECONDS``. A ``401`` discards the cached
-    access token and repeats the call once with a fresh grant; the
-    repeat runs with ``allow_refresh`` cleared, so it cannot recurse.
-    Every other failure raises :class:`PayPalAPIError`. No response
-    body, URL or credential reaches the raised message or a log record.
+    ``settings.HTTP_TIMEOUT_SECONDS``. The response is streamed and
+    measured against :data:`MAX_RESPONSE_BYTES` before any of it is
+    decoded. A ``401`` discards the cached access token and repeats the
+    call once with a fresh grant; the repeat runs with ``allow_refresh``
+    cleared, so it cannot recurse, and the body of the rejected call is
+    closed without being read. Every other failure raises
+    :class:`PayPalAPIError`. No response body, URL or credential reaches
+    the raised message or a log record.
     """
     headers = {
         "Authorization": "Bearer " + await _bearer_credential(),
         "Accept": "application/json",
     }
+    response_body = None  # type: Optional[bytes]
+    headers.update(outbound_trace_headers())
     try:
         async with _client() as client:
-            response = await client.request(
+            async with client.stream(
                 _GET_METHOD,
                 settings.PAYPAL_API_BASE + path,
                 headers=headers,
                 timeout=settings.HTTP_TIMEOUT_SECONDS,
-            )
-        if (
-            response.status_code == _UNAUTHORIZED_STATUS
-            and allow_refresh
-        ):
+            ) as response:
+                retrying = (
+                    response.status_code == _UNAUTHORIZED_STATUS
+                    and allow_refresh
+                )
+                if not retrying:
+                    response_body = await _bounded_body(response, operation)
+                    response.raise_for_status()
+        if retrying:
             reset_access_token_cache()
             logger.warning(
                 "PayPal rejected the access token; repeating the read "
@@ -1284,27 +1484,33 @@ async def _get_json(
                     "provider_operation": operation,
                     "provider_status": response.status_code,
                     "paypal_debug_id": _debug_id(response),
+                    PROVIDER_ORDER_FIELD: order_id,
                 },
             )
             return await _get_json(
-                path, operation=operation, allow_refresh=False
+                path,
+                operation=operation,
+                allow_refresh=False,
+                order_id=order_id,
             )
-        response.raise_for_status()
-        payload = _decoded_object(response, operation)
+        payload = _decoded_object(response, operation, response_body)
     except PayPalAPIError:
         raise
     except _TRANSPORT_ERRORS as error:
-        raise _api_error(error, path, operation) from None
+        raise _api_error(
+            error, path, operation, response_body, order_id
+        ) from None
 
     debug_id = _debug_id(response)
 
-    logger.info(
+    logger.debug(
         "PayPal REST read completed",
         extra={
             "path": path,
             "provider_operation": operation,
             "provider_status": response.status_code,
             "paypal_debug_id": debug_id,
+            PROVIDER_ORDER_FIELD: order_id,
         },
     )
     return payload
@@ -1378,7 +1584,7 @@ def _approval_host_suffixes() -> Tuple[str, ...]:
 
     Each suffix is the final two labels of an entry of
     ``settings.PAYPAL_CERT_HOST_ALLOWLIST``, so the accepted domains come
-    from validated configuration rather than from a literal written here.
+    from validated configuration.
     """
     suffixes = set()
     for entry in settings.PAYPAL_CERT_HOST_ALLOWLIST:
@@ -1503,6 +1709,7 @@ async def capture_order(
         idempotency_key=key,
         operation=_OPERATION_CAPTURE,
         extra_headers={PREFER_HEADER: PREFER_REPRESENTATION},
+        order_id=str(order_id),
     )
     if _first_capture(captured) is not None:
         return captured
@@ -1513,6 +1720,7 @@ async def capture_order(
             "provider_operation": _OPERATION_CAPTURE,
             "paypal_request_id": key,
             "capture_status": _capture_status(captured, None),
+            PROVIDER_ORDER_FIELD: str(order_id),
         },
     )
     return await fetch_order(order_id)
@@ -1529,6 +1737,7 @@ async def fetch_order(order_id: str) -> Dict[str, Any]:
     return await _get_json(
         _ORDERS_PATH + "/" + str(order_id),
         operation=_OPERATION_FETCH,
+        order_id=str(order_id),
     )
 
 

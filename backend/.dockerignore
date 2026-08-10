@@ -23,6 +23,22 @@ google-credentials.json
 **/*credentials*.json
 gcp-*.json
 **/gcp-*.json
+# Written into the workspace by google-github-actions/auth, so it is
+# present in the build context of any image built by the deployment
+# workflow. The patterns above do not match it: the name carries "creds",
+# not "credentials".
+gha-creds-*.json
+**/gha-creds-*.json
+
+# Credential file google-github-actions/auth writes into the workspace.
+# Its name carries no "credentials" substring, so the patterns above do
+# not cover it.
+gha-creds-*.json
+**/gha-creds-*.json
+
+# Credential file google-github-actions/auth writes into the workspace.
+gha-creds-*.json
+**/gha-creds-*.json
 
 # Generic credential directories and secret files
 credentials/

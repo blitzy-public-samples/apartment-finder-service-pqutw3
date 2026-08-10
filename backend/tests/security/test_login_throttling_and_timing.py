@@ -6,12 +6,32 @@ lockout threshold, a response time that differed according to the cost
 factor of the stored hash, and a refusal branch whose attempt-counting
 statements made it slower than the branch that found no account.
 
-The timing cases measure the elapsed time of complete requests and
-compare each refusal branch against the others. Because every refusal is
-padded out to one budget, the time a branch takes is a floor that the
-machine can only add to, so the branches are sampled round-robin and each
-is read at its shortest -- the reading that carries the least noise and
-therefore the clearest view of the work the branch does.
+The refusal branches are covered at two levels. The primary gate counts
+work rather than time: each branch is driven through the endpoint while
+the credential check, the hash comparisons inside it and the call that
+holds the refusal to its budget are counted, so a branch that
+short-circuits fails whatever the host is doing. Alongside it, a
+confidence measurement carries the ``timing`` mark and reads a wall
+clock -- it measures the elapsed time of complete requests and compares
+each branch against the others. Because every refusal is padded out to
+one budget, the time a branch takes is a floor that the machine can only
+add to, so the branches are sampled round-robin and each is read at its
+shortest: the reading that carries the least noise and therefore the
+clearest view of the work the branch does. Deselecting the mark loses no
+coverage of the control, because the counted case asserts the same
+property without a clock.
+
+The rate limiter's storage is covered by operating it -- a health probe
+answered, a counter incremented, read back and released -- rather than by
+finding the object in place, so a storage that constructed but could not
+be reached fails here.
+
+The frozen login and registration contracts are asserted as a floor
+rather than as an exact set: every required member must be present and
+carry its required value, and no member the response must never carry may
+appear. The AAP permits a field to be added and forbids one being
+removed, so an exact-equality assertion would fail on a permitted change
+while an added credential field would pass one that only counted keys.
 """
 
 import time
@@ -21,6 +41,7 @@ from unittest import mock
 import bcrypt
 import pytest
 from fastapi.testclient import TestClient
+from limits import RateLimitItemPerMinute
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -57,6 +78,75 @@ TIMING_TOLERANCE_SECONDS = max(
     0.15, security.MIN_LOGIN_REFUSAL_SECONDS * 0.35
 )
 
+#: Members the login response must carry. The frozen contract fixes these
+#: as a floor rather than as the whole body: a field may be added, none
+#: may be removed, so the assertions below test containment.
+REQUIRED_LOGIN_FIELDS = frozenset({"access_token", "token_type"})
+
+#: Members the registration response must carry.
+REQUIRED_REGISTRATION_FIELDS = frozenset(
+    {"user", "access_token", "token_type"}
+)
+
+#: Members the nested user object must carry.
+REQUIRED_USER_FIELDS = frozenset({"id", "email"})
+
+#: Names no authentication response may carry at any depth. Each would
+#: either disclose a credential or expose lockout state an attacker uses
+#: to time its next attempt, so an added field bearing one of these is a
+#: regression even though adding fields is otherwise permitted.
+FORBIDDEN_RESPONSE_FIELDS = (
+    "hashed_password",
+    "password",
+    "salt",
+    "secret",
+    "secret_key",
+    "failed_login_attempts",
+    "locked_until",
+)
+
+
+#: Key the storage cases operate on. It is namespaced away from every key
+#: the application uses and is released in a ``finally``, so operating it
+#: leaves the shared counters as they were found.
+STORAGE_PROBE_KEY = "blitzy-storage-probe"
+
+#: Seconds the probe key is allowed to live, had it not been released.
+STORAGE_PROBE_EXPIRY_SECONDS = 60
+
+#: Identity and allowance the strategy case counts against.
+STORAGE_PROBE_IDENTITY = "blitzy-storage-probe-identity"
+
+STORAGE_PROBE_LIMIT = 5
+
+
+def assert_carries_no_sensitive_field(payload):
+    """Fails if ``payload`` names a forbidden field at any depth."""
+    pending = [payload]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for name, value in current.items():
+                assert name not in FORBIDDEN_RESPONSE_FIELDS, name
+                pending.append(value)
+        elif isinstance(current, list):
+            pending.extend(current)
+
+
+# Samples taken when one credential check is measured against another.
+# The shortest is kept, for the reason
+# TestRefusalBranchesTakeTheSameTime._measure_branches records: each check
+# is padded out to a floor the machine can only add to.
+COST_SAMPLES = 3
+
+# How much longer a refused check may take than the most expensive
+# supported one. Both are held to the same budget, so the ratio between
+# them isolates the work each does rather than the budget they share. A
+# refusal that compared the stored hash would take about half again as
+# long, because UNSUPPORTED_ROUNDS is one above the ceiling and so costs
+# twice a comparison at it.
+REFUSAL_COST_TOLERANCE = 1.3
+
 
 def hash_at(password, rounds):
     """Returns a bcrypt hash of ``password`` at ``rounds``."""
@@ -64,6 +154,20 @@ def hash_at(password, rounds):
         password.encode("utf-8"),
         bcrypt.gensalt(rounds=rounds),
     ).decode("utf-8")
+
+
+def shortest_credential_check(stored, expected):
+    """Returns the shortest of several checks of PASSWORD against ``stored``.
+
+    The result of every check is asserted as it is measured, so a check
+    that stopped returning what it should cannot be read as a fast one.
+    """
+    readings = []
+    for _ in range(COST_SAMPLES):
+        started = time.monotonic()
+        assert security.verify_credential(PASSWORD, stored) is expected
+        readings.append(time.monotonic() - started)
+    return min(readings)
 
 
 def legacy_hash(password):
@@ -346,15 +450,56 @@ class TestRateLimiterEngages:
 
 
 class TestRateLimiterStorageIsConfigurable:
-    """The limiter counts where the settings say, not only in memory."""
+    """The limiter counts where the settings say, not only in memory.
+
+    Reachability is established by operating the storage rather than by
+    finding an object in place: a health probe is answered, and a counter
+    is incremented, read back and released. A storage that constructed but
+    could not be reached would satisfy the object check and fail these.
+    """
+
+    def storage(self):
+        """Returns the backend the limiter's strategy counts through."""
+        strategy = auth_module.limiter.limiter
+        assert strategy is not None
+        backend = strategy.storage
+        assert backend is not None
+        return backend
 
     def test_the_limiter_uses_the_configured_storage(self):
         assert auth_module.limiter is not None
         storage = auth_module.limiter._storage_uri
         assert storage == settings.RATE_LIMIT_STORAGE_URI
 
-    def test_the_configured_storage_is_reachable(self):
-        assert auth_module.limiter.limiter is not None
+    def test_the_configured_storage_answers_a_health_probe(self):
+        assert self.storage().check() is True
+
+    def test_the_configured_storage_counts_and_releases_a_key(self):
+        backend = self.storage()
+        key = STORAGE_PROBE_KEY
+        backend.clear(key)
+        try:
+            assert backend.get(key) == 0
+            assert backend.incr(key, STORAGE_PROBE_EXPIRY_SECONDS) == 1
+            assert backend.get(key) == 1
+            assert backend.incr(key, STORAGE_PROBE_EXPIRY_SECONDS) == 2
+            assert backend.get(key) == 2
+        finally:
+            backend.clear(key)
+        assert backend.get(key) == 0
+
+    def test_the_strategy_records_a_hit_through_that_storage(self):
+        """The strategy the limiter holds counts against the backend."""
+        backend = self.storage()
+        item = RateLimitItemPerMinute(STORAGE_PROBE_LIMIT)
+        strategy = auth_module.limiter.limiter
+        strategy.clear(item, STORAGE_PROBE_IDENTITY)
+        try:
+            assert strategy.hit(item, STORAGE_PROBE_IDENTITY) is True
+            assert backend.get(item.key_for(STORAGE_PROBE_IDENTITY)) == 1
+        finally:
+            strategy.clear(item, STORAGE_PROBE_IDENTITY)
+        assert backend.get(item.key_for(STORAGE_PROBE_IDENTITY)) == 0
 
 
 class TestCredentialCheckWorkIsUniform:
@@ -382,6 +527,36 @@ class TestCredentialCheckWorkIsUniform:
     def test_a_floor_is_measured_at_import(self):
         assert security.MIN_CREDENTIAL_CHECK_SECONDS > 0
 
+    @pytest.mark.parametrize(
+        "shape", ["absent", "legacy", "configured", "unusable"]
+    )
+    def test_every_path_is_held_to_the_floor(self, shape, monkeypatch):
+        """The floor is applied on every path, counted not timed.
+
+        This is the deterministic form of the measurement below: whatever
+        it is given, the check ends by holding itself to the credential
+        budget, so a path that returned early would not reach the call and
+        would fail here on any machine.
+        """
+        stored = {
+            "absent": None,
+            "legacy": legacy_hash(PASSWORD),
+            "configured": security.get_password_hash(PASSWORD),
+            "unusable": "not-a-hash",
+        }[shape]
+        budgets = []
+        real_pad = security._pad_until
+
+        def pad(started, budget):
+            budgets.append(budget)
+            return real_pad(started, budget)
+
+        monkeypatch.setattr(security, "_pad_until", pad)
+        security.verify_credential(WRONG_PASSWORD, stored)
+
+        assert budgets == [security.MIN_CREDENTIAL_CHECK_SECONDS], shape
+
+    @pytest.mark.timing
     def test_every_path_takes_at_least_the_floor(self):
         """A legacy hash must not finish sooner than no hash at all.
 
@@ -488,14 +663,77 @@ class TestStoredCostRangeIsBounded:
         )
         assert stored not in str(records)
 
-    def test_a_hash_above_the_ceiling_costs_no_more_than_the_budget(
+    @pytest.mark.parametrize(
+        "cost,expected",
+        [
+            (None, 2),
+            (UNSUPPORTED_ROUNDS, 1),
+        ],
+    )
+    def test_a_hash_above_the_ceiling_is_never_compared(
+        self, cost, expected, monkeypatch
+    ):
+        """The over-ceiling hash is refused rather than compared.
+
+        This is the deterministic form of the measurement below. A
+        credential check performs two comparisons -- one against the stored
+        hash and one against the decoy -- and a stored hash whose cost is
+        above the supported ceiling is refused before the first of them, so
+        exactly one comparison is made. Counting them proves the expensive
+        comparison never runs, without asserting anything about how long
+        the machine took.
+        """
+        stored = (
+            security.get_password_hash(PASSWORD)
+            if cost is None
+            else hash_at(PASSWORD, cost)
+        )
+        comparisons = []
+        real_checkpw = bcrypt.checkpw
+
+        def checkpw(candidate, stored_hash):
+            comparisons.append(stored_hash)
+            return real_checkpw(candidate, stored_hash)
+
+        monkeypatch.setattr(bcrypt, "checkpw", checkpw)
+        security.verify_credential(PASSWORD, stored)
+
+        assert len(comparisons) == expected, comparisons
+        if expected == 1:
+            assert comparisons[0] == security.DECOY_HASH.encode("utf-8")
+
+    @pytest.mark.timing
+    def test_a_hash_above_the_ceiling_costs_no_more_than_a_supported_one(
+
         self,
     ):
-        stored = hash_at(PASSWORD, UNSUPPORTED_ROUNDS)
-        started = time.monotonic()
-        security.verify_credential(PASSWORD, stored)
-        measured = time.monotonic() - started
-        assert measured < security.MIN_CREDENTIAL_CHECK_SECONDS * 2
+        """Refusing an unsupported cost is not slower than accepting one.
+
+        The refusal is reached without comparing against the stored hash,
+        so it performs one comparison and then waits out the same budget a
+        supported check waits out. That is the property: an unsupported
+        cost factor neither costs the server more nor reveals itself in
+        the time the check takes.
+
+        The reference is measured in this run rather than read from
+        ``MIN_CREDENTIAL_CHECK_SECONDS``, which is calibrated once when
+        the module is imported. A comparison on a loaded host can cost
+        several times what it did at import, so an assertion against that
+        constant compares a later measurement with an earlier calibration
+        and fails while the property still holds. Comparing two checks
+        taken together removes the machine from the comparison, because
+        both carry whatever the host is doing at the time.
+        """
+        supported = hash_at(PASSWORD, security.MAX_SUPPORTED_BCRYPT_COST)
+        refused = hash_at(PASSWORD, UNSUPPORTED_ROUNDS)
+
+        reference = shortest_credential_check(supported, True)
+        measured = shortest_credential_check(refused, False)
+
+        assert measured < reference * REFUSAL_COST_TOLERANCE, (
+            measured,
+            reference,
+        )
 
     @pytest.mark.parametrize(
         "cost", [LEGACY_ROUNDS, security.MIN_SUPPORTED_BCRYPT_COST]
@@ -505,8 +743,166 @@ class TestStoredCostRangeIsBounded:
         assert security.verify_credential(PASSWORD, stored) is True
 
 
+class TestRefusalBranchesDoTheSameWork:
+    """Every login refusal performs the same work, counted not timed.
+
+    This is the primary gate on the refusal branches, and it reads no
+    clock. Each branch is driven through the endpoint while the three
+    calls that make the branches indistinguishable are counted: the single
+    credential check, the two hash comparisons inside it, and the single
+    call that holds the refusal to its budget. A branch that short-circuits
+    -- the defect M-1 named, where an unknown address skipped the
+    comparison an existing one performed -- changes one of these counts
+    and fails here regardless of how loaded the host is.
+
+    The wall-clock case that follows measures the same property end to end
+    and is classified separately, because a measurement of elapsed time
+    cannot be made independent of the machine taking it.
+    """
+
+    #: How many times one refusal calls the credential check.
+    EXPECTED_CREDENTIAL_CHECKS = 1
+
+    #: How many hash comparisons one credential check performs: one
+    #: against the stored or stand-in hash, one against the decoy.
+    EXPECTED_COMPARISONS = 2
+
+    #: How many times one refusal holds itself to the refusal budget.
+    EXPECTED_EQUALIZATIONS = 1
+
+    @staticmethod
+    def counted(monkeypatch):
+        """Counts the calls that make the refusal branches uniform."""
+        counts = {
+            "credential_checks": 0,
+            "comparisons": 0,
+            "equalizations": 0,
+        }
+        real_credential = security.verify_credential
+        real_password = security.verify_password
+        real_equalize = security.equalize_login_refusal
+
+        def credential(plain, stored):
+            counts["credential_checks"] += 1
+            return real_credential(plain, stored)
+
+        def password(plain, stored):
+            counts["comparisons"] += 1
+            return real_password(plain, stored)
+
+        def equalize(started):
+            counts["equalizations"] += 1
+            return real_equalize(started)
+
+        # The endpoint module binds these names at import, so both the
+        # module that defines them and the module that calls them are
+        # patched.
+        monkeypatch.setattr(security, "verify_password", password)
+        monkeypatch.setattr(security, "verify_credential", credential)
+        monkeypatch.setattr(auth_module, "verify_credential", credential)
+        monkeypatch.setattr(
+            auth_module, "equalize_login_refusal", equalize
+        )
+        return counts
+
+    def branches(self, db):
+        """Seeds the four refusal branches and returns their credentials."""
+        make_user(
+            db,
+            "current@example.com",
+            security.get_password_hash(PASSWORD),
+        )
+        make_user(
+            db,
+            "expensive@example.com",
+            hash_at(PASSWORD, UNSUPPORTED_ROUNDS),
+        )
+        locked = make_user(
+            db,
+            "locked@example.com",
+            security.get_password_hash(PASSWORD),
+        )
+        locked.locked_until = datetime.now(timezone.utc) + timedelta(
+            minutes=30
+        )
+        db.commit()
+        return {
+            "unknown": ("absent@example.com", WRONG_PASSWORD),
+            "wrong_password": ("current@example.com", WRONG_PASSWORD),
+            "locked": ("locked@example.com", PASSWORD),
+            "unsupported_cost": (
+                "expensive@example.com",
+                WRONG_PASSWORD,
+            ),
+        }
+
+    @pytest.mark.parametrize(
+        "branch",
+        ["unknown", "wrong_password", "locked", "unsupported_cost"],
+    )
+    def test_each_refusal_branch_does_the_counted_work(
+        self, branch, db, client, monkeypatch
+    ):
+        credentials = self.branches(db)
+        address, password = credentials[branch]
+        counts = self.counted(monkeypatch)
+
+        response = login(client, address, password)
+
+        assert response.status_code == 401, response.text
+        assert counts["credential_checks"] == (
+            self.EXPECTED_CREDENTIAL_CHECKS
+        ), (branch, counts)
+        assert counts["comparisons"] == self.EXPECTED_COMPARISONS, (
+            branch,
+            counts,
+        )
+        assert counts["equalizations"] == (
+            self.EXPECTED_EQUALIZATIONS
+        ), (branch, counts)
+
+    def test_every_branch_answers_with_one_identical_refusal(
+        self, db, client
+    ):
+        """No branch is distinguishable by its status, body or headers."""
+        credentials = self.branches(db)
+        answers = {}
+        for name, (address, password) in credentials.items():
+            response = login(client, address, password)
+            answers[name] = (
+                response.status_code,
+                response.json(),
+                response.headers.get("content-type"),
+            )
+
+        distinct = set(
+            (status, repr(body), content_type)
+            for status, body, content_type in answers.values()
+        )
+        assert len(distinct) == 1, answers
+        status, body, _ = list(answers.values())[0]
+        assert status == 401
+        assert body == {"detail": auth_module.INVALID_CREDENTIALS_DETAIL}
+
+    def test_the_refusal_budget_covers_the_credential_budget(self):
+        """The refusal budget is the wider of the two, deterministically."""
+        assert security.MIN_LOGIN_REFUSAL_SECONDS > (
+            security.MIN_CREDENTIAL_CHECK_SECONDS
+        )
+        assert security.REFUSAL_WORK_ALLOWANCE > 0
+
+
+@pytest.mark.timing
 class TestRefusalBranchesTakeTheSameTime:
-    """Every login refusal is held to one budget, measured end to end."""
+    """Every login refusal is held to one budget, measured end to end.
+
+    This is a confidence measurement rather than the primary gate, and it
+    is classified as such: it reads a wall clock, so an adverse pattern of
+    host contention can move a reading even though the branches perform
+    identical work. Deselect it with ``-m "not timing"`` where that
+    matters; the counted case above proves the same property
+    deterministically and is never deselected.
+    """
 
     @staticmethod
     def _measure_branches(client, branches, before_round=None):
@@ -638,12 +1034,6 @@ class TestRefusalBranchesTakeTheSameTime:
         )
         assert counting.locked_until is None, counting.locked_until
 
-    def test_the_refusal_budget_covers_the_credential_budget(self):
-        assert security.MIN_LOGIN_REFUSAL_SECONDS > (
-            security.MIN_CREDENTIAL_CHECK_SECONDS
-        )
-        assert security.REFUSAL_WORK_ALLOWANCE > 0
-
     def test_the_padding_helper_returns_at_once_past_the_budget(self):
         started = time.monotonic() - (
             security.MIN_LOGIN_REFUSAL_SECONDS + 1.0
@@ -654,17 +1044,37 @@ class TestRefusalBranchesTakeTheSameTime:
 
 
 class TestFrozenLoginContract:
-    """The response shapes the frontend reads are unchanged."""
+    """The response shapes the frontend reads are unchanged.
 
-    def test_login_returns_exactly_the_two_keys(self, db, client):
+    The contract fixes a floor, not the whole body: a field may be added
+    and none may be removed. Each case therefore asserts that every
+    required member is present and carries its required value, and that
+    no member the response must never carry has appeared -- rather than
+    asserting the body equals one exact set, which would fail on an
+    addition the contract permits.
+    """
+
+    def test_login_carries_the_two_required_keys(self, db, client):
         user = make_user(
             db, "i@example.com", security.get_password_hash(PASSWORD)
         )
         response = login(client, user.email, PASSWORD)
         assert response.status_code == 200
         body = response.json()
-        assert set(body) == {"access_token", "token_type"}
+        assert REQUIRED_LOGIN_FIELDS <= set(body)
         assert body["token_type"] == "bearer"
+        assert isinstance(body["access_token"], str)
+        assert body["access_token"]
+
+    def test_login_carries_no_sensitive_key(self, db, client):
+        user = make_user(
+            db, "k@example.com", security.get_password_hash(PASSWORD)
+        )
+        response = login(client, user.email, PASSWORD)
+        assert response.status_code == 200
+        assert_carries_no_sensitive_field(response.json())
+        for name in FORBIDDEN_RESPONSE_FIELDS:
+            assert name not in response.text
 
     def test_registration_keeps_its_nested_user_object(self, client):
         response = client.post(
@@ -673,6 +1083,8 @@ class TestFrozenLoginContract:
         )
         assert response.status_code == 200
         body = response.json()
-        assert set(body) == {"user", "access_token", "token_type"}
-        assert set(body["user"]) == {"id", "email"}
+        assert REQUIRED_REGISTRATION_FIELDS <= set(body)
+        assert REQUIRED_USER_FIELDS <= set(body["user"])
+        assert body["token_type"] == "bearer"
+        assert_carries_no_sensitive_field(body)
         assert "hashed_password" not in response.text

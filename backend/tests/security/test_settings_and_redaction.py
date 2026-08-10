@@ -14,6 +14,9 @@ import io
 import json
 import logging
 import os
+import queue
+import threading
+import time
 from decimal import Decimal
 from unittest import mock
 
@@ -94,6 +97,23 @@ def build_settings(**overrides):
     values = dict(BASELINE_SETTINGS)
     values.update(overrides)
     with _environment_without_settings():
+        return Settings(_env_file=None, **values)
+
+
+def build_deployed_settings(**overrides):
+    """Builds ``Settings`` for an environment other than the local one.
+
+    A deployed environment must name the managed secret backend, and that
+    backend requires every managed setting to be present in the process
+    environment, so this arranges both. The values placed in the
+    environment are the ones the build is given, so the two sources agree.
+    """
+    values = dict(BASELINE_SETTINGS)
+    values.update(overrides)
+    values.setdefault("SECRET_BACKEND", CONFIG.MANAGED_BACKEND_NAME)
+    with _environment_without_settings():
+        for name in CONFIG.MANAGED_SECRET_SETTINGS:
+            os.environ[name] = str(values[name])
         return Settings(_env_file=None, **values)
 
 
@@ -503,7 +523,7 @@ class TestPaymentCallbackAddresses:
         )
 
     def test_production_accepts_live_mode(self):
-        built = build_settings(
+        built = build_deployed_settings(
             ENVIRONMENT="production",
             PAYPAL_MODE="live",
             PAYPAL_API_BASE="https://api-m.paypal.com",
@@ -621,7 +641,7 @@ def build_deployed(**overrides):
     """Builds settings for a deployed environment plus the overrides."""
     values = dict(DEPLOYED_SETTINGS)
     values.update(overrides)
-    return build_settings(**values)
+    return build_deployed_settings(**values)
 
 
 def assert_deployed_rejected(**overrides):
@@ -1362,6 +1382,224 @@ class TestListenerShutdown:
         assert not thread.is_alive()
 
 
+class TestListenerShutdownIsBounded:
+    """Every wait the shutdown makes finishes, and says so when it does not.
+
+    ``QueueListener.stop`` offers its sentinel with ``put_nowait``, which
+    raises on a queue at capacity, and then joins its thread with no
+    timeout, so a thread blocked inside a write never returns. The module
+    reference was also released before the stop was attempted and the
+    failure was swallowed, so a listener that would not stop was left
+    running invisibly.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clean_failure_register(self):
+        """Empties the recorded reasons before and after each case."""
+        del app_logging._STOP_FAILURES[:]
+        try:
+            yield
+        finally:
+            del app_logging._STOP_FAILURES[:]
+
+    @pytest.fixture
+    def rebuild_afterwards(self):
+        """Restores a live listener however a case leaves the module."""
+        configure_logging()
+        try:
+            yield
+        finally:
+            app_logging._listener = None
+            configure_logging()
+
+    def test_the_bounds_are_finite_and_the_budget_is_documented(self):
+        assert app_logging.LISTENER_SENTINEL_TIMEOUT_SECONDS > 0
+        assert app_logging.LISTENER_JOIN_TIMEOUT_SECONDS > 0
+        budget = (
+            app_logging.QUEUE_DRAIN_TIMEOUT_SECONDS
+            + app_logging.LISTENER_SENTINEL_TIMEOUT_SECONDS
+            + app_logging.LISTENER_JOIN_TIMEOUT_SECONDS
+        )
+        assert budget < 30
+
+    def test_a_clean_stop_records_no_failure(self, rebuild_afterwards):
+        app_logging._stop_listener()
+
+        assert app_logging._listener is None
+        assert app_logging.listener_stop_failures() == ()
+
+    def test_a_full_queue_does_not_raise_and_is_reported(
+        self, rebuild_afterwards
+    ):
+        """A queue at capacity ends the wait instead of raising."""
+        listener = app_logging._listener
+        assert listener is not None
+        thread = listener._thread
+
+        class Saturated:
+            """A queue that never accepts another item."""
+
+            def __init__(self, inner):
+                self._inner = inner
+                self.offered = 0
+
+            def put(self, *args, **kwargs):
+                self.offered += 1
+                raise queue.Full()
+
+            def put_nowait(self, item):
+                self.offered += 1
+                raise queue.Full()
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        saturated = Saturated(listener.queue)
+        listener.queue = saturated
+        started = time.monotonic()
+        try:
+            app_logging._stop_listener()
+        finally:
+            listener.queue = saturated._inner
+        elapsed = time.monotonic() - started
+
+        assert saturated.offered >= 1
+        assert elapsed < (
+            app_logging.QUEUE_DRAIN_TIMEOUT_SECONDS
+            + app_logging.LISTENER_SENTINEL_TIMEOUT_SECONDS
+            + app_logging.LISTENER_JOIN_TIMEOUT_SECONDS
+            + 5
+        )
+        assert app_logging.STOP_REASON_SENTINEL_REFUSED in (
+            app_logging.listener_stop_failures()
+        )
+        assert app_logging._listener is listener
+        assert thread.is_alive()
+
+    def test_a_thread_that_will_not_exit_is_retained_and_reported(
+        self, rebuild_afterwards
+    ):
+        """A join that elapses leaves the live reference in place."""
+        listener = app_logging._listener
+        assert listener is not None
+        release = threading.Event()
+
+        class Immortal:
+            """A thread stand-in that outlives its join."""
+
+            def __init__(self):
+                self.joined_with = []
+
+            def is_alive(self):
+                return not release.is_set()
+
+            def join(self, timeout=None):
+                self.joined_with.append(timeout)
+                release.wait(0)
+
+        immortal = Immortal()
+        real_thread = listener._thread
+        listener._thread = immortal
+        started = time.monotonic()
+        try:
+            app_logging._stop_listener()
+        finally:
+            release.set()
+            listener._thread = real_thread
+        elapsed = time.monotonic() - started
+
+        assert immortal.joined_with == [
+            app_logging.LISTENER_JOIN_TIMEOUT_SECONDS
+        ]
+        assert elapsed < (
+            app_logging.QUEUE_DRAIN_TIMEOUT_SECONDS
+            + app_logging.LISTENER_SENTINEL_TIMEOUT_SECONDS
+            + app_logging.LISTENER_JOIN_TIMEOUT_SECONDS
+            + 5
+        )
+        assert app_logging.STOP_REASON_THREAD_ALIVE in (
+            app_logging.listener_stop_failures()
+        )
+        assert app_logging._listener is listener
+
+    def test_an_undrained_queue_is_reported(self, rebuild_afterwards):
+        """A drain that does not finish is recorded, not swallowed."""
+        with mock.patch.object(
+            app_logging, "flush_log_queue", return_value=False
+        ):
+            app_logging._stop_listener()
+
+        assert app_logging.STOP_REASON_NOT_DRAINED in (
+            app_logging.listener_stop_failures()
+        )
+        assert app_logging._listener is None
+
+    def test_the_recorded_reasons_are_deduplicated(
+        self, rebuild_afterwards
+    ):
+        with mock.patch.object(
+            app_logging, "flush_log_queue", return_value=False
+        ):
+            app_logging._stop_listener()
+            configure_logging()
+            app_logging._stop_listener()
+
+        reasons = app_logging.listener_stop_failures()
+        assert reasons.count(app_logging.STOP_REASON_NOT_DRAINED) == 1
+
+    def test_the_register_is_a_copy_a_caller_cannot_mutate(
+        self, rebuild_afterwards
+    ):
+        app_logging._record_stop_failure("probe reason")
+        reported = app_logging.listener_stop_failures()
+        assert isinstance(reported, tuple)
+        assert "probe reason" in reported
+
+    def test_the_sentinel_offer_reports_a_refusal_rather_than_raising(
+        self,
+    ):
+        class Refusing:
+            def put(self, *args, **kwargs):
+                raise queue.Full()
+
+            def put_nowait(self, item):
+                raise queue.Full()
+
+        class Listener:
+            _sentinel = None
+            queue = Refusing()
+
+        assert (
+            app_logging._offer_sentinel(Listener(), 0.01) is False
+        )
+
+    def test_the_sentinel_offer_accepts_a_queue_with_room(self):
+        room = queue.Queue(maxsize=1)
+
+        class Listener:
+            _sentinel = None
+
+        listener = Listener()
+        listener.queue = room
+        assert app_logging._offer_sentinel(listener, 0.01) is True
+        assert room.qsize() == 1
+
+    def test_a_listener_without_a_queue_is_refused(self):
+        class Listener:
+            _sentinel = None
+            queue = None
+
+        assert app_logging._offer_sentinel(Listener(), 0.01) is False
+
+    def test_the_bounded_stop_is_what_runs_at_interpreter_exit(self):
+        """The exit hook is the bounded stop, not the library's own."""
+        source = io.open(
+            app_logging.__file__, encoding="utf-8"
+        ).read()
+        assert "atexit.register(_stop_listener)" in source
+        assert "listener.stop()" not in source
+
+
 class TestRegistrationAddressContract:
     """The address contract matches the frozen client-side validator."""
 
@@ -1485,3 +1723,493 @@ class TestRedactionLeavesOtherOutputIntact:
             lambda logger: logger.info("context", extra={"obj": object()})
         )
         assert json.loads(rendered)["level"] == "INFO"
+
+
+class TestExceptionMessageIsRedactedBeforeItIsCut:
+    """A credential straddling the message limit is still rewritten.
+
+    Before the fix the message was cut to
+    :data:`EXCEPTION_MESSAGE_LIMIT` and the cut text was redacted
+    afterwards, so a credential whose key name fell inside the limit and
+    whose value fell past it lost the pattern that matches it and was
+    emitted verbatim.
+    """
+
+    def _straddling(self, prefix_length):
+        """Returns an exception whose credential sits at the cut."""
+        prefix = "x" * prefix_length
+        return ValueError(prefix + "api_key=" + SENTINEL + " trailing")
+
+    @pytest.mark.parametrize(
+        "offset", [-12, -9, -8, -4, -1, 0, 1, 4, 40]
+    )
+    def test_the_credential_never_survives_the_cut(self, offset):
+        limit = app_logging.EXCEPTION_MESSAGE_LIMIT
+        error = self._straddling(limit + offset - len("api_key="))
+        fields = app_logging.exception_fields(error)
+
+        assert SENTINEL not in fields["exception_message"]
+        assert len(fields["exception_message"]) <= limit
+
+    def test_a_message_within_the_limit_is_unchanged_apart_from_redaction(
+        self,
+    ):
+        fields = app_logging.exception_fields(
+            ValueError("api_key=" + SENTINEL)
+        )
+
+        assert fields["exception_message"] == (
+            "api_key=" + REDACTION_PLACEHOLDER
+        )
+
+    def test_no_partial_placeholder_is_emitted(self):
+        limit = app_logging.EXCEPTION_MESSAGE_LIMIT
+        for cut in range(1, len(REDACTION_PLACEHOLDER)):
+            prefix = "x" * (limit - len("api_key=") - cut)
+            fields = app_logging.exception_fields(
+                ValueError(prefix + "api_key=" + SENTINEL)
+            )
+            message = fields["exception_message"]
+            assert SENTINEL not in message
+            trailing = message[-len(REDACTION_PLACEHOLDER):]
+            assert REDACTION_PLACEHOLDER not in trailing or (
+                trailing.endswith(REDACTION_PLACEHOLDER)
+            )
+
+    def test_a_registered_value_is_replaced_before_the_cut(self):
+        app_logging.register_secret_values(SENTINEL)
+        limit = app_logging.EXCEPTION_MESSAGE_LIMIT
+        prefix = "x" * (limit - 4)
+        fields = app_logging.exception_fields(
+            ValueError(prefix + "quoted " + SENTINEL + " in prose")
+        )
+
+        assert SENTINEL not in fields["exception_message"]
+
+
+class TestEmitFailureIsReportedRatherThanDumpedOrDropped:
+    """A record the handler cannot emit reaches a sanitized sink.
+
+    Before the fix both handlers used the standard library's own error
+    path, which writes the record's representation and the raw traceback
+    to standard error while ``logging.raiseExceptions`` is set and
+    discards the record silently otherwise. Neither outcome is
+    acceptable: the first bypasses redaction, and the second loses an
+    audit record without a trace.
+    """
+
+    @pytest.fixture
+    def counted(self):
+        """Clears the emit-failure count around the case."""
+        app_logging.reset_logging_failure_count()
+        try:
+            yield
+        finally:
+            app_logging.reset_logging_failure_count()
+
+    def _record(self):
+        """Returns a record whose message carries the marker."""
+        return logging.LogRecord(
+            BASE_LOGGER_NAME + ".probe.emitfailure",
+            logging.ERROR,
+            __file__,
+            0,
+            "api_key=" + SENTINEL,
+            None,
+            None,
+        )
+
+    @contextlib.contextmanager
+    def _captured_stderr(self):
+        """Yields the buffer standard error is redirected to."""
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            yield buffer
+
+    @pytest.mark.parametrize(
+        "handler_name", ["queue", "stream"]
+    )
+    def test_the_failure_is_written_as_one_redacted_json_line(
+        self, counted, handler_name
+    ):
+        configure_logging()
+        if handler_name == "queue":
+            handler = app_logging.QueueDispatchHandler(
+                app_logging._record_queue, app_logging._stream_handler
+            )
+        else:
+            handler = app_logging.RedactingStreamHandler(
+                stream=io.StringIO()
+            )
+        record = self._record()
+
+        with self._captured_stderr() as buffer:
+            handler.handleError(record)
+
+        lines = [
+            line for line in buffer.getvalue().splitlines() if line.strip()
+        ]
+        assert len(lines) == 1
+        payload = json.loads(lines[0])
+        assert payload["message"] == app_logging.EMIT_FAILURE_MESSAGE
+        context = payload["context"]
+        assert context[app_logging.SIGNAL_FIELD] == (
+            app_logging.EMIT_FAILURE_SIGNAL
+        )
+        assert context["logger"] == record.name
+        assert context["level"] == "ERROR"
+        assert SENTINEL not in lines[0]
+        assert REDACTION_PLACEHOLDER in context["original_message"]
+        assert "Traceback" not in lines[0]
+
+    def test_the_failure_is_counted_as_a_health_signal(self, counted):
+        handler = app_logging.RedactingStreamHandler(stream=io.StringIO())
+
+        with self._captured_stderr():
+            handler.handleError(self._record())
+            handler.handleError(self._record())
+
+        assert app_logging.logging_failure_count() == 2
+        assert app_logging.reset_logging_failure_count() == 2
+        assert app_logging.logging_failure_count() == 0
+
+    def test_the_record_is_not_discarded_when_exceptions_are_silenced(
+        self, counted
+    ):
+        handler = app_logging.RedactingStreamHandler(stream=io.StringIO())
+        saved = logging.raiseExceptions
+        logging.raiseExceptions = False
+        try:
+            with self._captured_stderr() as buffer:
+                handler.handleError(self._record())
+        finally:
+            logging.raiseExceptions = saved
+
+        assert buffer.getvalue().strip()
+        assert app_logging.logging_failure_count() == 1
+
+    def test_a_record_that_cannot_be_rendered_is_still_reported(
+        self, counted
+    ):
+        class Unrenderable:
+            def __str__(self):
+                raise RuntimeError("cannot render")
+
+        record = logging.LogRecord(
+            BASE_LOGGER_NAME + ".probe.unrenderable",
+            logging.ERROR,
+            __file__,
+            0,
+            Unrenderable(),
+            None,
+            None,
+        )
+        handler = app_logging.RedactingStreamHandler(stream=io.StringIO())
+
+        with self._captured_stderr() as buffer:
+            handler.handleError(record)
+
+        payload = json.loads(buffer.getvalue().strip())
+        assert payload["message"] == app_logging.EMIT_FAILURE_MESSAGE
+        assert app_logging.logging_failure_count() == 1
+
+    def test_a_plain_stream_handler_is_treated_as_foreign(self):
+        plain = logging.StreamHandler(stream=io.StringIO())
+        plain.setFormatter(RedactingJsonFormatter())
+        plain.addFilter(RedactingFilter())
+
+        assert app_logging._is_redacting_stream_handler(plain) is False
+
+    def test_the_installed_stream_handler_reports_its_failures(self):
+        configure_logging()
+
+        assert isinstance(
+            app_logging._stream_handler, app_logging.RedactingStreamHandler
+        )
+
+
+class TestOutboundHttpNamespacesAreGoverned:
+    """The outbound client namespaces reach no ungoverned handler.
+
+    ``httpx`` writes the full request target of every call at INFO and
+    ``httpcore`` writes connection detail at DEBUG. Before the fix
+    neither namespace was governed, so a request target -- including the
+    listing provider's query terms -- could reach a handler installed
+    elsewhere unredacted.
+    """
+
+    @pytest.mark.parametrize(
+        "name", ["httpx", "httpcore"]
+    )
+    def test_the_namespace_carries_exactly_the_governed_handler(
+        self, name
+    ):
+        configure_logging()
+        governed = logging.getLogger(name)
+
+        assert [
+            getattr(entry, "name", None) for entry in governed.handlers
+        ] == [HANDLER_NAME]
+        assert governed.propagate is False
+
+    @pytest.mark.parametrize(
+        "name, level",
+        [
+            ("httpx", logging.INFO),
+            ("httpcore", logging.DEBUG),
+        ],
+    )
+    def test_the_request_telemetry_level_is_suppressed(self, name, level):
+        configure_logging()
+
+        assert logging.getLogger(name).isEnabledFor(level) is False
+
+    @pytest.mark.parametrize(
+        "name", ["httpx", "httpcore"]
+    )
+    def test_a_foreign_handler_on_the_namespace_is_removed(self, name):
+        configure_logging()
+        governed = logging.getLogger(name)
+        foreign = logging.StreamHandler(io.StringIO())
+        foreign.set_name("outbound-bypass-" + name)
+        governed.addHandler(foreign)
+        try:
+            configure_logging()
+            assert foreign not in governed.handlers
+        finally:
+            if foreign in governed.handlers:
+                governed.removeHandler(foreign)
+            configure_logging()
+
+    @pytest.mark.parametrize(
+        "name", ["httpx.client", "httpcore.connection"]
+    )
+    def test_a_descendant_cannot_bypass_the_governed_handler(self, name):
+        descendant = logging.getLogger(name)
+        escape = logging.StreamHandler(io.StringIO())
+        descendant.addHandler(escape)
+        descendant.propagate = False
+        try:
+            configure_logging()
+            assert descendant.handlers == []
+            assert descendant.propagate is True
+        finally:
+            if escape in descendant.handlers:
+                descendant.removeHandler(escape)
+            configure_logging()
+
+    def test_a_governed_warning_carrying_a_url_loses_its_query(self):
+        rendered = emit(
+            lambda logger: logger.warning(
+                "HTTP Request: GET https://provider.example.com/v2/"
+                "listings?zip_codes=11201&api_key=" + SENTINEL
+            )
+        )
+
+        assert SENTINEL not in rendered
+        assert "zip_codes" not in rendered
+        assert REDACTION_PLACEHOLDER in rendered
+
+
+class TestMigrationNamespacesAreGoverned:
+    """Migration records reach the redacting handler and nothing else.
+
+    Before the fix ``backend/alembic.ini`` installed a plain
+    ``StreamHandler`` on standard error with a message-only formatter and
+    let the root logger carry it, so every record a revision wrote --
+    including an account address -- was emitted unredacted and
+    unstructured.
+    """
+
+    @pytest.mark.parametrize(
+        "name", ["alembic", "sqlalchemy"]
+    )
+    def test_the_namespace_carries_exactly_the_governed_handler(
+        self, name
+    ):
+        configure_logging()
+        governed = logging.getLogger(name)
+
+        assert [
+            getattr(entry, "name", None) for entry in governed.handlers
+        ] == [HANDLER_NAME]
+        assert governed.propagate is False
+
+    def test_the_migration_namespace_emits_at_information_level(self):
+        configure_logging()
+
+        assert logging.getLogger("alembic").isEnabledFor(logging.INFO)
+
+    def test_the_statement_namespace_is_held_above_statement_records(self):
+        configure_logging()
+
+        assert (
+            logging.getLogger("sqlalchemy").isEnabledFor(logging.INFO)
+            is False
+        )
+
+    def test_the_migration_entry_point_returns_the_governed_logger(self):
+        returned = app_logging.configure_migration_logging()
+
+        assert returned is logging.getLogger("alembic")
+        assert [
+            getattr(entry, "name", None) for entry in returned.handlers
+        ] == [HANDLER_NAME]
+
+    def test_the_suite_and_the_module_name_the_same_namespace(self):
+        from backend.tests.support import MIGRATION_LOGGER_NAMESPACE
+
+        assert MIGRATION_LOGGER_NAMESPACE == (
+            app_logging.MIGRATION_LOGGER_NAMES[0]
+        )
+
+    def test_an_address_in_a_migration_record_is_replaced(self):
+        rendered = emit(
+            lambda logger: logger.info(
+                "Seeded the role admin for operator@example.com"
+            )
+        )
+
+        assert "operator@example.com" not in rendered
+        assert REDACTION_PLACEHOLDER in rendered
+
+
+class TestTraceContextCorrelation:
+    """A W3C trace context is adopted, minted, bound and propagated.
+
+    Before the fix the only correlation identifier was the request
+    identifier this service generates itself, so a record could not be
+    joined to the caller's trace or to the outbound call it caused.
+    """
+
+    VALID_PARENT = (
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    )
+
+    def test_a_well_formed_parent_is_adopted(self):
+        assert app_logging.parse_traceparent(self.VALID_PARENT) == (
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "00f067aa0ba902b7",
+            "01",
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            5,
+            "",
+            "nonsense",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-x",
+            "00-4bf92f3577b34da6a3ce929d0e0e473Z-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0",
+            "0-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        ],
+    )
+    def test_a_malformed_parent_is_refused(self, value):
+        assert app_logging.parse_traceparent(value) is None
+
+    def test_a_later_version_may_carry_further_fields(self):
+        assert app_logging.parse_traceparent(
+            "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra"
+        ) == (
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "00f067aa0ba902b7",
+            "01",
+        )
+
+    def test_binding_adopts_the_trace_and_mints_a_fresh_span(self):
+        adopted = "4bf92f3577b34da6a3ce929d0e0e4736"
+        token = app_logging.bind_trace_context(adopted, "00f067aa0ba902b7")
+        try:
+            bound = app_logging.current_trace_context()
+            assert bound[0] == adopted
+            assert bound[1] == "00f067aa0ba902b7"
+            assert bound[2] == app_logging.TRACE_FLAG_SAMPLED
+        finally:
+            app_logging.reset_trace_context(token)
+
+        assert app_logging.current_trace_context() is None
+
+    @pytest.mark.parametrize(
+        "trace_id, span_id",
+        [
+            (None, None),
+            ("not-hexadecimal", "also-not"),
+            ("4bf92f3577b34da6a3ce929d0e0e47", "00f067aa"),
+        ],
+    )
+    def test_an_unusable_value_is_replaced_by_a_fresh_one(
+        self, trace_id, span_id
+    ):
+        token = app_logging.bind_trace_context(trace_id, span_id)
+        try:
+            bound = app_logging.current_trace_context()
+            assert len(bound[0]) == app_logging.TRACE_ID_LENGTH
+            assert len(bound[1]) == app_logging.SPAN_ID_LENGTH
+            assert int(bound[0], 16) >= 0
+            assert int(bound[1], 16) >= 0
+        finally:
+            app_logging.reset_trace_context(token)
+
+    def test_no_context_yields_no_outbound_header(self):
+        assert app_logging.current_trace_context() is None
+        assert app_logging.outbound_trace_headers() == {}
+        assert app_logging.current_traceparent() is None
+
+    def test_the_outbound_header_carries_the_bound_context(self):
+        token = app_logging.bind_trace_context()
+        try:
+            bound = app_logging.current_trace_context()
+            headers = app_logging.outbound_trace_headers()
+            assert headers == {
+                app_logging.TRACEPARENT_HEADER: (
+                    app_logging.format_traceparent(*bound)
+                )
+            }
+            assert app_logging.parse_traceparent(
+                headers[app_logging.TRACEPARENT_HEADER]
+            ) == bound
+        finally:
+            app_logging.reset_trace_context(token)
+
+    def test_every_governed_record_carries_the_bound_identifiers(self):
+        configure_logging()
+        handler = app_logging._stream_handler
+        written = io.StringIO()
+        replaced = handler.setStream(written)
+        request_token = app_logging.bind_request_id("probe0trace1")
+        trace_token = app_logging.bind_trace_context()
+        bound = app_logging.current_trace_context()
+        try:
+            get_logger("backend.probe.correlated").warning("correlated")
+            app_logging.flush_log_queue()
+        finally:
+            app_logging.reset_trace_context(trace_token)
+            app_logging.reset_request_id(request_token)
+            handler.setStream(replaced)
+
+        entries = [
+            json.loads(line)
+            for line in written.getvalue().splitlines()
+            if line.strip()
+        ]
+        matching = [
+            entry for entry in entries if entry["message"] == "correlated"
+        ]
+        assert len(matching) == 1
+        context = matching[0]["context"]
+        assert context[app_logging.REQUEST_ID_FIELD] == "probe0trace1"
+        assert context[app_logging.TRACE_ID_FIELD] == bound[0]
+        assert context[app_logging.SPAN_ID_FIELD] == bound[1]
+
+    def test_the_identifiers_are_absent_when_no_context_is_bound(self):
+        rendered = emit(lambda logger: logger.info("uncorrelated"))
+        context = json.loads(rendered).get("context", {})
+
+        assert app_logging.TRACE_ID_FIELD not in context
+        assert app_logging.SPAN_ID_FIELD not in context

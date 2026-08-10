@@ -1,0 +1,31 @@
+# Replica range the bundle scales between.
+#
+# The minimum is the same token 50-frontend.yaml declares its replica count
+# from, so applying both does not immediately scale the workload down.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: apartment-finder
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+  minReplicas: ${FRONTEND_REPLICAS}
+  maxReplicas: ${FRONTEND_MAX_REPLICAS}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300

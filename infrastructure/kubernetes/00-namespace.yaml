@@ -1,0 +1,17 @@
+# Namespace every workload of this service runs in.
+#
+# The name is one half of the workload identity member on
+# google_service_account_iam_member.backend_workload_identity in
+# infrastructure/terraform/main.tf, so it must equal the value of the
+# Terraform variable kubernetes_namespace.
+#
+# ${K8S_NAMESPACE} and every other ${...} token in this directory is
+# substituted by scripts/render_kubernetes_manifests.sh, which refuses to
+# render while any required token is unset and refuses to emit output
+# carrying an unresolved token.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: apartment-finder

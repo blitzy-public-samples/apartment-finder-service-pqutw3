@@ -16,21 +16,18 @@ LISTING_URL_SCHEMES = ("https",)
 #: so a host that merely ends with one of these names does not match.
 LISTING_URL_DOMAINS = ("zillow.com",)
 
-#: Characters refused in a text field. A text column stores no NUL, so a
-#: value carrying one cannot be written and is refused by the contract
-#: instead of by the driver.
+#: Characters refused in every text field. A text column stores no NUL.
 FORBIDDEN_TEXT_CHARACTERS = ("\x00",)
 
 #: Names of the fields carrying a measurement stored in a floating-point
-#: column. A JSON body cannot carry a value outside the finite range of
-#: that column's type, so each of these fields refuses one.
+#: column. Each refuses a value outside the finite range of that type.
 MEASUREMENT_FIELDS = ("rent", "broker_fee", "square_footage")
 
 #: Names of the fields carrying a count stored in an integer column.
 COUNT_FIELDS = ("bedrooms", "bathrooms")
 
-#: Largest value an integer column holds. A JSON body cannot carry a
-#: count above this, so each of those fields refuses one.
+#: Largest value an integer column holds. Each field in
+#: :data:`COUNT_FIELDS` refuses a value above it.
 MAX_COUNT = 2 ** 31 - 1
 
 #: Every field carrying a number, measurements and counts together. A
@@ -103,11 +100,9 @@ class Listing(BaseModel):
     ``updated_at`` and ``rent`` are non-null columns and stay required;
     every other column is nullable and projects as ``None``.
 
-    Each field in :data:`MEASUREMENT_FIELDS` must be a finite number,
-    because a JSON body carries no representation for an infinity or a
-    NaN, and each field in :data:`NUMERIC_FIELDS` refuses a boolean. A
-    stored row carrying a value this contract cannot represent therefore
-    fails to project.
+    Each field in :data:`MEASUREMENT_FIELDS` must be a finite number, and
+    each field in :data:`NUMERIC_FIELDS` refuses a boolean. A stored row
+    carrying a value this contract cannot represent fails to project.
     """
 
     id: int
@@ -151,10 +146,9 @@ class ListingCreate(BaseModel):
     value.
 
     Each field in :data:`MEASUREMENT_FIELDS` must be a finite number the
-    column's type can represent, so a body carrying an infinity, a NaN or
-    a magnitude beyond that type is refused here rather than stored. Each
-    field in :data:`COUNT_FIELDS` is bounded at :data:`MAX_COUNT` for the
-    same reason, and each field in :data:`NUMERIC_FIELDS` refuses a
+    column's type can represent: an infinity, a NaN or a magnitude beyond
+    that type is refused. Each field in :data:`COUNT_FIELDS` is bounded at
+    :data:`MAX_COUNT`, and each field in :data:`NUMERIC_FIELDS` refuses a
     boolean.
     """
 
@@ -175,8 +169,7 @@ class ListingCreate(BaseModel):
         """Refuses a measurement outside the finite range of its column.
 
         Runs before the declared type is applied, so a whole number too
-        large to convert to that type is refused here instead of raising
-        during conversion.
+        large to convert to that type is refused.
         """
         return _finite_measurement(value)
 
@@ -204,9 +197,8 @@ class ListingCreate(BaseModel):
         The value must parse as an absolute URL, use a scheme in
         :data:`LISTING_URL_SCHEMES`, carry no user information, and
         address a host that falls under :data:`LISTING_URL_DOMAINS`. The
-        host is taken from the parsed URL rather than from the raw text,
-        so an address that carries an allowlisted name anywhere other
-        than in its host is refused.
+        host is taken from the parsed URL, so an address carrying an
+        allowlisted name anywhere other than in its host is refused.
         """
         if value is None:
             return value

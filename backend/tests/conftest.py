@@ -59,6 +59,8 @@ The fixtures published are:
   endpoint and the counters it is throttled by
 * :func:`fresh_rate_limit_storage` -- an autouse fixture clearing those
   counters around every test in the suite
+* :func:`fresh_readiness_outcome` -- an autouse fixture discarding the
+  readiness route's recorded outcome around every test in the suite
 * :func:`migration_connection`, :func:`alembic_config`,
   :func:`migrated_client` and :func:`pre_revision_schema` -- an empty
   isolated database, the Alembic configuration bound to it, a test client
@@ -67,6 +69,33 @@ The fixtures published are:
 * :func:`admin_seed_revision` and :func:`run_admin_seed` -- the
   administrative-grant migration and a callable that runs it on the
   isolated database
+* :func:`postgres_url`, :func:`postgres_engine`,
+  :func:`postgres_migration_connection` and
+  :func:`postgres_legacy_schema` -- the PostgreSQL database the cases in
+  ``backend/tests/integration`` run against, an engine and an open
+  connection on it, and the pre-revision schema issued in that dialect.
+  The database is named by ``POSTGRES_TEST_DATABASE_URL``; a case
+  requesting any of these fixtures is skipped while that variable names
+  nothing, so the rest of the suite is unaffected by its absence
+* :func:`postgres_base_url`, :func:`postgres_schema`,
+  :func:`postgres_url`, :func:`postgres_engine`,
+  :func:`postgres_mapped_engine`, :func:`postgres_session_factory`,
+  :func:`postgres_db`, :func:`postgres_client`,
+  :func:`postgres_observer`, :func:`postgres_alembic_config` and
+  :func:`postgres_migration_connection` -- the same surfaces on a real
+  PostgreSQL 13 server, in a schema created for one case and dropped
+  after it
+
+The SQLite fixtures and the PostgreSQL ones answer different questions.
+SQLite is what the functional cases run on: it is fast, needs no server
+and holds its database in this process. PostgreSQL is the deployed
+dialect, and the cases that use it are the ones whose subject only
+exists there -- a row lock two transactions contend for, a unique index
+one transaction waits on while another holds it uncommitted, and the
+exact type, precision, nullability and server default a revision
+installs. Those cases are marked ``postgres``, take their server from
+``POSTGRES_TEST_URL``, skip when it names none, and fail instead of
+skipping when ``REQUIRE_POSTGRES_TESTS`` is set.
 
 Usage::
 
@@ -87,6 +116,7 @@ Usage::
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -155,7 +185,19 @@ from alembic.config import Config  # noqa: E402
 from alembic.operations import Operations  # noqa: E402
 from alembic.runtime.migration import MigrationContext  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import create_engine, text  # noqa: E402
+from sqlalchemy import (  # noqa: E402
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
@@ -185,7 +227,11 @@ from backend.app.db.models import (  # noqa: E402
     Subscription,
     User,
 )
-from backend.app.main import app, limiter  # noqa: E402
+from backend.app.main import (  # noqa: E402
+    app,
+    limiter,
+    reset_readiness_cache,
+)
 
 #: Names the settings class and :data:`TEST_SETTINGS` disagree on.
 _SETTINGS_COVERAGE_GAP = sorted(
@@ -302,6 +348,20 @@ ALEMBIC_INI = REPO_ROOT / "backend" / "alembic.ini"
 #: Database the migration fixtures apply the revisions to. It is held in
 #: memory by a single connection and outlives no test.
 MIGRATION_DATABASE_URL = "sqlite://"
+
+#: Additional environment variable names accepted for the PostgreSQL
+#: integration server, beside :data:`POSTGRES_URL_VARIABLE`. Both spellings
+#: are honoured because both are set by continuous-integration jobs, and a
+#: job that names the server under either one must reach it rather than
+#: silently skipping every case that needs it.
+POSTGRES_URL_VARIABLE_ALIASES = ("POSTGRES_TEST_DATABASE_URL",)
+
+#: Additional environment variable names accepted for requiring the server,
+#: beside :data:`POSTGRES_REQUIRED_VARIABLE`.
+POSTGRES_REQUIRED_VARIABLE_ALIASES = ("POSTGRES_TEST_REQUIRED",)
+
+#: Value the required-variable names carry to require a database.
+POSTGRES_REQUIRED_VALUE = "true"
 
 #: The six tables the application carried before revision 0001. Each is
 #: written without the columns, uniqueness constraints and table that
@@ -1093,6 +1153,23 @@ def fresh_rate_limit_storage():
         reset_limiter_counters()
 
 
+@pytest.fixture(autouse=True)
+def fresh_readiness_outcome():
+    """Discard the recorded readiness outcome around every test.
+
+    The readiness route reuses one outcome for
+    ``settings.READINESS_CACHE_SECONDS``, which spans many tests. Clearing
+    it before and after each test means no test reads an outcome another
+    test produced, and a test that drives the reuse deliberately records
+    its own outcome inside its own body.
+    """
+    reset_readiness_cache()
+    try:
+        yield
+    finally:
+        reset_readiness_cache()
+
+
 SESSION_EVENT_LOOP = []
 
 
@@ -1730,5 +1807,446 @@ def pre_revision_schema():
     def create(connection: Any) -> None:
         for statement in PRE_REVISION_TABLES:
             connection.execute(text(statement))
+
+    return create
+
+
+# ---------------------------------------------------------------------
+# PostgreSQL integration fixtures
+#
+# The fixtures above build their schema in memory with SQLite, which is
+# what makes the suite fast and independent. The ones below run against a
+# real PostgreSQL 13 server, which is the deployed dialect, and exist for
+# the properties SQLite cannot exhibit: a row lock two transactions
+# contend for, a unique index one transaction waits on while another
+# holds it uncommitted, and the exact type, precision, nullability and
+# server default the migration installs.
+#
+# The server is named by POSTGRES_TEST_URL. Each case receives a database
+# of its own, created before it and dropped after it, and every name
+# carries POSTGRES_DATABASE_PREFIX -- so the database the server was
+# named by is never the database a case reads or writes, and a case
+# cannot see another's objects. A database rather than a schema is the
+# unit of isolation because backend/app/db/database.py passes its own
+# libpq ``options`` for every PostgreSQL connection, which replaces any
+# search path a URL carries, so a revision run through the application's
+# own engine would resolve an unqualified name in the default schema.
+# ---------------------------------------------------------------------
+
+#: Environment variable naming the PostgreSQL server the integration
+#: fixtures connect to, as a SQLAlchemy URL. It is deliberately not
+#: ``settings.DATABASE_URL``: that name is isolated by this module and
+#: :func:`_refuse_unisolated_configuration` refuses to run against a
+#: value this module did not place, so an integration target is named
+#: separately and explicitly.
+POSTGRES_URL_VARIABLE = "POSTGRES_TEST_URL"
+
+#: Environment variable that turns an absent server from a skipped case
+#: into a failed one. The continuous-integration workflow sets it, so the
+#: gate there is real, while a developer without a server still gets a
+#: green run of everything else.
+POSTGRES_REQUIRED_VARIABLE = "REQUIRE_POSTGRES_TESTS"
+
+#: Values of :data:`POSTGRES_REQUIRED_VARIABLE` that require the server.
+POSTGRES_REQUIRED_VALUES = ("1", "true", "yes", "on")
+
+#: Reported when no server is named.
+POSTGRES_ABSENT_MESSAGE = (
+    "no PostgreSQL server is named by " + POSTGRES_URL_VARIABLE
+)
+
+#: Reported when the named role cannot create a database.
+POSTGRES_NO_CREATEDB_MESSAGE = (
+    "the role named by "
+    + POSTGRES_URL_VARIABLE
+    + " cannot create a database, so no case can be isolated in one"
+)
+
+#: Reported when the server or the privilege is missing and the run
+#: requires the production-dialect cases.
+POSTGRES_REQUIRED_SUFFIX = (
+    ", and "
+    + POSTGRES_REQUIRED_VARIABLE
+    + " requires the production-dialect cases to run"
+)
+
+#: Schemes a PostgreSQL URL may carry.
+POSTGRES_SCHEMES = ("postgresql://", "postgresql+psycopg2://")
+
+#: Prefix every database created for a case carries. Nothing without it
+#: is ever created, written or dropped by these fixtures.
+POSTGRES_DATABASE_PREFIX = "blitzy_case_"
+
+#: Seconds an observer waits for a backend to be seen waiting on a lock.
+POSTGRES_WAIT_SECONDS = 30.0
+
+#: Seconds between two readings of the server's activity view.
+POSTGRES_POLL_SECONDS = 0.05
+
+#: Statement counting the backends of one database waiting on a lock.
+BLOCKED_BACKENDS = text(
+    "SELECT count(*) FROM pg_stat_activity "
+    "WHERE datname = :name AND wait_event_type = 'Lock'"
+)
+
+#: Statement reading whether the connected role may create a database.
+ROLE_MAY_CREATE_DATABASE = text(
+    "SELECT rolcreatedb OR rolsuper FROM pg_roles "
+    "WHERE rolname = current_user"
+)
+
+
+def postgres_url_from_environment() -> Optional[str]:
+    """Return the URL of the integration server, or ``None``.
+
+    A value that names no PostgreSQL scheme is treated as absent, so a
+    misspelled URL skips rather than failing to connect later.
+    """
+    declared = ""
+    for name in (POSTGRES_URL_VARIABLE,) + POSTGRES_URL_VARIABLE_ALIASES:
+        declared = os.environ.get(name, "").strip()
+        if declared:
+            break
+    if not declared:
+        return None
+    if not declared.startswith(POSTGRES_SCHEMES):
+        return None
+    return declared
+
+
+def postgres_is_required() -> bool:
+    """Report whether an absent server must fail rather than skip."""
+    for name in (
+        POSTGRES_REQUIRED_VARIABLE,
+    ) + POSTGRES_REQUIRED_VARIABLE_ALIASES:
+        if (
+            os.environ.get(name, "").strip().lower()
+            in POSTGRES_REQUIRED_VALUES
+        ):
+            return True
+    return False
+
+
+def _withhold_postgres(reason: str) -> None:
+    """Skip the case, or fail it when the run requires the server."""
+    if postgres_is_required():
+        raise AssertionError(reason + POSTGRES_REQUIRED_SUFFIX)
+    pytest.skip(reason)
+
+
+def _case_database_url(server_url: str, database: str) -> str:
+    """Return ``server_url`` addressing ``database`` instead.
+
+    Only the path is replaced, so the credentials, host, port and any
+    query the server URL carries are preserved.
+    """
+    parts = urlsplit(server_url)
+    replaced = parts._replace(path="/" + database)
+    return replaced.geturl()
+
+
+@pytest.fixture(scope="session")
+def postgres_base_url() -> str:
+    """Return the integration server's URL, or stop the case.
+
+    The case is skipped when no server is named or when the named role
+    cannot create a database, and failed instead of skipped when
+    :data:`POSTGRES_REQUIRED_VARIABLE` requires the server.
+    """
+    declared = postgres_url_from_environment()
+    if declared is None:
+        _withhold_postgres(POSTGRES_ABSENT_MESSAGE)
+    engine = create_engine(declared)
+    try:
+        with engine.connect() as connection:
+            allowed = connection.execute(
+                ROLE_MAY_CREATE_DATABASE
+            ).scalar()
+    finally:
+        engine.dispose()
+    if not allowed:
+        _withhold_postgres(POSTGRES_NO_CREATEDB_MESSAGE)
+    return declared
+
+
+@pytest.fixture
+def postgres_database(postgres_base_url) -> str:
+    """Yield the name of a database created for one case.
+
+    It is dropped with everything in it once the case ends, whether it
+    passed or failed, so no object outlives one case. ``WITH (FORCE)``
+    closes a connection the case left open rather than refusing the drop.
+    """
+    name = POSTGRES_DATABASE_PREFIX + uuid.uuid4().hex[:16]
+    engine = create_engine(postgres_base_url)
+    administer = engine.connect().execution_options(
+        isolation_level="AUTOCOMMIT"
+    )
+    try:
+        administer.execute(text("CREATE DATABASE " + name))
+        yield name
+    finally:
+        administer.execute(
+            text("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
+        )
+        administer.close()
+
+
+def _legacy_metadata() -> MetaData:
+    """Build the six tables that precede revision 0001, portably.
+
+    The definitions carry SQLAlchemy types rather than the literal DDL
+    :data:`PRE_REVISION_TABLES` holds, so the same declaration is issued
+    against PostgreSQL and against SQLite. The columns, the keys and the
+    absence of the columns revision 0001 adds match that literal DDL
+    exactly.
+    """
+    metadata = MetaData()
+    Table(
+        "users",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("email", String, nullable=False, unique=True),
+        Column("hashed_password", String, nullable=False),
+        Column("created_at", DateTime, nullable=False),
+        Column("last_login", DateTime, nullable=True),
+    )
+    Table(
+        "listings",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("created_at", DateTime, nullable=False),
+        Column("updated_at", DateTime, nullable=False),
+        Column("rent", Float, nullable=False),
+        Column("broker_fee", Float, nullable=True),
+        Column("square_footage", Float, nullable=True),
+        Column("bedrooms", Integer, nullable=True),
+        Column("bathrooms", Integer, nullable=True),
+        Column("available_date", DateTime, nullable=True),
+        Column("street_address", String, nullable=True),
+        Column("zillow_url", String, nullable=True),
+    )
+    Table(
+        "filters",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column(
+            "user_id", Integer, ForeignKey("users.id"), nullable=False
+        ),
+        Column("name", String, nullable=False),
+        Column("created_at", DateTime, nullable=False),
+        Column("last_used", DateTime, nullable=True),
+    )
+    Table(
+        "zip_codes",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column(
+            "filter_id", Integer, ForeignKey("filters.id"), nullable=False
+        ),
+        Column("code", String, nullable=False),
+    )
+    Table(
+        "criteria",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column(
+            "filter_id", Integer, ForeignKey("filters.id"), nullable=False
+        ),
+        Column("field", String, nullable=False),
+        Column("operator", String, nullable=False),
+        Column("value", String, nullable=False),
+    )
+    Table(
+        "subscriptions",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column(
+            "user_id", Integer, ForeignKey("users.id"), nullable=False
+        ),
+        Column("start_date", DateTime, nullable=False),
+        Column("end_date", DateTime, nullable=True),
+        Column("status", String, nullable=False),
+    )
+    return metadata
+
+
+def _drop_every_table(engine: Any) -> None:
+    """Drop every table the connected schema holds.
+
+    The names come from the schema itself, so a table a revision created
+    is removed whether or not this suite declares it -- the Alembic
+    version table and the bookkeeping table revision 0001 writes among
+    them. Each name is quoted by the dialect's own preparer.
+    """
+    preparer = engine.dialect.identifier_preparer
+    with engine.begin() as connection:
+        for name in inspect(connection).get_table_names():
+            connection.execute(
+                text(
+                    "DROP TABLE IF EXISTS {0} CASCADE".format(
+                        preparer.quote(name)
+                    )
+                )
+            )
+        engine.dispose()
+
+
+@pytest.fixture
+def postgres_url(postgres_base_url, postgres_database) -> str:
+    """Return the URL of the database created for this case."""
+    return _case_database_url(postgres_base_url, postgres_database)
+
+
+@pytest.fixture
+def postgres_engine(postgres_url, postgres_database):
+    """Yield an engine on this case's database, pooling connections.
+
+    The pool is the default one rather than a single shared connection,
+    so two sessions drawn from it are two independent transactions on the
+    server and can contend with each other.
+    """
+    engine = create_engine(postgres_url, pool_pre_ping=True)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def postgres_mapped_engine(postgres_engine):
+    """Yield an engine whose database the mapped metadata built."""
+    Base.metadata.create_all(bind=postgres_engine)
+    return postgres_engine
+
+
+@pytest.fixture
+def postgres_session_factory(postgres_mapped_engine):
+    """Return a session factory bound to this case's database."""
+    return sessionmaker(
+        autocommit=False, autoflush=False, bind=postgres_mapped_engine
+    )
+
+
+@pytest.fixture
+def postgres_db(postgres_session_factory):
+    """Yield one session on this case's database."""
+    session = postgres_session_factory()
+    try:
+        yield session
+    finally:
+        session.rollback()
+        session.close()
+
+
+@pytest.fixture
+def postgres_client(postgres_session_factory):
+    """Yield a test client whose requests reach this case's database.
+
+    Each request is served by a session of its own, drawn from the pooled
+    engine, so two requests in flight together hold two transactions.
+    """
+
+    def override_get_db():
+        session = postgres_session_factory()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(
+            app, base_url=CLIENT_BASE_URL
+        ) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def postgres_observer(postgres_base_url, postgres_database):
+    """Yield a callable reporting when a case backend waits on a lock.
+
+    The observer holds a connection to the server database rather than to
+    this case's, so reading the activity view is never blocked by the
+    contention it is watching. The connection commits each read on its
+    own: PostgreSQL holds the statistics views stable for the duration of
+    a transaction, so a connection that stayed in one would return its
+    first reading over and over and never see a wait begin.
+
+    The callable waits up to :data:`POSTGRES_WAIT_SECONDS` for the
+    requested number of backends to be seen waiting, and returns whether
+    they were.
+    """
+    engine = create_engine(postgres_base_url)
+    connection = engine.connect().execution_options(
+        isolation_level="AUTOCOMMIT"
+    )
+
+    def blocked(count: int = 1) -> bool:
+        """Report whether ``count`` backends are waiting on a lock."""
+        deadline = time.monotonic() + POSTGRES_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            waiting = connection.execute(
+                BLOCKED_BACKENDS, {"name": postgres_database}
+            ).scalar()
+            if (waiting or 0) >= count:
+                return True
+            time.sleep(POSTGRES_POLL_SECONDS)
+        return False
+
+    try:
+        yield blocked
+    finally:
+        connection.close()
+        engine.dispose()
+
+
+@pytest.fixture
+def postgres_alembic_config(postgres_url):
+    """Return a callable building an Alembic configuration.
+
+    It mirrors :func:`alembic_config` and is bound to a connection opened
+    on this case's database, so a revision applied through it installs
+    its objects there.
+    """
+
+    def build(connection: Any) -> Config:
+        config = Config(str(ALEMBIC_INI))
+        config.attributes["connection"] = connection
+        config.attributes["configure_logger"] = False
+        return config
+
+    return build
+
+
+@pytest.fixture
+def postgres_migration_connection(postgres_engine):
+    """Yield an open connection to this case's empty database.
+
+    The database carries no table, so a revision applied through
+    :func:`postgres_alembic_config` runs against the state a first
+    deployment presents.
+    """
+    connection = postgres_engine.connect()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+@pytest.fixture
+def postgres_legacy_schema():
+    """Return a callable creating the pre-revision schema portably.
+
+    The callable takes a connection and issues the six tables that
+    precede revision 0001 from :func:`_legacy_metadata`, so the
+    declaration is the same one SQLite receives while the DDL is the
+    dialect's own.
+    """
+
+    def create(connection: Any) -> None:
+        _legacy_metadata().create_all(bind=connection)
 
     return create

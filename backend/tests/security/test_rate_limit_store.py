@@ -50,12 +50,15 @@ from backend.app.core.config import (
     settings,
 )
 from backend.app.core.rate_limit import (
+    FALLBACK_CLIENT_ADDRESS,
+    FORWARDED_FOR_HEADER,
     RATE_LIMIT_RESET_HEADER,
     RETAINED_KEY_RATIO,
     BoundedMemoryStorage,
     HeaderWritingLimiter,
     _resolve_key_cap,
     build_limiter,
+    client_address,
 )
 
 #: Ceiling each store under test is built with. It is small enough that a
@@ -344,3 +347,210 @@ class TestEvictionCostsDoNotFollowTheNumberOfKeys:
 
         assert store.get_expiry("open") > time.time()
         assert store.get("open") == 1
+
+
+def _request(peer=None, forwarded=None):
+    """Returns a request carrying ``peer`` and ``forwarded``.
+
+    The scope is the minimum a ``Request`` needs to report a client and a
+    header, so the cases drive the real object rather than a stand-in for
+    it.
+    """
+    from starlette.requests import Request
+
+    headers = []
+    if forwarded is not None:
+        headers.append(
+            (FORWARDED_FOR_HEADER.lower().encode(), forwarded.encode())
+        )
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/auth/login",
+        "headers": headers,
+        "client": None if peer is None else (peer, 51234),
+    }
+    return Request(scope)
+
+
+class TestTheAddressARequestIsCountedAgainst:
+    """The counter key is the caller, and the caller cannot choose it.
+
+    Behind proxies of our own the peer address is the innermost proxy, so
+    counting against it puts every caller in one bucket and lets one
+    caller exhaust the limit for all of them. Reading the forwarded chain
+    without bounding it has the opposite failure: the caller writes the
+    header and takes a fresh bucket per request. The hop count resolves
+    both, and these cases assert each direction.
+    """
+
+    def test_no_hops_reads_the_peer_address(self, monkeypatch):
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 0)
+
+        assert client_address(_request(peer="203.0.113.7")) == (
+            "203.0.113.7"
+        )
+
+    def test_no_hops_ignores_the_forwarded_header_entirely(
+        self, monkeypatch
+    ):
+        """A caller writing the header changes nothing while hops are 0."""
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 0)
+
+        resolved = client_address(
+            _request(peer="203.0.113.7", forwarded="198.51.100.23")
+        )
+
+        assert resolved == "203.0.113.7"
+
+    def test_one_hop_reads_the_entry_the_proxy_wrote(self, monkeypatch):
+        """The rightmost entry is the peer our own proxy accepted."""
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 1)
+
+        resolved = client_address(
+            _request(peer="10.0.0.9", forwarded="198.51.100.23")
+        )
+
+        assert resolved == "198.51.100.23"
+
+    def test_one_hop_ignores_an_address_the_caller_prepended(
+        self, monkeypatch
+    ):
+        """A spoofed entry sits left of the one the proxy wrote.
+
+        This is the shape of the attack: the caller sends the header
+        itself, and the proxy appends the address it actually accepted the
+        connection from. Counting from the right-hand end reads the
+        proxy's entry, so the spoofed value changes no key.
+        """
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 1)
+
+        spoofed = client_address(
+            _request(
+                peer="10.0.0.9",
+                forwarded="192.0.2.1, 198.51.100.23",
+            )
+        )
+        honest = client_address(
+            _request(peer="10.0.0.9", forwarded="198.51.100.23")
+        )
+
+        assert spoofed == honest == "198.51.100.23"
+
+    def test_two_hops_read_two_entries_from_the_end(self, monkeypatch):
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 2)
+
+        resolved = client_address(
+            _request(
+                peer="10.0.0.9",
+                forwarded="198.51.100.23, 10.0.1.4",
+            )
+        )
+
+        assert resolved == "198.51.100.23"
+
+    def test_a_shared_proxy_does_not_put_every_caller_in_one_bucket(
+        self, monkeypatch
+    ):
+        """Two callers behind one proxy resolve to two different keys.
+
+        Without the hop count both requests report the proxy's address and
+        share a counter, which is the defect: one caller's traffic refuses
+        the other's.
+        """
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 1)
+
+        first = client_address(
+            _request(peer="10.0.0.9", forwarded="198.51.100.23")
+        )
+        second = client_address(
+            _request(peer="10.0.0.9", forwarded="198.51.100.24")
+        )
+
+        assert first != second
+
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 0)
+
+        assert client_address(
+            _request(peer="10.0.0.9", forwarded="198.51.100.23")
+        ) == client_address(
+            _request(peer="10.0.0.9", forwarded="198.51.100.24")
+        )
+
+    def test_a_chain_shorter_than_the_hop_count_falls_back(
+        self, monkeypatch
+    ):
+        """A truncated chain narrows the identity rather than widening it."""
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 3)
+
+        resolved = client_address(
+            _request(peer="10.0.0.9", forwarded="198.51.100.23")
+        )
+
+        assert resolved == "10.0.0.9"
+
+    def test_an_absent_header_falls_back_to_the_peer(self, monkeypatch):
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 1)
+
+        assert client_address(_request(peer="10.0.0.9")) == "10.0.0.9"
+
+    @pytest.mark.parametrize(
+        "forwarded",
+        [
+            "not-an-address",
+            "example.com",
+            "999.999.999.999",
+            "  ",
+            "<script>",
+            "198.51.100.23; DROP",
+        ],
+    )
+    def test_an_entry_that_is_not_an_address_falls_back(
+        self, monkeypatch, forwarded
+    ):
+        """Only an IP address may become a counter key."""
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 1)
+
+        assert client_address(
+            _request(peer="10.0.0.9", forwarded=forwarded)
+        ) == "10.0.0.9"
+
+    @pytest.mark.parametrize(
+        "written,expected",
+        [
+            ("198.51.100.23", "198.51.100.23"),
+            ("198.51.100.23:41234", "198.51.100.23"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("[2001:db8::1]", "2001:db8::1"),
+            ("[2001:db8::1]:41234", "2001:db8::1"),
+            (" 198.51.100.23 ", "198.51.100.23"),
+        ],
+    )
+    def test_every_form_a_proxy_writes_is_reduced_to_the_address(
+        self, monkeypatch, written, expected
+    ):
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 1)
+
+        assert client_address(
+            _request(peer="10.0.0.9", forwarded=written)
+        ) == expected
+
+    def test_a_connection_reporting_no_peer_is_still_counted(
+        self, monkeypatch
+    ):
+        """An unidentifiable caller gets a key rather than no key.
+
+        Returning nothing would leave the request uncounted, so a fixed
+        key is used and such requests are limited together.
+        """
+        monkeypatch.setattr(settings, "TRUSTED_PROXY_HOPS", 0)
+
+        assert client_address(_request()) == FALLBACK_CLIENT_ADDRESS
+
+    def test_the_default_hop_count_reads_no_forwarded_header(self):
+        """The shipped default is the one a caller cannot influence."""
+        assert settings.__fields__["TRUSTED_PROXY_HOPS"].default == 0
+
+    def test_the_limiter_is_keyed_by_that_function(self):
+        """The application's limiter uses this resolution, not the peer."""
+        assert build_limiter()._key_func is client_address

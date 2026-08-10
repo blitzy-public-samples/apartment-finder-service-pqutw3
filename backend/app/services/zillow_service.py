@@ -8,7 +8,9 @@ from backend.app.core.config import (
     settings,
 )
 from backend.app.core.logging import (
+    current_request_id,
     get_logger,
+    outbound_trace_headers,
     register_required_secret_values,
 )
 from backend.app.schema.listing import ListingCreate
@@ -81,8 +83,29 @@ REASON_RESPONSE_TOO_LARGE = "response_body_too_large"
 #: :data:`MAX_PROVIDER_LISTINGS`.
 REASON_TOO_MANY_LISTINGS = "listing_count_past_cap"
 
+#: Rejection reason: the caller handed more postal codes than
+#: ``settings.INGESTION_ZIP_CODE_CHUNK`` admits in one request.
+REASON_CHUNK_TOO_LARGE = "zip_code_chunk_past_cap"
+
+#: Message recorded when a request is refused for its chunk size.
+REQUEST_CHUNK_REFUSED_MESSAGE = (
+    "Refused to call the listing provider with more postal codes than "
+    "one request accepts"
+)
+#: Discard reason: an entry in the listings field was not an object.
+REASON_LISTING_NOT_OBJECT = "listing_not_object"
+
 #: Method the provider endpoint is read with.
 _GET_METHOD = "GET"
+
+#: Request header the provider credential travels in, so it appears in no
+#: URL, no query string, no proxy log and no referrer.
+API_KEY_HEADER = "X-API-Key"
+
+#: Request header the bound request identifier is sent to the provider in.
+#: A provider-side record and the local record for the same call then
+#: carry the same identifier.
+REQUEST_ID_HEADER = "X-Request-ID"
 
 
 def _client() -> "httpx.Client":
@@ -162,11 +185,18 @@ def fetch_listings(zip_codes: List[str], filters: Dict) -> List[Dict]:
     """
     Fetches apartment listings from Zillow API
 
+    ``zip_codes`` is one bounded chunk of postal codes, not a whole
+    corpus: a list carrying more than ``settings.INGESTION_ZIP_CODE_CHUNK``
+    entries is refused without a request being issued, and the refusal is
+    recorded with the count and the cap. The caller in
+    :mod:`backend.app.tasks.listing_updater` chunks to that same setting.
+
     Returns the provider's listing objects, or an empty list when the
-    request fails, when the response body is past
-    :data:`MAX_PROVIDER_RESPONSE_BYTES`, when it is not decodable JSON,
-    or when the decoded body does not carry a list of listing objects.
-    At most :data:`MAX_PROVIDER_LISTINGS` objects are returned.
+    chunk is past that cap, when the request fails, when the response
+    body is past :data:`MAX_PROVIDER_RESPONSE_BYTES`, when it is not
+    decodable JSON, or when the decoded body does not carry a list of
+    listing objects. At most :data:`MAX_PROVIDER_LISTINGS` objects are
+    returned.
 
     Every failure is logged once, as the failing exception's class and
     defining module with no message text and no request target, and none
@@ -180,11 +210,28 @@ def fetch_listings(zip_codes: List[str], filters: Dict) -> List[Dict]:
         )
         return []
 
+    chunk_ceiling = int(settings.INGESTION_ZIP_CODE_CHUNK)
+    if len(zip_codes) > chunk_ceiling:
+        logger.error(
+            REQUEST_CHUNK_REFUSED_MESSAGE,
+            extra={
+                "reason": REASON_CHUNK_TOO_LARGE,
+                "setting": "INGESTION_ZIP_CODE_CHUNK",
+                "zip_codes": len(zip_codes),
+                "max_zip_codes": chunk_ceiling,
+            },
+        )
+        return []
+
     params = {
         "zip_codes": ",".join(zip_codes),
         **filters
     }
-    headers = {"X-API-Key": ZILLOW_API_KEY}
+    headers = {API_KEY_HEADER: ZILLOW_API_KEY}
+    correlation = current_request_id()
+    if correlation:
+        headers[REQUEST_ID_HEADER] = correlation
+    headers.update(outbound_trace_headers())
 
     try:
         with _client() as client:
@@ -230,15 +277,16 @@ def fetch_listings(zip_codes: List[str], filters: Dict) -> List[Dict]:
 
     accepted = [entry for entry in listings if isinstance(entry, dict)]
     if len(accepted) != len(listings):
-        logger.error(
+        logger.warning(
             "Discarded Zillow API listings that were not objects",
             extra={
+                "reason": REASON_LISTING_NOT_OBJECT,
                 "received": len(listings),
                 "discarded": len(listings) - len(accepted),
             },
         )
     if len(accepted) > MAX_PROVIDER_LISTINGS:
-        logger.error(
+        logger.warning(
             "Truncated the Zillow API listings at the accepted count",
             extra={
                 "reason": REASON_TOO_MANY_LISTINGS,

@@ -26,9 +26,17 @@ on one that only recreates the table.
 
 A table this revision adds columns to is created in full when it is
 absent, so the revision applies to an empty database as well as to one
-holding the six tables that precede it. Offline, no database is present
-to inspect, so ``--sql`` emits the additive statements unconditionally,
-for a database already holding those six tables.
+holding the six tables that precede it. The name of every table it
+creates that way is written to :data:`CREATED_TABLES_RECORD`, and
+``downgrade`` drops exactly the tables recorded there before removing that
+record. An empty database therefore returns to being empty, and a
+database that already held those six tables keeps every one of them,
+because on that path no name is recorded and the record itself is never
+created. The record carries table names only.
+
+Offline, no database is present to inspect, so ``--sql`` emits the
+additive statements unconditionally, for a database already holding those
+six tables, and neither direction emits a statement for the record.
 
 ``listings`` is one of the tables created only when absent, and it is
 created with no uniqueness over ``zillow_url``. The mapped
@@ -71,6 +79,29 @@ ZIP_CODES = "zip_codes"
 CRITERIA = "criteria"
 SUBSCRIPTIONS = "subscriptions"
 WEBHOOK_EVENTS = "webhook_events"
+
+#: Bookkeeping table this revision writes the name of every table it
+#: created into. It is owned by this revision alone, is created only when
+#: at least one name is written to it, and is dropped by ``downgrade``.
+#: It holds no application data.
+CREATED_TABLES_RECORD = "alembic_0001_created_tables"
+
+#: The bookkeeping table as a statement target.
+created_tables_record = sa.table(
+    CREATED_TABLES_RECORD, sa.column("table_name")
+)
+
+#: The tables that precede this revision, in an order that drops a child
+#: before its parent. ``downgrade`` visits them in this order when it
+#: removes the tables this revision created.
+PRECEDING_TABLES_DROP_ORDER = (
+    CRITERIA,
+    ZIP_CODES,
+    FILTERS,
+    SUBSCRIPTIONS,
+    LISTINGS,
+    USERS,
+)
 
 #: Column of ``subscriptions`` this revision constrains to be unique.
 ORDER_COLUMN = "paypal_order_id"
@@ -387,54 +418,120 @@ def _refuse_present_shape():
         )
 
 
+def _create_created_tables_record():
+    """Create the bookkeeping table this revision records names in."""
+    op.create_table(
+        CREATED_TABLES_RECORD,
+        sa.Column("table_name", sa.String(length=63), nullable=False),
+        sa.PrimaryKeyConstraint("table_name"),
+    )
+
+
+def _record_created_tables(names):
+    """Write ``names`` to the bookkeeping table, creating it first.
+
+    Nothing is created and nothing is written when ``names`` is empty, so
+    a database that already held every preceding table carries no record
+    and no bookkeeping table.
+    """
+    if not names:
+        return
+    _create_created_tables_record()
+    op.get_bind().execute(
+        created_tables_record.insert(),
+        [{"table_name": name} for name in names],
+    )
+
+
+def _recorded_created_tables():
+    """Return the table names the bookkeeping table holds.
+
+    An empty set is returned when the bookkeeping table is absent, which
+    is the state left by an upgrade that created no table.
+    """
+    if not _table_present(CREATED_TABLES_RECORD):
+        return set()
+    rows = op.get_bind().execute(
+        sa.select(created_tables_record.c.table_name)
+    ).fetchall()
+    return set(row[0] for row in rows)
+
+
 def _upgrade_users():
-    """Bring ``users`` to this revision's shape."""
+    """Bring ``users`` to this revision's shape.
+
+    Returns ``True`` when the table was created by this call.
+    """
     if not _table_present(USERS):
         _create_users()
-        return
+        return True
     for column in _users_added_columns():
         op.add_column(USERS, column)
+    return False
 
 
 def _upgrade_listings():
-    """Ensure ``listings`` exists; this revision alters no column of it."""
+    """Ensure ``listings`` exists; this revision alters no column of it.
+
+    Returns ``True`` when the table was created by this call.
+    """
     if not _table_present(LISTINGS):
         _create_listings()
+        return True
+    return False
 
 
 def _upgrade_filters():
-    """Ensure ``filters`` exists; this revision alters no column of it."""
+    """Ensure ``filters`` exists; this revision alters no column of it.
+
+    Returns ``True`` when the table was created by this call.
+    """
     if not _table_present(FILTERS):
         _create_filters()
+        return True
+    return False
 
 
 def _upgrade_zip_codes():
-    """Ensure ``zip_codes`` exists; no column of it is altered."""
+    """Ensure ``zip_codes`` exists; no column of it is altered.
+
+    Returns ``True`` when the table was created by this call.
+    """
     if not _table_present(ZIP_CODES):
         _create_zip_codes()
+        return True
+    return False
 
 
 def _upgrade_criteria():
-    """Ensure ``criteria`` exists; no column of it is altered."""
+    """Ensure ``criteria`` exists; no column of it is altered.
+
+    Returns ``True`` when the table was created by this call.
+    """
     if not _table_present(CRITERIA):
         _create_criteria()
+        return True
+    return False
 
 
 def _upgrade_subscriptions():
-    """Bring ``subscriptions`` to this revision's shape."""
+    """Bring ``subscriptions`` to this revision's shape.
+
+    Returns ``True`` when the table was created by this call.
+    """
     if not _table_present(SUBSCRIPTIONS):
         _create_subscriptions()
-        return
+        return True
     existing = _column_names(SUBSCRIPTIONS)
     for column in _subscriptions_added_columns():
         if column.name not in existing:
             op.add_column(SUBSCRIPTIONS, column)
-    if _uniqueness_over(SUBSCRIPTIONS, [ORDER_COLUMN]) is not None:
-        return
-    with op.batch_alter_table(SUBSCRIPTIONS) as batch_op:
-        batch_op.create_unique_constraint(
-            SUBSCRIPTIONS_ORDER_UNIQUE, [ORDER_COLUMN]
-        )
+    if _uniqueness_over(SUBSCRIPTIONS, [ORDER_COLUMN]) is None:
+        with op.batch_alter_table(SUBSCRIPTIONS) as batch_op:
+            batch_op.create_unique_constraint(
+                SUBSCRIPTIONS_ORDER_UNIQUE, [ORDER_COLUMN]
+            )
+    return False
 
 
 def _upgrade_webhook_events():
@@ -464,19 +561,28 @@ def upgrade() -> None:
 
     Raises ``RuntimeError`` when any object this revision adds is already
     present. The tables are visited in an order that satisfies their
-    foreign keys.
+    foreign keys, and the name of each one created here is written to
+    :data:`CREATED_TABLES_RECORD` so ``downgrade`` removes exactly that
+    set. ``webhook_events`` is not recorded there: ``downgrade`` owns it
+    unconditionally.
     """
     if _emitting_statements():
         _upgrade_offline()
         return
     _refuse_present_shape()
-    _upgrade_users()
-    _upgrade_listings()
-    _upgrade_filters()
-    _upgrade_zip_codes()
-    _upgrade_criteria()
-    _upgrade_subscriptions()
+    created = []
+    for table, upgrade_table in (
+        (USERS, _upgrade_users),
+        (LISTINGS, _upgrade_listings),
+        (FILTERS, _upgrade_filters),
+        (ZIP_CODES, _upgrade_zip_codes),
+        (CRITERIA, _upgrade_criteria),
+        (SUBSCRIPTIONS, _upgrade_subscriptions),
+    ):
+        if upgrade_table():
+            created.append(table)
     _upgrade_webhook_events()
+    _record_created_tables(created)
 
 
 def _downgrade_webhook_events():
@@ -559,14 +665,37 @@ def _downgrade_offline():
         op.drop_column(USERS, column.name)
 
 
+def _drop_created_tables(created):
+    """Drop the tables named in ``created``, children before parents."""
+    for table in PRECEDING_TABLES_DROP_ORDER:
+        if table in created and _table_present(table):
+            op.drop_table(table)
+
+
+def _drop_created_tables_record():
+    """Drop the bookkeeping table, when it is present."""
+    if _table_present(CREATED_TABLES_RECORD):
+        op.drop_table(CREATED_TABLES_RECORD)
+
+
 def downgrade() -> None:
     """Reverse this revision.
 
-    The uniqueness constraint is dropped before the column it covers.
+    The uniqueness constraint is dropped before the column it covers, and
+    a table recorded in :data:`CREATED_TABLES_RECORD` is dropped whole
+    rather than having its added columns removed. The record itself is
+    dropped last, so the reversal leaves neither an application table nor
+    a bookkeeping table behind on a database this revision built from
+    nothing.
     """
     if _emitting_statements():
         _downgrade_offline()
         return
+    created = _recorded_created_tables()
     _downgrade_webhook_events()
-    _downgrade_subscriptions()
-    _downgrade_users()
+    if SUBSCRIPTIONS not in created:
+        _downgrade_subscriptions()
+    if USERS not in created:
+        _downgrade_users()
+    _drop_created_tables(created)
+    _drop_created_tables_record()

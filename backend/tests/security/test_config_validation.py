@@ -50,6 +50,8 @@ not on the path the settings class reads it from, and hands the child
 only the baseline plus the case's replacement.
 """
 
+import contextlib
+import logging
 import os
 import subprocess
 import sys
@@ -63,9 +65,13 @@ from backend.app.core.config import (
     ALLOWED_JWT_ALGORITHMS,
     DEFAULT_ENV_FILE,
     DEFAULT_MAX_PAGINATION_OFFSET,
+    ENVIRONMENT_BACKEND_NAME,
     ENV_FILE_VARIABLE,
     IN_PROCESS_RATE_LIMIT_SCHEMES,
     LIVE_MODE,
+    LOCAL_ENVIRONMENT,
+    LOCAL_ONLY_LOG_LEVEL,
+    LOG_LEVEL_NAMES,
     MANAGED_BACKEND_NAME,
     MANAGED_SECRET_SETTINGS,
     MAX_PAGINATION_OFFSET_CEILING,
@@ -80,6 +86,7 @@ from backend.app.core.config import (
     rate_limit_storage_scheme,
     settings,
 )
+from backend.app.core import logging as app_logging
 from backend.app.core.logging import (
     MIN_SECRET_VALUE_LENGTH,
     REDACTION_PLACEHOLDER,
@@ -195,7 +202,32 @@ def valid_settings() -> Dict[str, Any]:
         ),
         "SENDGRID_API_KEY": "sendgrid-test-key",
         "FROM_EMAIL": "no-reply@apartment-finder.dev",
+        "SECRET_BACKEND": MANAGED_BACKEND_NAME,
     }
+
+
+@contextlib.contextmanager
+def _managed_values_in_the_environment(values: Dict[str, Any]):
+    """Places every managed setting in the process environment.
+
+    The managed secret backend requires each of those settings to arrive
+    as a process variable, so a build that names it needs them present.
+    The values placed here are the ones the build is given, so the two
+    sources agree. The environment is restored on the way out.
+    """
+    restore = {
+        name: os.environ.get(name) for name in MANAGED_SECRET_SETTINGS
+    }
+    for name in MANAGED_SECRET_SETTINGS:
+        os.environ[name] = str(values[name])
+    try:
+        yield
+    finally:
+        for name, previous in restore.items():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
 
 
 def build_settings(**overrides: Any) -> Settings:
@@ -203,10 +235,20 @@ def build_settings(**overrides: Any) -> Settings:
 
     The environment file is not read. The values reaching validation are
     the baseline ones with ``overrides`` applied over them.
+
+    The baseline names the managed secret backend, which requires every
+    managed setting to be present in the process environment, so a caller
+    that leaves ``SECRET_BACKEND`` alone gets them placed there. A caller
+    that names ``SECRET_BACKEND`` itself is asserting something about the
+    backend, so nothing is placed and the environment stays as that
+    caller arranged it.
     """
     values = valid_settings()
     values.update(overrides)
-    return Settings(_env_file=None, **values)
+    if "SECRET_BACKEND" in overrides:
+        return Settings(_env_file=None, **values)
+    with _managed_values_in_the_environment(values):
+        return Settings(_env_file=None, **values)
 
 
 def rejection_message(**overrides: Any) -> str:
@@ -406,7 +448,7 @@ def test_the_valid_baseline_configuration_is_accepted():
     assert settings.PAYPAL_MODE == baseline["PAYPAL_MODE"]
     assert settings.PAYPAL_API_BASE == baseline["PAYPAL_API_BASE"]
     assert settings.FROM_EMAIL == baseline["FROM_EMAIL"]
-    assert settings.SECRET_BACKEND == "env"
+    assert settings.SECRET_BACKEND == baseline["SECRET_BACKEND"]
 
 
 def test_the_baseline_normalises_delimited_and_cased_settings():
@@ -978,14 +1020,8 @@ class TestEnvironmentFileSelection:
         assert _configured_env_file() == "local.env"
 
     def test_the_default_file_is_addressed_absolutely(self):
-        """The default names one file, whatever the working directory.
-
-        A relative default is resolved against the directory the process
-        was started in, so the same command reads a different file -- or
-        no file -- depending on where it was run. The default is anchored
-        on the repository root instead, which is what makes the
-        documented startup command work from any directory.
-        """
+        """The default is an absolute path to ``.env`` at the repository
+        root, so it names one file whatever the working directory."""
         assert os.path.isabs(DEFAULT_ENV_FILE)
         assert os.path.dirname(DEFAULT_ENV_FILE) == str(REPO_ROOT)
         assert os.path.basename(DEFAULT_ENV_FILE) == ".env"
@@ -1032,8 +1068,69 @@ class TestAManagedSecretBackendRequiresTheEnvironment:
     def test_the_default_backend_requires_nothing_of_the_environment(
         self,
     ):
-        """The check applies to the managed backend only."""
-        assert build_settings().SECRET_BACKEND == "env"
+        """The check applies to the managed backend only.
+
+        The default backend is accepted only in the local environment, so
+        the case names it while asserting that no managed value has to be
+        placed in the process environment for the build to succeed.
+        """
+        built = build_settings(
+            ENVIRONMENT=LOCAL_ENVIRONMENT,
+            SECRET_BACKEND=ENVIRONMENT_BACKEND_NAME,
+        )
+
+        assert built.SECRET_BACKEND == ENVIRONMENT_BACKEND_NAME
+
+    @pytest.mark.parametrize(
+        "environment", ["development", "staging", PRODUCTION_ENVIRONMENT]
+    )
+    def test_a_deployed_environment_refuses_the_default_backend(
+        self, environment
+    ):
+        """Only a local run may read its secrets from its own environment.
+
+        Every other environment must name the managed backend, so that a
+        deployment cannot serve on secrets delivered by an environment
+        file. The compose definition defaults ``SECRET_BACKEND`` to the
+        environment backend for local convenience, and this is the check
+        that stops a Cloud SQL stack inheriting that default.
+        """
+        overrides = {
+            "ENVIRONMENT": environment,
+            "SECRET_BACKEND": ENVIRONMENT_BACKEND_NAME,
+        }
+        if environment == PRODUCTION_ENVIRONMENT:
+            overrides["PAYPAL_MODE"] = LIVE_MODE
+            overrides["PAYPAL_API_BASE"] = PAYPAL_API_BASES[LIVE_MODE]
+
+        message = rejection_message(**overrides)
+
+        assert "SECRET_BACKEND" in message
+        assert MANAGED_BACKEND_NAME in message
+        assert environment in message
+
+    def test_the_local_environment_accepts_the_managed_backend(
+        self, monkeypatch
+    ):
+        """Naming the managed backend locally is still accepted.
+
+        The requirement runs one way only: a deployed environment must
+        name the managed backend, and a local run may name either.
+        """
+        self._supply(
+            monkeypatch,
+            dict(
+                (name, str(valid_settings()[name]))
+                for name in MANAGED_SECRET_SETTINGS
+            ),
+        )
+
+        built = build_settings(
+            ENVIRONMENT=LOCAL_ENVIRONMENT,
+            SECRET_BACKEND=MANAGED_BACKEND_NAME,
+        )
+
+        assert built.SECRET_BACKEND == MANAGED_BACKEND_NAME
 
     def test_every_managed_value_supplied_is_accepted(self, monkeypatch):
         built = self._managed(monkeypatch)
@@ -1184,3 +1281,108 @@ class TestTheSuiteRunsOnIsolatedConfiguration:
             conftest.reset_limiter_counters()
 
         assert conftest.SHARED_LIMITER_MESSAGE in str(raised.value)
+
+
+class TestTheLogLevelIsValidated:
+    """The record threshold is a named level and nothing else.
+
+    The level governs every structured record the application writes, so
+    a value the application has no name for cannot be accepted: a
+    deployment that mistypes the level must be told rather than served at
+    a threshold it did not choose. The one level that records a rendered
+    traceback is confined to the local environment.
+    """
+
+    def test_the_default_is_the_information_level(self):
+        assert build_settings().LOG_LEVEL == "INFO"
+        assert "INFO" in LOG_LEVEL_NAMES
+
+    @pytest.mark.parametrize("name", LOG_LEVEL_NAMES)
+    def test_every_named_level_is_accepted(self, name):
+        """Each accepted name resolves to itself, local included."""
+        built = build_settings(ENVIRONMENT=LOCAL_ENVIRONMENT, LOG_LEVEL=name)
+
+        assert built.LOG_LEVEL == name
+
+    @pytest.mark.parametrize(
+        "written", ["info", "Info", " warning ", "eRRor"]
+    )
+    def test_a_name_is_read_however_it_is_written(self, written):
+        built = build_settings(LOG_LEVEL=written)
+
+        assert built.LOG_LEVEL == written.strip().upper()
+
+    @pytest.mark.parametrize(
+        "value",
+        ["20", "0", "TRACE", "VERBOSE", "NOTSET", "WARN", "", "   "],
+    )
+    def test_a_value_outside_the_names_is_refused(self, value):
+        """A numeric level and a near-miss name both stop startup."""
+        message = rejection_message(LOG_LEVEL=value)
+
+        assert "LOG_LEVEL" in message
+
+    @pytest.mark.parametrize(
+        "environment", ["development", "staging", PRODUCTION_ENVIRONMENT]
+    )
+    def test_the_traceback_level_is_refused_outside_local(
+        self, environment
+    ):
+        """The refusal names the level and the environment it refused."""
+        message = rejection_message(
+            ENVIRONMENT=environment, LOG_LEVEL=LOCAL_ONLY_LOG_LEVEL
+        )
+
+        assert LOCAL_ONLY_LOG_LEVEL in message
+        assert environment in message
+
+    def test_the_traceback_level_is_accepted_locally(self):
+        built = build_settings(
+            ENVIRONMENT=LOCAL_ENVIRONMENT, LOG_LEVEL=LOCAL_ONLY_LOG_LEVEL
+        )
+
+        assert built.LOG_LEVEL == LOCAL_ONLY_LOG_LEVEL
+
+    def test_the_names_are_the_ones_the_logger_resolves(self):
+        """Every accepted name is a level the logging module knows.
+
+        The setting would otherwise accept a name the logger falls back
+        from, which would leave the configured threshold silently
+        replaced by the default.
+        """
+        for name in LOG_LEVEL_NAMES:
+            assert app_logging._resolve_level(name) == getattr(
+                logging, name
+            )
+
+    def test_the_application_applies_the_configured_level(self):
+        """Passing the setting through moves the base logger's level."""
+        base = logging.getLogger(app_logging.BASE_LOGGER_NAME)
+        original = base.level
+        try:
+            app_logging.configure_logging("WARNING")
+            assert base.level == logging.WARNING
+            app_logging.configure_logging(settings.LOG_LEVEL)
+            assert base.level == getattr(logging, settings.LOG_LEVEL)
+        finally:
+            base.setLevel(original)
+
+    def test_the_configured_level_cannot_lower_a_namespace_floor(self):
+        """A verbose application level leaves the other namespaces alone.
+
+        The outbound HTTP, migration and statement namespaces carry
+        thresholds of their own that keep a request target or a statement
+        out of the log; a configured application level must not reach
+        them.
+        """
+        floors = app_logging._governed_namespace_levels()
+        base = logging.getLogger(app_logging.BASE_LOGGER_NAME)
+        original = base.level
+        try:
+            app_logging.configure_logging(LOCAL_ONLY_LOG_LEVEL)
+            assert floors
+            for name, level in floors:
+                assert logging.getLogger(name).level == level
+        finally:
+            app_logging.configure_logging(settings.LOG_LEVEL)
+            base.setLevel(original)

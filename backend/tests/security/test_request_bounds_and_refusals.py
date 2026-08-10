@@ -93,6 +93,24 @@ from backend.app.schema.listing import (
 #: Password the fixtures hash and the login cases send.
 PASSWORD = "testpassword123"
 
+#: Members the login response must carry. The frozen contract fixes these
+#: as a floor rather than as the whole body, and imposes no order: a field
+#: may be added, none may be removed, so the assertion tests containment.
+REQUIRED_LOGIN_FIELDS = frozenset({"access_token", "token_type"})
+
+#: Names no authentication response may carry. Each would either disclose
+#: a credential or expose lockout state, so an added field bearing one of
+#: these is a regression even though adding fields is otherwise permitted.
+FORBIDDEN_RESPONSE_FIELDS = (
+    "hashed_password",
+    "password",
+    "salt",
+    "secret",
+    "secret_key",
+    "failed_login_attempts",
+    "locked_until",
+)
+
 #: Header carrying the policy under test.
 CSP_HEADER = "content-security-policy"
 
@@ -656,7 +674,16 @@ class TestRefusalsShareOneShape:
             },
         )
         assert response.status_code == 200
-        assert list(response.json()) == ["access_token", "token_type"]
+        # The frozen contract is a floor, not an exact set or an order:
+        # every required member is present, and no member the response
+        # must never carry has appeared.
+        body = response.json()
+        assert REQUIRED_LOGIN_FIELDS <= set(body)
+        assert body["token_type"] == "bearer"
+        assert body["access_token"]
+        for name in FORBIDDEN_RESPONSE_FIELDS:
+            assert name not in body
+            assert name not in response.text
         for header in RATE_LIMIT_HEADERS + (RETRY_AFTER_HEADER,):
             assert header not in response.headers
 

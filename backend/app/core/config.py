@@ -60,6 +60,9 @@ The checks applied here are:
 * when ``SECRET_BACKEND`` names :data:`MANAGED_BACKEND_NAME`, every
   setting listed in :data:`MANAGED_SECRET_SETTINGS` must arrive from
   the process environment rather than from an environment file
+* the log level must name an entry in :data:`LOG_LEVEL_NAMES`, and
+  :data:`LOCAL_ONLY_LOG_LEVEL` is accepted only while ``ENVIRONMENT``
+  names :data:`LOCAL_ENVIRONMENT`
 
 Constructing :class:`Settings` raises ``ValidationError`` for a rejected
 value, and the module-level :data:`settings` instance applies that
@@ -88,15 +91,25 @@ from pydantic import BaseSettings, Field, root_validator, validator
 __all__ = [
     "ALLOWED_JWT_ALGORITHMS",
     "BOUNDED_MEMORY_SCHEME",
+    "DB_TIMEOUT_CEILING_SECONDS",
+    "DEFAULT_DB_CONNECT_TIMEOUT_SECONDS",
+    "DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS",
+    "DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS",
     "DEFAULT_ENV_FILE",
+    "DEFAULT_INGESTION_MAX_ZIP_CODES",
+    "DEFAULT_INGESTION_ZIP_CODE_CHUNK",
     "DEFAULT_MAX_PAGINATION_OFFSET",
     "DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES",
     "ENVIRONMENT_BACKEND_NAME",
     "ENV_FILE_VARIABLE",
     "ENVIRONMENT_NAMES",
+    "INGESTION_MAX_ZIP_CODES_CEILING",
+    "INGESTION_ZIP_CODE_CHUNK_CEILING",
     "IN_PROCESS_RATE_LIMIT_SCHEMES",
     "LIVE_MODE",
     "LOCAL_ENVIRONMENT",
+    "LOCAL_ONLY_LOG_LEVEL",
+    "LOG_LEVEL_NAMES",
     "MANAGED_BACKEND_NAME",
     "MANAGED_SECRET_SETTINGS",
     "MAX_PAGINATION_OFFSET_CEILING",
@@ -158,8 +171,7 @@ REPOSITORY_ROOT = os.path.dirname(
 
 #: File settings are also read from when :data:`ENV_FILE_VARIABLE` is
 #: absent from the process environment. It is an absolute path under
-#: :data:`REPOSITORY_ROOT`, so the same file is read whichever directory
-#: the process was started in.
+#: :data:`REPOSITORY_ROOT`.
 DEFAULT_ENV_FILE = os.path.join(REPOSITORY_ROOT, ".env")
 
 #: PayPal environment name that identifies live credentials.
@@ -204,6 +216,38 @@ MANAGED_SECRET_SETTINGS = (
     "PAYPAL_WEBHOOK_ID",
     "SENDGRID_API_KEY",
 )
+
+#: Settings the delivery pipeline publishes as a namespace-scoped
+#: Kubernetes secret rather than as a value in the deployed ConfigMap,
+#: because the value carries a credential.
+#:
+#: ``RATE_LIMIT_STORAGE_URI`` names the shared store the credential-endpoint
+#: counters are kept in. The store requires an AUTH string, so the assembled
+#: address is a credential even though the setting is not one of
+#: :data:`MANAGED_SECRET_SETTINGS`: those six are read from Secret Manager by
+#: the CSI driver at pod start, while this one is read by the deployment and
+#: written into the ``backend-rate-limit-store`` secret every workload
+#: references. It is excluded from the ConfigMap key-set assertion the
+#: infrastructure job of ``.github/workflows/ci.yml`` makes.
+PIPELINE_SECRET_SETTINGS = ("RATE_LIMIT_STORAGE_URI",)
+
+#: Log levels accepted by ``Settings.LOG_LEVEL``. The names are the
+#: standard library's, and they are the only accepted spelling: a numeric
+#: level is refused, so a deployment cannot set a threshold the
+#: application has no name for.
+LOG_LEVEL_NAMES = (
+    "CRITICAL",
+    "ERROR",
+    "WARNING",
+    "INFO",
+    "DEBUG",
+)
+
+#: Level accepted only while ``Settings.ENVIRONMENT`` is
+#: :data:`LOCAL_ENVIRONMENT`. At this level
+#: :func:`backend.app.core.logging.log_exception` emits the rendered
+#: traceback, which names statement text and module paths.
+LOCAL_ONLY_LOG_LEVEL = "DEBUG"
 
 #: Rate-limit storage scheme served from this process's own memory and
 #: bounded by ``Settings.RATE_LIMIT_MAX_TRACKED_KEYS``. Implemented by
@@ -280,6 +324,49 @@ MAX_PAGINATION_OFFSET_CEILING = 1000000
 #: Row offset applied to ``Settings.MAX_PAGINATION_OFFSET`` when the
 #: environment names none.
 DEFAULT_MAX_PAGINATION_OFFSET = 10000
+
+#: Largest value any database timeout may be set to, in seconds. A value
+#: above it is refused by settings validation.
+DB_TIMEOUT_CEILING_SECONDS = 300
+
+#: Seconds a connection attempt to the database may take when the
+#: environment names none. It is applied as the libpq ``connect_timeout``
+#: parameter, which waits indefinitely when it is omitted or zero.
+DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 3
+
+#: Seconds one statement may run on the server when the environment names
+#: none. It is applied as the PostgreSQL ``statement_timeout`` runtime
+#: parameter, so a statement past it is cancelled by the server rather
+#: than left running after the client has stopped waiting. The default is
+#: below the readiness probe's own client timeout, so the probe's
+#: statement is bounded on the server before the probe abandons it.
+DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS = 3
+
+#: Seconds an established database connection may hold unacknowledged
+#: data before the socket is aborted, when the environment names none. It
+#: is applied as the libpq ``tcp_user_timeout`` parameter, which bounds
+#: the wait a caller holding a pooled connection sees when the server
+#: stops answering: ``statement_timeout`` cancels the statement on the
+#: server, but the cancellation cannot reach a client whose packets are
+#: no longer acknowledged. Platforms without the underlying socket option
+#: ignore the parameter.
+DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS = 4
+
+#: Largest value ``Settings.INGESTION_MAX_ZIP_CODES`` may be set to. A
+#: value above it is refused by settings validation.
+INGESTION_MAX_ZIP_CODES_CEILING = 100000
+
+#: Number of postal codes one ingestion pass reads when the environment
+#: names none.
+DEFAULT_INGESTION_MAX_ZIP_CODES = 1000
+
+#: Largest value ``Settings.INGESTION_ZIP_CODE_CHUNK`` may be set to. A
+#: value above it is refused by settings validation.
+INGESTION_ZIP_CODE_CHUNK_CEILING = 1000
+
+#: Number of postal codes one provider request carries when the
+#: environment names none.
+DEFAULT_INGESTION_ZIP_CODE_CHUNK = 50
 
 #: Smallest accepted length of the token signing key, in UTF-8 bytes.
 MIN_SIGNING_KEY_BYTES = 32
@@ -737,13 +824,11 @@ def _configured_env_file() -> Optional[str]:
 
     :data:`DEFAULT_ENV_FILE` is returned when
     :data:`ENV_FILE_VARIABLE` is absent from the process environment,
-    and ``None`` when it is present and names nothing. A process that
-    supplies every setting itself therefore reads no file.
+    and ``None`` when it is present and names nothing.
 
-    The default is an absolute path under :data:`REPOSITORY_ROOT`, so the
-    file a process reads does not depend on the directory it was started
-    in. A value supplied through :data:`ENV_FILE_VARIABLE` is used as
-    given, so a relative one is still resolved against that directory.
+    The default is an absolute path under :data:`REPOSITORY_ROOT`. A
+    value supplied through :data:`ENV_FILE_VARIABLE` is used as given,
+    so a relative one resolves against the working directory.
     """
     declared = os.environ.get(ENV_FILE_VARIABLE)
     if declared is None:
@@ -766,6 +851,23 @@ class Settings(BaseSettings):
 
     # Database
     DATABASE_URL: str
+    DB_CONNECT_TIMEOUT_SECONDS: int = Field(
+        DEFAULT_DB_CONNECT_TIMEOUT_SECONDS,
+        ge=1,
+        le=DB_TIMEOUT_CEILING_SECONDS,
+    )
+    DB_STATEMENT_TIMEOUT_SECONDS: int = Field(
+        DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS,
+        ge=1,
+        le=DB_TIMEOUT_CEILING_SECONDS,
+    )
+    DB_TCP_USER_TIMEOUT_SECONDS: int = Field(
+        DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS,
+        ge=1,
+        le=DB_TIMEOUT_CEILING_SECONDS,
+    )
+    DB_POOL_TIMEOUT_SECONDS: float = Field(10.0, gt=0, le=300)
+    DB_POOL_RECYCLE_SECONDS: int = Field(1800, ge=60, le=86400)
 
     # JWT / token signing
     SECRET_KEY: str
@@ -794,8 +896,17 @@ class Settings(BaseSettings):
     RATE_LIMIT_LOGIN: str = "5/minute"
     RATE_LIMIT_REGISTER: str = "3/minute"
     RATE_LIMIT_WEBHOOK: str = "60/minute"
+    RATE_LIMIT_READINESS: str = "60/minute"
     RATE_LIMIT_STORAGE_URI: str = BOUNDED_MEMORY_SCHEME + "://"
     RATE_LIMIT_MAX_TRACKED_KEYS: int = Field(4096, ge=64, le=1048576)
+    # Proxies of our own a request passes through before it reaches this
+    # process. Zero reads no forwarded header and counts a request against
+    # the peer address of its connection.
+    TRUSTED_PROXY_HOPS: int = Field(0, ge=0, le=10)
+
+    # Readiness probe bounds
+    READINESS_CACHE_SECONDS: float = Field(5.0, gt=0, le=300)
+    READINESS_TIMEOUT_SECONDS: float = Field(2.0, gt=0, le=60)
 
     # Login lockout
     LOGIN_MAX_ATTEMPTS: int = Field(5, ge=1, le=100)
@@ -805,6 +916,16 @@ class Settings(BaseSettings):
     ZILLOW_API_URL: str = "https://zillow-api.example.com/v2/listings"
     ZILLOW_API_KEY: str
     HTTP_TIMEOUT_SECONDS: float = Field(10.0, gt=0, le=300)
+    INGESTION_MAX_ZIP_CODES: int = Field(
+        DEFAULT_INGESTION_MAX_ZIP_CODES,
+        ge=1,
+        le=INGESTION_MAX_ZIP_CODES_CEILING,
+    )
+    INGESTION_ZIP_CODE_CHUNK: int = Field(
+        DEFAULT_INGESTION_ZIP_CODE_CHUNK,
+        ge=1,
+        le=INGESTION_ZIP_CODE_CHUNK_CEILING,
+    )
 
     # PayPal integration
     PAYPAL_MODE: str = SANDBOX_MODE
@@ -830,9 +951,12 @@ class Settings(BaseSettings):
     SENDGRID_API_KEY: str
     FROM_EMAIL: str = "no-reply@example.com"
 
-    # Secret management and observability
-    SECRET_BACKEND: str = Field("env")
-    SENTRY_DSN: Optional[str]
+    # Secret management and observability. The default reads secrets from
+    # this process's own environment and is accepted only while
+    # ENVIRONMENT names LOCAL_ENVIRONMENT; every other environment
+    # requires MANAGED_BACKEND_NAME.
+    SECRET_BACKEND: str = Field(ENVIRONMENT_BACKEND_NAME)
+    LOG_LEVEL: str = LOG_LEVEL_NAMES[3]
 
     @validator(*_LIST_VALUED_FIELDS, pre=True)
     def _split_delimited_list(cls, value: Any) -> Any:
@@ -1006,6 +1130,32 @@ class Settings(BaseSettings):
         if candidate not in SECRET_BACKENDS:
             raise ValueError(
                 f"must be one of {sorted(SECRET_BACKENDS)}"
+            )
+        return candidate
+
+    @validator("LOG_LEVEL")
+    def _check_log_level(cls, value: str, values: Dict[str, Any]) -> str:
+        """Return the level name in upper case, refusing any other value.
+
+        Only a name in :data:`LOG_LEVEL_NAMES` is accepted, so a numeric
+        threshold or a misspelling stops startup rather than resolving to
+        a level the deployment did not ask for.
+        :data:`LOCAL_ONLY_LOG_LEVEL` is accepted only while
+        ``ENVIRONMENT`` is :data:`LOCAL_ENVIRONMENT`.
+        """
+        candidate = value.strip().upper()
+        if candidate not in LOG_LEVEL_NAMES:
+            raise ValueError(f"must be one of {list(LOG_LEVEL_NAMES)}")
+        environment = values.get("ENVIRONMENT")
+        if (
+            candidate == LOCAL_ONLY_LOG_LEVEL
+            and environment is not None
+            and environment != LOCAL_ENVIRONMENT
+        ):
+            raise ValueError(
+                f"must not be {LOCAL_ONLY_LOG_LEVEL} while ENVIRONMENT "
+                f"is {environment}, because that level records a "
+                "rendered traceback"
             )
         return candidate
 
@@ -1238,7 +1388,10 @@ class Settings(BaseSettings):
         return candidate
 
     @validator(
-        "RATE_LIMIT_LOGIN", "RATE_LIMIT_REGISTER", "RATE_LIMIT_WEBHOOK"
+        "RATE_LIMIT_LOGIN",
+        "RATE_LIMIT_REGISTER",
+        "RATE_LIMIT_WEBHOOK",
+        "RATE_LIMIT_READINESS",
     )
     def _check_rate_limit(cls, value: str) -> str:
         """Return the rate-limit expression stripped.
@@ -1438,14 +1591,29 @@ class Settings(BaseSettings):
     def _check_value_source(
         cls, values: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Require managed values to arrive from the environment.
+        """Require managed secret delivery outside local runs.
 
-        When ``SECRET_BACKEND`` names :data:`MANAGED_BACKEND_NAME`,
-        every setting listed in :data:`MANAGED_SECRET_SETTINGS` must be
-        present and non-blank in the process environment. An environment
-        file is then not an accepted source for those values.
+        ``SECRET_BACKEND`` must name :data:`MANAGED_BACKEND_NAME` unless
+        ``ENVIRONMENT`` names :data:`LOCAL_ENVIRONMENT`. When it names
+        :data:`MANAGED_BACKEND_NAME`, every setting listed in
+        :data:`MANAGED_SECRET_SETTINGS` must be present and non-blank in
+        the process environment. An environment file is then not an
+        accepted source for those values.
         """
-        if values.get("SECRET_BACKEND") != MANAGED_BACKEND_NAME:
+        backend = values.get("SECRET_BACKEND")
+        environment = values.get("ENVIRONMENT")
+        if (
+            backend is not None
+            and environment is not None
+            and environment != LOCAL_ENVIRONMENT
+            and backend != MANAGED_BACKEND_NAME
+        ):
+            raise ValueError(
+                f"SECRET_BACKEND must be {MANAGED_BACKEND_NAME} when "
+                f"ENVIRONMENT is {environment}; {backend} is accepted "
+                f"only when ENVIRONMENT is {LOCAL_ENVIRONMENT}"
+            )
+        if backend != MANAGED_BACKEND_NAME:
             return values
         supplied = {
             name.upper()
