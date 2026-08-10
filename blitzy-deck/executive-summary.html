@@ -7,48 +7,14 @@
 
 <link rel="icon" href="data:,">
 
-<!--
-  Asset delivery. Four assets are fetched from two content delivery networks.
-  Subresource integrity pins each script and stylesheet to the exact bytes
-  reviewed; the three taggable assets carry an integrity attribute, and the
-  mermaid ES module carries its hash in the import map below. crossorigin and
-  referrerpolicy accompany each one.
-
-  The policy below restricts the origins this document may reach at all:
-  connect-src is none, base-uri is none and form-action is none.
-  'unsafe-inline' is declared for style and script, and the theme and the
-  initialisation are inline in this file.
-
-  Two residuals are recorded here and are not closed. The typeface stylesheet
-  carries no integrity attribute. Its response is negotiated per browser, so
-  its bytes are not fixed and no hash describes it; it delivers no script and
-  is constrained by origin alone. The mermaid module's hash is declared in the
-  import map, and import-map integrity is a recent addition that older
-  browsers ignore. Where it is ignored the module loads unpinned from the one
-  origin the policy permits.
-
-  One expected console message. With developer tools open, the browser fetches
-  the .map source-map side-files that reveal.js and lucide.min.js name, and
-  connect-src 'none' blocks both. Those fetches come from the debugger; this
-  deck contains no fetch, XMLHttpRequest, WebSocket or EventSource call.
-  Verified in a real browser: both diagrams draw, every icon renders, all
-  eighteen slides are reachable, and no integrity check fails. With developer
-  tools closed the console is silent.
-
-  Every choice above, and the alternatives weighed against it, is recorded in
-  docs/security/DECISION_LOG.md.
--->
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
 
-<!-- typefaces -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Space+Grotesk:wght@500;600;700&amp;family=Fira+Code:wght@400;500&amp;display=swap" referrerpolicy="no-referrer">
 
-<!-- reveal.js framework stylesheet -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" integrity="sha384-YgvgKeZJykuztG+iQPoZHNZENTFZvOcOJ/uRzmJTje6GHYN9zAw+y5rx/L8MQKA/" crossorigin="anonymous" referrerpolicy="no-referrer">
 
-<!-- Module integrity for the diagram renderer, declared where a module's hash belongs -->
 <script type="importmap">
 {
   "imports": {
@@ -85,7 +51,6 @@
   --gradient-accent-bar: linear-gradient(90deg, #5B39F3 0%, #94FAD5 100%);
 }
 
-/* base typography */
 html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 
 .reveal {
@@ -143,20 +108,13 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   white-space: nowrap;
 }
 
-/* Muted text is distinguished by size and weight, not by lightness.
-   --blitzy-text-muted (#999999) is declared above, as the theme
-   specifies, and is applied to borders and rules only. Measured against
-   the 4.5:1 normal-text threshold it is 2.85:1 on #FFFFFF and 2.51:1 on
-   the light surfaces. Recorded at docs/security/DECISION_LOG.md. */
 .lede {
   font-size: 0.6em;
   color: var(--blitzy-text);
   max-width: 1500px;
 }
 
-/* Screen-reader-only content. Used for table captions and diagram
-   descriptions, which name a visual for assistive technology without
-   adding rendered text to the slide. */
+/* Visually hidden text for accessible captions and diagram descriptions. */
 .sr-only {
   position: absolute;
   width: 1px;
@@ -170,7 +128,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 }
 .emphasis { font-weight: 600; color: var(--blitzy-primary-deep); }
 
-/* full-bleed slide frame */
 .reveal .slides { text-align: left; }
 
 .reveal .slides > section {
@@ -193,17 +150,10 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   padding: 78px 104px;
 }
 
-/* slide types */
 .slide-title {
   background: var(--gradient-hero) !important;
   color: var(--blitzy-text-invert);
 }
-/* The hero gradient's light stop (#7A6DEC) carries white at only 4.02:1
-   and the teal eyebrow at 3.23:1. A navy scrim inside the slide keeps
-   the mandated gradient visible beneath it while raising every pair
-   above the 4.5:1 normal-text threshold: measured across all three
-   gradient stops, white lands at 6.13:1 or better and teal at 4.93:1 or
-   better at the scrim's lightest point. */
 .slide-title .slide-body {
   background: linear-gradient(
     90deg,
@@ -244,7 +194,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   font-family: var(--ff-mono);
   font-size: 0.42em;
   letter-spacing: 0.16em;
-  /* 4.45:1 at 0.78 over the gradient's light stop; 5.08:1 at 0.86. */
   color: rgba(255, 255, 255, 0.86);
   margin-top: 26px;
   text-transform: uppercase;
@@ -255,10 +204,14 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   color: var(--blitzy-text-invert);
 }
 .slide-closing h2 { color: var(--blitzy-text-invert); font-size: 2.35em; font-weight: 700; }
+.slide-closing .lede { color: rgba(255, 255, 255, 0.9); }
 .slide-closing li { color: rgba(255, 255, 255, 0.9); }
 .slide-closing li::before { background: var(--blitzy-accent-teal); }
+/* .lede sets its own colour, so a class declaration on the paragraph
+   overrides the inverted colour this slide inherits. On the navy the
+   theme's body ink measures 1.30:1; this value, composited at its own
+   0.9 alpha over the navy, measures 13.34:1. */
 
-/* component classes */
 .eyebrow {
   display: block;
   font-family: var(--ff-mono);
@@ -363,13 +316,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   stroke: var(--blitzy-accent-teal);
   stroke-width: 2;
 }
-/* Separation between these two lines is set by an explicit margin on
-   .brand-sub below, not by a line-height here. A line-height was tried
-   and measured: the inherited unitless ratio resolves against this
-   element's own font-size and leaves the descender of "Blitzy" touching
-   the cap-height of the line beneath it, while a value large enough to
-   help depends on the display face's own ascent-plus-descent, which a
-   font substitution would change. A margin is the deterministic control. */
 .brand-lockup .brand-word {
   font-family: var(--ff-display);
   font-weight: 700;
@@ -387,7 +333,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   color: var(--blitzy-accent-teal);
 }
 
-/* styled table */
 .data-table {
   width: 100%;
   border-collapse: collapse;
@@ -424,7 +369,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   white-space: nowrap;
 }
 
-/* mermaid container */
 .mermaid {
   display: flex;
   align-items: center;
@@ -464,7 +408,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   color: var(--blitzy-primary-deep);
 }
 
-/* slide header block */
 .slide-head { margin-bottom: 6px; }
 .slide-foot {
   margin-top: 28px;
@@ -505,14 +448,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   margin-top: 44px;
 }
 
-/* Responsive behaviour.
-
-   reveal.js scales the 1920x1080 canvas with a transform: every length
-   above shrinks proportionally on a smaller viewport and nothing reflows
-   on its own. The breakpoints below reflow the card and table grids at
-   three widths, and the height rules give a slide taller than the canvas
-   its own scroll. Recorded at docs/security/DECISION_LOG.md. */
-
 @media (max-width: 1400px) {
   .kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .slide-body { padding: 64px 76px; }
@@ -532,25 +467,17 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   .icon-row { grid-template-columns: minmax(0, 1fr); }
   .callout { flex-direction: column; align-items: flex-start; gap: 12px; }
   .reveal li { padding-left: 34px; }
-  /* A single column is the tallest layout the deck produces, so the same
-     top-aligned scrolling the short-viewport rule applies is needed here
-     regardless of viewport height. */
   .slide-body {
     padding: 26px 36px;
     justify-content: flex-start;
     min-height: 0;
     overflow-y: auto;
   }
-  /* Scrolling stops content being lost, but a reader should not have to
-     scroll to reach the fifth metric. Stacked into one column the card
-     grid measured 1310 against the 1080-unit slide box, so the card's
-     own spacing is tightened here to bring all five back inside it. */
   .kpi-grid { gap: 12px; margin-top: 14px; }
   .kpi-card { padding: 14px 16px; gap: 8px; }
   .kpi-value { font-size: 1.4em; }
 }
 
-/* A slide taller than the canvas gets its own scroll. */
 @media (max-height: 820px) {
   .slide-body {
     justify-content: flex-start;
@@ -574,14 +501,13 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 <div class="reveal">
 <div class="slides">
 
-<!-- 1. title -->
 <section class="slide-title">
 <div class="slide-body">
 
     <span class="hero-icon" aria-hidden="true"><i data-lucide="shield-check" aria-hidden="true"></i></span>
     <span class="eyebrow">Security Remediation</span>
     <h1>apartment-finder-service</h1>
-    <p class="scope">Twenty security findings remediated in code across authentication, authorization, payments and secrets, each covered by an automated test. No new product functionality. Deployment and credential rotation remain for an operator.</p>
+    <p class="scope">Twenty security findings remediated in code across authentication, authorization, payments and secrets: fifteen proven by automated test, five carrying an operational step no test here can perform. No new product functionality. Deployment and credential rotation remain for an operator.</p>
     <p class="audience">Prepared for executive leadership and the change-approval reviewers</p>
 </div>
 <aside class="notes">
@@ -595,7 +521,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </aside>
 </section>
 
-<!-- 2. headline metrics -->
 <section>
 <div class="slide-body">
 
@@ -603,12 +528,12 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
       <span class="eyebrow eyebrow-ink">Outcome</span>
       <h2>What the work delivered</h2>
     </div>
-    <p class="lede">Before this work the service could not start and its test suite collected no tests. Every figure below is measured in code and tests. None of it is a statement about a deployed environment: nothing here has been released yet.</p>
+    <p class="lede">Before this work the service could not start and its test suite collected no tests. Every figure below is measured in code and tests. None of it is a statement about a deployed environment, which this repository cannot see.</p>
     <div class="kpi-grid">
       <div class="kpi-card">
         <span class="kpi-icon" aria-hidden="true"><i data-lucide="shield-check" aria-hidden="true"></i></span>
         <span class="kpi-value">20</span>
-        <span class="kpi-label">findings remediated in code and covered by tests, across four vulnerability clusters</span>
+        <span class="kpi-label">findings remediated in code, across four vulnerability clusters, split fifteen and five below</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="git-branch" aria-hidden="true"></i></span>
@@ -622,8 +547,8 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="file-check" aria-hidden="true"></i></span>
-        <span class="kpi-value">91</span>
-        <span class="kpi-label">files changed: 61 new, 30 updated</span>
+        <span class="kpi-value">129</span>
+        <span class="kpi-label">files changed: 99 new, 30 updated</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="check-circle" aria-hidden="true"></i></span>
@@ -647,14 +572,17 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
       </div>
       <div class="kpi-card">
         <span class="kpi-icon" aria-hidden="true"><i data-lucide="map" aria-hidden="true"></i></span>
-        <span class="kpi-value">69</span>
-        <span class="kpi-label">planned changes mapped end to end: 30 created, 29 updated, 10 read-only</span>
+        <span class="kpi-value">68</span>
+        <span class="kpi-label">planned changes mapped end to end: 30 created, 29 updated, 9 read-only</span>
       </div>
     </div>
 </div>
 <aside class="notes">
   Before this work the service could not start at all and its test suite collected no
-  tests. The twenty findings are the agreed register, and each has a fix and a test.
+  tests. The twenty findings are the agreed register and each has a delivered fix:
+  fifteen are proven by automated test alone, and the other five carry an operational
+  step no test in this repository can perform, which is what the two cards beside the
+  headline count report and what the operator slide lists.
   Advisories fell from nineteen across seven packages to seven across three; every one
   of the seven survives because no fix for it runs on the Python version this service
   deliberately pins, and each carries a named compensating control. The single
@@ -664,7 +592,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </aside>
 </section>
 
-<!-- 3. architecture overview -->
 <section>
 <div class="slide-body">
 
@@ -713,18 +640,20 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   </pre>
 </div>
 <aside class="notes">
-  Three boxes deliberately have no arrows. Managed secret storage is provisioned and
-  the running service is authorized to read all six secrets, but mounting them into the
-  pod is a change to deployment manifests that live outside this repository, so no
-  delivery flow is drawn. The event stream and object storage are provisioned by the
-  infrastructure definitions and no application code reads or writes either. The React
+  Two boxes deliberately have no arrows. Object storage is provisioned by the
+  infrastructure definitions and no application code reads or writes it. And the React
   client cannot currently consume this API; those defects predate this work and
   repairing them needs an authorized frontend change. An earlier version of this
-  diagram drew all three as working flows.
+  diagram drew both as working flows.
+  Secret delivery, by contrast, is drawn, and that is the change from an earlier
+  version of this note: managed per-secret containers grant read access to a workload
+  identity, and that identity is how the backend service, the ingestion task and the
+  schema upgrade job obtain their six secrets. The manifests that mount them are
+  versioned in this repository. What an operator still supplies is each secret's
+  value.
 </aside>
 </section>
 
-<!-- 4. divider: authentication -->
 <section class="slide-divider">
 <div class="slide-body">
 
@@ -734,7 +663,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </div>
 </section>
 
-<!-- 5. authentication hardening -->
 <section>
 <div class="slide-body">
 
@@ -769,7 +697,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </aside>
 </section>
 
-<!-- 6. divider: authorization -->
 <section class="slide-divider">
 <div class="slide-body">
 
@@ -779,7 +706,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </div>
 </section>
 
-<!-- 7. authorization model -->
 <section>
 <div class="slide-body">
 
@@ -825,7 +751,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </aside>
 </section>
 
-<!-- 8. divider: payments -->
 <section class="slide-divider">
 <div class="slide-body">
 
@@ -835,7 +760,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </div>
 </section>
 
-<!-- 9. payment integrity -->
 <section>
 <div class="slide-body">
 
@@ -870,7 +794,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </aside>
 </section>
 
-<!-- 10. divider: secrets and infrastructure -->
 <section class="slide-divider">
 <div class="slide-body">
 
@@ -880,7 +803,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </div>
 </section>
 
-<!-- 11. secrets and platform hardening -->
 <section>
 <div class="slide-body">
 
@@ -909,13 +831,13 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   travelled in web addresses and was printed into logs when a call failed. All are out of
   the code now and cannot return, but removal only stops future exposure: anything
   already exposed stays live until it is rotated, which is the operator step this deck
-  returns to. Managed secret storage is provisioned and the service is authorized to read
-  it; mounting it into the running pods is a manifest change made outside this
-  repository.
+  returns to. Managed secret storage is provisioned, the service is authorized to read it,
+  and the manifests that mount it into the running pods are versioned here too: a provider
+  class names the six secrets and the pod mounts them read-only as files. What an operator
+  supplies is each secret's value.
 </aside>
 </section>
 
-<!-- 12. before and after request authorization -->
 <section>
 <div class="slide-body">
 
@@ -950,7 +872,7 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
       CHK --&gt;|"no"| NOGO["No access&lt;br/&gt;granted"]
       CHK --&gt;|"yes"| ACT["Access granted;&lt;br/&gt;server clock sets&lt;br/&gt;the dates"]
     end
-    subgraph BEFORE["1 - Before"]
+    subgraph BEFORE["Before"]
       direction LR
       RQ1["Request carries&lt;br/&gt;its own amount&lt;br/&gt;and access dates"] --&gt; Q1{"Signed in&lt;br/&gt;at all?"}
       Q1 --&gt;|"yes"| SAVE1["Access granted&lt;br/&gt;immediately, exactly&lt;br/&gt;as sent"]
@@ -964,7 +886,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </div>
 </section>
 
-<!-- 13. dependency remediation -->
 <section>
 <div class="slide-body">
 
@@ -1020,7 +941,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </aside>
 </section>
 
-<!-- 14. what the pipeline verifies -->
 <section>
 <div class="slide-body">
 
@@ -1049,7 +969,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </div>
 </section>
 
-<!-- 15. risk and mitigation -->
 <section>
 <div class="slide-body">
 
@@ -1072,12 +991,12 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
           <td>Measured impact; announced, not silent</td>
         </tr>
         <tr>
-          <td>Fourteen dependency advisories are accepted as residual risk: seven in the deployed service, seven more in test and audit tooling that is never deployed.</td>
+          <td>Eight dependency advisories are accepted as residual risk: seven in the deployed service, one in the test framework that is never deployed.</td>
           <td>No fix for any of them is installable on the runtime this service deliberately pins. Each one carries a named compensating control, both sets are registered, and two automated guards run on every change.</td>
         </tr>
         <tr>
-          <td>Credentials live until rotated</td>
-          <td>Announced as the next step; credential rotation still to run, and it cannot be undone</td>
+          <td>Exposed credentials must be treated as compromised until rotated</td>
+          <td>Announced as the next step. Rotation is not performed here, it needs provider consoles, and it cannot be undone</td>
         </tr>
         <tr>
           <td>New required settings must be present before the service will start, and the shipped configuration template will not start it as delivered.</td>
@@ -1098,8 +1017,10 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   this repository calls that route, and the ingestion task writes to the database
   directly, so that workflow is untouched. It is stated in the readme, the review
   document and the decision log, never introduced silently, and it needs a sign-off.
-  On the seven advisories: each has a named compensating control, and two automated
-  guards run on every change. Be precise about what those guards prove. One asserts a
+  On the seven in the deployed service: each has a named compensating control, and two
+  automated guards run on every change. The eighth sits in the test framework, which no
+  deployed process installs, and that absence is its control. Be precise about what
+  those guards prove. One asserts a
   package stays absent. The other has two layers, and the first layer is a text search
   that an aliased import or a dynamic call would evade, which is why a second layer
   parses the code and follows aliases. Together they detect the realistic ways an
@@ -1109,7 +1030,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </aside>
 </section>
 
-<!-- 16. what stands between this and a first release -->
 <section>
 <div class="slide-body">
 
@@ -1119,7 +1039,7 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
     </div>
     <div class="callout">
       <i data-lucide="alert-triangle" aria-hidden="true"></i>
-      <p>The code is remediated and tested. <span class="mono">No part of this has been deployed</span>, and these four gates are why.</p>
+      <p>The code is remediated and tested. <span class="mono">Four gates stand before a first release</span>, and none can be settled from inside a commit.</p>
     </div>
     <table class="data-table">
       <caption class="sr-only">Summary summary</caption>
@@ -1140,8 +1060,8 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
           <td>The version is a fixed constraint of this work and was not raised. That function is therefore left out of the deployment until an owner decides between raising the constraint and retiring the function. Everything else releases normally; this step reports itself blocked rather than failing the release or quietly weakening the constraint.</td>
         </tr>
         <tr>
-          <td>The cluster objects the release updates are defined outside this repository.</td>
-          <td>Both release paths check that each one exists before changing anything, and stop naming whatever is missing. Nothing is created implicitly, so a misnamed target fails early instead of half-way through.</td>
+          <td>The release updates cluster objects it will not create, so a brand-new cluster needs one apply first.</td>
+          <td>The definitions are versioned here and both release paths apply them, but each path first checks the two serving objects exist and stops naming whatever is missing. Nothing is created implicitly, so a misnamed target fails early instead of half-way through.</td>
         </tr>
       </tbody>
     </table>
@@ -1149,7 +1069,7 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
       <div><i data-lucide="lock" aria-hidden="true"></i><span>Cluster access by permission</span></div>
       <div><i data-lucide="server" aria-hidden="true"></i><span>New image registry</span></div>
       <div><i data-lucide="alert-triangle" aria-hidden="true"></i><span>One function blocked</span></div>
-      <div><i data-lucide="check-circle" aria-hidden="true"></i><span>Targets verified first</span></div>
+      <div><i data-lucide="check-circle" aria-hidden="true"></i><span>Applied state to confirm</span></div>
     </div>
 </div>
 <aside class="notes">
@@ -1158,7 +1078,9 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   database connection string, a cloud service-account key, a signing key and a partner
   API key; the runbook orders it revoke, rotate, delete, then review prior access,
   because rewriting history before revoking leaves a live credential in every existing
-  clone. Secret delivery and the Kubernetes manifests live outside this repository.
+  clone. The Kubernetes manifests and the mount that delivers each secret are versioned
+  here; what an operator supplies is each secret's value, and one apply of the workload
+  group against a cluster that does not have the two serving objects yet.
   The deployment inputs include a renamed cluster-location secret, federated identity
   replacing a long-lived key that must be deleted rather than left unused, and a runner
   with a network path to the now-private control plane. The disclosure channel needs
@@ -1168,7 +1090,6 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </aside>
 </section>
 
-<!-- 17. onboarding and continuity -->
 <section>
 <div class="slide-body">
 
@@ -1199,20 +1120,22 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   the dependency audit, the code scan, the full test suite, the security suite and both
   guards do gate every change, and the deployment workflow calls that same pipeline
   rather than repeating part of it. Two checks are not gated and must be run locally,
-  the infrastructure validation and the container build. One job, the frontend check, is
-  expected to fail and deliberately gates nothing.
+  the infrastructure validation and the container build. The frontend job is a limited
+  gate rather than an exempt one: it lints the whole tree against a recorded warning
+  budget and runs the unit tests, but no type check and no production build. It passes
+  today, and a regression inside it fails the pipeline. An earlier version of this note
+  said it was expected to fail and gated nothing.
 </aside>
 </section>
 
-<!-- 18. closing -->
 <section class="slide-closing">
 <div class="slide-body">
 
     <span class="eyebrow">Where this leaves us</span>
     <h2>Ready for review</h2>
-    <p class="lede">Remediated and tested. Ready for your review, not yet released.</p>
+    <p class="lede">Remediated and tested. Ready for your review, with four release gates still to settle.</p>
     <ul>
-      <li>Each fix carries a test that proves it.</li>
+      <li>Fifteen findings proven by test; five need an operator step.</li>
       <li>Rotating the exposed credentials and settling the four release gates come next.</li>
       <li>One breaking change awaits your sign-off.</li>
     </ul>
@@ -1232,10 +1155,8 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
 </div>
 </div>
 
-<!-- reveal.js framework -->
 <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js" integrity="sha384-M/JtqCVlLcK9lwVnBnMXP0V577CBULkjodKsR/PITOe4MSKNbbwqCemEyluOw0+5" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 
-<!-- lucide icon runtime -->
 <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js" integrity="sha384-ieG+IKD0d/ZPXyCBTMVAbqsQdns8QGJR/e26WMw7M4fkaI/rHcS/YIoi+ah9WGge" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 
 <!-- mermaid + lucide render cycle; the specifier resolves through the import map, which carries the module's integrity hash -->

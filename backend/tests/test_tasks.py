@@ -22,6 +22,8 @@ from backend.app.core.logging import (
 )
 from backend.tests.support import enforce_sqlite_foreign_keys
 from backend.app.db.models import Base, Filter, Listing, User, ZipCode
+from backend.app.services import zillow_service
+from backend.app.services.zillow_service import ListingProviderError
 from backend.app.tasks import listing_updater
 from backend.app.tasks.listing_updater import (
     IDENTITY_COLUMN,
@@ -40,39 +42,24 @@ LISTING_URL = 'https://www.zillow.com/homedetails/1'
 
 SECOND_LISTING_URL = 'https://www.zillow.com/homedetails/2'
 
-# Message the pass records when it completes. It is asserted absent from
-# the cases where a failure must end the pass instead.
 PASS_COMPLETED_MESSAGE = 'Completed an ingestion pass'
 
-# Value placed in the numeric rent column to make the flush raise for one
-# statement. The type layer cannot prepare it as a parameter.
 UNBINDABLE_RENT = 'not-a-number'
 
-# Detail carried by the stand-in defect below.
 DEFECT_DETAIL = 'a defect in the row builder'
 
-# Longest a stand-in provider call waits to be released. It bounds the
-# case below so a pass that blocked the loop fails instead of hanging.
 BLOCKED_FETCH_TIMEOUT = 5.0
 
-# Detail carried by the stand-in provider failure below. The value is
-# plain prose holding no credential shape, which the redacting
-# formatter leaves unchanged.
 PROVIDER_FAILURE_DETAIL = 'the listing provider was unreachable'
 
-# Stream signature the cases below assert is absent from stdout and
-# stderr: the ingestion failure message followed by the failure detail.
 BARE_PRINT_SIGNATURE = (
     INGESTION_FAILED_MESSAGE + ': ' + PROVIDER_FAILURE_DETAIL
 )
 
-# Longest the assertions below wait for the queue-backed log listener to
-# write every record one pass produced.
 LOG_DRAIN_TIMEOUT = 5.0
 
 
 class _RecordCollector(stdlib_logging.Handler):
-    """Holds every record the logger it is attached to emits."""
 
     def __init__(self):
         super().__init__(level=stdlib_logging.DEBUG)
@@ -166,7 +153,6 @@ def _unbindable_then_valid():
 
 @contextlib.contextmanager
 def _collected_task_records():
-    """Collects the records the ingestion module's logger emits."""
     collector = _RecordCollector()
     logger = stdlib_logging.getLogger(TASK_MODULE)
     logger.addHandler(collector)
@@ -177,7 +163,6 @@ def _collected_task_records():
 
 
 def _record_named(records, message):
-    """Returns the one collected record carrying ``message``."""
     matching = [
         record for record in records if record.getMessage() == message
     ]
@@ -189,7 +174,11 @@ def _record_named(records, message):
 async def test_update_listings_completes_without_raising(
     mock_db_session,
 ):
-    """The ingestion pass reports failures rather than propagating."""
+    """A pass over an empty provider result completes and commits.
+
+    A provider that answered and reported no listings is a result rather
+    than a failure, so the pass commits once and rolls back nothing.
+    """
     with patch(
         TASK_MODULE + '.SessionLocal', return_value=mock_db_session
     ):
@@ -220,7 +209,8 @@ async def test_update_listings_closes_the_session_on_failure(
                 TASK_MODULE + '.fetch_listings',
                 side_effect=RuntimeError('provider unavailable'),
             ):
-                await update_listings()
+                with pytest.raises(RuntimeError):
+                    await update_listings()
 
     assert mock_db_session.rollback.call_count == 1
     assert mock_db_session.close.call_count == 1
@@ -245,7 +235,8 @@ async def test_a_failed_pass_is_reported_through_the_module_logger(
                 with patch(
                     TASK_MODULE + '.log_exception'
                 ) as mock_log_exception:
-                    await update_listings()
+                    with pytest.raises(RuntimeError):
+                        await update_listings()
 
     assert mock_log_exception.call_count == 1
     reported_logger, message, error = mock_log_exception.call_args.args[:3]
@@ -273,7 +264,8 @@ async def test_a_failed_pass_writes_no_failure_detail_to_a_stream(
                 TASK_MODULE + '.fetch_listings',
                 side_effect=RuntimeError(PROVIDER_FAILURE_DETAIL),
             ):
-                await update_listings()
+                with pytest.raises(RuntimeError):
+                    await update_listings()
 
     flush_log_queue(LOG_DRAIN_TIMEOUT)
     captured = capsys.readouterr()
@@ -284,6 +276,142 @@ async def test_a_failed_pass_writes_no_failure_detail_to_a_stream(
 
     assert mock_db_session.rollback.call_count == 1
     assert mock_db_session.close.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_provider_refusal_propagates_carrying_its_reason(
+    session_factory, db, saved_zip_code
+):
+    """A provider read that produced nothing ends the pass.
+
+    The pass records the provider's stable refusal reason and re-raises
+    the provider's own error class, so a caller running one pass per
+    process -- which is how the ingestion schedule invokes it -- exits
+    non-zero and the schedule's retry and failed-job history apply.
+    """
+    refusal = ListingProviderError(
+        'the provider answered with a shape the adapter does not read',
+        zillow_service.REASON_COLLECTION_NOT_LIST,
+    )
+
+    with patch(TASK_MODULE + '.SessionLocal', session_factory):
+        with patch(
+            TASK_MODULE + '.fetch_listings', side_effect=refusal
+        ):
+            with _collected_task_records() as records:
+                with pytest.raises(ListingProviderError) as raised:
+                    await update_listings()
+
+    assert raised.value is refusal
+    assert db.query(Listing).count() == 0
+
+    messages = [record.getMessage() for record in records]
+    assert INGESTION_FAILED_MESSAGE in messages
+    assert PASS_COMPLETED_MESSAGE not in messages
+    failure = _record_named(records, INGESTION_FAILED_MESSAGE)
+    assert failure.exception_type == 'ListingProviderError'
+    assert (
+        getattr(failure, 'provider_reason')
+        == zillow_service.REASON_COLLECTION_NOT_LIST
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failure_on_a_later_chunk_rolls_the_whole_pass_back(
+    mock_db_session,
+):
+    """A pass that did not complete commits nothing and claims nothing.
+
+    The first chunk is answered with a record and the second is refused.
+    The pass rolls back once, never commits, records no completion, and
+    raises -- so a partially refreshed corpus is never left behind and no
+    record could be read as a successful pass.
+    """
+    answers = [
+        [_provider_listing()],
+        ListingProviderError(
+            'the provider was unreachable',
+            zillow_service.REASON_REQUEST_FAILED,
+        ),
+    ]
+
+    def answer(zip_codes, filters):
+        outcome = answers.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    with patch(
+        TASK_MODULE + '.SessionLocal', return_value=mock_db_session
+    ):
+        with patch(
+            TASK_MODULE + '.tracked_zip_codes',
+            return_value=[ZIP_CODE, '54321'],
+        ):
+            with patch(
+                TASK_MODULE + '.zip_code_chunks',
+                return_value=[[ZIP_CODE], ['54321']],
+            ):
+                with patch(TASK_MODULE + '.fetch_listings', new=answer):
+                    with _collected_task_records() as records:
+                        with pytest.raises(ListingProviderError):
+                            await update_listings()
+
+    assert answers == []
+    assert mock_db_session.commit.call_count == 0
+    assert mock_db_session.rollback.call_count == 1
+    assert mock_db_session.close.call_count == 1
+    assert PASS_COMPLETED_MESSAGE not in [
+        record.getMessage() for record in records
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_in_process_schedule_continues_after_a_failed_pass(
+    mock_db_session,
+):
+    """A failure ends one pass, not the schedule that runs passes.
+
+    ``update_listings`` re-raises so a one-pass-per-process caller fails.
+    ``run_listing_updater`` runs passes inside the serving process, so it
+    absorbs that failure, records it once and waits for the next cycle.
+    """
+    passes = []
+
+    async def failing_pass():
+        passes.append(1)
+        raise RuntimeError('provider down')
+
+    slept = []
+
+    async def record_sleep(seconds):
+        slept.append(seconds)
+        raise asyncio.CancelledError()
+
+    with patch(TASK_MODULE + '.update_listings', new=failing_pass):
+        with patch(TASK_MODULE + '.asyncio.sleep', new=record_sleep):
+            with _collected_task_records() as records:
+                with pytest.raises(asyncio.CancelledError):
+                    await listing_updater.run_listing_updater()
+
+    assert passes == [1]
+    assert slept == [UPDATE_INTERVAL.total_seconds()]
+    messages = [record.getMessage() for record in records]
+    assert listing_updater.SCHEDULE_CONTINUED_MESSAGE in messages
+
+
+@pytest.mark.asyncio
+async def test_the_in_process_schedule_stops_when_it_is_cancelled(
+    mock_db_session,
+):
+    """Cancellation is not a failure and is not absorbed."""
+
+    async def cancelled_pass():
+        raise asyncio.CancelledError()
+
+    with patch(TASK_MODULE + '.update_listings', new=cancelled_pass):
+        with pytest.raises(asyncio.CancelledError):
+            await listing_updater.run_listing_updater()
 
 
 def test_update_interval_is_positive():
@@ -299,7 +427,6 @@ def test_tracked_zip_codes_is_empty_without_a_saved_filter(db):
 
 
 def _seed_zip_codes(db, codes):
-    """Stores one saved filter naming every code in ``codes``."""
     user = User(
         email='bulk-ingest@example.com',
         hashed_password='x',
@@ -319,14 +446,6 @@ def _seed_zip_codes(db, codes):
 
 
 class TestThePostalCodeInputIsBounded:
-    """No pass reads or sends an unbounded list of postal codes.
-
-    The number of saved filters is caller-controlled and unbounded, so
-    the read is capped and what it read is split into requests of a
-    bounded size. Both bounds are read from settings, so the assertions
-    derive their expected counts from the settings rather than from
-    literals.
-    """
 
     def test_the_read_stops_at_the_configured_maximum(
         self, db, monkeypatch
@@ -424,7 +543,6 @@ class TestThePostalCodeInputIsBounded:
 
 
 class TestReconciliationReadsOneStatementPerChunk:
-    """The number of read statements follows chunks, not records."""
 
     @pytest.mark.asyncio
     async def test_one_identity_read_serves_a_whole_chunk(
@@ -514,7 +632,6 @@ class TestReconciliationReadsOneStatementPerChunk:
     async def test_a_repeated_identity_inside_one_chunk_stores_one_row(
         self, session_factory
     ):
-        """The second copy refreshes the row the first copy wrote."""
         payload = [
             _provider_listing(price=2400),
             _provider_listing(price=2600),
@@ -542,7 +659,6 @@ class TestReconciliationReadsOneStatementPerChunk:
 async def test_a_pass_is_skipped_when_no_filter_names_a_postal_code(
     session_factory,
 ):
-    """No postal code means the provider is not called at all."""
     with patch(
         TASK_MODULE + '.SessionLocal', session_factory
     ):
@@ -556,7 +672,6 @@ async def test_a_pass_is_skipped_when_no_filter_names_a_postal_code(
 async def test_a_provider_listing_is_persisted_as_a_mapped_orm_row(
     session_factory, db, saved_zip_code
 ):
-    """The pass writes a real listings row, mapping provider names."""
     with patch(TASK_MODULE + '.SessionLocal', session_factory):
         with patch(
             TASK_MODULE + '.fetch_listings',
@@ -564,7 +679,6 @@ async def test_a_provider_listing_is_persisted_as_a_mapped_orm_row(
         ) as mock_fetch:
             await update_listings()
 
-    # The provider receives the stored postal codes.
     assert mock_fetch.call_args.args[0] == [ZIP_CODE]
 
     rows = db.query(Listing).all()
@@ -584,7 +698,6 @@ async def test_a_provider_listing_is_persisted_as_a_mapped_orm_row(
 async def test_a_second_pass_refreshes_rather_than_duplicates(
     session_factory, db, saved_zip_code
 ):
-    """The identity column reconciles a record seen twice."""
     for rent in (2400, 2500):
         with patch(TASK_MODULE + '.SessionLocal', session_factory):
             with patch(
@@ -615,14 +728,6 @@ def _unique_column_sets(session, table):
 
 
 def test_the_mapped_corpus_declares_no_provider_address_uniqueness(db):
-    """The mapped table constrains no set of columns on the address.
-
-    Revision 0001 declares none either, and
-    ``backend/tests/security/test_revision_contracts.py`` asserts that
-    directly, so the mapped table and the migrated table agree and the
-    reconciliation below has no database backstop by design rather than
-    by omission.
-    """
     assert (IDENTITY_COLUMN,) not in _unique_column_sets(db, 'listings')
     assert Listing.__table__.columns[IDENTITY_COLUMN].unique in (
         None, False
@@ -634,7 +739,6 @@ def test_the_mapped_corpus_declares_no_provider_address_uniqueness(db):
 
 
 def _seed_listing(session, url, rent):
-    """Stores one listing carrying ``url`` and returns its identifier."""
     moment = datetime.now(timezone.utc)
     row = Listing(
         created_at=moment,
@@ -648,7 +752,6 @@ def _seed_listing(session, url, rent):
 
 
 def test_two_rows_may_carry_one_provider_address(db):
-    """The corpus stores a repeated address rather than refusing it."""
     first = _seed_listing(db, LISTING_URL, 2400)
     second = _seed_listing(db, LISTING_URL, 2500)
 
@@ -660,15 +763,6 @@ def test_two_rows_may_carry_one_provider_address(db):
 async def test_a_pass_reconciles_the_earliest_of_two_matching_rows(
     session_factory, db, saved_zip_code
 ):
-    """Interleaved inserts leave duplicates; a pass stays deterministic.
-
-    Two rows carrying one provider address are stored, which is the state
-    two passes inserting at once can leave behind now that no uniqueness
-    refuses the second insert. Every later pass then updates the earliest
-    of them, adds nothing, and leaves the other exactly as it was -- so
-    the corpus stops growing and the outcome does not depend on the order
-    the database returns rows in.
-    """
     earliest = _seed_listing(db, LISTING_URL, 2400)
     later = _seed_listing(db, LISTING_URL, 2500)
     untouched = db.query(Listing).filter(
@@ -695,7 +789,6 @@ async def test_a_pass_reconciles_the_earliest_of_two_matching_rows(
 async def test_a_record_carrying_no_identity_is_discarded(
     session_factory, db, saved_zip_code
 ):
-    """A record with no identity cannot be reconciled, so it is dropped."""
     record = _provider_listing()
     del record['listing_url']
 
@@ -712,7 +805,6 @@ async def test_a_record_carrying_no_identity_is_discarded(
 async def test_a_record_failing_the_contract_is_discarded(
     session_factory, db, saved_zip_code
 ):
-    """An unusable record is dropped without failing the whole pass."""
     good = _provider_listing()
     bad = _provider_listing(listing_url='https://www.zillow.com/2')
     del bad['price']
@@ -732,12 +824,6 @@ async def test_a_record_failing_the_contract_is_discarded(
 async def test_a_value_the_database_cannot_bind_is_a_record_refusal(
     session_factory, db, saved_zip_code
 ):
-    """A parameter that cannot be prepared discards that record only.
-
-    The failure is raised for one statement before the database receives
-    it, so it names the record being written. The pass is asserted to
-    complete, to record the refusal, and to store the other record.
-    """
     refused = _provider_listing()
     accepted = _provider_listing(listing_url=SECOND_LISTING_URL)
 
@@ -771,13 +857,6 @@ async def test_a_value_the_database_cannot_bind_is_a_record_refusal(
 async def test_a_defect_raising_value_error_ends_the_pass(
     session_factory, db, saved_zip_code
 ):
-    """A bare ``ValueError`` is a defect, not a record the database refused.
-
-    The pass is asserted to roll back, to store nothing, to report the
-    failure through the ingestion failure path, and to report no
-    completion, so a defect can never be counted as a refused record on a
-    pass that reported success.
-    """
     with patch(TASK_MODULE + '.SessionLocal', session_factory):
         with patch(
             TASK_MODULE + '.fetch_listings',
@@ -788,7 +867,8 @@ async def test_a_defect_raising_value_error_ends_the_pass(
                 side_effect=ValueError(DEFECT_DETAIL),
             ):
                 with _collected_task_records() as records:
-                    await update_listings()
+                    with pytest.raises(ValueError):
+                        await update_listings()
 
     assert db.query(Listing).count() == 0
 
@@ -804,12 +884,6 @@ async def test_a_defect_raising_value_error_ends_the_pass(
 async def test_a_lost_connection_ends_the_pass(
     session_factory, db, saved_zip_code
 ):
-    """A driver error that describes the session ends the pass.
-
-    ``OperationalError`` applies to every record equally, so it is
-    asserted to reach the ingestion failure path rather than the
-    record-refusal path.
-    """
     with patch(TASK_MODULE + '.SessionLocal', session_factory):
         with patch(
             TASK_MODULE + '.fetch_listings',
@@ -822,7 +896,8 @@ async def test_a_lost_connection_ends_the_pass(
                 ),
             ):
                 with _collected_task_records() as records:
-                    await update_listings()
+                    with pytest.raises(OperationalError):
+                        await update_listings()
 
     assert db.query(Listing).count() == 0
 
@@ -836,7 +911,6 @@ async def test_a_lost_connection_ends_the_pass(
 async def test_a_provider_field_outside_the_allowlist_is_ignored(
     session_factory, db, saved_zip_code
 ):
-    """Nothing the provider sends can reach an undeclared column."""
     record = _provider_listing(id=99, owner_id=7, description='ignored')
 
     with patch(TASK_MODULE + '.SessionLocal', session_factory):
@@ -855,7 +929,6 @@ async def test_a_provider_field_outside_the_allowlist_is_ignored(
 async def test_the_provider_call_runs_off_the_event_loop(
     session_factory, saved_zip_code
 ):
-    """The synchronous provider call is made on a worker thread."""
     loop_thread = threading.get_ident()
     calling_threads = []
 
@@ -875,11 +948,6 @@ async def test_the_provider_call_runs_off_the_event_loop(
 async def test_the_event_loop_runs_while_the_provider_is_waiting(
     session_factory, saved_zip_code
 ):
-    """A concurrent task progresses before the provider call returns.
-
-    The stand-in provider call blocks until the other task releases it,
-    so it can only return once the loop has run that task.
-    """
     released = threading.Event()
     release_observed = []
 
@@ -905,14 +973,6 @@ async def test_the_event_loop_runs_while_the_provider_is_waiting(
 async def test_every_record_of_one_pass_shares_a_run_identifier(
     session_factory, saved_zip_code
 ):
-    """One pass binds one identifier and one trace to all its records.
-
-    A scheduled pass answers no request, so without an identifier of its
-    own its records carry nothing to group them by: two passes running
-    minutes apart are indistinguishable in the log, and a failure cannot
-    be tied to the pass that produced it. The identifier is prefixed, so a
-    pass is never mistaken for a request.
-    """
     with _collected_task_records() as records:
         with patch(TASK_MODULE + '.SessionLocal', session_factory):
             with patch(TASK_MODULE + '.fetch_listings') as fetch:
@@ -940,7 +1000,6 @@ async def test_every_record_of_one_pass_shares_a_run_identifier(
 async def test_two_passes_carry_two_run_identifiers(
     session_factory, saved_zip_code
 ):
-    """Consecutive passes are told apart by their identifiers."""
     collected = []
     for _ in range(2):
         with _collected_task_records() as records:
@@ -961,7 +1020,6 @@ async def test_two_passes_carry_two_run_identifiers(
 async def test_the_identifiers_are_unbound_after_a_pass(
     session_factory, saved_zip_code
 ):
-    """Nothing a pass bound survives it, on the failing path too."""
     with patch(TASK_MODULE + '.SessionLocal', session_factory):
         with patch(TASK_MODULE + '.fetch_listings') as fetch:
             fetch.return_value = []
@@ -975,7 +1033,8 @@ async def test_the_identifiers_are_unbound_after_a_pass(
             TASK_MODULE + '.fetch_listings',
             side_effect=RuntimeError('provider down'),
         ):
-            await update_listings()
+            with pytest.raises(RuntimeError):
+                await update_listings()
 
     assert current_request_id() is None
     assert current_trace_context() is None
@@ -985,14 +1044,14 @@ async def test_the_identifiers_are_unbound_after_a_pass(
 async def test_a_failed_pass_records_under_its_run_identifier(
     session_factory, saved_zip_code
 ):
-    """A failure is correlated with the pass that produced it."""
     with _collected_task_records() as records:
         with patch(TASK_MODULE + '.SessionLocal', session_factory):
             with patch(
                 TASK_MODULE + '.fetch_listings',
                 side_effect=RuntimeError('provider down'),
             ):
-                await update_listings()
+                with pytest.raises(RuntimeError):
+                    await update_listings()
 
     failures = [
         record

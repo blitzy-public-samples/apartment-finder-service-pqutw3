@@ -1,28 +1,3 @@
-"""The credential endpoints' brute-force controls.
-
-The unit under test is :mod:`backend.app.api.endpoints.auth`. Each case
-exercises ``POST /auth/login`` or ``POST /auth/register`` and asserts
-the refusal the control under test returns.
-
-Four controls are covered:
-
-* the per-account lockout, which counts failures on
-  ``users.failed_login_attempts`` and sets ``users.locked_until`` on
-  reaching ``settings.LOGIN_MAX_ATTEMPTS``
-* the uniformity of every refusal ``POST /auth/login`` returns, whether
-  the address names no account, the account's lock is in force, or the
-  password does not match
-* the per-address rate limit the two credential endpoints declare
-  against ``settings.RATE_LIMIT_LOGIN`` and
-  ``settings.RATE_LIMIT_REGISTER``, measured on an account carrying no
-  lock and answered without any credential work or account lookup
-* the password contract :mod:`backend.app.schema.user` applies -- a
-  seventy-two byte ceiling and the four-class policy floor
-
-Every request body is posted as JSON keyed on ``email`` and
-``password``.
-"""
-
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -48,69 +23,45 @@ from backend.app.main import (
 )
 from backend.tests.support import VALID_TEST_PASSWORD
 
-#: Route a registration is posted to.
 REGISTER_PATH = "/auth/register"
 
-#: Clears the shared per-address limiter counters around every case in
-#: this module.
 pytestmark = pytest.mark.usefixtures("reset_rate_limits")
 
-#: Password that matches no seeded account. It stays inside the byte
-#: ceiling ``UserLogin`` applies.
 WRONG_PASSWORD = "Wr0ngPassphrase!2024"
 
-#: Address that names no stored account.
 UNKNOWN_EMAIL = "no.such.account@example.com"
 
-#: Maximum UTF-8 byte length the credential contract accepts.
 PASSWORD_MAX_BYTES = 72
 
-#: Fragment every constructed password is built from. It carries an
-#: upper-case letter, a lower-case letter, a digit and a special
-#: character, which is every class the policy floor names.
 _POLICY_FRAGMENT = "TestPassw0rd!"
 
-#: Password whose UTF-8 encoding is exactly
-#: :data:`PASSWORD_MAX_BYTES` bytes long.
 PASSWORD_AT_BYTE_CEILING = _POLICY_FRAGMENT + "y" * 59
 
-#: Password one byte beyond the ceiling, every character encoding to a
-#: single byte.
 PASSWORD_OVER_CEILING_ASCII = PASSWORD_AT_BYTE_CEILING + "z"
 
-#: Password carrying fewer characters than :data:`PASSWORD_MAX_BYTES`
-#: while encoding to more bytes than it.
 PASSWORD_OVER_CEILING_MULTIBYTE = _POLICY_FRAGMENT + "\u00e9" * 30
 
-#: Headers whose value changes between two requests independently of
-#: the credentials those requests carried. Each is a correlation or
-#: timing value minted per request, so a difference between two refusals
-#: discloses nothing about which credential either one carried.
 VOLATILE_HEADERS = frozenset(
     {REQUEST_ID_HEADER.lower(), TRACEPARENT_HEADER.lower(), "date"}
 )
 
 
 def _allowance(expression):
-    """Return the request count a rate-limit expression names."""
     return int(expression.split("/", 1)[0])
 
 
 def _as_utc(moment):
-    """Return an instant as offset-aware UTC."""
     if moment.tzinfo is None:
         return moment.replace(tzinfo=timezone.utc)
     return moment
 
 
 def _stored(db, user_id):
-    """Return the persisted account row, discarding any cached copy."""
     db.expire_all()
     return db.query(User).filter(User.id == user_id).one()
 
 
 def _account_exists(db, email):
-    """Report whether a row holds the address."""
     return (
         db.query(User).filter(User.email == email).one_or_none()
         is not None
@@ -184,12 +135,10 @@ def _credential_calls(monkeypatch):
     compare = security.verify_password
 
     def recording_check(plain_password, hashed_password):
-        """Record the stored hash and delegate the credential check."""
         record["checks"].append(hashed_password)
         return check(plain_password, hashed_password)
 
     def recording_compare(plain_password, hashed_password):
-        """Record the compared hash and delegate the comparison."""
         record["comparisons"].append(hashed_password)
         return compare(plain_password, hashed_password)
 
@@ -201,12 +150,10 @@ def _credential_calls(monkeypatch):
 
 
 def _invalid_credentials_body():
-    """Return the body every refused login carries."""
     return {"detail": auth_module.INVALID_CREDENTIALS_DETAIL}
 
 
 def _throttled_body():
-    """Return the body every request refused by the throttle carries."""
     return {"detail": TOO_MANY_REQUESTS_DETAIL}
 
 
@@ -226,7 +173,6 @@ def _recorded_statements(session):
     def record(
         connection, cursor, statement, parameters, context, executemany
     ):
-        """Append one executed statement to the recording."""
         statements.append(statement)
 
     event.listen(engine, "before_cursor_execute", record)
@@ -237,7 +183,6 @@ def _recorded_statements(session):
 
 
 def _touching_accounts(statements):
-    """Return the recorded statements naming the accounts table."""
     return [
         statement
         for statement in statements
@@ -505,17 +450,6 @@ def test_registration_beyond_the_configured_rate_is_throttled(client):
 def test_a_throttled_login_never_reaches_the_account(
     monkeypatch, db, client, registered_user
 ):
-    """A login refused by the throttle runs no part of the handler.
-
-    The allowance is spent on logins that succeed, so the account
-    carries no lock and a zero failed-attempt count when the throttled
-    request arrives, and the correct password is what that request
-    carries. That request answers 429 carrying
-    :data:`backend.app.main.TOO_MANY_REQUESTS_DETAIL` and no token, it
-    issues no statement against ``users``, it drives no credential check
-    and no password comparison, and it leaves the count and the lock as
-    it found them.
-    """
     _consume_login_allowance(client, registered_user.email)
     unlocked = _stored(db, registered_user.id)
     assert unlocked.failed_login_attempts == 0
@@ -550,19 +484,6 @@ def test_the_throttle_and_the_lock_are_told_apart(
     registered_user,
     second_registered_user,
 ):
-    """The two controls answer differently and neither stands in.
-
-    One account is driven to its lock with the allowance cleared before
-    each request, so the lock alone refuses it; a second account spends
-    the allowance on logins that succeed, so the throttle alone refuses
-    it. The lock's refusal answers 401 carrying
-    :data:`backend.app.api.endpoints.auth.INVALID_CREDENTIALS_DETAIL`
-    after reading the row and running one credential check, and the
-    throttle's refusal answers 429 carrying
-    :data:`backend.app.main.TOO_MANY_REQUESTS_DETAIL` having read no row
-    and run no credential check. The two statuses and the two bodies
-    differ.
-    """
     _drive_to_threshold(login_json, client, registered_user.email)
     assert _stored(db, registered_user.id).locked_until is not None
 
@@ -712,7 +633,6 @@ def application_records():
 
 
 def _refusals(records):
-    """Return the login-refusal records among ``records``."""
     return [
         record
         for record in records
@@ -721,16 +641,6 @@ def _refusals(records):
 
 
 class TestEveryRefusalIsRecordedUnderAStableCode:
-    """A refused login is recorded, and the code says which refusal it was.
-
-    The response is deliberately identical for every refusal, so without a
-    record there is no way to tell a password-guessing run against one
-    account from a spray across many, and no way to count refusals at all.
-    The record carries a stable code rather than prose, so a detection rule
-    selects it by field, and it carries the account identifier rather than
-    the submitted address, so reading the log discloses no address that was
-    tried.
-    """
 
     def test_an_unknown_address_is_recorded_with_no_identifier(
         self, client, login_json, application_records
@@ -762,7 +672,6 @@ class TestEveryRefusalIsRecordedUnderAStableCode:
     def test_a_locked_account_is_recorded_under_its_own_code(
         self, client, login_json, registered_user, application_records
     ):
-        """The lock refusal is distinguishable from a wrong password."""
         _drive_to_threshold(login_json, client, registered_user.email)
         application_records.clear()
 
@@ -793,7 +702,6 @@ class TestEveryRefusalIsRecordedUnderAStableCode:
         )
 
     def test_each_code_is_distinct(self):
-        """No two refusals share a code, so a query can separate them."""
         codes = [
             auth_module.DECISION_UNKNOWN_ACCOUNT,
             auth_module.DECISION_ACCOUNT_LOCKED,
@@ -810,7 +718,6 @@ class TestEveryRefusalIsRecordedUnderAStableCode:
     def test_no_refusal_record_carries_a_submitted_value(
         self, client, login_json, registered_user, application_records
     ):
-        """Neither address nor password reaches any record."""
         login_json(client, UNKNOWN_EMAIL, WRONG_PASSWORD)
         login_json(client, registered_user.email, WRONG_PASSWORD)
 
@@ -834,15 +741,6 @@ class TestEveryRefusalIsRecordedUnderAStableCode:
     def test_a_lost_registration_race_is_recorded_with_context(
         self, client, session_factory, application_records
     ):
-        """The race refusal names its code and the path it refused.
-
-        The record previously carried neither, so a run of concurrent
-        registrations could not be told apart from the ordinary
-        already-registered response -- which the pre-check answers without
-        recording anything at all. The unique constraint is driven
-        directly, because the two committing requests cannot be
-        interleaved from a single-threaded client.
-        """
         address = "race.candidate@example.com"
 
         def override_get_db():

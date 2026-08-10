@@ -1,56 +1,5 @@
-"""Scheduled ingestion of provider listings into the ``listings`` table.
-
-One pass reads the postal codes stored on saved filters, asks the
-provider for the listings covering them, maps each returned record onto
-the listing creation contract, and reconciles it against the stored
-corpus on :data:`IDENTITY_COLUMN`: a record whose value already names a
-stored row updates that row rather than adding another.
-
-Two bounds keep the work one pass does independent of how large the
-corpus of saved filters grows. :func:`tracked_zip_codes` reads at most
-``settings.INGESTION_MAX_ZIP_CODES`` postal codes, recording once when it
-reaches that number, and :func:`zip_code_chunks` splits what it read into
-requests of at most ``settings.INGESTION_ZIP_CODE_CHUNK`` postal codes
-each, so no single provider request carries an unbounded list. Each
-chunk's provider response is bounded in turn by the provider client.
-
-Within one chunk the stored rows every record in it might reconcile
-against are read by :func:`_existing_by_identity` in one statement, so
-the number of read statements a pass issues follows the number of chunks
-rather than the number of records the provider returned.
-
-That reconciliation is a read followed by a write, and the column it
-matches on carries no uniqueness in the mapped table or in revision
-``0001``, so the database refuses nothing on the strength of it. Two
-passes running at once may therefore each read no row and each insert
-one, leaving two rows carrying one value. The read is ordered by primary
-key and takes the first row, so once that has happened every later pass
-reconciles the same one of them and the corpus does not keep growing.
-
-Every write goes through a mapped ORM instance and names its columns
-explicitly: a record is either constructed as a new
-:class:`backend.app.db.models.Listing` or assigned onto the declared
-mutable columns of the row it matches. No attribute is copied
-dynamically from a provider object, and the identity column and the
-server-assigned ``id`` and ``created_at`` are never reassigned.
-
-A record carrying no identity is discarded rather than recorded, so it is
-never inserted and never reconciled. A record that fails the contract is
-discarded the same way, and names the contract fields it failed. A record
-the database refuses for a reason that describes that record -- one
-:func:`_is_record_failure` attributes to it, drawn from
-:data:`RECORD_FAILURES` -- is discarded too: each record is written inside
-its own savepoint, so one unwritable record is counted and dropped while
-every other record in the same payload is still recorded. All three are
-counted and reported once per pass. A failure that describes the session,
-the database or this module ends the pass instead, and is never counted as
-a record the database refused.
-
-The pass owns one session and commits once. Any failure rolls the session
-back and is reported rather than propagated, and the schedule continues.
-A failure is reported by exception class -- and by the driver's error
-class where the database raised it -- carrying no message text, and no
-provider value travels with it.
+"""Bounded scheduled ingestion and reconciliation of provider
+listings.
 """
 
 import asyncio
@@ -110,6 +59,13 @@ PROVIDER_FILTERS: Dict[str, str] = {}
 #: Message recorded when one ingestion pass does not complete.
 INGESTION_FAILED_MESSAGE = "An error occurred while updating listings"
 
+#: Message recorded when the in-process schedule absorbs a failed pass and
+#: continues to the next one. A caller running a single pass per process
+#: receives the failure instead of this record.
+SCHEDULE_CONTINUED_MESSAGE = (
+    "Continuing the ingestion schedule after a failed pass"
+)
+
 #: Message recorded when the database refuses one provider record.
 RECORD_REFUSED_MESSAGE = "Discarded a provider listing the database refused"
 
@@ -161,17 +117,20 @@ def _failure_fields(error: BaseException) -> Dict[str, Optional[str]]:
     """Returns the class-level description of ``error``.
 
     The exception's class and defining module are reported, together with
-    the driver error class when the exception wraps one. No message text
-    is included: a driver message carries the server's own detail line,
+    the driver error class when the exception wraps one and the provider's
+    stable refusal reason when the error carries one. No message text is
+    included: a driver message carries the server's own detail line,
     which repeats the value it refused.
     """
     origin = getattr(error, "orig", None)
+    reason = getattr(error, "reason", None)
     return {
         "exception_type": type(error).__name__,
         "exception_module": getattr(type(error), "__module__", None),
         "database_error": (
             type(origin).__name__ if origin is not None else None
         ),
+        "provider_reason": reason if isinstance(reason, str) else None,
     }
 
 
@@ -369,33 +328,8 @@ def _write(
 
 @asyncio.coroutine
 async def update_listings():
-    """Run one ingestion cycle over the listings the provider returns.
-
-    Opens its own session, upserts each fetched listing by its Zillow
-    identifier -- copying the processed attributes onto an existing row
-    or adding a new one -- and commits once at the end of the cycle.
-
-    The postal codes the cycle covers are read under
-    ``settings.INGESTION_MAX_ZIP_CODES`` and issued as one provider
-    request per chunk of at most ``settings.INGESTION_ZIP_CODE_CHUNK``
-    codes. Each chunk's records are reconciled against one read of the
-    stored rows for that chunk, and the number of provider requests the
-    cycle made is reported alongside the record counts.
-
-    Every provider call is synchronous and is run on a worker thread, so
-    awaiting it yields the event loop for the duration of that request
-    rather than holding it until the request's timeout elapses.
-
-    Any exception rolls the session back and is recorded through the
-    redacting logger rather than propagated, so a failed cycle leaves no
-    partial write behind and does not stop the caller. The session is
-    closed on every path.
-
-    One correlation identifier and one trace are bound for the whole
-    cycle, so every record the cycle emits -- its own, the provider
-    client's and the statement logger's -- carries them, and the outbound
-    provider call carries the trace onward. Both are unbound on every
-    path, so nothing leaks into the next cycle.
+    """Run one bounded ingestion cycle, reconcile each chunk, commit
+    once, and log and roll back any cycle failure.
     """
     run_id = RUN_ID_PREFIX + new_span_id()
     run_token = bind_request_id(run_id)
@@ -473,8 +407,9 @@ async def update_listings():
     except Exception as e:
         db.rollback()
         # Records the failure as the exception's class, the module that
-        # defines it and the driver's error class, together with the pass
-        # metadata. No message text is carried.
+        # defines it, the driver's error class and the provider's refusal
+        # reason where it carries one, together with the pass metadata. No
+        # message text is carried.
         log_exception(
             logger,
             INGESTION_FAILED_MESSAGE,
@@ -482,7 +417,9 @@ async def update_listings():
             processed_listings=processed,
             exception_message=None,
             database_error=_failure_fields(e)["database_error"],
+            provider_reason=_failure_fields(e)["provider_reason"],
         )
+        raise
     finally:
         db.close()
         reset_trace_context(trace_token)
@@ -497,10 +434,23 @@ async def run_listing_updater():
     measured between the end of one cycle and the start of the next.
 
     This coroutine does not return: it is scheduled as a background task
-    and cancelled to stop it. A failed cycle is followed by the next one
-    after the same interval; :func:`update_listings` reports every
-    failure rather than propagating it.
+    and cancelled to stop it. :func:`update_listings` re-raises a failed
+    pass, so a failure is caught here, recorded once as the exception's
+    class with no message text, and followed by the next cycle after the
+    same interval. Cancellation is not a failure and is allowed through,
+    so the task still stops when it is cancelled.
     """
     while True:
-        await update_listings()
+        try:
+            await update_listings()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_exception(
+                logger,
+                SCHEDULE_CONTINUED_MESSAGE,
+                e,
+                exception_message=None,
+                provider_reason=_failure_fields(e)["provider_reason"],
+            )
         await asyncio.sleep(UPDATE_INTERVAL.total_seconds())

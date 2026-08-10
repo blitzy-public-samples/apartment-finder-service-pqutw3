@@ -59,21 +59,32 @@ Two consequences matter to a reporter or an auditor.
 
 **Dependency advisories.** Where a dependency's only available fix requires Python 3.10 or
 later, the advisory is accepted as documented residual risk with a named compensating
-control, rather than resolved by advancing the interpreter. **Fourteen** advisories are
+control, rather than resolved by advancing the interpreter. **Eight** advisories are
 currently accepted on that basis, and they divide into two sets that should not be read as
 one:
 
 | Set | Manifest | Accepted | Packages | In the deployed image |
 | --- | --- | --- | --- | --- |
 | Runtime | `backend/requirements.txt` | 7 | 3 | Yes |
-| Development | `backend/requirements-dev.txt` | 7 | 5 | No |
-| **Total** | both | **14** | 8 | |
+| Development | `backend/requirements-dev.txt` | 1 | 1 | No |
+| **Total** | both | **8** | 4 | |
 
 The seven runtime advisories sit in packages the deployed image installs, so each carries a
-control argued against the specific defective code path. The seven development advisories
-sit in test, lint and audit tooling that no deployed process installs, so their control is
-that absence. Every figure a reader will meet elsewhere in this repository states which of
-the two it describes.
+control argued against the specific defective code path. The one development advisory sits
+in the test framework, which no deployed process installs, so its control is that absence.
+Every figure a reader will meet elsewhere in this repository states which of the two it
+describes.
+
+A third manifest, `backend/requirements-audit.txt`, declares the dependency-audit
+instrument and is **not audited**: `pip-audit` resolves a dependency tree of its own, and
+auditing the manifest that declares it reports the scanner's supply chain as this
+project's. That accounting is what took the accepted total to fourteen in an earlier
+revision; six of the seven identifiers then in the development set belonged to the
+instrument rather than to anything this repository tests or ships. They are not suppressed
+now — no ignore list names one of them — because the manifest carrying them is no longer
+part of the measured surface. *The audit instrument's own tree* in
+[`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) records the measurement
+and what bounds the instrument's exposure.
 
 **Hosting platform.** The provider retired the Python 3.9 runtime of its managed serverless
 functions product on **5 April 2026**, so that hosting option is closed at this version.
@@ -87,7 +98,7 @@ and carries no exposure for it, but it is a current operational constraint an au
 assessing deployment readiness needs, and it is registered as accepted residual risk
 alongside the advisories above.
 
-Each of the fourteen is recorded in
+Each of the eight is recorded in
 [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) with its unreachable
 fix version, the measured ceilings that put the fix out of reach, the reachability evidence
 for this codebase, and its compensating control. They are not enumerated here, so that the
@@ -233,15 +244,23 @@ Out of scope:
 - The third-party services this system integrates with. Report issues in PayPal, Zillow, SendGrid, or Google Cloud to those providers directly.
 - `frontend/` source, which the current change set treats as read-only reference material. A finding there cannot be fixed under this scope; it will be recorded rather than patched.
 
-**A note on the frontend, because it affects how you read a red build.** Frontend integration
-is **currently non-operational and separately scoped**: the client in `frontend/` cannot
-presently consume this API, and its continuous-integration job is expected to fail. The defects predate this policy and are not security weaknesses in
-the service: the client calls a different authentication route and reads a response field the
-backend does not return, omits the `Authorization` header on protected calls, and integrates
-PayPal through a different product contract. Repairing it requires an authorized change to
-`frontend/`, which is out of scope here — and the backend will not be weakened to accommodate
-it. Treat the frontend job's failure as a known, tracked limitation rather than as a signal
-about the security gates, which run in a separate job that it cannot block.
+**A note on the frontend, because it affects how you read this policy's scope.** Frontend
+integration is **currently non-operational and separately scoped**: the client in
+`frontend/` cannot presently consume this API. The defects predate this policy and are not
+security weaknesses in the service: the client calls a different authentication route and
+reads a response field the backend does not return, omits the `Authorization` header on
+protected calls, and integrates PayPal through a different product contract. Repairing it
+requires an authorized change to `frontend/`, which is out of scope here — and the backend
+will not be weakened to accommodate it.
+
+**Its continuous-integration job does gate, and it passes.** `.github/workflows/ci.yml`
+runs a `Frontend gates` job with no `continue-on-error`: a linter with a warning budget
+recording the count the read-only source already carries, and the test command with
+`--passWithNoTests` because the workspace holds no test file. It is a **limited** gate — it
+runs no `tsc --noEmit` and no production build, so a green result does not prove the client
+compiles — but it is not a tolerated failure, and a red one blocks the change like any other.
+The paragraph headed *On the tolerated job*, further down this policy, states this once more
+with the history behind it.
 
 ### Safe harbour
 
@@ -252,12 +271,13 @@ project:
 - **`frontend/` source.** It is in this repository, but the change set that produced this policy treated it as read-only reference material, so a finding there is **recorded rather than patched** under the current scope. That is a statement of the authorized change scope, not a judgement that frontend findings are unimportant — and it is a boundary the owner can lift.
 - **Findings requiring an already-compromised host, or local filesystem access to the machine running the service.** Whether these are accepted is item 2's decision; they are noted here because the codebase assumes the host is trusted.
 - **Volumetric denial of service.** Traffic floods and volume-driven resource exhaustion are a deployment and edge-infrastructure concern rather than a property of this code. The application-level resource controls it does carry — a bounded page size, a request-body cap and rate limits on the credential endpoints — are in scope as code.
+- **Two email addresses sharing a login-throttle row.** A refused login updates one row of a fixed-size table, selected by a keyed digest of the submitted address, so two different addresses can select the same row and briefly serialise behind one another's write. That is intended rather than a defect: it is what lets every refusal branch perform the same database work, which is what removes the timing difference between an account that exists and one that does not. The row holds no address, no credential and no account identifier, only a count and a timestamp, and the set of rows never grows. The reasoning and the accepted trade-off are recorded at row 94.7.1 of [`docs/security/DECISION_LOG.md`](docs/security/DECISION_LOG.md).
 
 ## Security Posture and Where It Is Documented
 
 | Document | What it holds |
 | --- | --- |
-| [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) | Two registers covering all fourteen accepted advisories &mdash; seven runtime and seven development-only &mdash; with their unreachable fix versions, the measured Python 3.9 ceilings, the reachability evidence with its stated assumptions, each named compensating control, and the total-suppression accounting. |
+| [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) | Two registers covering all eight accepted advisories &mdash; seven runtime and one development-only &mdash; with their unreachable fix versions, the measured Python 3.9 ceilings, the reachability evidence with its stated assumptions, each named compensating control, and the total-suppression accounting. |
 | [`docs/security/CREDENTIAL_ROTATION.md`](docs/security/CREDENTIAL_ROTATION.md) | The staged runbook: provision the new configuration, deploy and verify, then revoke and rotate the credentials exposed through version control. |
 | [`docs/security/DECISION_LOG.md`](docs/security/DECISION_LOG.md) | Every non-trivial security decision, the alternatives that existed, and the risk each carries. |
 | [`docs/security/TRACEABILITY_MATRIX.md`](docs/security/TRACEABILITY_MATRIX.md) | The bidirectional mapping from finding, to the file that fixes it, to the test that verifies it. |
@@ -316,9 +336,7 @@ root. Each of those differences changes the result, so a reader who followed the
 block did not reproduce the gate they thought they were reproducing.
 
 ```bash
-# Lint — the workflow runs this from backend/; `flake8 backend` from the
-# repository root is equivalent, and setup.cfg carries both path forms so that
-# either invocation directory resolves the frozen-module exception.
+# Lint
 cd backend
 flake8 .
 cd ..
@@ -333,15 +351,10 @@ pip-audit --strict -r backend/requirements.txt \
   --ignore-vuln PYSEC-2026-2270 \
   --ignore-vuln PYSEC-2026-2132
 
-# Dependency audit — the development manifest, suppressed separately
+# Dependency audit — the development manifest, suppressed separately.
+# backend/requirements-audit.txt declares the instrument and is not audited.
 pip-audit --strict -r backend/requirements-dev.txt \
-  --ignore-vuln PYSEC-2026-1845 \
-  --ignore-vuln PYSEC-2026-3625 \
-  --ignore-vuln PYSEC-2026-1374 \
-  --ignore-vuln PYSEC-2026-1375 \
-  --ignore-vuln PYSEC-2026-2275 \
-  --ignore-vuln PYSEC-2026-141 \
-  --ignore-vuln PYSEC-2026-142
+  --ignore-vuln PYSEC-2026-1845
 
 # Static analysis
 bandit -r backend/app -ll
@@ -393,11 +406,14 @@ report, which inflates the count and obscures which findings belong to this appl
 - **`--strict` is mandatory.** Without it `pip-audit` treats a package it cannot resolve
   as a warning and still exits zero, so a manifest entry that no longer audits would pass
   silently.
-- **The two manifests carry different suppression lists**, fourteen identifiers in total.
-  Only the runtime seven are the subject of
-  [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md); the development seven
-  never ship and are documented where they are declared. Applying one list to the other
-  manifest fails.
+- **The two audited manifests carry different suppression lists**, eight identifiers in
+  total. Each set has its own section in
+  [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) &mdash; the *Runtime
+  register* for the seven the deployed image installs, the *Development register* for the
+  single test-framework advisory that never ships &mdash; and the two sets are disjoint.
+  Applying one list to the other manifest fails. A third manifest,
+  `backend/requirements-audit.txt`, declares the audit instrument and is installed but
+  audited by neither step.
 
 - **`--strict` and the `--ignore-vuln` flags are not decoration.** Without them the audit
   exits **non-zero**, because the seven accepted advisories are still reported. A plain
@@ -442,9 +458,15 @@ run in `.github/workflows/ci.yml`, and neither is a substitute for the other.
 frontend checks as a job marked `continue-on-error: true` and described in both documents
 as `Frontend checks (known blocker, gates nothing)`, because the read-only frontend source
 could not pass a linter. That job now passes and gates like every other: the linter is
-invoked directly with the one unparseable file excluded and recorded as a reported
-finding, and the suite runs with `--passWithNoTests` because the workspace carries no test
-file. There is therefore no job whose red build a reader should discount.
+invoked directly over the whole of `frontend/src`, its report is judged by
+`.github/scripts/check_frontend_lint_budget.js` against the count the workflow declares in
+`ESLINT_WARNING_BUDGET`, and the one unparseable file's finding is exempted from that
+budget rather than hidden from the lint, so it stays visible in
+the uploaded report and is recorded as a reported finding, and the suite runs with
+`--passWithNoTests` because the workspace carries no test file. It is a **limited** gate:
+it runs no `tsc --noEmit` and no production build, so a green result does not prove the
+client compiles. There is therefore no job whose red build a reader should discount, and
+no green one a reader should over-read.
 
 ## Payment Data
 
@@ -471,15 +493,20 @@ the single place the inventory lives and the one to read: it names each item, sa
 still open, and separates the items awaiting a decision from the items awaiting an operator.
 Two properties of it are worth knowing in advance.
 
-- **One item closed by a change of state rather than by a decision.**
+- **Three items closed by a change of state rather than by a decision.**
   `frontend/package-lock.json` is now tracked, so the reported absence of a frontend
-  dependency lock file is no longer true of this tree. Nothing was decided and nothing was
-  fixed.
-- **Four items are owned by an operator rather than by code.** This repository defines no
-  Kubernetes manifests; secret *delivery* into the running pod is authorized here but
-  performed outside this repository; the deployment job needs a runner with a network path to
-  the private control plane; and the frontend is not shippable, so its continuous-integration
-  job is a tolerated failure that gates nothing.
+  dependency lock file is no longer true of this tree. The Kubernetes objects and the secret
+  delivery into the running pod are now declared here, at `infrastructure/kubernetes/`, and
+  applied through `scripts/render_kubernetes_manifests.sh` by both release paths; an earlier
+  revision of this policy said they were performed outside this repository. And the frontend
+  job now passes and gates rather than being tolerated. Nothing was decided in any of the
+  three; the tree changed.
+- **Two items are owned by an operator rather than by code.** The declared cluster objects
+  must **exist** before the first release, and nothing here can reach a cluster to create
+  them; and the deployment job needs a self-hosted runner with a network path to the private
+  control plane. Both are stated in full at
+  [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) O-7, with the operator
+  contract in the README's Deployment section.
 
 This policy quotes no total. An earlier revision published one, it drifted from the inventory
 it summarised, and §35.1 records that drift as the reason a count is no longer published in

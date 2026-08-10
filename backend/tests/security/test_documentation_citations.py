@@ -39,23 +39,65 @@ REVIEW_DOCUMENT = "docs/review/CRITICAL_DECISIONS.md"
 PIN_SITES = (
     (
         "backend/app/tasks/listing_updater.py",
-        370,
+        329,
         "@asyncio.coroutine",
     ),
     ("infrastructure/docker/Dockerfile.backend", 1, "python:3.9-slim"),
-    (".github/workflows/ci.yml", 88, "3.9"),
-    ("infrastructure/terraform/main.tf", 386, "python39"),
-    ("scripts/deploy.sh", 669, "python39"),
+    (".github/workflows/ci.yml", 108, "3.9"),
+    ("infrastructure/terraform/main.tf", 384, "python39"),
+    ("scripts/deploy.sh", 768, "python39"),
 )
 
 #: Line references the review document must no longer carry for the pin
 #: sites, each having described an earlier tree.
+#:
+#: Two generations are withdrawn. The first five described the tree this
+#: work started from. The rest described it after the pins had been
+#: rewritten but before the delivery paths, the gate workflow and the
+#: ingestion module grew around them, which moved four of the five sites
+#: again. A number that has been corrected twice is the clearest evidence
+#: that hand-maintained line references drift, which is why every live
+#: citation is read back from the file it names.
 WITHDRAWN_CITATIONS = (
     "backend/app/tasks/listing_updater.py:10",
+    "backend/app/tasks/listing_updater.py:319",
+    "backend/app/tasks/listing_updater.py:370",
     "infrastructure/docker/Dockerfile.backend:2",
     ".github/workflows/ci.yml:19",
+    ".github/workflows/ci.yml:88",
     "infrastructure/terraform/main.tf:99",
+    "infrastructure/terraform/main.tf:386",
     "scripts/deploy.sh:24",
+    "scripts/deploy.sh:664",
+    "scripts/deploy.sh:669",
+    "scripts/deploy.sh:775",
+)
+
+#: Line references the review document must no longer carry for the
+#: model constructs. A reviewer following one of these in the delivered
+#: tree lands on a declaration other than the one named, because the
+#: module grew: the first range now covers the workload index names, the
+#: third names a tuple rather than a column, and the fourth names the
+#: open-intent predicate.
+WITHDRAWN_MODEL_CITATIONS = (
+    "backend/app/db/models.py:7-17",
+    "models.py:67-76",
+    "models.py:19",
+    "models.py:37",
+)
+
+#: Constructs the review document names in place of those references, and
+#: the module each must resolve in.
+MODEL_CONSTRUCTS = (
+    ("backend/app/db/models.py", "User.role"),
+)
+
+#: Wording the review document must carry for each branch of revision
+#: 0001's downgrade, so a reviewer is not told the reversal is narrower
+#: than it is.
+DOWNGRADE_BRANCH_MARKERS = (
+    "alembic_0001_created_tables",
+    "leaving those six tables and every row in them in place",
 )
 
 
@@ -98,6 +140,40 @@ def test_no_withdrawn_citation_survives_in_the_document(withdrawn):
     record of the correction from a citation a reviewer would follow.
     """
     assert withdrawn not in _document_text(), withdrawn
+
+
+@pytest.mark.parametrize("withdrawn", WITHDRAWN_MODEL_CITATIONS)
+def test_no_withdrawn_model_citation_survives(withdrawn):
+    """A model reference by line number is gone from the document.
+
+    The model module is the one a reviewer of the authorization decision
+    opens first, and following a line range into a declaration other than
+    the one named is worse than being given no reference: it reads as a
+    contradiction of the document rather than as a stale pointer.
+    """
+    assert withdrawn not in _document_text(), withdrawn
+
+
+@pytest.mark.parametrize("path,construct", MODEL_CONSTRUCTS)
+def test_the_named_model_construct_resolves(path, construct):
+    """The construct the document names in its place exists in that file."""
+    assert construct in _document_text(), construct
+
+    attribute = construct.split(".")[-1]
+    body = "\n".join(_lines(path))
+
+    assert "%s = Column(" % attribute in body, (path, construct)
+
+
+@pytest.mark.parametrize("marker", DOWNGRADE_BRANCH_MARKERS)
+def test_the_document_states_both_downgrade_branches(marker):
+    """Both branches of the additive revision's reversal are described.
+
+    The revision behaves differently depending on what it found, so a
+    reviewer told only that it "drops the added columns" would pass an
+    empty-baseline deployment whose reversal drops whole tables.
+    """
+    assert marker in _document_text(), marker
 
 
 @pytest.mark.parametrize("path,number,required", PIN_SITES)
@@ -315,6 +391,7 @@ OPEN_ITEMS = (
     "O-6",
     "O-7",
     "O-8",
+    "O-9",
 )
 
 #: Documents that must carry every open item.
@@ -331,9 +408,17 @@ def test_every_open_item_is_registered(item, path):
 
     The reviewer signing off the five decisions would otherwise be
     entitled to read anything not named as a risk as delivered and
-    working. Four of these eight are functional gaps rather than security
+    working. Five of these nine are functional gaps rather than security
     weaknesses, which is exactly the kind of shortfall a security document
     tends to omit.
+
+    O-7 carries two statements rather than one, and both registers state
+    both. Committing the workload manifests narrowed the first to a
+    one-time bootstrap apply rather than closing it, and left the second --
+    the frontend's end-of-life Node major and its undeclared dependency --
+    exactly as written. The narrowing is recorded in place instead of
+    rewriting the row, because a register that silently absorbed either
+    statement into the other would have lost a disclosure.
     """
     text = (REPOSITORY_ROOT / path).read_text(encoding="utf-8")
     assert "| {} |".format(item) in text, (path, item)
@@ -423,7 +508,7 @@ def test_the_policy_documents_the_gate_the_workflow_runs(command):
 def test_the_policy_suppresses_exactly_what_the_workflow_suppresses():
     """The suppression identifiers match the workflow's, in both manifests.
 
-    Fourteen identifiers are suppressed across two manifests, and the two
+    Eight identifiers are suppressed across two manifests, and the two
     lists are different. A policy carrying a stale or partial list invites
     a reporter to run an audit that reports findings the gate suppresses,
     or to suppress findings the gate reports.
@@ -437,7 +522,7 @@ def test_the_policy_suppresses_exactly_what_the_workflow_suppresses():
     in_workflow = pattern.findall(workflow)
     in_policy = pattern.findall(policy)
 
-    assert len(in_workflow) == 14, in_workflow
+    assert len(in_workflow) == 8, in_workflow
     assert in_policy == in_workflow
 
 

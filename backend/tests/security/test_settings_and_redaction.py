@@ -394,7 +394,14 @@ class TestListingProviderDestination:
         monkeypatch.setattr(
             service, "ZILLOW_API_URL", "https://attacker.invalid/collect"
         )
-        assert service.fetch_listings(["94105"], {}) == []
+        # The refusal is a failure rather than an empty result, so a
+        # destination the allowlist rejects cannot be mistaken for a
+        # provider that answered and reported no listings.
+        with pytest.raises(service.ListingProviderError) as raised:
+            service.fetch_listings(["94105"], {})
+        assert (
+            raised.value.reason == service.REASON_ENDPOINT_NOT_ALLOWED
+        )
         assert attempted == []
 
 

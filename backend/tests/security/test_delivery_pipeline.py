@@ -33,6 +33,7 @@ restated, so a manifest added to a stage without a decision is reported by
 whose default changed cannot silently invalidate a case here.
 """
 
+import inspect
 import io
 import os
 import re
@@ -43,6 +44,8 @@ import tempfile
 import pytest
 import yaml
 from conftest import REPO_ROOT
+
+from backend.app.tasks import listing_updater
 
 from backend.app.core.config import (
     IN_PROCESS_RATE_LIMIT_SCHEMES,
@@ -59,8 +62,40 @@ CD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "cd.yml"
 #: Both workflows, keyed by the name used in failure messages.
 WORKFLOWS = {"ci": CI_WORKFLOW, "cd": CD_WORKFLOW}
 
+#: Facts the deployment requires of the run that triggered it. A
+#: ``workflow_run`` run holds this repository's token and the release
+#: credentials, which the run that triggered it need not have held, so
+#: these four are what establish that the triggering run is this
+#: repository's own verified release candidate.
+REQUIRED_PROVENANCE = (
+    "github.event.workflow_run.conclusion",
+    "github.event.workflow_run.event",
+    "github.event.workflow_run.head_branch",
+    "github.event.workflow_run.head_repository.full_name",
+)
+
+#: One term of a guard: a context path compared with a quoted literal or
+#: with another context path.
+GUARD_TERM = re.compile(
+    r"^\s*([A-Za-z0-9_.]+)\s*==\s*(?:'([^']*)'|([A-Za-z0-9_.]+))\s*$"
+)
+
+#: Repository identity the cases below compare against. Its value is
+#: immaterial; what matters is that the base repository and the triggering
+#: run's head repository are compared with each other.
+REPOSITORY_IDENTITY = "owner/apartment-finder-service"
+
+#: Expression the deployment passes to the gate, and the input it passes
+#: it as.
+VERIFIED_HEAD = "${{ github.event.workflow_run.head_sha }}"
+
 #: Terraform configuration that provisions the deployed resources.
 TERRAFORM_MAIN = REPO_ROOT / "infrastructure" / "terraform" / "main.tf"
+
+#: Container stack that declares the local rate-limit store.
+COMPOSE_FILE = (
+    REPO_ROOT / "infrastructure" / "docker" / "docker-compose.yml"
+)
 
 #: Terraform inputs the configuration above declares.
 TERRAFORM_VARIABLES = (
@@ -96,7 +131,6 @@ STRICT_SHELL_OPTIONS = "set -euo pipefail"
 STEPS_WITHOUT_STRICT_OPTIONS = frozenset(
     {
         ("ci", "Check the secret and ignore policy"),
-        ("ci", "Run pip-audit against the development manifest"),
         ("ci", "Check the application starts"),
         ("ci", "Run backend security tests"),
         ("ci", "Run backend unit tests"),
@@ -153,11 +187,32 @@ EXPECTED_MANIFESTS = {
     ),
 }
 
+#: Name each one-shot Job is rendered under, as
+#: ``token -> (renderer group, recorded stem)``. The renderer derives the
+#: whole name from the image tag rather than the manifest assembling it, so
+#: the token carries the stem and the release component together and the
+#: substitution below stands in for both.
+#: :func:`test_each_one_shot_job_is_named_by_the_renderer` asserts each
+#: entry against the renderer, so the stand-in cannot drift from it.
+DERIVED_JOB_NAMES = {
+    "MIGRATION_JOB_NAME": ("migration", "backend-migrate"),
+    "ADMIN_CREDENTIAL_JOB_NAME": (
+        "admin-credential",
+        "backend-admin-credential",
+    ),
+}
+
 #: The one-shot schema migration, and the stage that applies it.
 MIGRATION_MANIFEST = "60-migration-job.yaml"
 
 #: Container inside the migration job.
 MIGRATION_CONTAINER = "migrate"
+
+#: The periodic listing-refresh workload, and the stage that runs it.
+INGESTION_MANIFEST = "65-ingestion-cronjob.yaml"
+
+#: Container inside the ingestion schedule.
+INGESTION_CONTAINER = "ingest"
 
 #: The workloads that run continuously, and the port each serves on.
 WORKLOAD_PORTS = {"backend": 8000, "frontend": 80}
@@ -296,6 +351,71 @@ def _scripts(path):
     ]
 
 
+def _deployment_guard():
+    """Returns the one condition every deployment job reaches."""
+    jobs = _jobs(CD_WORKFLOW)
+    conditional = [job for job, spec in jobs.items() if spec.get("if")]
+    assert len(conditional) == 1, conditional
+    return jobs[conditional[0]]["if"]
+
+
+def _guard_terms(guard):
+    """Returns ``(path, literal, path)`` for each term of a guard.
+
+    The guard is a conjunction, so it is split on ``&&`` and every part has
+    to be an equality. A part that is not fails here rather than being
+    read wrongly by the evaluator below, which understands conjunction and
+    equality and nothing else.
+    """
+    terms = []
+    for part in guard.split("&&"):
+        match = GUARD_TERM.match(part)
+        assert match, part
+        terms.append(match.groups())
+    return terms
+
+
+def _resolve(context, path):
+    """Returns the value ``path`` names in ``context``, or ``None``."""
+    current = context
+    for name in path.split("."):
+        if not isinstance(current, dict) or name not in current:
+            return None
+        current = current[name]
+    return current
+
+
+def _guard_admits(guard, github):
+    """Returns whether ``guard`` admits the run ``github`` describes."""
+    context = {"github": github}
+    for path, literal, other in _guard_terms(guard):
+        left = _resolve(context, path)
+        right = literal if other is None else _resolve(context, other)
+        if left != right:
+            return False
+    return True
+
+
+def _github_context(**workflow_run):
+    """Returns a context describing a trusted push of this repository.
+
+    Each keyword replaces one field of the triggering run, so a case names
+    only the fact it makes untrustworthy.
+    """
+    run = {
+        "conclusion": "success",
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": "0" * 40,
+        "head_repository": {"full_name": REPOSITORY_IDENTITY},
+    }
+    run.update(workflow_run)
+    return {
+        "repository": REPOSITORY_IDENTITY,
+        "event": {"workflow_run": run},
+    }
+
+
 def _render_text():
     """Returns the renderer as one string."""
     return RENDER_SCRIPT.read_text(encoding="utf-8")
@@ -332,6 +452,10 @@ def _resolved(name):
     body = (MANIFEST_DIR / name).read_text(encoding="utf-8")
     for token, value in _render_defaults().items():
         body = body.replace("${" + token + "}", value)
+    for token, (_group, stem) in DERIVED_JOB_NAMES.items():
+        body = body.replace(
+            "${" + token + "}", "%s-rendered-at-release" % stem
+        )
     return re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", "rendered-at-release", body)
 
 
@@ -694,14 +818,20 @@ def test_the_example_environment_names_the_provisioned_store():
     """Asserts the documentation points at what is actually provisioned.
 
     A developer reading the setting needs to know a store exists and how
-    to address it, in the container stack and in a deployment alike.
+    to address it, in the container stack and in a deployment alike. The
+    template names the setting and its accepted local value; the address of
+    each provisioned store is documented where that store is declared, so
+    those are read from the compose stack and from the configuration.
     """
     documented = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-    section = documented.split(RATE_LIMIT_SETTING + "=")[0]
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+    configuration = TERRAFORM_MAIN.read_text(encoding="utf-8")
 
-    assert "redis://cache:6379/0" in section
-    assert "google_redis_instance.rate_limit" in section
-    assert "Secret Manager" in section
+    assert RATE_LIMIT_SETTING in documented
+    assert "bounded-memory://" in documented
+    assert "redis://cache:6379/0" in compose
+    assert "google_redis_instance" in configuration
+    assert "rate_limit" in configuration
 
 
 def test_the_helper_reads_a_script_from_every_run_step():
@@ -991,6 +1121,45 @@ def test_the_migration_job_is_bounded_and_cleans_up_after_itself():
     assert "upgrade head" in started
 
 
+def test_the_ingestion_schedule_can_observe_a_failed_pass():
+    """Asserts a failed ingestion pass reaches the schedule as a failure.
+
+    The schedule decides retry and failed-job history from the container's
+    exit status, so the two halves of that contract are asserted together:
+    the manifest declares an attempt limit and a failure history, and the
+    command runs the pass in a way that lets its failure set the exit
+    status. ``update_listings`` re-raises, and the command neither wraps
+    the call in an exception handler nor follows it with anything whose
+    success would mask it -- so a provider outage or a response the
+    adapter cannot read exits non-zero rather than reporting a pass that
+    refreshed nothing.
+    """
+    document = _one(INGESTION_MANIFEST, "CronJob")
+    job = document["spec"]["jobTemplate"]["spec"]
+    container = _container(document, INGESTION_CONTAINER)
+    started = "\n".join(container["command"])
+
+    assert 1 <= int(job["backoffLimit"]) <= 3
+    assert int(document["spec"]["failedJobsHistoryLimit"]) > 0
+    assert document["spec"]["concurrencyPolicy"] == "Forbid"
+    assert _pod_spec(document)["restartPolicy"] == "Never"
+
+    # The pass is the last thing the command runs, and it replaces the
+    # shell, so its status is the container's status.
+    assert "asyncio.run(update_listings())" in started
+    assert started.rstrip().splitlines()[-1].lstrip().startswith("exec ")
+    for suppressor in ("|| true", "; true", "set +e", "except"):
+        assert suppressor not in started, suppressor
+
+    # The other half of the contract: the pass raises rather than
+    # absorbing a failure, and it is read from the module rather than
+    # restated here.
+    source = inspect.getsource(listing_updater.update_listings)
+    handler = source.split("except Exception")[-1]
+    assert "db.rollback()" in handler
+    assert "\n        raise\n" in handler
+
+
 def test_the_migration_runs_under_its_own_narrow_identity():
     """Asserts the migration reads one credential, not six.
 
@@ -1021,18 +1190,58 @@ def test_the_migration_runs_under_its_own_narrow_identity():
     assert pod["serviceAccountName"] != serving["serviceAccountName"]
 
 
+@pytest.mark.parametrize("token", sorted(DERIVED_JOB_NAMES))
+def test_each_one_shot_job_is_named_by_the_renderer(token):
+    """Asserts one derivation names the object and every command on it.
+
+    The manifest carries the name as a token, and the renderer derives that
+    token from the image tag -- folding it to the alphabet and the length a
+    Kubernetes object name accepts. A name a delivery path assembled itself
+    could differ from the one the manifest was rendered with, which is how a
+    wait can be issued on an object that was never created.
+    """
+    group, stem = DERIVED_JOB_NAMES[token]
+    renderer = _render_text()
+
+    declared = [
+        name
+        for manifest, expected in EXPECTED_MANIFESTS.items()
+        for kind, name in expected
+        if kind == "Job" and name == stem
+    ]
+    assert declared == [stem], declared
+
+    assert '"%s:%s:%s"' % (group, token, stem) in renderer
+    assert "job-name" in renderer
+    assert "${%s}" % token in "".join(
+        (MANIFEST_DIR / manifest).read_text(encoding="utf-8")
+        for manifest in EXPECTED_MANIFESTS
+    )
+
+
 def test_the_migration_job_reads_the_same_configuration_as_the_api():
     """Asserts the revisions are applied to the database the API serves.
 
     A job reading a different configuration could migrate one database
-    while the API serves another.
+    while the API serves another, so the settings map both read is
+    asserted to be one map. The credential secret the API also reads is
+    not among the job's sources: it carries the shared rate-limit address,
+    which a migration run never reads, and a one-shot pod is given only
+    what it reads.
     """
-    job = _one(MIGRATION_MANIFEST, "Job")
-    api = _one("40-backend.yaml", "Deployment")
+    job = _container(_one(MIGRATION_MANIFEST, "Job"), MIGRATION_CONTAINER)
+    api = _container(_one("40-backend.yaml", "Deployment"), "backend")
 
-    assert _container(job, MIGRATION_CONTAINER)["envFrom"] == (
-        _container(api, "backend")["envFrom"]
-    )
+    def maps(container):
+        return [
+            entry["configMapRef"]
+            for entry in container["envFrom"]
+            if "configMapRef" in entry
+        ]
+
+    assert maps(job) == maps(api)
+    assert maps(job), job["envFrom"]
+    assert [entry for entry in job["envFrom"] if "secretRef" in entry] == []
 
 
 def test_no_manifest_names_a_registry_project_or_tag_of_its_own():
@@ -1413,6 +1622,130 @@ def test_the_deployment_consumes_the_result_rather_than_repeating_it():
             if any(entry in reached for entry in needs):
                 reached.add(job)
     assert reached == set(jobs), sorted(set(jobs) - reached)
+
+
+def test_the_deployment_admits_only_a_trusted_triggering_run():
+    """Asserts the guard names every fact a trusted run must carry.
+
+    ``workflow_run`` fires for any completed run of the named workflow,
+    including one from a pull request opened from a fork, and the run it
+    starts carries this repository's permissions rather than the triggering
+    run's. The conclusion alone is therefore not provenance.
+    """
+    guard = _deployment_guard()
+    named = {path for path, _literal, _other in _guard_terms(guard)}
+
+    for path in REQUIRED_PROVENANCE:
+        assert path in named, (path, sorted(named))
+    assert _guard_admits(guard, _github_context())
+
+
+@pytest.mark.parametrize(
+    "untrusted",
+    [
+        pytest.param({"conclusion": "failure"}, id="run-did-not-pass"),
+        pytest.param({"event": "pull_request"}, id="not-a-push"),
+        pytest.param({"head_branch": "topic"}, id="not-the-release-branch"),
+        pytest.param(
+            {"head_repository": {"full_name": "attacker/apartment-finder"}},
+            id="a-fork",
+        ),
+        pytest.param(
+            {
+                "event": "pull_request",
+                "head_branch": "main",
+                "head_repository": {
+                    "full_name": "attacker/apartment-finder"
+                },
+            },
+            id="a-fork-pull-request-from-a-branch-named-main",
+        ),
+    ],
+)
+def test_the_deployment_refuses_an_untrusted_triggering_run(untrusted):
+    """Asserts each untrustworthy run is refused by the guard.
+
+    The last case is the one the trigger's own branch filter does not
+    catch: that filter matches the triggering run's head branch, which on a
+    fork is the fork's branch name, so a fork branch named for the release
+    branch satisfies it.
+    """
+    guard = _deployment_guard()
+    assert not _guard_admits(guard, _github_context(**untrusted)), untrusted
+
+
+def test_the_deployment_refuses_a_mismatched_repository_identity():
+    """Asserts the head repository is compared with this repository."""
+    guard = _deployment_guard()
+    context = _github_context()
+    context["repository"] = "someone-else/apartment-finder"
+
+    assert not _guard_admits(guard, context)
+
+
+def test_the_gate_verifies_the_commit_the_deployment_releases():
+    """Asserts the called gate reads the commit being released.
+
+    A reusable workflow runs the definition its caller holds and checks out
+    the caller's revision unless told otherwise, so calling it without the
+    released commit would re-verify a different one.
+    """
+    called = [
+        spec
+        for spec in _jobs(CD_WORKFLOW).values()
+        if str(spec.get("uses", "")).startswith("./.github/workflows/ci.yml")
+    ]
+    assert called, sorted(_jobs(CD_WORKFLOW))
+
+    document = _document(CI_WORKFLOW)
+    declared = document[True]["workflow_call"]["inputs"]
+    reference = document["env"]["CHECKOUT_REF"]
+
+    for spec in called:
+        passed = spec.get("with") or {}
+        carrying = [
+            name for name, value in passed.items() if value == VERIFIED_HEAD
+        ]
+        assert carrying, passed
+        for name in carrying:
+            assert name in declared, (name, sorted(declared))
+            assert name in reference, (name, reference)
+
+    #: Every checkout in the called workflow resolves that one value, so
+    #: no job of the gate reads a different revision from another.
+    checkouts = [
+        step
+        for _job, step in _steps(CI_WORKFLOW)
+        if str(step.get("uses", "")).startswith("actions/checkout")
+    ]
+    assert checkouts
+    for step in checkouts:
+        assert step["with"]["ref"] == "${{ env.CHECKOUT_REF }}", step
+
+
+def test_the_gate_installs_one_pinned_bootstrap_everywhere():
+    """Asserts the installer is pinned, once, and read from there.
+
+    Every job that reads a manifest installs the bootstrap first. An
+    unpinned upgrade resolves whatever release the index serves at the
+    moment the gate runs, which is a package outside both audited
+    manifests executing ahead of the audit itself.
+    """
+    document = _document(CI_WORKFLOW)
+    pinned = document["env"]["PIP_VERSION"]
+
+    assert re.match(r"^\d+(\.\d+)+$", str(pinned)), pinned
+
+    installs = [
+        line.strip()
+        for _job, _name, script in _scripts(CI_WORKFLOW)
+        for line in script.splitlines()
+        if "pip install --upgrade" in line
+    ]
+    assert installs
+    for line in installs:
+        assert 'pip=="' not in line, line
+        assert '"pip==${PIP_VERSION}"' in line, line
 
 
 def test_the_deployment_releases_the_commit_that_was_verified():

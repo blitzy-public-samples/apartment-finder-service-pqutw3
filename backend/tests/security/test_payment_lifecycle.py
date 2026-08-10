@@ -48,6 +48,9 @@ from backend.app.core.security import (
 )
 from backend.app.db import database as database_module
 from backend.app.db.models import (
+    OPEN_INTENT_INDEX_PREDICATE,
+    OPEN_INTENT_STATUSES,
+    OPEN_INTENT_UNIQUE_INDEX_NAME,
     Base,
     Subscription,
     User,
@@ -55,7 +58,7 @@ from backend.app.db.models import (
 )
 from backend.app.main import app
 from backend.app.services import paypal_service
-from backend.tests.support import enforce_sqlite_foreign_keys
+from backend.tests.support import CLIENT_BASE_URL, enforce_sqlite_foreign_keys
 
 PASSWORD = "Str0ng-Passphrase-9"
 
@@ -4104,3 +4107,402 @@ class TestANotificationThatCannotBeAppliedChangesNothing:
             db.query(User).filter(User.id == subscriber.id).one().role
             == "registered"
         )
+
+
+#: Bound on one step of the two-request race settling.
+RACE_STEP_SECONDS = 15.0
+
+#: Bound on the pair of racing requests both being answered.
+RACE_PAIR_SECONDS = 60.0
+
+
+class TestOnlyOneOpenIntentPerPlan:
+    """One open payment intent exists per account and plan.
+
+    The creation route reads for a reusable intent and inserts when it
+    finds none. Those two steps are not one atomic step, so two requests
+    arriving together can both read nothing and both insert. The partial
+    unique index admits one of the inserts and refuses the other, and the
+    refused request reloads the committed row instead of recording a
+    second intent and opening a second order against it.
+    """
+
+    def _intent(self, user, status=None, plan_id=PREMIUM_MONTHLY, **extra):
+        """Returns an open intent row for ``user``."""
+        values = {
+            "user_id": user.id,
+            "plan_id": plan_id,
+            "amount": PLAN.amount,
+            "currency": PLAN.currency,
+            "status": status or subscriptions_module.PENDING_STATUS,
+            "start_date": datetime.now(timezone.utc),
+            "end_date": None,
+        }
+        values.update(extra)
+        return Subscription(**values)
+
+    def test_the_mapped_table_declares_the_uniqueness_over_the_window(self):
+        """The index is unique, keyed by owner and plan, and partial."""
+        declared = {
+            index.name: index for index in Subscription.__table__.indexes
+        }
+        assert OPEN_INTENT_UNIQUE_INDEX_NAME in declared
+        index = declared[OPEN_INTENT_UNIQUE_INDEX_NAME]
+        assert index.unique is True
+        assert [column.name for column in index.columns] == [
+            "user_id",
+            "plan_id",
+        ]
+        # The predicate is carried for both engines the suite runs on, so
+        # the mapped tables the tests build and the migrated tables carry
+        # the same uniqueness.
+        for dialect in ("postgresql", "sqlite"):
+            clause = index.dialect_options[dialect]["where"]
+            assert str(clause) == OPEN_INTENT_INDEX_PREDICATE
+        assert set(OPEN_INTENT_STATUSES) == {
+            subscriptions_module.PENDING_STATUS,
+            subscriptions_module.FAILED_STATUS,
+        }
+
+    def test_a_second_open_intent_for_the_same_plan_is_refused(
+        self, db, subscriber
+    ):
+        """The database refuses a second intent inside the window."""
+        db.add(self._intent(subscriber))
+        db.commit()
+
+        db.add(
+            self._intent(
+                subscriber, status=subscriptions_module.FAILED_STATUS
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+        assert db.query(Subscription).count() == 1
+
+    def test_a_settled_or_closed_intent_leaves_the_window_open(
+        self, db, subscriber
+    ):
+        """A row outside the window constrains nothing."""
+        db.add(self._intent(subscriber, status="active", end_date=None))
+        db.add(
+            self._intent(
+                subscriber, end_date=datetime.now(timezone.utc)
+            )
+        )
+        db.commit()
+
+        db.add(self._intent(subscriber))
+        db.commit()
+        assert db.query(Subscription).count() == 3
+
+    def test_a_refused_insert_reloads_the_committed_intent(
+        self, db, subscriber
+    ):
+        """The refused request reuses the row that was admitted.
+
+        The read is stood in for so that it misses once, which is what a
+        request that loses the race observes. The insert that follows is
+        refused by the index, and the identifier and idempotency key that
+        come back are the committed row's own.
+        """
+        committed = self._intent(subscriber)
+        db.add(committed)
+        db.commit()
+        expected_id = committed.id
+
+        real_read = subscriptions_module._reusable_intent
+        reads = {"count": 0}
+
+        def missing_once(session, user, plan):
+            """Misses on the first read and reads truly afterwards."""
+            reads["count"] += 1
+            if reads["count"] == 1:
+                return None
+            return real_read(session, user, plan)
+
+        with patch.object(
+            subscriptions_module, "_reusable_intent", missing_once
+        ):
+            subscription_id, key = subscriptions_module._open_intent(
+                db, subscriber, PLAN
+            )
+
+        assert subscription_id == expected_id
+        assert key == paypal_service.order_request_id(expected_id)
+        assert reads["count"] == 2
+        db.expire_all()
+        assert db.query(Subscription).count() == 1
+        assert (
+            db.query(Subscription).one().status
+            == subscriptions_module.PENDING_STATUS
+        )
+
+    def test_a_conflict_no_reusable_row_explains_is_raised(
+        self, db, subscriber
+    ):
+        """A conflict the window does not explain is not retried.
+
+        Only a refusal the index raised has a committed row behind it. A
+        refusal with no such row is a different constraint's, and is
+        raised rather than answered with someone else's intent.
+        """
+        failure = IntegrityError("INSERT", {}, Exception("another constraint"))
+        with patch.object(
+            subscriptions_module,
+            "_reusable_intent",
+            lambda session, user, plan: None,
+        ):
+            with patch.object(db, "flush", side_effect=failure):
+                with pytest.raises(IntegrityError):
+                    subscriptions_module._open_intent(db, subscriber, PLAN)
+
+        db.rollback()
+        assert db.query(Subscription).count() == 0
+
+    @pytest.mark.postgres
+    @pytest.mark.asyncio
+    async def test_two_concurrent_creations_open_one_intent_on_postgres(
+        self, monkeypatch, postgres_client, postgres_db
+    ):
+        """Two requests racing on one plan open one intent and one order.
+
+        Both requests are held until each has read for a reusable intent
+        and found none, which is the interleaving the unguarded route
+        allowed. They are then released together against the real server:
+        the index admits one insert and refuses the other, and the refused
+        request reloads the committed row. One row is stored, one order is
+        opened, and both requests are answered with the same intent.
+        """
+        import asyncio
+
+        import httpx
+
+        account = User(
+            email="race@example.com",
+            hashed_password=get_password_hash(PASSWORD),
+            created_at=datetime.now(timezone.utc),
+            role="registered",
+        )
+        postgres_db.add(account)
+        postgres_db.commit()
+        postgres_db.refresh(account)
+        headers = bearer(account)
+
+        # The account lock serialises a racing pair on the server, so
+        # with it in place the second request waits there and never
+        # reaches the lookup below. That serialization is what
+        # TestConcurrentCreatesResolveToOneIntent asserts. It is stood
+        # down here so that both requests do reach the lookup together,
+        # leaving the partial unique index as the only thing able to
+        # refuse the second insert, which is the defence this case
+        # covers.
+        monkeypatch.setattr(
+            subscriptions_module, "_lock_account", lambda db, user: None
+        )
+
+        gate = threading.Barrier(2, timeout=RACE_STEP_SECONDS)
+        real_read = subscriptions_module._reusable_intent
+        held = {"count": 0}
+        guard = threading.Lock()
+
+        def read_then_wait_for_the_other(session, user, plan):
+            """Reads, then waits until both requests have read."""
+            result = real_read(session, user, plan)
+            with guard:
+                mine = held["count"] < 2
+                if mine:
+                    held["count"] += 1
+            if mine:
+                gate.wait()
+            return result
+
+        monkeypatch.setattr(
+            subscriptions_module,
+            "_reusable_intent",
+            read_then_wait_for_the_other,
+        )
+
+        keys = []
+
+        async def record_the_order(
+            plan_id, return_url, cancel_url, idempotency_key=None
+        ):
+            """Records the idempotency key each order is opened under."""
+            keys.append(idempotency_key)
+            return order_response()
+
+        monkeypatch.setattr(
+            subscriptions_module, "create_order", record_the_order
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url=CLIENT_BASE_URL,
+        ) as caller:
+
+            async def create():
+                """Opens a subscription for the racing account."""
+                return await caller.post(
+                    "/subscriptions/",
+                    json={"plan_id": PREMIUM_MONTHLY},
+                    headers=headers,
+                )
+
+            first, second = await asyncio.wait_for(
+                asyncio.gather(
+                    asyncio.ensure_future(create()),
+                    asyncio.ensure_future(create()),
+                ),
+                RACE_PAIR_SECONDS,
+            )
+
+        assert held["count"] == 2, (
+            "both requests were expected to read before either inserted"
+        )
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["id"] == second.json()["id"]
+        assert first.json()["approval_url"] == second.json()["approval_url"]
+
+        postgres_db.rollback()
+        postgres_db.expire_all()
+        stored = (
+            postgres_db.query(Subscription)
+            .filter(Subscription.user_id == account.id)
+            .all()
+        )
+        assert len(stored) == 1
+        assert stored[0].plan_id == PREMIUM_MONTHLY
+        assert stored[0].id == first.json()["id"]
+        assert stored[0].paypal_order_id == ORDER_ID
+        assert len(keys) == 2
+        assert set(keys) == {
+            paypal_service.order_request_id(stored[0].id)
+        }
+
+
+class AccountLockContention(object):
+    """Holds the first create inside its locked transaction.
+
+    The first caller to reach the open-attempt lookup is the *holder*: it
+    has already taken the account's write lock, and it is held there with
+    its transaction open. The second caller therefore reaches
+    ``_lock_account`` and waits on the server for that lock rather than
+    on this object, which is what makes the wait the database's own.
+    """
+
+    def __init__(self):
+        self.holder_thread = None
+        self.holder_locked = threading.Event()
+        self.release_holder = threading.Event()
+        self.overlapped = False
+
+    def interpose(self, perform):
+        """Returns the lookup's result, holding the first caller."""
+        if self.holder_thread is not None:
+            return perform()
+        self.holder_thread = threading.current_thread().ident
+        result = perform()
+        self.holder_locked.set()
+        assert self.release_holder.wait(RACE_STEP_SECONDS), (
+            "the first create was never released from its transaction"
+        )
+        return result
+
+
+class TestConcurrentCreatesResolveToOneIntent:
+    """Two creates that overlap open one row and one provider order."""
+
+    @pytest.mark.postgres
+    @pytest.mark.asyncio
+    async def test_two_overlapping_creates_share_one_row_and_one_key(
+        self, monkeypatch, postgres_client, postgres_db, postgres_observer
+    ):
+        """The second create waits on the account lock and reuses the row.
+
+        Both requests are in flight together against a real PostgreSQL
+        database. The first is held inside the transaction that holds the
+        account's write lock; the second is observed waiting on a lock in
+        the server's activity view, which is the proof the serialization
+        is the database's rather than a scheduling accident. Once the
+        first commits, the second reads the row it recorded: one
+        subscription row is stored, both responses name it, and both
+        provider calls carry the one idempotency key derived from it.
+        """
+        import asyncio
+
+        import httpx
+
+        subscriber = User(
+            email="concurrent-payer@example.com",
+            hashed_password=get_password_hash(PASSWORD),
+            created_at=datetime.now(timezone.utc),
+            role="registered",
+        )
+        postgres_db.add(subscriber)
+        postgres_db.commit()
+        postgres_db.refresh(subscriber)
+        headers = bearer(subscriber)
+
+        barrier = AccountLockContention()
+        lookup = subscriptions_module._reusable_intent
+        monkeypatch.setattr(
+            subscriptions_module,
+            "_reusable_intent",
+            lambda db, user, plan: barrier.interpose(
+                lambda: lookup(db, user, plan)
+            ),
+        )
+        creator = AsyncMock(return_value=order_response())
+        monkeypatch.setattr(subscriptions_module, "create_order", creator)
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url=CLIENT_BASE_URL,
+        ) as caller:
+
+            async def post():
+                """Opens one subscription for the seeded account."""
+                return await caller.post(
+                    "/subscriptions/",
+                    json={"plan_id": PREMIUM_MONTHLY},
+                    headers=headers,
+                )
+
+            first = asyncio.ensure_future(post())
+            loop = asyncio.get_event_loop()
+            assert await loop.run_in_executor(
+                None,
+                barrier.holder_locked.wait,
+                RACE_STEP_SECONDS,
+            ), "the first create never took the account lock"
+
+            second = asyncio.ensure_future(post())
+            assert await loop.run_in_executor(
+                None, postgres_observer, 1
+            ), (
+                "the second create was never seen waiting on the account "
+                "lock the first holds"
+            )
+            barrier.overlapped = not first.done()
+            barrier.release_holder.set()
+            opened, repeated = await asyncio.wait_for(
+                asyncio.gather(first, second), RACE_PAIR_SECONDS
+            )
+
+        assert barrier.overlapped is True
+        assert opened.status_code == 200
+        assert repeated.status_code == 200
+        assert repeated.json()["id"] == opened.json()["id"]
+
+        postgres_db.expire_all()
+        stored = postgres_db.query(Subscription).one()
+        assert stored.id == opened.json()["id"]
+        assert stored.status == subscriptions_module.PENDING_STATUS
+        keys = [
+            call.kwargs["idempotency_key"]
+            for call in creator.await_args_list
+        ]
+        assert keys == [paypal_service.order_request_id(stored.id)] * 2

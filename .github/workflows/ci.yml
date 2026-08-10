@@ -1,18 +1,23 @@
 name: CI
 
-# The complete verification gate. The deployment workflow is triggered by
-# a completed run of this one and proceeds only on its success, so every
-# check the repository is held to belongs here and nowhere else.
+# CI success is the deployment workflow's release gate.
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  # .github/workflows/cd.yml calls this workflow as its deployment gate,
-  # so every job declared here has to pass before anything is deployed,
-  # and a job added here is added to that gate with it.
   workflow_call:
+    inputs:
+      verified_ref:
+        description: >-
+          Commit the caller is releasing. Every checkout below resolves to
+          it, so a called run verifies that commit rather than the revision
+          a reusable workflow resolves to by default. Left empty on push
+          and pull_request, where the triggering commit is used.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -20,6 +25,19 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Commit every checkout below resolves to. A called run receives it from
+  # the caller; a push or pull_request run has no input and falls back to
+  # its own triggering commit.
+  CHECKOUT_REF: ${{ inputs.verified_ref || github.sha }}
+  # Version of the bootstrap installer every job installs before it reads
+  # a manifest. It is pinned here and read from here alone, so the five
+  # installs cannot drift from one another and none of them resolves
+  # whatever release the index happens to serve. The value is the release
+  # the repository is verified with, and it is inventoried in
+  # backend/requirements-dev.txt and docs/security/RESIDUAL_RISK.md.
+  PIP_VERSION: '26.0.1'
 
 jobs:
   # Security gates, backend tests and the database-backed integration
@@ -77,9 +95,11 @@ jobs:
     steps:
     # Every action is referenced by the commit its release tag pointed at,
     # so a tag repointed at different code cannot change what this workflow
-    # runs.
+    # runs. Every checkout resolves CHECKOUT_REF, so a called run reads the
+    # commit its caller is releasing.
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
+        ref: ${{ env.CHECKOUT_REF }}
         fetch-depth: 0
 
     - name: Set up Python
@@ -90,9 +110,12 @@ jobs:
     - name: Install Python dependencies
       run: |
         set -euo pipefail
-        python -m pip install --upgrade pip
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
         pip install -r backend/requirements.txt
         pip install -r backend/requirements-dev.txt
+        # The audit instrument, declared apart from the manifests it reads
+        # so its own dependency tree is not one of them.
+        pip install -r backend/requirements-audit.txt
 
     - name: Check the secret and ignore policy
       run: |
@@ -107,11 +130,15 @@ jobs:
     - name: Run pip-audit against the runtime manifest
       run: |
         set -euo pipefail
-        # Each manifest is audited against its own register in
+        # Each audited manifest is audited against its own register in
         # docs/security/RESIDUAL_RISK.md: the runtime identifiers below
-        # are the "Runtime register" set, and the development identifiers
-        # are the "Development register" set. Fourteen identifiers are
-        # suppressed in total across the two manifests.
+        # are the "Runtime register" set, and the development identifier
+        # in the next step is the "Development register" set. Eight
+        # identifiers are suppressed in total across the two.
+        #
+        # backend/requirements-audit.txt is not audited. It declares the
+        # instrument performing the audit, whose own dependency tree is
+        # tooling rather than this project's dependency surface.
         #
         # These seven are the runtime register. Each is recorded there with
         # the version that fixes it, the reason that version is unreachable
@@ -127,18 +154,13 @@ jobs:
 
     - name: Run pip-audit against the development manifest
       run: |
-        # These seven are a separate, development-only register. They
-        # reach no deployed artifact, and each is recorded in the comment
-        # block at backend/requirements-dev.txt rather than in the
-        # residual-risk document, which covers the runtime set alone.
+        set -euo pipefail
+        # This one is a separate, development-only set. It reaches no
+        # deployed artifact. Its authority is the Development register
+        # section of docs/security/RESIDUAL_RISK.md, and it is inventoried
+        # in the comment block at backend/requirements-dev.txt.
         pip-audit --strict -r backend/requirements-dev.txt \
-          --ignore-vuln PYSEC-2026-1845 \
-          --ignore-vuln PYSEC-2026-3625 \
-          --ignore-vuln PYSEC-2026-1374 \
-          --ignore-vuln PYSEC-2026-1375 \
-          --ignore-vuln PYSEC-2026-2275 \
-          --ignore-vuln PYSEC-2026-141 \
-          --ignore-vuln PYSEC-2026-142
+          --ignore-vuln PYSEC-2026-1845
 
     - name: Run Bandit
       run: |
@@ -165,10 +187,49 @@ jobs:
         set -euo pipefail
 
         cd backend
+        # The head reverses on its own, the rest of the chain unwinds to
+        # base, and the whole chain re-applies. Targeting base rather than
+        # counting steps keeps this correct as revisions are added; that
+        # every single revision reverses independently is asserted by
+        # backend/tests/security/test_migration_gate.py.
         alembic upgrade head
-        alembic downgrade -1
-        alembic downgrade -1
+        alembic current
+
+        # The reversal takes one step per revision in the chain, and the
+        # number of steps is read from the chain, so a revision added later
+        # is reversed by this gate without it being edited.
+        revisions="$(python - <<'PY'
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        chain = ScriptDirectory.from_config(Config("alembic.ini"))
+        print(len(list(chain.walk_revisions())))
+        PY
+        )"
+
+        for _ in $(seq 1 "$revisions"); do
+          alembic downgrade -1
+          alembic current
+        done
+
+        python - <<'PY'
+        import os
+
+        from sqlalchemy import create_engine, inspect, text
+
+        engine = create_engine(os.environ["DATABASE_URL"])
+        with engine.connect() as connection:
+            remaining = sorted(inspect(connection).get_table_names())
+            stamped = connection.execute(
+                text("select count(*) from alembic_version")
+            ).scalar()
+        assert remaining == ["alembic_version"], remaining
+        assert stamped == 0, stamped
+        print("the reversal reached the base")
+        PY
+
         alembic upgrade head
+        alembic current
 
     - name: Check exactly one administrator holds the role
       run: |
@@ -260,6 +321,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
 
     - name: Set up Python
       uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -270,7 +333,7 @@ jobs:
       run: |
         set -euo pipefail
 
-        python -m pip install --upgrade pip
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
         pip install -r backend/requirements.txt
         pip install -r backend/requirements-dev.txt
 
@@ -278,13 +341,45 @@ jobs:
       run: |
         set -euo pipefail
 
-        # Both revisions must apply, reverse independently and reapply, which
-        # is what makes the schema change reversible from the code.
+        # Every revision must apply, reverse one step at a time and reapply,
+        # which is what makes the schema change reversible from the code. The
+        # number of reversal steps is read from the chain, so a revision added
+        # later is reversed by this gate without it being edited.
         python -m alembic -c backend/alembic.ini upgrade head
         python -m alembic -c backend/alembic.ini current
-        python -m alembic -c backend/alembic.ini downgrade -1
-        python -m alembic -c backend/alembic.ini downgrade -1
+
+        revisions="$(python - <<'PY'
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        chain = ScriptDirectory.from_config(Config("backend/alembic.ini"))
+        print(len(list(chain.walk_revisions())))
+        PY
+        )"
+
+        for _ in $(seq 1 "$revisions"); do
+          python -m alembic -c backend/alembic.ini downgrade -1
+          python -m alembic -c backend/alembic.ini current
+        done
+
+        python - <<'PY'
+        import os
+
+        from sqlalchemy import create_engine, inspect, text
+
+        engine = create_engine(os.environ["DATABASE_URL"])
+        with engine.connect() as connection:
+            remaining = sorted(inspect(connection).get_table_names())
+            stamped = connection.execute(
+                text("select count(*) from alembic_version")
+            ).scalar()
+        assert remaining == ["alembic_version"], remaining
+        assert stamped == 0, stamped
+        print("the reversal reached the base")
+        PY
+
         python -m alembic -c backend/alembic.ini upgrade head
+        python -m alembic -c backend/alembic.ini current
 
     - name: Assert exactly one account holds the administrative role
       run: |
@@ -407,6 +502,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
 
     - name: Set up Python
       uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -416,7 +513,7 @@ jobs:
     - name: Install Python dependencies
       run: |
         set -euo pipefail
-        python -m pip install --upgrade pip
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
         pip install -r backend/requirements.txt
         pip install -r backend/requirements-dev.txt
 
@@ -480,6 +577,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
 
     - name: Set up Python
       uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -490,7 +589,7 @@ jobs:
       run: |
         set -euo pipefail
 
-        python -m pip install --upgrade pip
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
         pip install -r backend/requirements.txt
 
     - name: Apply database migrations
@@ -599,9 +698,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
 
     - name: Set up Node.js
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
       with:
         node-version: '22'
 
@@ -614,25 +715,12 @@ jobs:
 
     - name: Run ESLint
       env:
-        # The warning count frontend/src already carries, measured at 8 with
-        # 0 errors outside the exempt file. frontend/src is read-only
-        # reference material here, so the budget records that count rather
-        # than demanding zero, and acts as a ratchet: a new warning exceeds
-        # it and fails this job while the existing ones do not.
+        # Enforce the documented frontend warning budget while preserving
+        # the report artifact.
         ESLINT_WARNING_BUDGET: '8'
       run: |
         set -euo pipefail
 
-        # frontend/package.json declares no lint script and is a read-only
-        # reference in this change set, so the linter is invoked directly. It
-        # reads the eslintConfig block that file already carries.
-        #
-        # eslint exits non-zero while any problem remains, which cannot tell
-        # a new problem from a known one, so the report is written here and
-        # judged by the budget script. src/services/paypal.ts is exempted
-        # there rather than excluded here, so its parser defect -- read-only
-        # frontend source, recorded as a reported finding in SECURITY.md --
-        # stays visible in the uploaded report instead of being hidden.
         cd frontend
         npx --no-install eslint src --ext .ts,.tsx,.js,.jsx \
           -f json -o eslint-report.json || true
@@ -669,6 +757,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
 
     - name: Set up Python
       uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -679,13 +769,18 @@ jobs:
       run: |
         set -euo pipefail
 
-        python -m pip install --upgrade pip
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
         pip install -r backend/requirements.txt
         pip install -r backend/requirements-dev.txt
 
     - name: Set up Terraform
-      uses: hashicorp/setup-terraform@v3
+      uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
       with:
+        # Exact release rather than a range, so the binary this job runs is
+        # the one the configuration is verified with. It satisfies the
+        # required_version constraint infrastructure/terraform/main.tf
+        # declares.
+        terraform_version: 1.15.8
         terraform_wrapper: false
 
     - name: Validate the Terraform configuration
@@ -701,7 +796,5 @@ jobs:
       run: |
         set -euo pipefail
 
-        # The assertions live in a script rather than in this block so
-        # that they are covered by the repository's own lint and can be
-        # run from a workstation.
+        # Run the reusable contract checker.
         python .github/scripts/check_manifest_settings_contract.py

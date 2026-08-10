@@ -1,69 +1,14 @@
-"""Alembic migration environment for the apartment-finder-service.
-
-The repository root reaches ``sys.path`` through ``prepend_sys_path`` in
-``backend/alembic.ini``, which Alembic applies before this module is
-imported. The ``backend.app.*`` imports below resolve from there.
-
-**This environment reads no setting that has no default beside the
-database URL.** It resolves ``DATABASE_URL`` itself -- from the process
-environment, then from the environment file :data:`ENV_FILE_VARIABLE`
-names, then from ``.env`` at the repository root -- and builds its own
-engine from it. It does not import :mod:`backend.app.core.config`, so
-applying a revision needs neither the token-signing key nor any provider
-credential, and a process that runs migrations may be given the database
-credential alone. The mapped metadata comes from
-:mod:`backend.app.db.models`, which reads no setting.
-
-The three connection bounds :func:`connect_args` applies are read from
-the same two sources, each with the default the application declares, so
-this environment reaches the database on the terms the application does
-without importing the application's settings to get there. None of the
-three names a credential and none is required, so reading them adds
-nothing a migration process must be given.
-
-Logging is installed by
-:func:`backend.app.core.logging.configure_migration_logging`, so every
-record a revision writes is rendered as redacted JSON by the same handler
-the application uses and reaches no handler installed elsewhere.
-``backend/alembic.ini`` declares no logging sections and installs no
-handler of its own.
-
-Both of Alembic's modes are served. Online, a revision runs against a
-connection and may inspect the schema it is altering. Offline --
-``--sql`` -- a statement stream is produced with no database attached:
-``op.get_bind()`` yields a stand-in that cannot be inspected and no
-statement returns a result, so each revision emits its statements
-unconditionally and checks no state. ``literal_binds`` is set below,
-which is what carries a revision's bound values into the emitted
-statements.
-
-A statement stream therefore carries every value its statements match on
-or write, inline. :data:`OFFLINE_BANNER` is emitted ahead of it saying
-so, and setting :data:`SQL_OUTPUT_VARIABLE` writes the stream to the
-named file, created with owner-only permissions, instead of to standard
-output. While the stream itself is on standard output the log records are
-moved to standard error, so the two are never interleaved and the stream
-can be redirected into a file on its own.
-
-Two entries of ``config.attributes`` are read, and both are absent when
-Alembic is driven from its command line:
-
-* :data:`CONNECTION_ATTRIBUTE` -- an open connection the migrations run
-  on. Absent, a connection is opened from an engine built here and closed
-  afterwards. Present, the connection is used as given and is left open,
-  so its owner keeps control of the transaction it belongs to.
-* :data:`CONFIGURE_LOGGER_ATTRIBUTE` -- whether the governed logging
-  configuration is installed. Absent, it is installed.
-
+"""Alembic environment with bounded database connections and
+redacted logging.
 """
 
 import os
 import sys
 
 from alembic import context
-from dotenv import dotenv_values
 from sqlalchemy import create_engine
 
+from backend.app.core import db_contract
 from backend.app.core.logging import (
     configure_migration_logging,
     redirect_log_stream,
@@ -77,22 +22,18 @@ CONNECTION_ATTRIBUTE = "connection"
 #: configuration is installed.
 CONFIGURE_LOGGER_ATTRIBUTE = "configure_logger"
 
-#: Setting this environment reads. It is the only one.
-DATABASE_URL_SETTING = "DATABASE_URL"
+#: Setting this environment reads that has no default. It is the only
+#: one.
+DATABASE_URL_SETTING = db_contract.DATABASE_URL_SETTING
 
-#: Environment variable naming the file the setting is read from when the
-#: process environment does not carry it. An empty value reads no file.
-ENV_FILE_VARIABLE = "ENV_FILE"
+#: Setting naming the deployment environment, which decides whether a
+#: local database scheme is accepted.
+ENVIRONMENT_SETTING = db_contract.ENVIRONMENT_SETTING
 
-#: Environment file read when :data:`ENV_FILE_VARIABLE` is absent,
-#: resolved from this file's own path rather than from the working
-#: directory.
-DEFAULT_ENV_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__)
-    ))),
-    ".env",
-)
+#: Environment variable naming the file every setting is read from when
+#: the process environment does not carry it. An empty value reads no
+#: file.
+ENV_FILE_VARIABLE = db_contract.ENV_FILE_VARIABLE
 
 #: Environment variable naming the file an offline statement stream is
 #: written to. Absent, the stream is written to standard output.
@@ -116,34 +57,52 @@ MISSING_URL_MESSAGE = (
     "at the repository root."
 )
 
+#: Message prefix of the failure raised when a resolved value is refused.
+#: The reason follows it and names the rule rather than the value.
+REFUSED_VALUE_PREFIX = "The migration environment refuses a value: "
+
 #: URL scheme prefixes served by the PostgreSQL driver.
-POSTGRESQL_SCHEMES = ("postgresql://", "postgresql+")
+POSTGRESQL_SCHEMES = db_contract.POSTGRESQL_SCHEMES
 
 #: Template of the libpq runtime parameters applied to every PostgreSQL
 #: connection. ``timezone`` pins the session to UTC and
 #: ``statement_timeout`` bounds how long one statement may run on the
 #: server, expressed in milliseconds.
 POSTGRESQL_SESSION_OPTIONS_TEMPLATE = (
-    "-c timezone=utc -c statement_timeout={statement_timeout_ms}"
+    db_contract.POSTGRESQL_SESSION_OPTIONS_TEMPLATE
 )
 
 #: Number of milliseconds in one second.
-MILLISECONDS_PER_SECOND = 1000
+MILLISECONDS_PER_SECOND = db_contract.MILLISECONDS_PER_SECOND
 
 #: The connection bounds this environment reads, each with the default
 #: the application declares for it. Every one has a default, so none of
-#: them has to be supplied to a migration process.
+#: them has to be supplied to a migration process. The statement bound is
+#: the migration one: a revision's statements are schema changes, and the
+#: request-path bound does not apply to them.
 BOUND_SETTINGS = {
-    "DB_CONNECT_TIMEOUT_SECONDS": 3,
-    "DB_STATEMENT_TIMEOUT_SECONDS": 3,
-    "DB_TCP_USER_TIMEOUT_SECONDS": 4,
+    "DB_CONNECT_TIMEOUT_SECONDS": (
+        db_contract.DEFAULT_DB_CONNECT_TIMEOUT_SECONDS,
+        db_contract.DB_TIMEOUT_CEILING_SECONDS,
+    ),
+    "DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS": (
+        db_contract.DEFAULT_DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS,
+        db_contract.DB_MIGRATION_TIMEOUT_CEILING_SECONDS,
+    ),
+    "DB_TCP_USER_TIMEOUT_SECONDS": (
+        db_contract.DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS,
+        db_contract.DB_TIMEOUT_CEILING_SECONDS,
+    ),
 }
 
+#: Setting carrying the bound on one migration statement.
+STATEMENT_TIMEOUT_SETTING = "DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS"
+
 #: URL scheme prefixes served by the SQLite driver.
-SQLITE_SCHEMES = ("sqlite://", "sqlite+")
+SQLITE_SCHEMES = db_contract.SQLITE_SCHEMES
 
 #: Driver arguments applied to every SQLite connection.
-SQLITE_CONNECT_ARGS = {"check_same_thread": False}
+SQLITE_CONNECT_ARGS = dict(db_contract.SQLITE_CONNECT_ARGS)
 
 config = context.config
 
@@ -153,107 +112,106 @@ if config.attributes.get(CONFIGURE_LOGGER_ATTRIBUTE, True):
 target_metadata = Base.metadata
 
 
-def _env_file_path():
-    """Return the environment file to read, or ``None`` to read none.
+def _refuse(reason: str) -> "RuntimeError":
+    """Return the failure raised for a value this environment refuses.
 
-    An ``ENV_FILE`` value is used exactly as given, and an empty one
-    selects no file at all. Absent, :data:`DEFAULT_ENV_FILE` is named.
+    The message carries :data:`REFUSED_VALUE_PREFIX` and the reason,
+    which names the setting and the rule and never the value, so it can
+    be rendered where a credential must not appear.
     """
-    named = os.environ.get(ENV_FILE_VARIABLE)
-    if named is None:
-        return DEFAULT_ENV_FILE
-    if not named.strip():
-        return None
-    return named
+    return RuntimeError(REFUSED_VALUE_PREFIX + reason)
+
+
+def environment_name() -> str:
+    """Return the deployment environment this run belongs to.
+
+    The value is resolved from the same two sources as every other
+    setting, and defaults to the one ``Settings.ENVIRONMENT`` declares. A
+    name outside
+    :data:`backend.app.core.db_contract.ENVIRONMENT_NAMES` raises
+    ``RuntimeError``.
+    """
+    try:
+        return db_contract.environment_name()
+    except ValueError as refused:
+        raise _refuse(str(refused)) from None
 
 
 def database_url() -> str:
     """Return the database URL this environment runs against.
 
     The process environment is read first, then the environment file
-    :func:`_env_file_path` names, and only the one setting
+    :data:`ENV_FILE_VARIABLE` names, and only the one setting
     :data:`DATABASE_URL_SETTING` is taken from either. Raises
     ``RuntimeError`` carrying :data:`MISSING_URL_MESSAGE` when neither
-    source supplies a non-blank value; the message names no value.
+    source supplies a non-blank value.
+
+    The resolved value is held to
+    :func:`backend.app.core.db_contract.validate_database_url` under the
+    environment :func:`environment_name` reports, so a target the
+    application would refuse is refused here too. A refusal raises
+    ``RuntimeError``, and neither message names a value.
     """
-    supplied = os.environ.get(DATABASE_URL_SETTING)
-    if supplied and supplied.strip():
-        return supplied.strip()
-
-    path = _env_file_path()
-    if path and os.path.isfile(path):
-        values = dotenv_values(path)
-        from_file = values.get(DATABASE_URL_SETTING)
-        if from_file and from_file.strip():
-            return from_file.strip()
-
-    raise RuntimeError(MISSING_URL_MESSAGE)
+    supplied = db_contract.resolve_setting(DATABASE_URL_SETTING)
+    if supplied is None:
+        raise RuntimeError(MISSING_URL_MESSAGE)
+    try:
+        return db_contract.validate_database_url(
+            supplied, environment_name()
+        )
+    except ValueError as refused:
+        raise _refuse(
+            "{0} {1}".format(DATABASE_URL_SETTING, refused)
+        ) from None
 
 
 def _bound(name: str) -> int:
     """Return one connection bound, in whole seconds.
 
     :data:`BOUND_SETTINGS` names the bound and carries the default the
-    application declares for it. The process environment is read first
-    and then the environment file :func:`_env_file_path` names, which are
-    the two sources the application's settings read, so both sides reach
-    the same value. A value that is absent, blank or not a whole number
-    leaves the default in place; the application refuses such a value at
-    startup, so no run that could compare the two mappings reaches this
-    fallback.
+    application declares for it together with its ceiling. The process
+    environment is read first and then the environment file
+    :data:`ENV_FILE_VARIABLE` names, which are the two sources the
+    application's settings read, so both sides reach the same value. A
+    value either source names is held to
+    :func:`backend.app.core.db_contract.validate_bound`, so one the
+    application would refuse raises ``RuntimeError`` here rather than
+    being replaced by the default.
     """
-    default = BOUND_SETTINGS[name]
-    supplied = os.environ.get(name)
-    if supplied is None:
-        path = _env_file_path()
-        if path and os.path.isfile(path):
-            supplied = dotenv_values(path).get(name)
-    if supplied is None or not str(supplied).strip():
-        return default
+    default, ceiling = BOUND_SETTINGS[name]
     try:
-        return int(str(supplied).strip())
-    except ValueError:
-        return default
+        return db_contract.read_bound(
+            name,
+            default,
+            db_contract.DB_TIMEOUT_FLOOR_SECONDS,
+            ceiling,
+        )
+    except ValueError as refused:
+        raise _refuse(str(refused)) from None
 
 
 def session_options() -> str:
     """Return the libpq ``options`` string a connection is opened with.
 
-    The statement timeout is rendered in milliseconds, matching
-    :func:`backend.app.db.database.postgresql_session_options`.
+    The statement timeout is
+    :data:`STATEMENT_TIMEOUT_SETTING`, rendered in milliseconds. It bounds
+    one schema statement, so it is read from that setting rather than from
+    the request-path bound
+    :func:`backend.app.db.database.postgresql_session_options` renders.
     """
-    return POSTGRESQL_SESSION_OPTIONS_TEMPLATE.format(
-        statement_timeout_ms=(
-            _bound("DB_STATEMENT_TIMEOUT_SECONDS") * MILLISECONDS_PER_SECOND
-        )
-    )
+    return db_contract.session_options(_bound(STATEMENT_TIMEOUT_SETTING))
 
 
 def connect_args(url: str):
-    """Return the driver arguments the configured backend accepts.
-
-    The mapping is the one
-    :func:`backend.app.db.database._connect_args` builds for the same
-    URL; ``backend/tests/security/test_migration_revisions.py`` asserts
-    the two agree, so this environment reaches the database on the same
-    terms the application does without importing the application's
-    settings to get there. A PostgreSQL URL therefore carries the UTC
-    session and the server-side statement timeout, a bound on one
-    connection attempt, and a bound on how long an established socket may
-    hold unacknowledged data.
+    """Return driver arguments matching the application's database
+    connection bounds.
     """
-    if url.startswith(POSTGRESQL_SCHEMES):
-        return {
-            "options": session_options(),
-            "connect_timeout": _bound("DB_CONNECT_TIMEOUT_SECONDS"),
-            "tcp_user_timeout": (
-                _bound("DB_TCP_USER_TIMEOUT_SECONDS")
-                * MILLISECONDS_PER_SECOND
-            ),
-        }
-    if url.startswith(SQLITE_SCHEMES):
-        return dict(SQLITE_CONNECT_ARGS)
-    return {}
+    return db_contract.connect_args(
+        url,
+        _bound("DB_CONNECT_TIMEOUT_SECONDS"),
+        _bound(STATEMENT_TIMEOUT_SETTING),
+        _bound("DB_TCP_USER_TIMEOUT_SECONDS"),
+    )
 
 
 def _migration_engine(url: str):

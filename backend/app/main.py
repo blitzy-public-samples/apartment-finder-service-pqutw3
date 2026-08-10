@@ -1,79 +1,5 @@
-"""ASGI application assembly, middleware stack and error handling.
-
-This module builds the application. The API router is mounted at the
-application root, so every route keeps the path its own router declares.
-
-Every request traverses the following layers, listed from the outermost
-inbound layer inwards:
-
-* a request identifier, taken from the inbound
-  :data:`REQUEST_ID_HEADER` when it carries one and generated otherwise,
-  bound for the duration of the request and returned on every response
-* protective response headers applied to every response
-* host validation against the configured host allowlist
-* cross-origin access limited to an explicit list of origins, methods
-  and request headers
-* the request rate limiter that the credential endpoints share,
-  evaluated here before any part of the request body is read
-* a cap on the size and on the chunk count of every request body,
-  whatever its content type, applied as the body streams rather than by
-  buffering it
-
-Cross-origin access sits outside the body-size cap and the host check so
-that the responses those two layers generate themselves -- ``413`` and
-``400`` -- carry the same cross-origin headers as any other response,
-and an allowed browser origin therefore sees the documented JSON rather
-than an opaque network failure.
-
-One response is produced outside every layer above: the catch-all
-handler for an error that reached no other handler runs in the server's
-outermost error layer, which no application middleware can wrap. That
-handler therefore sets both :data:`SECURITY_HEADERS` and, for an origin
-on the configured list, the same credentialed cross-origin headers the
-cross-origin layer would have set. No wildcard origin is ever emitted.
-
-The API router is then mounted at the application root, so every route
-keeps the path its own router declares. An unauthenticated liveness
-endpoint is exposed at ``/health``, and error handlers return bodies
-that carry no internal detail.
-
-A readiness endpoint is exposed at :data:`READINESS_PATH`. It reads the
-database, and the work it may perform is bounded four ways: the request
-is counted against ``settings.RATE_LIMIT_READINESS``, one outcome is
-reused for ``settings.READINESS_CACHE_SECONDS``, one caller at a time
-performs the read, and the read is bounded by
-``settings.READINESS_TIMEOUT_SECONDS``. A burst of probes during an
-outage therefore costs one bounded read per window and holds at most one
-connection.
-
-The request identifier is carried on every structured record emitted
-while the request is being served, including the records the outbound
-PayPal calls and the authorization decisions emit, so one transaction is
-joinable from the inbound rejection to the provider call it caused. It is
-also returned in the body of a ``500`` response as a support handle.
-
-A rejection already written to the audit trail by the code that raised it
-is marked, and :func:`http_exception_handler` leaves it at that one
-record rather than adding a second. A throttling decision and an error
-that reached no dedicated handler are each recorded once, the latter as
-the exception's type, defining module and redacted message rather than a
-traceback.
-
-The shared asynchronous HTTP client the PayPal integration issues its
-calls through is opened when the application starts and closed when it
-stops.
-The shared PayPal HTTP client is closed and the log queue is drained
-when the server stops.
-
-The database schema is owned by the Alembic revisions under
-``backend/migrations/versions``. This module issues no DDL, exposes no
-schema-creation entry point, and holds no engine or session factory of
-its own: a route that needs a session declares
-:func:`backend.app.db.database.get_db`.
-
-Usage::
-
-    uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+"""FastAPI application assembly, middleware, health checks, and
+exception handling.
 """
 
 import base64
@@ -779,26 +705,8 @@ def _message_allowance(max_body_bytes: int) -> int:
 
 
 class BodySizeLimitMiddleware:
-    """Rejects a request body above ``max_body_bytes`` with HTTP 413.
-
-    A size declared by ``content-length`` is checked before any body is
-    read. A request that declares no size, as a chunked request does, is
-    counted as the application streams it: each chunk is passed straight
-    through and only its length is retained, so the body is neither
-    buffered nor replayed here, and the memory this layer holds does not
-    follow the body's size. The number of body messages is bounded as
-    well as the byte total, so a body sent as an unlimited run of tiny or
-    empty chunks is refused too. ``max_messages`` defaults to the
-    allowance :func:`_message_allowance` derives from the byte cap, so the
-    application configures one setting rather than two.
-
-    The cap applies to every request on every route, whatever content
-    type the body carries. A size declared above the cap is answered
-    before the application is called at all. A streamed body that passes
-    a bound is refused as the chunk that passes it is read, by raising
-    the ``413`` that :func:`http_exception_handler` renders -- the one
-    exception type the framework re-raises out of its body-parsing step
-    rather than reporting as a malformed body.
+    """Reject request bodies that exceed configured byte or
+    message-count limits.
     """
 
     def __init__(
@@ -919,21 +827,7 @@ def _matched_endpoint(scope: Scope) -> Optional[Callable]:
 
 
 class RateLimitGateMiddleware:
-    """Counts a request against its rate limit before the body is read.
-
-    ``limiter`` holds the limits the credential endpoints declare. Those
-    limits are attached to the endpoint functions, and the limiter's own
-    middleware leaves a decorated endpoint to its decorator, which runs
-    after the framework has parsed the request body. This layer counts
-    the request at the transport boundary instead: the route is matched
-    from the scope, the limit is evaluated, and a request over its limit
-    is answered ``429`` without its body being read at all.
-
-    A request that passes is marked as counted, so the decorator on the
-    endpoint does not count it a second time. The mark is only applied
-    once the evaluation has recorded which limit applies, which is what
-    the decorator reads when it sets the rate-limit response headers.
-    """
+    """Evaluate endpoint rate limits before request-body parsing."""
 
     def __init__(self, app: ASGIApp, limiter: Limiter) -> None:
         self.app = app
@@ -1407,26 +1301,8 @@ def readiness_check(
     response: Response,
     db: Session = Depends(get_db),
 ) -> Dict[str, str]:
-    """Reports whether the database this process reads is reachable.
-
-    Answers ``503`` when the database did not answer. The body names the
-    outcome and nothing else, and a failure is recorded through the
-    redacting logger. A sink that failed to write a record is reported on
-    the same path, as a record rather than as a response field.
-
-    The work behind the answer is bounded four ways: the request is
-    counted against ``settings.RATE_LIMIT_READINESS`` at the transport
-    boundary, an outcome is reused for
-    ``settings.READINESS_CACHE_SECONDS`` without reading the database
-    again, only one caller at a time performs that read, and the read
-    itself is bounded by ``settings.READINESS_TIMEOUT_SECONDS``.
-
-    The handler is synchronous, so it runs on a worker thread rather than
-    the event loop, and every wait it can make is bounded by the engine's
-    connect, statement and socket timeouts in
-    :mod:`backend.app.db.database`. Each of those sits below the client
-    timeout a probe waits under, so a probe that gives up leaves no work
-    running on the worker behind it.
+    """Return bounded database readiness, reusing cached outcomes and
+    reporting degraded log sinks.
     """
     _report_degraded_sinks()
     if readiness_outcome(db):

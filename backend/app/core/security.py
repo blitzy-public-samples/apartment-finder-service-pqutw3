@@ -1,52 +1,7 @@
-"""Access token minting and verification, and password hashing.
+"""JWT issuance and verification plus bcrypt password operations."""
 
-Tokens are signed with the symmetric key held in
-:mod:`backend.app.core.config` and with :data:`SIGNING_ALGORITHM`, and
-verified against :data:`JWT_ALGORITHMS`. Both are fixed when this module
-is imported, so a later change to ``settings.JWT_ALGORITHMS`` alters
-neither. The algorithm named in a token header is never consulted, and
-every claim in :data:`REQUIRED_CLAIMS` must be present and must match the
-configured issuer and audience for a token to resolve to a user.
-
-No token may outlive :data:`MAX_TOKEN_LIFETIME`: a caller may ask for a
-shorter lifetime, and a longer or non-positive one is refused.
-
-The subject of a token is the user's integer identifier. The role claim
-a token carries is descriptive only: :func:`get_current_user` resolves
-the user from the stored row and copies no claim onto it. The claim is
-recorded on ``request.state`` under :data:`CLAIMED_ROLE_ATTRIBUTE`, where
-a refusal reads it to name the role the caller asserted alongside the
-role the row carries. Nothing reads it to decide anything, and
-:func:`claimed_role` is the only accessor.
-
-Passwords are hashed with bcrypt at the configured cost factor, in the
-format bcrypt already stores, and verification reports a mismatch
-rather than raising when a stored hash cannot be parsed.
-
-The stored cost factors this module compares against run from
-:data:`MIN_SUPPORTED_BCRYPT_COST` to :data:`MAX_SUPPORTED_BCRYPT_COST`.
-A stored hash declaring a cost outside that range is reported as a
-mismatch without being compared, and one record naming the cost is
-emitted.
-
-:func:`verify_credential` is the entry point every login path takes. It
-performs the same work whatever it is given, bounded by
-:data:`MIN_CREDENTIAL_CHECK_SECONDS`, which is measured against a decoy
-hash carried at :data:`MAX_SUPPORTED_BCRYPT_COST`.
-:data:`MIN_LOGIN_REFUSAL_SECONDS` extends that bound over the database
-work a login performs after the comparison, and
-:func:`equalize_login_refusal` applies it. Together they mean the time a
-refused login takes reveals neither whether an address holds an account,
-nor what cost factor that account's stored hash carries, nor which
-refusal branch answered it.
-
-Usage::
-
-    token = create_access_token({"sub": str(user.id), "role": user.role})
-    hashed = get_password_hash(password)
-    matched = verify_credential(password, user.hashed_password)
-"""
-
+import hashlib
+import hmac
 import secrets
 import time
 import uuid
@@ -57,10 +12,11 @@ import bcrypt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
+from backend.app.core import hashing
 from backend.app.core.config import settings
 from backend.app.core.logging import get_logger
 from backend.app.db.database import get_db
-from backend.app.db.models import User
+from backend.app.db.models import LOGIN_ATTEMPT_SLOT_COUNT, User
 
 __all__ = [
     "CLAIMED_ROLE_ATTRIBUTE",
@@ -80,6 +36,7 @@ __all__ = [
     "equalize_login_refusal",
     "get_current_user",
     "get_password_hash",
+    "login_attempt_slot",
     "oauth2_scheme",
     "stored_bcrypt_cost",
     "verify_credential",
@@ -232,12 +189,13 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def _hash_at(password: str, cost: int) -> str:
-    """Return a bcrypt hash of the password at ``cost``."""
-    hashed = bcrypt.hashpw(
-        password.encode("utf-8"),
-        bcrypt.gensalt(rounds=cost),
-    )
-    return hashed.decode("utf-8")
+    """Return a bcrypt hash of the password at ``cost``.
+
+    The hash is produced by
+    :func:`backend.app.core.hashing.hash_at`, which the administrative
+    credential command hashes through as well, so both write one format.
+    """
+    return hashing.hash_at(password, cost)
 
 
 def get_password_hash(password: str) -> str:
@@ -288,6 +246,28 @@ def _pad_until(started: float, budget: float) -> None:
         time.sleep(remaining)
 
 
+def login_attempt_slot(email: str) -> int:
+    """Return the throttling bucket ``email`` is counted in.
+
+    The bucket is the submitted address reduced to one of
+    :data:`backend.app.db.models.LOGIN_ATTEMPT_SLOT_COUNT` values, so a
+    refusal for any address -- one holding an account or not -- names a
+    row that already exists and can be locked and updated. The address is
+    lowercased and stripped first, so the same address always reaches the
+    same bucket however it was typed.
+
+    The digest is an HMAC under :data:`settings.SECRET_KEY`, so which
+    addresses share a bucket is not computable without the signing key.
+    The value is a bucket index and not a credential: it is one-way, it
+    is not stored alongside the address, and several addresses map to it.
+    """
+    normalized = email.strip().lower().encode("utf-8")
+    digest = hmac.new(
+        settings.SECRET_KEY.encode("utf-8"), normalized, hashlib.sha256
+    ).digest()
+    return int.from_bytes(digest, "big") % LOGIN_ATTEMPT_SLOT_COUNT
+
+
 def equalize_login_refusal(started: float) -> None:
     """Hold a refused login until its budget has elapsed.
 
@@ -304,23 +284,8 @@ def equalize_login_refusal(started: float) -> None:
 def verify_credential(
     plain_password: str, hashed_password: Optional[str]
 ) -> bool:
-    """Report whether the candidate matches ``hashed_password``.
-
-    This is the single credential-checking entry point every login path
-    takes, whether an account was found or not. ``hashed_password`` is
-    the stored hash, or ``None`` when there is no account to compare
-    with, in which case :data:`DECOY_HASH` stands in and the result is
-    ``False``.
-
-    Every call performs the same work: one comparison against the stored
-    or stand-in hash, then one comparison against :data:`DECOY_HASH` at
-    :data:`MAX_SUPPORTED_BCRYPT_COST`, and finally a wait until
-    :data:`MIN_CREDENTIAL_CHECK_SECONDS` have elapsed. A stored hash
-    carrying a cost factor below the supported ceiling does not complete
-    sooner than one that matched no account, and one carrying a cost above
-    it is refused without being compared rather than taking longer, so the
-    elapsed time reveals neither whether an address holds an account, nor
-    what cost that account's hash carries, nor whether it is locked.
+    """Compare a candidate with the stored or decoy hash under a fixed
+    two-comparison timing budget.
     """
     started = time.monotonic()
     candidate = hashed_password if hashed_password else DECOY_HASH

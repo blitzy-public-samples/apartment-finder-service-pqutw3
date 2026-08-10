@@ -1,116 +1,5 @@
-"""Shared fixtures for the backend test suite.
-
-This module is imported before any test module in ``backend/tests`` and
-in ``backend/tests/security``. It performs two bootstrap steps at import
-time and then publishes the fixtures the suite draws on.
-
-The bootstrap steps are:
-
-* the repository root is prepended to ``sys.path`` when it is absent
-  from it
-* every setting :class:`backend.app.core.config.Settings` declares is
-  assigned in the process environment from
-  :data:`backend.tests.support.TEST_SETTINGS`, after any variable
-  already carrying that name in any letter case has been removed, and
-  environment-file loading is switched off through
-  :data:`ENV_FILE_VARIABLE`, so neither an ambient value nor a file
-  contributes a setting. The replaced values are held in
-  :data:`REPLACED_ENVIRONMENT` and restored by
-  :func:`pytest_unconfigure`
-* the resolved configuration is measured against
-  :data:`ISOLATED_SETTINGS` and collection stops when any of them names
-  something other than the isolated value
-
-Both steps run at import time, so pytest started from the repository
-root and pytest started from ``backend`` reach the same state, and
-neither an ambient variable nor an environment file can alter it. The
-coverage of :data:`TEST_SETTINGS` is checked against the settings class
-once the application has been imported, so a setting added to that class
-without a value there stops the suite instead of silently reading one
-from elsewhere.
-
-The values and helpers the test modules share are published by
-:mod:`backend.tests.support`, which is imported under that one name
-here and in every module that needs one of them.
-
-The schema these fixtures build comes from ``Base.metadata``, and the
-rows come from the fixtures below. Alembic is not involved unless a
-fixture named below runs a revision, so the administrator seeded by
-revision ``0002`` is not the account :func:`admin_user` returns, and a
-test asserting on :func:`admin_user` says nothing about that revision.
-
-The fixtures published are:
-
-* :func:`session_factory` and :func:`db` -- an isolated in-memory
-  database whose schema is built from ``Base.metadata``, with foreign
-  keys enforced on every connection
-* :func:`client` and :func:`anonymous_client` -- a test client whose
-  request-scoped session comes from the same factory :func:`db` draws
-  on, so a request and the test that made it read one database through
-  two sessions
-* :func:`guest_user`, :func:`registered_user`, :func:`premium_user`,
-  :func:`admin_user` and :func:`second_registered_user` -- one stored
-  row per role, plus a second row at :data:`Role.REGISTERED`
-* :func:`token_factory` and :func:`auth_header_factory` -- valid access
-  tokens and the header that carries them
-* :func:`forged_token_factory` -- a valid reference token and the
-  deliberately defective tokens that must fail verification
-* :func:`login_json` and :func:`reset_rate_limits` -- the credential
-  endpoint and the counters it is throttled by
-* :func:`fresh_rate_limit_storage` -- an autouse fixture clearing those
-  counters around every test in the suite
-* :func:`fresh_readiness_outcome` -- an autouse fixture discarding the
-  readiness route's recorded outcome around every test in the suite
-* :func:`migration_connection`, :func:`alembic_config`,
-  :func:`migrated_client` and :func:`pre_revision_schema` -- an empty
-  isolated database, the Alembic configuration bound to it, a test client
-  whose schema the revisions built, and the schema preceding revision
-  0001
-* :func:`admin_seed_revision` and :func:`run_admin_seed` -- the
-  administrative-grant migration and a callable that runs it on the
-  isolated database
-* :func:`postgres_url`, :func:`postgres_engine`,
-  :func:`postgres_migration_connection` and
-  :func:`postgres_legacy_schema` -- the PostgreSQL database the cases in
-  ``backend/tests/integration`` run against, an engine and an open
-  connection on it, and the pre-revision schema issued in that dialect.
-  The database is named by ``POSTGRES_TEST_DATABASE_URL``; a case
-  requesting any of these fixtures is skipped while that variable names
-  nothing, so the rest of the suite is unaffected by its absence
-* :func:`postgres_base_url`, :func:`postgres_schema`,
-  :func:`postgres_url`, :func:`postgres_engine`,
-  :func:`postgres_mapped_engine`, :func:`postgres_session_factory`,
-  :func:`postgres_db`, :func:`postgres_client`,
-  :func:`postgres_observer`, :func:`postgres_alembic_config` and
-  :func:`postgres_migration_connection` -- the same surfaces on a real
-  PostgreSQL 13 server, in a schema created for one case and dropped
-  after it
-
-The SQLite fixtures and the PostgreSQL ones answer different questions.
-SQLite is what the functional cases run on: it is fast, needs no server
-and holds its database in this process. PostgreSQL is the deployed
-dialect, and the cases that use it are the ones whose subject only
-exists there -- a row lock two transactions contend for, a unique index
-one transaction waits on while another holds it uncommitted, and the
-exact type, precision, nullability and server default a revision
-installs. Those cases are marked ``postgres``, take their server from
-``POSTGRES_TEST_URL``, skip when it names none, and fail instead of
-skipping when ``REQUIRE_POSTGRES_TESTS`` is set.
-
-Usage::
-
-    def test_a_page_is_public(anonymous_client):
-        assert anonymous_client.get("/listings/").status_code == 200
-
-    def test_a_write_needs_an_administrator(
-        client, auth_header_factory, registered_user
-    ):
-        response = client.post(
-            "/listings/",
-            json={"rent": 1000.0},
-            headers=auth_header_factory(registered_user),
-        )
-        assert response.status_code == 403
+"""Shared isolated database, client, token, and migration fixtures for
+backend tests.
 """
 
 import asyncio
@@ -139,24 +28,14 @@ from backend.tests.support import (  # noqa: E402
     enforce_sqlite_foreign_keys,
 )
 
-#: Environment variable :mod:`backend.app.core.config` reads the
-#: environment file path from. It is set to an empty value below, so the
-#: repository's own file contributes no setting.
 ENV_FILE_VARIABLE = "ENV_FILE"
 
-#: Value each of those names carried before this module replaced it, or
-#: ``None`` where the name was absent. :func:`pytest_unconfigure` and
-#: :func:`restored_process_environment` restore them when the session
-#: ends.
 REPLACED_ENVIRONMENT = dict(
     (_name, os.environ.get(_name)) for _name in TEST_SETTINGS
 )
 
-#: The same recording, under the name the isolation cases read it by.
 PRIOR_ENVIRONMENT = REPLACED_ENVIRONMENT
 
-#: Value :data:`ENV_FILE_VARIABLE` carried before this module cleared
-#: it, or ``None`` where it was absent.
 REPLACED_ENV_FILE = os.environ.get(ENV_FILE_VARIABLE)
 
 os.environ[ENV_FILE_VARIABLE] = ""
@@ -221,6 +100,7 @@ from backend.app.core.security import (  # noqa: E402
     create_access_token,
     get_password_hash,
 )
+from backend.app.db import database as database_module  # noqa: E402
 from backend.app.db.database import get_db  # noqa: E402
 from backend.app.db.models import (  # noqa: E402
     Base,
@@ -233,13 +113,10 @@ from backend.app.main import (  # noqa: E402
     reset_readiness_cache,
 )
 
-#: Names the settings class and :data:`TEST_SETTINGS` disagree on.
 _SETTINGS_COVERAGE_GAP = sorted(
     set(type(settings).__fields__) ^ set(TEST_SETTINGS)
 )
 
-#: Settings whose resolved value must equal the isolated one before any
-#: test runs.
 ISOLATED_SETTINGS = (
     "ENVIRONMENT",
     "DATABASE_URL",
@@ -249,14 +126,11 @@ ISOLATED_SETTINGS = (
     "PAYPAL_API_BASE",
 )
 
-#: Reported when a resolved setting is not the isolated one.
 UNISOLATED_SETTING_MESSAGE = (
     "the test suite refuses to run against a setting it did not place "
     "in the process environment"
 )
 
-#: Reported when the limiter counters are not held in this process
-#: alone.
 SHARED_LIMITER_MESSAGE = (
     "the test suite refuses to clear rate-limit counters held outside "
     "this process"
@@ -293,8 +167,6 @@ def _refuse_unisolated_configuration() -> None:
 
 _refuse_unisolated_configuration()
 
-#: Whether the limiter counters live in this process alone, measured
-#: once from the configuration the limiter was built against.
 LIMITER_IS_IN_PROCESS = (
     rate_limit_storage_scheme(settings.RATE_LIMIT_STORAGE_URI)
     in IN_PROCESS_RATE_LIMIT_SCHEMES
@@ -322,51 +194,26 @@ assert set(ROLE_EMAILS) == set(
     role.value for role in Role
 ), "ROLE_EMAILS must name every role the Role model defines"
 
-#: Order identifier carried by the subscription that entitles
-#: :func:`premium_user`. The column is unique, and one such row exists
-#: per test database.
 PREMIUM_ENTITLEMENT_ORDER_ID = "ORDER-PREMIUM-ENTITLEMENT"
 
-#: Subject :class:`ForgedTokenFactory` mints when none is given.
 DEFAULT_FORGED_SUBJECT = "1"
 
-#: Lifetime a forged token receives when its expiry is not displaced.
 FORGED_TOKEN_LIFETIME = timedelta(minutes=5)
 
-#: Interval by which :class:`ForgedTokenFactory` displaces a timestamp
-#: it is placing outside the window of validity.
 FORGED_TOKEN_SKEW = timedelta(minutes=30)
 
-#: Algorithms tried, in order, when a token must be signed with one the
-#: configuration does not accept.
 UNLISTED_ALGORITHM_CANDIDATES = ("HS512", "HS384", "HS256")
 
-#: Absolute path of the Alembic configuration the migration fixtures
-#: read.
 ALEMBIC_INI = REPO_ROOT / "backend" / "alembic.ini"
 
-#: Database the migration fixtures apply the revisions to. It is held in
-#: memory by a single connection and outlives no test.
 MIGRATION_DATABASE_URL = "sqlite://"
 
-#: Additional environment variable names accepted for the PostgreSQL
-#: integration server, beside :data:`POSTGRES_URL_VARIABLE`. Both spellings
-#: are honoured because both are set by continuous-integration jobs, and a
-#: job that names the server under either one must reach it rather than
-#: silently skipping every case that needs it.
 POSTGRES_URL_VARIABLE_ALIASES = ("POSTGRES_TEST_DATABASE_URL",)
 
-#: Additional environment variable names accepted for requiring the server,
-#: beside :data:`POSTGRES_REQUIRED_VARIABLE`.
 POSTGRES_REQUIRED_VARIABLE_ALIASES = ("POSTGRES_TEST_REQUIRED",)
 
-#: Value the required-variable names carry to require a database.
 POSTGRES_REQUIRED_VALUE = "true"
 
-#: The six tables the application carried before revision 0001. Each is
-#: written without the columns, uniqueness constraints and table that
-#: revision adds, so a revision applied over them exercises its
-#: alter-in-place path rather than its create path.
 PRE_REVISION_TABLES = (
     "CREATE TABLE users ("
     " id INTEGER NOT NULL PRIMARY KEY,"
@@ -416,7 +263,6 @@ PRE_REVISION_TABLES = (
     ")",
 )
 
-#: Path of the revision that grants the administrative role.
 ADMIN_SEED_REVISION_PATH = (
     REPO_ROOT
     / "backend"
@@ -425,14 +271,10 @@ ADMIN_SEED_REVISION_PATH = (
     / "0002_seed_single_admin.py"
 )
 
-#: Name the revision is loaded under by :func:`admin_seed_revision`. It
-#: sits outside every package in the repository, so the load adds no
-#: importable module to ``backend``.
 ADMIN_SEED_MODULE_NAME = "blitzy_admin_seed_revision_0002"
 
 
 def pytest_unconfigure(config: Any) -> None:
-    """Restore the environment values this module replaced."""
     replaced = dict(REPLACED_ENVIRONMENT)
     replaced[ENV_FILE_VARIABLE] = REPLACED_ENV_FILE
     for name, value in replaced.items():
@@ -442,73 +284,44 @@ def pytest_unconfigure(config: Any) -> None:
             os.environ[name] = value
 
 
-# ---------------------------------------------------------------------
-# The outbound PayPal wire contract. Every provider stand-in in the suite
-# validates the request it is handed through
-# :func:`assert_paypal_contract` before it serves a response, so a call
-# that departs from the contract fails the case that made it instead of
-# receiving a plausible answer.
-# ---------------------------------------------------------------------
-
-#: Path of PayPal's credential-exchange endpoint.
 PAYPAL_OAUTH_PATH = "/v1/oauth2/token"
 
-#: Path of PayPal's orders collection.
 PAYPAL_ORDERS_PATH = "/v2/checkout/orders"
 
-#: Suffix appended to an order's path to settle it.
 PAYPAL_CAPTURE_SUFFIX = "/capture"
 
-#: Path of PayPal's signature verifier.
 PAYPAL_VERIFY_PATH = "/v1/notifications/verify-webhook-signature"
 
-#: Grant the credential exchange requests.
 PAYPAL_GRANT_TYPE = "client_credentials"
 
-#: Header the settle call carries its representation preference in.
 PAYPAL_PREFER_HEADER = "Prefer"
 
-#: Field of the verifier document that carries the notification, which
-#: the document must carry as its final member so the notification can be
-#: taken back out of the transmitted bytes without decoding them.
 PAYPAL_VERIFY_EVENT_FIELD = "webhook_event"
 
-#: Intent the created order declares, and no other.
 PAYPAL_ORDER_INTENT = "CAPTURE"
 
-#: Description the created order's single purchase unit carries.
 PAYPAL_ORDER_DESCRIPTION = "Subscription Payment"
 
-#: Fields the created order carries at its top level, and no others.
 PAYPAL_ORDER_FIELDS = frozenset(
     {"intent", "purchase_units", "payment_source"}
 )
 
-#: Fields the single purchase unit carries, and no others.
 PAYPAL_PURCHASE_UNIT_FIELDS = frozenset({"amount", "description"})
 
-#: Fields the purchase unit's amount carries, and no others.
 PAYPAL_AMOUNT_FIELDS = frozenset({"currency_code", "value"})
 
-#: Payer experience context values the created order must carry.
 PAYPAL_EXPERIENCE_VALUES = {
     "user_action": "PAY_NOW",
     "shipping_preference": "NO_SHIPPING",
     "payment_method_preference": "IMMEDIATE_PAYMENT_REQUIRED",
 }
 
-#: Redirect targets the experience context carries. Their values are the
-#: caller's, so they are required to be absolute targets rather than
-#: compared against a fixed value.
 PAYPAL_REDIRECT_FIELDS = ("return_url", "cancel_url")
 
-#: Fields the experience context carries, and no others.
 PAYPAL_EXPERIENCE_FIELDS = frozenset(
     set(PAYPAL_EXPERIENCE_VALUES) | set(PAYPAL_REDIRECT_FIELDS)
 )
 
-#: Every amount and currency pair the plan catalog publishes. A created
-#: order carrying any other pair is a price this service does not sell.
 PAYPAL_CATALOG_PRICES = frozenset(
     (
         format_amount(get_plan(plan_id).amount),
@@ -517,10 +330,8 @@ PAYPAL_CATALOG_PRICES = frozenset(
     for plan_id in PLAN_IDS
 )
 
-#: Body the settle call sends, and no other.
 PAYPAL_CAPTURE_BODY = {}
 
-#: Fields the verifier document carries, and no others.
 PAYPAL_VERIFY_FIELDS = frozenset(
     {
         "auth_algo",
@@ -533,7 +344,6 @@ PAYPAL_VERIFY_FIELDS = frozenset(
     }
 )
 
-#: Route name returned for each recognised request.
 PAYPAL_ROUTE_TOKEN = "token"
 PAYPAL_ROUTE_CREATE_ORDER = "create_order"
 PAYPAL_ROUTE_CAPTURE_ORDER = "capture_order"
@@ -542,11 +352,10 @@ PAYPAL_ROUTE_VERIFY = "verify_webhook_signature"
 
 
 class PayPalContractError(AssertionError):
-    """Raised for an outbound request outside the provider contract."""
+    pass
 
 
 def _header(headers: Any, name: str) -> Optional[str]:
-    """Return one header value, matched without regard to case."""
     if not headers:
         return None
     for key, value in dict(headers).items():
@@ -556,7 +365,6 @@ def _header(headers: Any, name: str) -> Optional[str]:
 
 
 def _refuse(detail: str, method: Any, url: Any) -> None:
-    """Raise :class:`PayPalContractError` naming the request refused."""
     raise PayPalContractError(
         "{0}: {1} {2}".format(detail, method, url)
     )
@@ -587,7 +395,6 @@ def _assert_paypal_timeout(timeout: Any, method: Any, url: Any) -> None:
 
 
 def _paypal_route(path: str, method: str, url: Any) -> str:
-    """Return the contract route ``path`` addresses."""
     if path == PAYPAL_OAUTH_PATH:
         return PAYPAL_ROUTE_TOKEN
     if path == PAYPAL_VERIFY_PATH:
@@ -629,7 +436,6 @@ def _decoded_body(
 def _assert_absolute_target(
     value: Any, field: str, method: Any, url: Any
 ) -> None:
-    """Assert one redirect target is an absolute address."""
     if not isinstance(value, str) or not value.strip():
         _refuse(
             "experience context {0} is {1!r}".format(field, value),
@@ -649,7 +455,6 @@ def _assert_absolute_target(
 def _assert_experience_context(
     context: Any, method: Any, url: Any
 ) -> None:
-    """Assert the payer experience context field by field."""
     if not isinstance(context, dict):
         _refuse("order carries no experience context", method, url)
         return
@@ -675,7 +480,6 @@ def _assert_experience_context(
 
 
 def _assert_purchase_unit(unit: Any, method: Any, url: Any) -> None:
-    """Assert the single purchase unit, including its catalog price."""
     if not isinstance(unit, dict):
         _refuse("purchase unit is not an object", method, url)
         return
@@ -1092,19 +896,16 @@ def _as_tuple(
 
 
 def _epoch(value: Any) -> Any:
-    """Return ``value`` as a POSIX timestamp when it is a datetime."""
     if isinstance(value, datetime):
         return int(value.timestamp())
     return value
 
 
 def _b64url(raw: bytes) -> str:
-    """Return ``raw`` base64url-encoded with its padding removed."""
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 def _segment(payload: Dict[str, Any]) -> str:
-    """Return ``payload`` as one encoded, compact JSON token segment."""
     encoded = json.dumps(
         dict((name, _epoch(value)) for name, value in payload.items()),
         separators=(",", ":"),
@@ -1126,7 +927,6 @@ def _subject_of(principal: Any) -> str:
 
 
 def unlisted_algorithm() -> str:
-    """Return an algorithm name absent from the accepted algorithms."""
     for candidate in UNLISTED_ALGORITHM_CANDIDATES:
         if candidate not in JWT_ALGORITHMS:
             return candidate
@@ -1515,20 +1315,7 @@ def auth_header_factory(token_factory):
 
 
 class ForgedTokenFactory(object):
-    """Mints a valid reference token and defective tokens.
 
-    :meth:`forge` is the single point every signed token is built at,
-    and each named method below is one call to it with the claims, key
-    or algorithm that produces its defect. Every method accepts further
-    keyword arguments that replace a claim, so ``sub=str(user.id)``
-    aims any forgery at a particular stored row, and any claim may be
-    displaced in combination with any other.
-
-    :meth:`valid` mints the one token here that must verify. It differs
-    from each forgery in that forgery's defect and in nothing else.
-    """
-
-    #: The claims a token must carry to be accepted.
     required_claims: Tuple[str, ...] = tuple(REQUIRED_CLAIMS)
 
     def __init__(self, subject: str = DEFAULT_FORGED_SUBJECT) -> None:
@@ -1583,7 +1370,6 @@ class ForgedTokenFactory(object):
         )
 
     def valid(self, **overrides: Any) -> str:
-        """Return a token that must verify."""
         return self.forge(**overrides)
 
     def unsigned(
@@ -1605,21 +1391,17 @@ class ForgedTokenFactory(object):
         return "{0}.{1}.".format(_segment(header), _segment(payload))
 
     def wrong_key(self, **overrides: Any) -> str:
-        """Return a token signed with :data:`FOREIGN_SIGNING_KEY`."""
         return self.forge(key=FOREIGN_SIGNING_KEY, **overrides)
 
     def wrong_audience(self, **overrides: Any) -> str:
-        """Return a token whose ``aud`` is not the configured one."""
         overrides.setdefault("aud", FOREIGN_AUDIENCE)
         return self.forge(**overrides)
 
     def wrong_issuer(self, **overrides: Any) -> str:
-        """Return a token whose ``iss`` is not the configured one."""
         overrides.setdefault("iss", FOREIGN_ISSUER)
         return self.forge(**overrides)
 
     def expired(self, **overrides: Any) -> str:
-        """Return a token whose validity ended before now."""
         issued = datetime.now(timezone.utc) - FORGED_TOKEN_SKEW
         claims = {
             "iat": issued,
@@ -1630,7 +1412,6 @@ class ForgedTokenFactory(object):
         return self.forge(**claims)
 
     def future_not_before(self, **overrides: Any) -> str:
-        """Return a token whose validity has not yet begun."""
         ahead = datetime.now(timezone.utc) + FORGED_TOKEN_SKEW
         claims = {
             "iat": ahead,
@@ -1641,7 +1422,6 @@ class ForgedTokenFactory(object):
         return self.forge(**claims)
 
     def without_claim(self, name: str, **overrides: Any) -> str:
-        """Return a token carrying every claim except ``name``."""
         return self.forge(drop=name, **overrides)
 
     def unlisted_algorithm(self, **overrides: Any) -> str:
@@ -1656,7 +1436,6 @@ class ForgedTokenFactory(object):
     def legacy_email_subject(
         self, email: str = None, **overrides: Any
     ) -> str:
-        """Return a token whose ``sub`` is an address, not an id."""
         address = (
             ROLE_EMAILS[Role.REGISTERED.value] if email is None else email
         )
@@ -1763,11 +1542,12 @@ def alembic_config():
 def migrated_client(migration_connection, alembic_config):
     """Yield a test client whose schema the revisions built.
 
-    Both revisions are applied to the isolated database before the client
-    is yielded, so the rows the client reads and writes include the
-    account revision 0002 leaves holding the administrative role. The
-    application's request-scoped session dependency is overridden for the
-    duration of the test and the overrides are cleared afterwards.
+    The whole revision chain is applied to the isolated database before the
+    client is yielded, so the rows the client reads and writes include the
+    account revision 0002 leaves holding the administrative role, and the
+    indexes revision 0003 creates are in place. The application's
+    request-scoped session dependency is overridden for the duration of the
+    test and the overrides are cleared afterwards.
     """
     command.upgrade(alembic_config(migration_connection), "head")
     factory = sessionmaker(
@@ -1811,85 +1591,41 @@ def pre_revision_schema():
     return create
 
 
-# ---------------------------------------------------------------------
-# PostgreSQL integration fixtures
-#
-# The fixtures above build their schema in memory with SQLite, which is
-# what makes the suite fast and independent. The ones below run against a
-# real PostgreSQL 13 server, which is the deployed dialect, and exist for
-# the properties SQLite cannot exhibit: a row lock two transactions
-# contend for, a unique index one transaction waits on while another
-# holds it uncommitted, and the exact type, precision, nullability and
-# server default the migration installs.
-#
-# The server is named by POSTGRES_TEST_URL. Each case receives a database
-# of its own, created before it and dropped after it, and every name
-# carries POSTGRES_DATABASE_PREFIX -- so the database the server was
-# named by is never the database a case reads or writes, and a case
-# cannot see another's objects. A database rather than a schema is the
-# unit of isolation because backend/app/db/database.py passes its own
-# libpq ``options`` for every PostgreSQL connection, which replaces any
-# search path a URL carries, so a revision run through the application's
-# own engine would resolve an unqualified name in the default schema.
-# ---------------------------------------------------------------------
-
-#: Environment variable naming the PostgreSQL server the integration
-#: fixtures connect to, as a SQLAlchemy URL. It is deliberately not
-#: ``settings.DATABASE_URL``: that name is isolated by this module and
-#: :func:`_refuse_unisolated_configuration` refuses to run against a
-#: value this module did not place, so an integration target is named
-#: separately and explicitly.
 POSTGRES_URL_VARIABLE = "POSTGRES_TEST_URL"
 
-#: Environment variable that turns an absent server from a skipped case
-#: into a failed one. The continuous-integration workflow sets it, so the
-#: gate there is real, while a developer without a server still gets a
-#: green run of everything else.
 POSTGRES_REQUIRED_VARIABLE = "REQUIRE_POSTGRES_TESTS"
 
-#: Values of :data:`POSTGRES_REQUIRED_VARIABLE` that require the server.
 POSTGRES_REQUIRED_VALUES = ("1", "true", "yes", "on")
 
-#: Reported when no server is named.
 POSTGRES_ABSENT_MESSAGE = (
     "no PostgreSQL server is named by " + POSTGRES_URL_VARIABLE
 )
 
-#: Reported when the named role cannot create a database.
 POSTGRES_NO_CREATEDB_MESSAGE = (
     "the role named by "
     + POSTGRES_URL_VARIABLE
     + " cannot create a database, so no case can be isolated in one"
 )
 
-#: Reported when the server or the privilege is missing and the run
-#: requires the production-dialect cases.
 POSTGRES_REQUIRED_SUFFIX = (
     ", and "
     + POSTGRES_REQUIRED_VARIABLE
     + " requires the production-dialect cases to run"
 )
 
-#: Schemes a PostgreSQL URL may carry.
 POSTGRES_SCHEMES = ("postgresql://", "postgresql+psycopg2://")
 
-#: Prefix every database created for a case carries. Nothing without it
-#: is ever created, written or dropped by these fixtures.
 POSTGRES_DATABASE_PREFIX = "blitzy_case_"
 
-#: Seconds an observer waits for a backend to be seen waiting on a lock.
 POSTGRES_WAIT_SECONDS = 30.0
 
-#: Seconds between two readings of the server's activity view.
 POSTGRES_POLL_SECONDS = 0.05
 
-#: Statement counting the backends of one database waiting on a lock.
 BLOCKED_BACKENDS = text(
     "SELECT count(*) FROM pg_stat_activity "
     "WHERE datname = :name AND wait_event_type = 'Lock'"
 )
 
-#: Statement reading whether the connected role may create a database.
 ROLE_MAY_CREATE_DATABASE = text(
     "SELECT rolcreatedb OR rolsuper FROM pg_roles "
     "WHERE rolname = current_user"
@@ -1915,7 +1651,6 @@ def postgres_url_from_environment() -> Optional[str]:
 
 
 def postgres_is_required() -> bool:
-    """Report whether an absent server must fail rather than skip."""
     for name in (
         POSTGRES_REQUIRED_VARIABLE,
     ) + POSTGRES_REQUIRED_VARIABLE_ALIASES:
@@ -1928,7 +1663,6 @@ def postgres_is_required() -> bool:
 
 
 def _withhold_postgres(reason: str) -> None:
-    """Skip the case, or fail it when the run requires the server."""
     if postgres_is_required():
         raise AssertionError(reason + POSTGRES_REQUIRED_SUFFIX)
     pytest.skip(reason)
@@ -2098,17 +1832,84 @@ def postgres_url(postgres_base_url, postgres_database) -> str:
     return _case_database_url(postgres_base_url, postgres_database)
 
 
+def production_connect_args(url, statement_timeout_seconds=None):
+    """Return the connect arguments the application opens ``url`` with.
+
+    The mapping is the one
+    :func:`backend.app.db.database._connect_args` builds, so a case using
+    it reaches the server under the same three bounds a deployed
+    connection carries: the libpq handshake bound, the server-side
+    statement bound and the socket bound. ``statement_timeout_seconds``
+    replaces the statement bound alone, which lets a case observe a
+    contended write being ended by the server inside the case.
+    """
+    arguments = dict(database_module._connect_args(url))
+    if statement_timeout_seconds is not None and "options" in arguments:
+        arguments["options"] = (
+            database_module.POSTGRESQL_SESSION_OPTIONS_TEMPLATE.format(
+                statement_timeout_ms=(
+                    int(statement_timeout_seconds)
+                    * database_module.MILLISECONDS_PER_SECOND
+                )
+            )
+        )
+    return arguments
+
+
+#: Statement bound, in seconds, a case carries when it needs the server
+#: to end a contended write while the case is still running. It is below
+#: the configured application bound rather than above it, so the
+#: cancellation the case observes is the one a deployed connection would
+#: reach later.
+POSTGRES_SHORT_STATEMENT_TIMEOUT_SECONDS = 1
+
+
 @pytest.fixture
 def postgres_engine(postgres_url, postgres_database):
     """Yield an engine on this case's database, pooling connections.
 
     The pool is the default one rather than a single shared connection,
     so two sessions drawn from it are two independent transactions on the
-    server and can contend with each other.
+    server and can contend with each other. The connect arguments are the
+    application's own, so a case contends under the same statement,
+    handshake and socket bounds a deployed connection carries.
     """
-    engine = create_engine(postgres_url, pool_pre_ping=True)
+    engine = create_engine(
+        postgres_url,
+        hide_parameters=True,
+        connect_args=production_connect_args(postgres_url),
+        pool_pre_ping=True,
+    )
     try:
         yield engine
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def postgres_short_timeout_session_factory(postgres_mapped_engine):
+    """Return a session factory whose statement bound is deliberately low.
+
+    The engine carries the application's connect arguments with the
+    statement bound replaced by
+    :data:`POSTGRES_SHORT_STATEMENT_TIMEOUT_SECONDS`, and it addresses the
+    database :func:`postgres_mapped_engine` built, so a session from this
+    factory contends with one from the ordinary factory over the same
+    rows.
+    """
+    url = str(postgres_mapped_engine.url.render_as_string(hide_password=False))
+    engine = create_engine(
+        url,
+        hide_parameters=True,
+        connect_args=production_connect_args(
+            url, POSTGRES_SHORT_STATEMENT_TIMEOUT_SECONDS
+        ),
+        pool_pre_ping=True,
+    )
+    try:
+        yield sessionmaker(
+            autocommit=False, autoflush=False, bind=engine
+        )
     finally:
         engine.dispose()
 
@@ -2185,7 +1986,6 @@ def postgres_observer(postgres_base_url, postgres_database):
     )
 
     def blocked(count: int = 1) -> bool:
-        """Report whether ``count`` backends are waiting on a lock."""
         deadline = time.monotonic() + POSTGRES_WAIT_SECONDS
         while time.monotonic() < deadline:
             waiting = connection.execute(

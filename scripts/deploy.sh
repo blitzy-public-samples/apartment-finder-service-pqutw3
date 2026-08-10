@@ -1,29 +1,9 @@
 #!/bin/bash
 #
-# Releases apartment-finder-service to Google Kubernetes Engine, and to
-# Cloud Functions once a release owner has authorized that step.
-#
-# The release inventory is fixed, and it is the same inventory
-# .github/workflows/cd.yml addresses: the Deployments named in
-# RELEASE_WORKLOADS below, each running one container of the same name,
-# in the namespace K8S_NAMESPACE names. This script creates neither
-# Deployment. It asserts that each one exists, carrying the container
-# name it addresses, before it changes anything.
-#
-# The schema is migrated from the newly built image before any workload
-# serves that image, and the release aborts unless the migration
-# succeeds, so no container starts against a schema it does not match.
-#
-# Every step is checked and the script stops at the first failure, so the
-# closing success message is printed only once all of them have
-# succeeded. The images, contexts and workload names below are the ones
-# infrastructure/docker/docker-compose.yml and
-# .github/workflows/cd.yml name, so both deployment paths act on the same
-# artefacts.
+# Release the verified images, run migrations, roll out the Kubernetes
+# workloads, and optionally deploy the Cloud Function.
 #
 # Run `scripts/deploy.sh --help` for every input and its accepted form.
-#
-# Design rationale is recorded in docs/security/DECISION_LOG.md.
 
 # Abort on any failing command, on any unset variable and on any failure
 # within a pipeline, and let the ERR trap below reach every function.
@@ -58,21 +38,36 @@ declare -A WORKLOAD_CONTEXT=(
 )
 readonly WORKLOAD_CONTEXT
 
-# Workload whose image carries the Alembic revisions. The container the
-# revisions run under and the configuration file they are applied with are
-# declared by infrastructure/kubernetes/60-migration-job.yaml, which this
-# script renders rather than restating: a second copy of either here could
-# disagree with the manifest the release actually applies.
-readonly MIGRATION_WORKLOAD="backend"
+# Build arguments per workload: the space-separated names each image's
+# definition declares with ARG and this script passes with --build-arg.
+# The backend declares none. The frontend declares two, and its bundler
+# inlines both into the published bundle, so both are public values and
+# neither is a credential. .github/workflows/cd.yml passes the same two.
+#
+# REACT_APP_PAYPAL_CLIENT_ID carries the same value as the PAYPAL_CLIENT_ID
+# render token below, so the bundle and the backend configuration name one
+# PayPal application. It is derived rather than supplied, so the two cannot
+# be set to different applications.
+declare -A WORKLOAD_BUILD_ARGUMENTS=(
+    ["backend"]=""
+    ["frontend"]="REACT_APP_API_BASE_URL REACT_APP_PAYPAL_CLIENT_ID"
+)
+readonly WORKLOAD_BUILD_ARGUMENTS
 
 # Cloud Function contract. Every value here matches
 # infrastructure/terraform/main.tf, which owns the function and its
 # invoker binding. CLOUD_FUNCTION_RUNTIME is pinned and is not advanced
 # here; see deploy_cloud_function below.
+#
+# The source object is deliberately not named here. Terraform names it
+# after the archive's content digest, so the name changes whenever the
+# bytes do and cannot be restated as a constant without the two drifting
+# apart. It arrives as CLOUD_FUNCTION_SOURCE_OBJECT with its digest in
+# CLOUD_FUNCTION_SOURCE_MD5, both read from that configuration's outputs
+# of the same names.
 readonly CLOUD_FUNCTION_NAME="apartment-finder-probe"
 readonly CLOUD_FUNCTION_ENTRY_POINT="hello_world"
 readonly CLOUD_FUNCTION_RUNTIME="python39"
-readonly CLOUD_FUNCTION_SOURCE_OBJECT="function-source.zip"
 readonly CLOUD_FUNCTION_SOURCE_BUCKET_SUFFIX="-static-assets"
 
 # Bounds every step of the release carries.
@@ -136,6 +131,15 @@ readonly REPOSITORY_PATTERN='^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'
 readonly IMAGE_TAG_PATTERN='^[A-Za-z0-9_][A-Za-z0-9._-]{0,126}$'
 readonly DIGEST_PATTERN='^sha256:[0-9a-f]{64}$'
 
+# Accepted form of the function's source object and of its digest. The
+# object name has to carry a 32-character hex content digest, which is what
+# makes it address the bytes rather than label a location that can be
+# overwritten. The digest is the base64 MD5 that gcloud reports as
+# md5_hash and that Terraform exposes as md5hash, so the two are compared
+# in one encoding without re-encoding either.
+readonly FUNCTION_OBJECT_PATTERN='^function-source-[0-9a-f]{32}\.zip$'
+readonly FUNCTION_MD5_PATTERN='^[A-Za-z0-9+/]{22}==$'
+
 # Inputs, each read from the environment and validated by read_inputs.
 GCP_PROJECT_ID="${GCP_PROJECT_ID:-}"
 GKE_CLUSTER="${GKE_CLUSTER:-}"
@@ -144,6 +148,8 @@ K8S_NAMESPACE="${K8S_NAMESPACE:-}"
 VERSION="${VERSION:-}"
 ARTIFACT_REGISTRY_REPOSITORY="${ARTIFACT_REGISTRY_REPOSITORY:-apartment-finder}"
 CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED="${CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED:-false}"
+CLOUD_FUNCTION_SOURCE_OBJECT="${CLOUD_FUNCTION_SOURCE_OBJECT:-}"
+CLOUD_FUNCTION_SOURCE_MD5="${CLOUD_FUNCTION_SOURCE_MD5:-}"
 
 # References built from the inputs by build_references.
 REGISTRY_HOST=""
@@ -173,6 +179,14 @@ Required:
   K8S_NAMESPACE    Namespace holding the frontend and backend Deployments.
   VERSION          Image tag for this release. It must name no image that
                    has already been published: a reused tag is refused.
+  REACT_APP_API_BASE_URL
+                   Address the browser bundle calls the API at. Inlined
+                   into the bundle at build time, so it is public.
+  PAYPAL_CLIENT_ID Browser client identifier for hosted checkout. Inlined
+                   into the bundle as REACT_APP_PAYPAL_CLIENT_ID and also
+                   rendered into the backend configuration, so one value
+                   names one PayPal application on both sides. The PayPal
+                   secret is never a build argument.
 
 Optional:
   ARTIFACT_REGISTRY_REPOSITORY   Artifact Registry Docker repository the
@@ -182,6 +196,14 @@ Optional:
                                  "true" runs the Cloud Function step.
                                  Default: false, which reports the step
                                  as blocked and performs it not at all.
+
+Required only when CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED is "true", and
+read from the Terraform outputs of the same names:
+  CLOUD_FUNCTION_SOURCE_OBJECT   Name of the source archive object, which
+                                 carries the archive's content digest.
+  CLOUD_FUNCTION_SOURCE_MD5      Base64 MD5 of that object. The digest in
+                                 the bucket must match it or the function
+                                 step refuses to deploy.
 
 Requires gcloud, kubectl, docker, jq and timeout on PATH, an active
 Google Cloud credential, and bash 4 or newer.
@@ -196,13 +218,6 @@ report_failure() {
     echo "Nothing after that line ran." >&2
 }
 
-# Reached only through the EXIT trap below, and only ever after
-# acquire_cluster_credentials has set KUBECONFIG_FILE, which is why the
-# reachability note is suppressed here rather than the guard being dropped.
-#
-# The migration runs as a Job this script renders, and the Job carries its own
-# deadline and retention, so there is no pod for this handler to remove. Only
-# the kubeconfig this run wrote is its to clean up.
 cleanup() {
     # shellcheck disable=SC2317
     if [ -n "${KUBECONFIG_FILE}" ] && [ -e "${KUBECONFIG_FILE}" ]; then
@@ -297,6 +312,58 @@ read_inputs() {
             exit 1
             ;;
     esac
+
+    # Required only when the function step runs, so a release that leaves
+    # the function alone needs neither value and cannot be blocked for
+    # want of an output that Terraform reports as null while the function
+    # is unauthorized.
+    if [ "${CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED}" = "true" ]; then
+        require_input CLOUD_FUNCTION_SOURCE_OBJECT \
+            "${FUNCTION_OBJECT_PATTERN}"
+        require_input CLOUD_FUNCTION_SOURCE_MD5 "${FUNCTION_MD5_PATTERN}"
+    fi
+
+    read_build_arguments
+}
+
+# Resolve the frontend build arguments and require each one to carry a
+# value. Both are inlined into the published bundle, so an empty one
+# produces an image that builds and then cannot reach the API or open
+# hosted checkout -- a failure that reaches an end user rather than this
+# script. docker accepts an empty --build-arg without complaint, so the
+# check has to happen here.
+read_build_arguments() {
+    local workload
+    local name
+    local value
+    local -a names
+
+    : "${REACT_APP_PAYPAL_CLIENT_ID:=${PAYPAL_CLIENT_ID-}}"
+
+    for workload in "${RELEASE_WORKLOADS[@]}"; do
+        # The names are read into an array through a quoted here-string, so
+        # the table is split on whitespace without any expansion being left
+        # unquoted, and a workload declaring none yields an empty array
+        # rather than one empty name.
+        names=()
+        read -r -a names <<< "${WORKLOAD_BUILD_ARGUMENTS[${workload}]}"
+        if [ "${#names[@]}" -eq 0 ]; then
+            continue
+        fi
+
+        for name in "${names[@]}"; do
+            value="${!name-}"
+            if [ -z "${value}" ]; then
+                echo "${name} is required to build the ${workload} image" \
+                    "and is not set." >&2
+                echo "Both frontend build values are public: set" \
+                    "REACT_APP_API_BASE_URL, and PAYPAL_CLIENT_ID for the" \
+                    "browser client identifier. The PayPal secret is" \
+                    "never a build argument." >&2
+                exit 1
+            fi
+        done
+    done
 }
 
 build_references() {
@@ -310,9 +377,14 @@ build_references() {
     EXPECTED_CONTEXT="gke_${GCP_PROJECT_ID}_${GKE_REGION}_${GKE_CLUSTER}"
     readonly EXPECTED_CONTEXT
 
-    FUNCTION_SOURCE="gs://${GCP_PROJECT_ID}"
-    FUNCTION_SOURCE="${FUNCTION_SOURCE}${CLOUD_FUNCTION_SOURCE_BUCKET_SUFFIX}"
-    FUNCTION_SOURCE="${FUNCTION_SOURCE}/${CLOUD_FUNCTION_SOURCE_OBJECT}"
+    # Left empty when no source object was named, which read_inputs allows
+    # only while the function step is not authorized and therefore never
+    # reads this value.
+    if [ -n "${CLOUD_FUNCTION_SOURCE_OBJECT}" ]; then
+        FUNCTION_SOURCE="gs://${GCP_PROJECT_ID}"
+        FUNCTION_SOURCE="${FUNCTION_SOURCE}${CLOUD_FUNCTION_SOURCE_BUCKET_SUFFIX}"
+        FUNCTION_SOURCE="${FUNCTION_SOURCE}/${CLOUD_FUNCTION_SOURCE_OBJECT}"
+    fi
     readonly FUNCTION_SOURCE
 
     export_render_tokens
@@ -454,6 +526,8 @@ publish_images() {
     local context
     local reference
     local digest
+    local name
+    local -a names
 
     gcloud auth configure-docker "${REGISTRY_HOST}" --quiet
 
@@ -473,8 +547,23 @@ publish_images() {
 
         reference="${IMAGE_PREFIX}/${workload}:${VERSION}"
 
+        # One --build-arg per name the image declares, carried in this
+        # function's own positional parameters so each flag and value is a
+        # separate word and a value holding whitespace reaches the build
+        # whole. The backend declares none, so its list stays empty and
+        # expands to nothing. read_build_arguments has already refused an
+        # empty value for every name passed here.
+        names=()
+        read -r -a names <<< "${WORKLOAD_BUILD_ARGUMENTS[${workload}]}"
+        set --
+        if [ "${#names[@]}" -gt 0 ]; then
+            for name in "${names[@]}"; do
+                set -- "$@" --build-arg "${name}=${!name}"
+            done
+        fi
+
         timeout "${COMMAND_TIMEOUT_SECONDS}" docker build \
-            --file "${dockerfile}" --tag "${reference}" "${context}"
+            --file "${dockerfile}" "$@" --tag "${reference}" "${context}"
         timeout "${COMMAND_TIMEOUT_SECONDS}" docker push "${reference}"
 
         # The registry is asked for the digest it stored, so the rollout
@@ -507,15 +596,17 @@ publish_images() {
 apply_database_migrations() {
     echo "Applying database migrations..."
 
-    # One name per release, matching metadata.name of
-    # infrastructure/kubernetes/60-migration-job.yaml, which renders
-    # backend-migrate-${IMAGE_TAG} and which export_render_tokens sets
-    # IMAGE_TAG to VERSION for.
-    local job_name="${MIGRATION_WORKLOAD}-migrate-${VERSION}"
+    local job_name
 
     # Refreshed so the rendered Job carries the digest this run published
     # rather than the tag it was pushed under.
     export_render_tokens
+
+    # One name per release, read from the renderer that renders the Job, so
+    # the object applied is the object waited on. The renderer folds the tag
+    # to the alphabet and length a Kubernetes object name accepts, which a
+    # name assembled here would not.
+    job_name="$("${RENDER}" job-name migration)"
 
     "${RENDER}" migration | kubectl apply --namespace="${K8S_NAMESPACE}" --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" -f -
 
@@ -536,13 +627,8 @@ apply_database_migrations() {
     echo "The schema is at the head revision."
 }
 
-# Waits for the rollout deploy_workloads started. It issues no image
-# mutation of its own: an in-place image edit changes one field of whatever
-# the cluster happens to hold and leaves every other property as it was
-# found, so a workload whose probes, resources or security context were
-# never applied would keep not having them. The rendered manifests carry
-# this release's digests, so applying them is the rollout and this only
-# waits for it to land.
+# Wait for the manifest-driven rollout; this function does not mutate
+# images.
 await_rollout() {
     echo "Waiting for the rollout to land..."
 
@@ -631,10 +717,8 @@ deploy_cloud_function() {
 
     echo "Deploying ${CLOUD_FUNCTION_NAME}..."
 
-    # The source is an address rather than a path, and gcloud reports a
-    # malformed one only after it has begun the deployment. The form is
-    # checked here so that a value that cannot name an object is refused
-    # before anything is created.
+    # Validate the Cloud Function source URI and object before
+    # deployment.
     case "${FUNCTION_SOURCE}" in
         gs://*/*) ;;
         *)
@@ -644,19 +728,34 @@ deploy_cloud_function() {
             ;;
     esac
 
-    # And the object it names has to exist. Deploying from an absent
-    # archive fails after the function has been created, leaving a
-    # function with no source behind; asking first fails while nothing
-    # has changed.
-    if ! timeout "${COMMAND_TIMEOUT_SECONDS}" \
+    # And it has to be the archive Terraform published rather than merely
+    # an object answering to that name. Reading it first also fails while
+    # nothing has changed: deploying from an absent archive fails after
+    # the function has been created, leaving a function with no source.
+    local published
+    if ! published="$(timeout "${COMMAND_TIMEOUT_SECONDS}" \
         gcloud storage objects describe "${FUNCTION_SOURCE}" \
         --project="${GCP_PROJECT_ID}" \
         --quiet \
-        --format="value(name)" > /dev/null; then
+        --format="value(md5_hash)")"; then
         echo "The function source ${FUNCTION_SOURCE} does not exist," \
             "or this account cannot read it." >&2
         echo "Terraform provisions it; apply the configuration in" \
             "infrastructure/terraform first." >&2
+        exit 1
+    fi
+
+    # The digest is compared, not just the name, so an object replaced in
+    # the bucket after the apply is refused instead of deployed. Both
+    # values are the same base64 MD5, so neither is re-encoded here.
+    published="${published//[[:space:]]/}"
+    if [ "${published}" != "${CLOUD_FUNCTION_SOURCE_MD5}" ]; then
+        echo "The function source ${FUNCTION_SOURCE} carries digest" \
+            "\"${published}\" and CLOUD_FUNCTION_SOURCE_MD5 names" \
+            "\"${CLOUD_FUNCTION_SOURCE_MD5}\"." >&2
+        echo "That object is not the archive Terraform published. Re-read" \
+            "the cloud_function_source_object and" \
+            "cloud_function_source_md5 outputs, and do not deploy it." >&2
         exit 1
     fi
 
@@ -692,17 +791,13 @@ deploy_cloud_function() {
 
     echo "Cloud Function ${CLOUD_FUNCTION_NAME} is ${status}"
 
-    # The effective invoker policy is read back rather than inferred from
-    # the flags above, because a binding added outside this script would not
-    # show up in them.
+    # The effective invoker policy is read back from the deployed function.
+    # It reports every binding, including one added outside this script.
     local effective_members
     local public_principal
 
-    # Omission is not revocation. Deploying a function does not change an
-    # existing function's authentication status, so a public grant made by
-    # an earlier deployment outlives --no-allow-unauthenticated above. Each
-    # public principal is therefore removed explicitly, tolerating the
-    # "binding not found" case, before the effective policy is read back.
+    # Revoke public invokers explicitly and verify the effective policy
+    # after deployment.
     for public_principal in "allUsers" "allAuthenticatedUsers"; do
         timeout "${COMMAND_TIMEOUT_SECONDS}" \
             gcloud functions remove-iam-policy-binding \
@@ -756,7 +851,7 @@ apply_prerequisites() {
 # exactly one account holds the administrative role before committing.
 # docs/security/CREDENTIAL_ROTATION.md records when to run it.
 provision_admin_credential() {
-    local job_name="backend-admin-credential-${VERSION}"
+    local job_name
 
     if [ "${PROVISION_ADMIN_CREDENTIAL:-false}" != "true" ]; then
         echo "Skipping administrator credential provisioning; set" \
@@ -766,6 +861,29 @@ provision_admin_credential() {
 
     echo "Provisioning the administrator credential..."
     export ADMIN_CREDENTIAL_RESET="${ADMIN_CREDENTIAL_RESET:-false}"
+
+    # The name the rendered Job carries, read from the renderer that renders
+    # it, so the object applied is the object waited on.
+    job_name="$("${RENDER}" job-name admin-credential)"
+
+    # A completed Job is retained by ttlSecondsAfterFinished and a Job's pod
+    # template cannot be changed in place, so a reset on a release that has
+    # already provisioned would be refused. Any previous run of this name is
+    # removed first and its removal confirmed, so the apply below creates
+    # the object it then waits on.
+    if kubectl --namespace="${K8S_NAMESPACE}" get "job/${job_name}" \
+        --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" >/dev/null 2>&1; then
+        kubectl --namespace="${K8S_NAMESPACE}" delete "job/${job_name}" \
+            --wait=true --timeout="${MIGRATION_TIMEOUT}" \
+            --request-timeout="${KUBECTL_REQUEST_TIMEOUT}"
+    fi
+    if kubectl --namespace="${K8S_NAMESPACE}" get "job/${job_name}" \
+        --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" >/dev/null 2>&1; then
+        echo "${job_name} still exists after deletion; it was not" \
+            "recreated." >&2
+        exit 1
+    fi
+
     "${RENDER}" admin-credential | kubectl apply --namespace="${K8S_NAMESPACE}" --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" -f -
 
     if ! kubectl --namespace="${K8S_NAMESPACE}" wait "job/${job_name}" \

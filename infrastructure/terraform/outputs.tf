@@ -138,11 +138,28 @@ output "cloud_function_name" {
 }
 
 output "cloud_function_source_archive" {
-  description = "The gs:// address of the source archive the Cloud Function is built from. scripts/deploy.sh reads the same value from CLOUD_FUNCTION_SOURCE_ARCHIVE"
+  description = "The gs:// address of the source archive the Cloud Function is built from, as one string for an operator reading the plan. scripts/deploy.sh does not read this output: it takes the object name and its digest separately, from cloud_function_source_object and cloud_function_source_md5, so that it can compare the digest of the object it is about to deploy against the one Terraform packaged"
   value = one([
     for f in google_cloudfunctions_function.function :
     "gs://${f.source_archive_bucket}/${f.source_archive_object}"
   ])
+}
+
+# The identity of the one source object this configuration publishes, in the
+# two parts scripts/deploy.sh needs to deploy the same bytes Terraform
+# packaged rather than whatever currently answers to a name. The object name
+# carries the content digest, so it is itself content-addressed; the digest
+# below is the same base64 MD5 that `gcloud storage objects describe` reports
+# as md5_hash, so the script compares like with like and needs no re-encoding.
+# Both are null while var.cloud_function_deployment_authorized is false.
+output "cloud_function_source_object" {
+  description = "The name of the source archive object inside google_storage_bucket.static_assets, carrying the archive's content digest. scripts/deploy.sh reads the same value from CLOUD_FUNCTION_SOURCE_OBJECT"
+  value       = one(google_storage_bucket_object.function_source[*].name)
+}
+
+output "cloud_function_source_md5" {
+  description = "The base64 MD5 of the source archive object, in the encoding gcloud reports as md5_hash. scripts/deploy.sh reads the same value from CLOUD_FUNCTION_SOURCE_MD5 and refuses to deploy an object whose digest differs"
+  value       = one(google_storage_bucket_object.function_source[*].md5hash)
 }
 
 output "backend_workload_service_account_email" {
@@ -228,12 +245,11 @@ output "managed_secret_names" {
 }
 
 # The two identities the cluster's workloads assume. These are the values a
-# Kubernetes service account is annotated with, so they are published: the
-# annotation is the last step of the secret delivery path and it is applied
-# against the cluster rather than by this configuration. An email addresses
-# an identity and carries no credential, so nothing sensitive is emitted --
-# and no output here reads a secret value, which is why the secret versions
-# are written through write-only arguments and published nowhere.
+# Kubernetes service account is annotated with, and the annotation is the
+# last step of the secret delivery path, applied against the cluster rather
+# than by this configuration. An email addresses an identity and carries no
+# credential. No output in this file reads a secret value; the secret
+# versions are written through write-only arguments and published nowhere.
 output "workload_service_account_emails" {
   description = "The email of each workload identity, keyed by the Kubernetes service account that may act as it. Annotate each Kubernetes service account with iam.gke.io/gcp-service-account set to the matching value"
   value = {
@@ -265,9 +281,26 @@ output "secret_names" {
   value       = local.backend_secret_ids
 }
 
+# Derived from the bindings themselves rather than from a list of principals,
+# so this cannot report a grant that was not made. Each entry is one secret
+# and the one identity allowed to read it: the backend runtime identity holds
+# all six, the migration identity holds the connection string alone, and the
+# provisioning identity holds the two its job declares.
 output "secret_accessor_bindings" {
   description = "The secret-and-principal pairs granted roles/secretmanager.secretAccessor. A setting whose secret appears in secret_names but in no pair here is a secret no workload can read"
-  value       = sort(keys(local.secret_accessor_bindings))
+  value = sort(concat(
+    [
+      for binding in google_secret_manager_secret_iam_member.backend_workload :
+      "${binding.secret_id}:${binding.member}"
+    ],
+    [
+      "${google_secret_manager_secret_iam_member.backend_migrate.secret_id}:${google_secret_manager_secret_iam_member.backend_migrate.member}"
+    ],
+    [
+      for binding in google_secret_manager_secret_iam_member.admin_provisioner :
+      "${binding.secret_id}:${binding.member}"
+    ],
+  ))
 }
 
 output "cloud_function_runtime_service_account_email" {

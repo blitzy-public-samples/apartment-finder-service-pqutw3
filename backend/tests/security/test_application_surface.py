@@ -1242,9 +1242,12 @@ class TestIngestionFailureRecord:
                 % (PII_ADDRESS, PII_STREET)
             ),
         ):
-            asyncio.get_event_loop().run_until_complete(
-                listing_updater.update_listings()
-            )
+            # The pass re-raises after rolling back, so the failure is
+            # awaited here rather than being absorbed by the task.
+            with pytest.raises(RuntimeError):
+                asyncio.get_event_loop().run_until_complete(
+                    listing_updater.update_listings()
+                )
 
         errors = [
             record

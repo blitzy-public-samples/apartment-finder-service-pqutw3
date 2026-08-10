@@ -27,6 +27,9 @@ It publishes:
   :func:`migration_records_reach` -- the logger namespace the migration
   revisions record on, and the attachment that lets a capture handler
   read those records
+* :data:`ALEMBIC_INI`, :data:`REVISION_IDS` and :data:`REVISION_COUNT` --
+  the Alembic configuration the revision chain is declared in, the
+  revisions that chain carries, and how many reversal steps it takes
 
 Usage::
 
@@ -37,8 +40,10 @@ import contextlib
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Tuple
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import event
 
 #: Absolute path of the repository root, two directories above this
@@ -55,6 +60,7 @@ TEST_SETTINGS: Dict[str, str] = {
     "DATABASE_URL": "sqlite://",
     "DB_CONNECT_TIMEOUT_SECONDS": "3",
     "DB_STATEMENT_TIMEOUT_SECONDS": "3",
+    "DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS": "600",
     "DB_TCP_USER_TIMEOUT_SECONDS": "4",
     "DB_POOL_TIMEOUT_SECONDS": "10.0",
     "DB_POOL_RECYCLE_SECONDS": "1800",
@@ -106,6 +112,7 @@ TEST_SETTINGS: Dict[str, str] = {
     "FROM_EMAIL": "no-reply@example.com",
     "SECRET_BACKEND": "env",
     "LOG_LEVEL": "INFO",
+    "SENTRY_DSN": "",
 }
 
 #: Password every seeded row is created with. It satisfies the policy
@@ -175,6 +182,32 @@ def bearer_header(token: str) -> Dict[str, str]:
 #: it is named here as a literal so this module imports nothing from
 #: ``backend.app``.
 MIGRATION_LOGGER_NAMESPACE = "alembic"
+
+#: Absolute path of the Alembic configuration the revision chain is
+#: declared in. Its ``script_location`` is anchored on the file's own
+#: directory, so the chain below is read the same from any directory.
+ALEMBIC_INI = REPO_ROOT / "backend" / "alembic.ini"
+
+
+def _declared_revisions() -> Tuple[str, ...]:
+    """Return the identifiers of the revision chain, oldest first."""
+    directory = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
+    return tuple(
+        script.revision
+        for script in reversed(list(directory.walk_revisions()))
+    )
+
+
+#: The revisions ``backend/migrations/versions`` declares, oldest first,
+#: read from the chain rather than restated. Reversing the chain to the
+#: base takes one ``alembic downgrade -1`` per entry, and every consumer
+#: of that count reads it from here, so adding a revision changes the
+#: count everywhere at once.
+REVISION_IDS = _declared_revisions()
+
+#: Number of revisions the chain carries, and so the number of reversal
+#: steps a full round trip takes.
+REVISION_COUNT = len(REVISION_IDS)
 
 
 @contextlib.contextmanager

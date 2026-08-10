@@ -835,6 +835,12 @@ and re-asserts that exactly one account holds the role before committing. It rec
 the outcome and the administrator count through the redacting logger; no record
 carries the credential.
 
+It reads the database URL and the credential and no other setting, so it runs under an
+identity granted those two values alone. It emits two records for a successful run: the
+attempt, marked as not durable, and then the outcome with the administrator count read
+back after the transaction has committed. A commit that fails emits an error record
+instead, so a run that wrote nothing never leaves a record saying it did.
+
 1. **Revoke.** Nothing to revoke on first provisioning; skip this step. When
    rotating a credential already in use, note that this service issues stateless
    tokens with no revocation mechanism, so a token already issued to the
@@ -847,7 +853,8 @@ carries the credential.
    lowercase letter, a digit and a special character. Then run the step:
 
    ```bash
-   # Locally, from the repository root.
+   # Locally, from the repository root. DATABASE_URL is read from the
+   # environment or from .env, exactly as the migrations read it.
    ADMIN_SEED_PASSWORD='<the new credential>' \
      python -m backend.app.core.admin_provisioning
    ```
@@ -873,8 +880,8 @@ carries the credential.
    carries a placeholder rather than a value.
 4. **Review prior access.** Confirm the run reported the outcome you expected —
    `provisioned` on first use, `reset` on a deliberate rotation, `unchanged` if a
-   credential was already in place — and that the record states an administrator
-   count of one. Then review the sign-in history for the administrative address. If
+   credential was already in place — and that the committed record, the one that
+   follows the commit, states an administrator count of one. Then review the sign-in history for the administrative address. If
    the account was ever reachable with a credential you did not set, treat it as
    compromised, rotate again, and rotate the JWT signing key with it.
 
@@ -1204,17 +1211,45 @@ workload is a secret the service cannot start on.
 |---|---|---|
 | **Storage** | Six managed secret resources — for the signing key, the database connection string, the Zillow key, the PayPal client secret, the PayPal webhook identifier and the SendGrid key — provisioned by `infrastructure/terraform/main.tf` | **Provisioned.** This was true when this section was first written |
 | **Authorization** | A dedicated runtime service account, a `secretAccessor` grant on **each** of the six secrets individually rather than at the project, and a Workload Identity binding from that account to one Kubernetes service account | **Provisioned.** Added by the same round that wrote this correction; recorded at `docs/security/DECISION_LOG.md` §35.4 and §35.5 |
-| **Runtime delivery** | The cluster's Secret Manager CSI add-on, a `SecretProviderClass` naming the six secrets, and workloads that mount the CSI volume and consume the synced values by reference through `envFrom` | **Provisioned**, as versioned manifests under `infrastructure/kubernetes/`. This is the part that did not exist when this section was first written, and without it the six secrets were unreachable from the workload |
+| **Runtime delivery** | The cluster's Secret Manager CSI add-on, a `SecretProviderClass` naming the six secrets, and workloads that mount the CSI volume **as files** and export each one in a shell prelude before the process starts. **No `secretObjects` is declared and no Kubernetes Secret is synchronised**, so no credential is written into the cluster's datastore. An earlier revision of this row described a synchronised Secret consumed through `envFrom`; that is not what the manifests declare, and `docs/security/DECISION_LOG.md` row 92.8 records the correction | **Provisioned**, as versioned manifests under `infrastructure/kubernetes/`. This is the part that did not exist when this section was first written, and without it the six secrets were unreachable from the workload |
 | **Backend selection** | `SECRET_BACKEND` set to the managed backend in the workload's configuration | **Set.** This is what makes the delivery self-checking: the settings module refuses to start unless all six values arrived from the process environment, so a silently failed delivery is a Pod that will not start rather than a service running on the wrong values |
 
 **The delivery prerequisite an operator must satisfy.** Rotation writes a new secret
 version; nothing else in the chain changes. But the chain only functions if all four
 rows above are in place for the environment being rotated, so before a rotation is
-declared complete, confirm that the cluster carries the add-on, that the namespace and
-service-account names in the manifests match the ones the Workload Identity binding was
-created against, and that the workload restarted after the new version was written —
-a mounted secret is resolved when the Pod starts, so an existing Pod continues on the
-value it started with until it is replaced.
+declared complete, confirm that the cluster carries the add-on and that the namespace
+and service-account names in the manifests match the ones the Workload Identity binding
+was created against.
+
+**Then verify the delivery by the mechanism that is actually in use, which is a file
+mount rather than a Kubernetes Secret.** Do not look for a Kubernetes Secret holding the
+six values: none is created, by design. Verify instead, in this order:
+
+1. **The Pod was replaced.** A CSI volume is resolved when the Pod starts, so an
+   existing Pod runs on the version it started with no matter how many new versions the
+   store holds. Restart the Deployment and confirm the replacement Pods are `Running`
+   and `Ready`, and that the previous generation is gone rather than merely
+   unready — a rollout that is still progressing has not delivered anything.
+2. **The files are mounted and non-empty in the new Pod.** Each value arrives as a file
+   under the mount path the manifest declares, named for the setting it carries. An
+   empty file is the failure mode a synchronised Secret would have surfaced differently:
+   the mount succeeds and the value does not arrive. The workloads' own shell prelude
+   checks this and exits naming the file, so a Pod that starts at all has already
+   asserted it — which is why the next step is the one that matters most.
+3. **The Pod actually started.** Because the prelude refuses to launch the process when
+   any of the six files is absent or empty, and because the settings module refuses to
+   start unless all six arrived from the process environment, a running and ready Pod is
+   itself the evidence that delivery succeeded. A `CrashLoopBackOff` after a rotation
+   points at the file whose name the prelude printed, not at the application.
+4. **The one-shot workloads too, where the rotation touched what they read.** The
+   migration Job and the administrator-credential Job mount their own narrower provider
+   classes, and the ingestion CronJob mounts the serving set. A rotation is not complete
+   while any of them still holds a stale value, and a CronJob in particular will not
+   notice until its next scheduled run.
+
+Never declare a rotation complete on the strength of a new version existing in the
+store. The version is the write; the restarted Pod reading the mounted file is the
+delivery.
 
 Prefer, in this order: a new version in the managed secret store; the platform's own
 protected variable store for short-lived, non-critical values; and an environment

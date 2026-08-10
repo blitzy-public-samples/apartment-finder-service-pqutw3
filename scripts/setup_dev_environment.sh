@@ -1,13 +1,7 @@
 #!/bin/bash
 #
-# Prepares a local development environment for the
-# apartment-finder-service: a virtual environment, the project
-# dependencies, an environment file, a database role and database, and
-# the schema.
-#
-# Every step is checked and the script stops at the first failure, so the
-# closing success message is printed only once all of them have
-# succeeded.
+# Prepare the pinned Python environment, local configuration, database
+# objects, and schema.
 
 # Abort on any failing command, on any unset variable and on any failure
 # within a pipeline, and let the ERR trap below reach every function.
@@ -36,8 +30,6 @@ readonly DB_ROLE="apartment_finder"
 readonly COMPOSE_DB_HOST="db"
 
 # Account the schema revisions promote, and the role they promote it to.
-# Both values are fixed in
-# backend/migrations/versions/0002_seed_single_admin.py and must match it.
 # The same address is carried by the ADMIN_SEED_EMAIL entry of the
 # environment file.
 readonly ADMIN_EMAIL="test@blitzy.com"
@@ -55,15 +47,14 @@ readonly ADMIN_PASSWORD_LENGTH=24
 
 # Special characters every password this script generates or accepts is
 # drawn from, alongside letters and digits. The set carries no dollar
-# sign, backslash, quotation mark or backtick: docker compose reads a
-# dollar sign in an environment file as the start of a variable
-# reference and a backslash as an escape, so a password carrying either
-# would reach a container as something other than the value PostgreSQL
-# was given.
+# sign, backslash, quotation mark or backtick. docker compose reads a
+# dollar sign in an environment file as the start of a variable reference
+# and a backslash as an escape, so a password carrying either reaches a
+# container as something other than the value PostgreSQL was given.
 readonly PASSWORD_SPECIAL_CHARACTERS='!@#^&*()-_=+'
 
 # Characters removed by the acceptance check below. It is the set above
-# expressed for tr, with the hyphen last so that tr reads it literally.
+# expressed for tr, with the hyphen last, where tr reads it literally.
 readonly PASSWORD_ACCEPTED_FOR_TR='A-Za-z0-9!@#^&*()_=+-'
 
 # Length of the generated database role password, in characters, and the
@@ -82,9 +73,7 @@ SETUP_DB_ADMIN_DB="${SETUP_DB_ADMIN_DB:-postgres}"
 SETUP_DB_ADMIN_HOST="${SETUP_DB_ADMIN_HOST:-${DB_HOST}}"
 SETUP_DB_ADMIN_PORT="${SETUP_DB_ADMIN_PORT:-${DB_PORT}}"
 
-# Revision carrying the schema, and the revision carrying the grant. The
-# administrator seed account is stored under the schema revision, and the
-# grant revision is applied over it.
+# Schema revision and grant revision this script applies.
 readonly SCHEMA_REVISION="0001"
 readonly SEED_REVISION="0002"
 
@@ -238,7 +227,6 @@ require_venv_python() {
     fi
 }
 
-# Check for required software
 check_software() {
     echo "Checking for required software..."
 
@@ -297,7 +285,7 @@ database_step_will_mutate() {
 
 # Run one psql command as the administrator named by
 # SETUP_DB_ADMIN_USER. --no-password makes an unusable connection fail
-# rather than wait at a prompt, so the script never blocks.
+# immediately instead of waiting at a prompt.
 psql_admin() {
     psql --no-psqlrc --quiet --no-password --set=ON_ERROR_STOP=1 \
         --host="${SETUP_DB_ADMIN_HOST}" \
@@ -308,8 +296,8 @@ psql_admin() {
 
 # Confirm the administrator connection works and carries the privileges
 # the database step needs. It runs before the virtual environment, the
-# dependencies and the environment file, so a host where this connection
-# is unavailable is reported before anything has been created or written.
+# dependencies and the environment file, and reports an unusable
+# connection while nothing has yet been created or written.
 check_database_admin_access() {
     local privileged
 
@@ -356,7 +344,6 @@ check_database_admin_access() {
         "${SETUP_DB_ADMIN_USER}, which can create a role and a database."
 }
 
-# Set up the virtual environment
 setup_virtual_env() {
     echo "Setting up virtual environment..."
 
@@ -391,19 +378,16 @@ setup_virtual_env() {
     echo "Virtual environment ready at ${VENV_DIR}."
 }
 
-# Install project dependencies
 install_dependencies() {
     echo "Installing project dependencies..."
 
     require_venv_python
 
-    # Install the pinned Python dependencies into the virtual environment
     "${VENV_PYTHON}" -m pip install --upgrade pip
     "${VENV_PYTHON}" -m pip install \
         -r "${REPO_ROOT}/backend/requirements.txt" \
         -r "${REPO_ROOT}/backend/requirements-dev.txt"
 
-    # Install the Node.js dependencies from the committed lock file
     npm ci --prefix "${REPO_ROOT}/frontend"
 
     echo "Project dependencies installed."
@@ -723,11 +707,9 @@ configure_env_vars() {
         return 0
     fi
 
-    # Generate the token signing key
     generate_signing_key
     secret_key="${GENERATED_SIGNING_KEY}"
 
-    # Generate the password of the administrator seed account
     generate_admin_password
     admin_password="${GENERATED_ADMIN_PASSWORD}"
 

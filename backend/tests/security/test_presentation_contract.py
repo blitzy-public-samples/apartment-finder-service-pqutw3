@@ -91,12 +91,14 @@ FORBIDDEN_CLAIMS = (
     "maps to a fix and a verifying test",
 )
 
-#: Statements that replaced them.
+#: Statements that replaced them. The rotation wording is bounded to what
+#: this repository can establish: that the operation is not performed
+#: here, rather than that it is outstanding everywhere.
 REQUIRED_CLAIMS = (
     "remediated in code",
-    "credential rotation still to run",
+    "Rotation is not performed here",
     "replaced rather than upgraded",
-    "Credentials live until rotated",
+    "Exposed credentials must be treated as compromised until rotated",
 )
 
 #: Wording that states why rather than what. Rule 1 places rationale in

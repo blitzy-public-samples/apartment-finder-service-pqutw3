@@ -16,14 +16,10 @@ FROM_EMAIL = settings.FROM_EMAIL
 #: Every other status, including any other 2xx, is a failure.
 ACCEPTED_STATUS = 202
 
-# Replaces the provider credential wherever it appears in a record,
-# including in text that names no key such as provider error prose.
 register_required_secret_values(SENDGRID_API_KEY)
 
-#: Message recorded when a send does not complete.
 EMAIL_FAILURE_MESSAGE = "Failed to send email"
 
-#: Reason recorded with that message.
 REASON_SEND_FAILED = "email_send_failed"
 
 

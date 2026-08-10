@@ -460,6 +460,63 @@ def test_no_text_rule_uses_the_undercontrast_grey():
     assert offenders == [], offenders
 
 
+def test_the_closing_slide_overrides_the_lede_colour():
+    """Asserts the navy closing slide's lede is not the dark body ink.
+
+    ``.lede`` declares its own colour, and a class declaration on the
+    paragraph beats the inverted colour the closing slide sets for its
+    subtree to inherit. Without an override the closing takeaway renders
+    the theme's body ink on the navy, measuring 1.30:1 against a 4.5:1
+    threshold -- rendered, unclipped and unreadable, which no other
+    assertion here would notice.
+    """
+    text = _text()
+
+    override = re.search(r"\.slide-closing \.lede \{(.*?)\}", text, re.S)
+    assert override is not None
+    body = override.group(1)
+
+    assert "var(--blitzy-text)" not in body
+    assert "#333333" not in body
+    assert "rgba(255, 255, 255, 0.9)" in body
+
+
+def test_the_dark_closing_slide_recolours_every_text_element_it_carries():
+    """Asserts no text on the navy slide keeps the light-surface colour.
+
+    The closing slide sets a navy background and overrode its heading and
+    its bullets, but not its lead line, which kept ``--blitzy-text`` at
+    #333333 and rendered at 1.30:1 against #1A105F -- charcoal on navy,
+    measured in a browser and sampled from the rendered pixels. The
+    heading and bullets on the same slide measured 16.36:1, so the fault
+    was one missing selector rather than a theme-wide one. This case reads
+    which text elements the slide actually carries and requires a rule for
+    each, so adding a fifth element without recolouring it fails here.
+    """
+    text = _text()
+    closing = [
+        section
+        for section in _slides(text)
+        if _kind(section) == "slide-closing"
+    ][0]
+    style = re.search(r"<style>(.*?)</style>", text, re.S).group(1)
+
+    selectors = []
+    if re.search(r"<h2\b", closing):
+        selectors.append(".slide-closing h2")
+    if 'class="lede"' in closing:
+        selectors.append(".slide-closing .lede")
+    if re.search(r"<li\b", _rendered(closing)):
+        selectors.append(".slide-closing li")
+
+    assert selectors, "the closing slide carries no text element"
+    for selector in selectors:
+        assert selector in style, selector
+        declarations = style.split(selector, 1)[1].split("}", 1)[0]
+        assert "color:" in declarations, selector
+        assert "var(--blitzy-text)" not in declarations, selector
+
+
 def test_the_title_slide_carries_its_contrast_scrim():
     """Asserts the measured scrim over the mandated gradient survives.
 
@@ -566,16 +623,28 @@ def test_the_deck_reports_the_open_items_explicitly():
 def test_the_architecture_diagram_draws_no_absent_flow():
     """Asserts the diagram claims no data flow that does not exist.
 
-    Secret delivery into the running service, the event stream and the
-    browser client were all drawn as working flows. None is wired up, so
-    each is now an unconnected node instead of an arrow.
+    The browser client and object storage carry no flow, so each is an
+    unconnected node rather than an arrow. Secret delivery is the one that
+    changed: the delivered manifests mount every value into the workloads,
+    so its chain is drawn as the definitions carry it, and
+    ``test_the_architecture_diagram_draws_secret_delivery_as_delivered``
+    in ``test_operator_documentation.py`` asserts each of its edges. An
+    earlier revision of this case required that chain to be unconnected
+    and named two node identifiers the diagram no longer uses.
     """
     text = _text()
     diagram = re.search(
         r"<pre class=\"mermaid\">(.*?)</pre>", text, re.S
     ).group(1)
 
-    for absent in ("VAULT --", "-- VAULT", "STREAM --", "BROWSER --"):
+    for absent in (
+        "CLIENT --",
+        "&gt; CLIENT",
+        "PLATFORM --",
+        "&gt; PLATFORM",
+        "STREAM",
+        "BROWSER",
+    ):
         assert absent not in diagram, absent
     for node in ("VAULT[", "PLATFORM[", "CLIENT["):
         assert node in diagram, node

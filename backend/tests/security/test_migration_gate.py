@@ -26,7 +26,7 @@ What is asserted:
 * the account revision 0002 stores carries no credential any password
   produces
 * re-running the upgrade writes nothing further
-* each revision reverses on its own, and the pair re-applies afterwards
+* each revision reverses on its own, and the chain re-applies afterwards
 * the reversal also succeeds against a schema built by
   ``Base.metadata.create_all``, whose uniqueness over the order column
   the migration did not create
@@ -48,7 +48,8 @@ group asserts:
 * the priced amount round-trips exactly, as ``NUMERIC(10, 2)`` and not
   as a float
 * the order uniqueness is refused by the index PostgreSQL builds
-* both revisions reverse and re-apply on PostgreSQL, leaving exactly one
+* every revision in the chain reverses on PostgreSQL, one step per
+  revision, and the chain re-applies afterwards leaving exactly one
   administrator
 """
 
@@ -66,6 +67,7 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.app.core.security import verify_password
 from backend.app.db.models import Base, Filter, User
+from backend.tests.support import REVISION_COUNT
 
 #: Repository root, four directories above this file.
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -145,6 +147,14 @@ WORKLOAD_INDEXES = (
     "ix_listings_zillow_url",
 )
 
+#: Partial unique index revision 0004 creates. It is asserted present at
+#: the head and absent once that revision is reversed.
+OPEN_INTENT_INDEX = "uq_subscriptions_open_intent_per_plan"
+
+#: Table revision 0005 creates. It is asserted present at the head and
+#: absent once that revision is reversed.
+SLOT_TABLE = "login_attempt_slots"
+
 #: Uniqueness constraints the revisions name, mapped to the columns each
 #: covers.
 NAMED_UNIQUENESS = {
@@ -179,10 +189,16 @@ OFFLINE_UPGRADE_STATEMENTS = (
     "CREATE INDEX ix_subscriptions_user_id_status_end_date",
     "CREATE INDEX ix_subscriptions_user_id_plan_id_status",
     "CREATE INDEX ix_listings_zillow_url ON listings (zillow_url)",
+    "CREATE UNIQUE INDEX uq_subscriptions_open_intent_per_plan",
+    "WHERE status IN ('pending', 'failed') AND end_date IS NULL",
+    "CREATE TABLE login_attempt_slots",
+    "INSERT INTO login_attempt_slots",
 )
 
 #: Statements the offline downgrade stream must carry.
 OFFLINE_DOWNGRADE_STATEMENTS = (
+    "DROP TABLE login_attempt_slots",
+    "DROP INDEX uq_subscriptions_open_intent_per_plan",
     "DROP INDEX ix_listings_zillow_url",
     "DROP INDEX ix_subscriptions_user_id_plan_id_status",
     "DROP INDEX ix_subscriptions_user_id_status_end_date",
@@ -420,6 +436,19 @@ def _assert_mapped_shape(shape):
     assert not covering_the_url, covering_the_url
 
 
+def _assert_no_revision_objects(shape):
+    """Assert ``shape`` holds nothing the revisions created.
+
+    Revision 0001 creates the tables it needs when it is applied to a
+    database that carries none, and records which ones it created, so
+    reversing the whole chain on that database drops them again and leaves
+    Alembic's own version table by itself. This is the other branch of the
+    reversal from :func:`_assert_reversed_shape`, which is the branch a
+    database that already held the tables takes.
+    """
+    assert shape["tables"] == {"alembic_version"}, shape["tables"]
+
+
 def _assert_reversed_shape(shape):
     """Assert ``shape`` is the schema that precedes revision 0001."""
     assert "webhook_events" not in shape["tables"], shape["tables"]
@@ -524,18 +553,38 @@ def test_re_applying_the_administrator_seed_writes_nothing_further(
 
 
 def test_each_revision_reverses_and_the_chain_re_applies(tmp_path):
-    """Assert all three revisions reverse one at a time and re-apply.
+    """Assert all five revisions reverse one at a time and re-apply.
 
-    The first reversal removes the workload indexes and leaves both the
-    columns and the administrator in place; the second returns the
-    administrator to the default role and still leaves the columns in
-    place; the third removes what revision 0001 added and nothing that
-    precedes it.
+    The first reversal drops the login-throttling slots and leaves the
+    open-intent uniqueness, the workload indexes, the columns and the
+    administrator in place; the second removes the uniqueness and leaves
+    the workload indexes; the third removes the workload indexes and
+    leaves both the columns and the administrator in place; the fourth
+    returns the administrator to the default role and still leaves the
+    columns in place; the fifth removes what revision 0001 added and
+    nothing that precedes it.
+
+    Each reversal is taken one step at a time deliberately: a named
+    target would reach the base in one call and would stop asserting
+    that every revision reverses on its own.
     """
     url = _sqlite_url(tmp_path / "round_trip.db")
     _write_preceding_schema(url, (EXISTING_EMAIL,))
     _alembic(url, ["upgrade", "head"], tmp_path)
     assert len(_administrators(_accounts(url))) == 1
+    assert _index_names(url) >= set(WORKLOAD_INDEXES)
+    assert OPEN_INTENT_INDEX in _index_names(url)
+    assert SLOT_TABLE in _reflect(url)["tables"]
+
+    _alembic(url, ["downgrade", "-1"], tmp_path)
+    assert len(_administrators(_accounts(url))) == 1
+    assert SLOT_TABLE not in _reflect(url)["tables"]
+    assert OPEN_INTENT_INDEX in _index_names(url)
+    assert _index_names(url) >= set(WORKLOAD_INDEXES)
+
+    _alembic(url, ["downgrade", "-1"], tmp_path)
+    assert len(_administrators(_accounts(url))) == 1
+    assert OPEN_INTENT_INDEX not in _index_names(url)
     assert _index_names(url) >= set(WORKLOAD_INDEXES)
 
     _alembic(url, ["downgrade", "-1"], tmp_path)
@@ -554,6 +603,8 @@ def test_each_revision_reverses_and_the_chain_re_applies(tmp_path):
     _assert_mapped_shape(_reflect(url))
     assert len(_administrators(_accounts(url))) == 1
     assert _index_names(url) >= set(WORKLOAD_INDEXES)
+    assert OPEN_INTENT_INDEX in _index_names(url)
+    assert SLOT_TABLE in _reflect(url)["tables"]
 
 
 def test_the_reversal_succeeds_against_a_schema_built_from_the_models(
@@ -728,7 +779,7 @@ def _stored_shape(url, table, column):
 
 @pytest.fixture
 def migrated_postgres_database(postgres_url, tmp_path):
-    """Return the URL of the database both revisions were applied to.
+    """Return the URL of the database the whole chain was applied to.
 
     The revisions run through the Alembic command line in a subprocess,
     exactly as the SQLite cases above drive them, against the database
@@ -865,17 +916,27 @@ def test_the_order_uniqueness_is_enforced_by_postgres(
 def test_each_revision_reverses_on_postgres(
     migrated_postgres_database, tmp_path
 ):
-    """Asserts both revisions reverse and re-apply on PostgreSQL.
+    """Asserts every revision reverses and re-applies on PostgreSQL.
 
-    Each added column carries a server default, which is what makes the
-    pair reversible from the code; this asserts the reversal against the
-    deployed dialect rather than against SQLite's table rewrite.
+    Each added column carries a server default and each added index is
+    dropped by the revision that created it, which is what makes the chain
+    reversible from the code; this asserts the reversal against the
+    deployed dialect rather than against SQLite's table rewrite. One
+    reversal per revision is issued, counted from the chain, so a revision
+    added later is reversed here too.
+
+    The revisions were applied to a database carrying no table, so
+    revision 0001 created them and the reversal drops them: what remains is
+    Alembic's own version table. The other branch -- a database that
+    already held the tables, where the reversal removes only what 0001
+    added -- is asserted by
+    ``backend/tests/integration/test_postgres_migrations.py``.
     """
     url = migrated_postgres_database
 
-    _alembic(url, ["downgrade", "-1"], tmp_path)
-    _alembic(url, ["downgrade", "-1"], tmp_path)
-    _assert_reversed_shape(_reflect(url))
+    for _ in range(REVISION_COUNT):
+        _alembic(url, ["downgrade", "-1"], tmp_path)
+    _assert_no_revision_objects(_reflect(url))
 
     _alembic(url, ["upgrade", "head"], tmp_path)
     _assert_mapped_shape(_reflect(url))

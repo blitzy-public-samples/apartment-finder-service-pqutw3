@@ -1,40 +1,3 @@
-"""Access-token verification at the HTTP boundary.
-
-Every case in this module presents a crafted access token on a
-protected route and asserts that the request is refused. The refusal
-asserted is the one
-:func:`backend.app.core.security.get_current_user` raises for any token
-it will not accept: status ``401``, the body
-``{"detail": "Could not validate credentials"}`` and the header
-``WWW-Authenticate: Bearer``.
-
-Three families of case run against that contract.
-
-* Algorithm -- a token declaring ``none`` in any letter case, a token
-  correctly signed with an algorithm absent from the accepted list, a
-  token correctly signed with an asymmetric algorithm, and a token
-  declaring an asymmetric algorithm over an empty signature are each
-  refused.
-* Subject -- a token whose subject is a stored address, and a token
-  whose subject is not an integer, are each refused.
-* Refusal uniformity -- the response for a deleted account, and the
-  response for a subject naming no stored row, are each
-  indistinguishable from the response an invalid token receives, in
-  status code, in body bytes, in decoded body and in challenge header.
-
-The remaining cases assert that a foreign signing key, an elapsed
-expiry, a not-before time still in the future, a foreign audience, a
-foreign issuer and each individually absent required claim are refused.
-
-:func:`test_the_reference_token_is_accepted` presents the token every
-forgery here is derived from, which differs from each forgery in that
-forgery's defect and in nothing else.
-
-Every token is minted by the ``forged_token_factory`` fixture published
-by ``backend/tests/conftest.py``, and every forgery names the seeded
-``registered_user`` row.
-"""
-
 import time
 from functools import lru_cache
 
@@ -53,46 +16,28 @@ from backend.tests.support import (
     bearer_header,
 )
 
-#: Route every token in this module is presented on. Both of its
-#: methods resolve their principal through
-#: :func:`backend.app.core.authorization.require_role`.
 PROTECTED_PATH = "/filters/"
 
-#: Status code carried by every refusal asserted here.
 REFUSED_STATUS = 401
 
-#: Decoded body carried by every refusal asserted here.
 REFUSED_BODY = {"detail": "Could not validate credentials"}
 
-#: Response header naming the scheme a refused caller may retry with.
 CHALLENGE_HEADER = "WWW-Authenticate"
 
-#: Value :data:`CHALLENGE_HEADER` carries on every refusal.
 CHALLENGE_VALUE = "Bearer"
 
-#: Status code the reference token receives.
 ACCEPTED_STATUS = 200
 
-#: Letter cases of the unsigned algorithm name presented in a header.
 NONE_ALGORITHM_SPELLINGS = ("none", "None", "NONE", "NoNe")
 
-#: Asymmetric algorithm name the confusion cases declare.
 ASYMMETRIC_ALGORITHM = "RS256"
 
-#: The claims a token must carry.
-#: :func:`test_the_claim_drop_cases_cover_every_required_claim` holds
-#: this tuple equal to
-#: :data:`backend.app.core.security.REQUIRED_CLAIMS`.
 REQUIRED_CLAIM_NAMES = ("exp", "iat", "nbf", "sub", "aud", "iss", "jti")
 
-#: Subjects that ``int`` does not read as a row identifier.
 NON_INTEGER_SUBJECTS = ("", "   ", "not-an-integer", "1.0")
 
-#: Distance above the seeded row's identifier used to name no row.
 UNUSED_IDENTIFIER_OFFSET = 1000
 
-# Parameters of the throwaway RSA key the asymmetric forgery is signed
-# with.
 _RSA_PUBLIC_EXPONENT = 65537
 _RSA_KEY_SIZE = 2048
 
@@ -125,17 +70,14 @@ def present(client, token):
 
 
 def declared_algorithm(token):
-    """Return the algorithm name the token's own header declares."""
     return jwt.get_unverified_header(token)["alg"]
 
 
 def carried_claims(token):
-    """Return the claims the token carries, verifying nothing."""
     return jwt.decode(token, options={"verify_signature": False})
 
 
 def assert_refused(response):
-    """Assert the response is the refusal a rejected token receives."""
     assert response.status_code == REFUSED_STATUS
     assert response.json() == REFUSED_BODY
     assert response.headers[CHALLENGE_HEADER] == CHALLENGE_VALUE
@@ -182,11 +124,6 @@ def test_finding_c2_a_token_declaring_none_is_rejected(
 def test_finding_c2_a_token_declaring_an_unlisted_algorithm_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts an unlisted algorithm is refused though signed correctly.
-
-    The token is signed with the configured key, and its signature is
-    correct for the algorithm its header declares.
-    """
     token = forged_token_factory.unlisted_algorithm(
         sub=str(registered_user.id)
     )
@@ -199,11 +136,6 @@ def test_finding_c2_a_token_declaring_an_unlisted_algorithm_is_rejected(
 def test_finding_c2_an_asymmetric_algorithm_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts a correctly signed asymmetric token is refused.
-
-    The token is signed with a throwaway RSA key and its header
-    declares that key's algorithm.
-    """
     token = forged_token_factory.forge(
         key=attacker_signing_key(),
         algorithm=ASYMMETRIC_ALGORITHM,
@@ -229,12 +161,6 @@ def test_finding_c2_a_stripped_asymmetric_signature_is_rejected(
 def test_a_token_signed_with_a_foreign_key_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts a token whose only defect is its key is refused.
-
-    The foreign key is not the configured key and is no shorter than
-    the configured floor, and the token carries every required claim
-    and is unexpired.
-    """
     assert FOREIGN_SIGNING_KEY != settings.SECRET_KEY
     assert (
         len(FOREIGN_SIGNING_KEY.encode("utf-8"))
@@ -308,11 +234,6 @@ def test_the_claim_drop_cases_cover_every_required_claim():
 def test_finding_h7_a_token_whose_subject_is_an_address_is_rejected(
     client, forged_token_factory, registered_user
 ):
-    """Asserts a subject naming a stored address is refused.
-
-    The address is the one the stored row holds, and that row's own
-    identifier is an integer.
-    """
     token = forged_token_factory.legacy_email_subject(
         email=registered_user.email
     )
@@ -334,12 +255,6 @@ def test_finding_h7_a_subject_that_is_not_an_integer_is_rejected(
 def test_finding_m1_a_deleted_account_is_refused_like_a_bad_token(
     client, db, forged_token_factory, registered_user
 ):
-    """Asserts a deleted account draws the invalid-token refusal.
-
-    The token is accepted while the row exists, the row is then
-    removed, and the refusal that follows is compared with the refusal
-    an invalid token draws in the same test.
-    """
     subject = str(registered_user.id)
     token = forged_token_factory.valid(sub=subject)
     assert present(client, token).status_code == ACCEPTED_STATUS
@@ -357,11 +272,6 @@ def test_finding_m1_a_deleted_account_is_refused_like_a_bad_token(
 def test_finding_m1_an_unknown_subject_is_refused_like_a_bad_token(
     client, db, forged_token_factory, registered_user
 ):
-    """Asserts a subject naming no row draws the same refusal.
-
-    The identifier is confirmed absent from the database before the
-    token naming it is presented.
-    """
     unknown = registered_user.id + UNUSED_IDENTIFIER_OFFSET
     assert db.query(User).filter(User.id == unknown).first() is None
     absent = present(

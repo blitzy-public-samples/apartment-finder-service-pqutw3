@@ -430,7 +430,7 @@ def test_every_suppressed_advisory_is_registered():
     register = RESIDUAL_REGISTER.read_text(encoding="utf-8")
     suppressed = _suppressed_advisories()
 
-    assert len(suppressed) == 14
+    assert len(suppressed) == 8
     for identifier in sorted(suppressed):
         assert identifier in register, identifier
 

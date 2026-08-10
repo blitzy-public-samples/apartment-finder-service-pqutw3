@@ -79,6 +79,12 @@ SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_dev_environment.sh"
 #: importing it, so the name is read from its declaration.
 MIGRATION_ENVIRONMENT = REPO_ROOT / "backend" / "migrations" / "env.py"
 
+#: Module declaring the database configuration contract every caller that
+#: reaches the database resolves and validates a value through.
+DATABASE_CONTRACT = (
+    REPO_ROOT / "backend" / "app" / "core" / "db_contract.py"
+)
+
 #: Secret delivery the deployment workflow applies to the cluster.
 DELIVERY_MANIFEST = (
     REPO_ROOT / "infrastructure" / "kubernetes" / "30-backend-secrets.yaml"
@@ -105,22 +111,6 @@ PIPELINE_FILES = WORKFLOWS + (DEPLOY_SCRIPT, DELIVERY_MANIFEST)
 #: them cannot stop another's checks from running; the remaining jobs carry
 #: the integration, frontend and infrastructure gates.
 CI_JOB = "backend"
-
-#: Actions referenced by a published release tag rather than by a commit.
-#:
-#: Every other action in both workflows is pinned to a commit. These two
-#: are not, because their commit identifiers are not derivable in the
-#: environment this repository is verified in, and inventing one would
-#: reference a commit that does not exist. The exposure is bounded rather
-#: than accepted blind: each is used only in a job that declares no
-#: environment, requests no permission, authenticates to nothing and
-#: reaches neither a credential nor a cluster -- the frontend job, which
-#: lints and tests read-only source, and the infrastructure job, which
-#: runs `terraform validate` with no backend. Pinning them is recorded as
-#: an open item in docs/security/RESIDUAL_RISK.md.
-TAG_PINNED_ACTIONS = frozenset(
-    {"actions/setup-node", "hashicorp/setup-terraform"}
-)
 
 #: Job of :data:`CD_WORKFLOW` that carries every gate, and the job that
 #: deploys only once it has passed.
@@ -191,9 +181,16 @@ NPM_TEST = re.compile(r"\bnpm\s+test\b")
 #: One ``secret_id`` a Terraform secret resource declares.
 TERRAFORM_SECRET_ID = re.compile(r'(?m)^\s*secret_id\s*=\s*"([^"]+)"\s*$')
 
-#: The setting name :data:`MIGRATION_ENVIRONMENT` declares it reads.
+#: The setting name :data:`DATABASE_CONTRACT` declares, which
+#: :data:`MIGRATION_ENVIRONMENT` binds under the same name.
 MIGRATION_SETTING_DECLARATION = re.compile(
     r'(?m)^DATABASE_URL_SETTING\s*=\s*"([^"]+)"\s*$'
+)
+
+#: The binding through which :data:`MIGRATION_ENVIRONMENT` takes that
+#: name, which is what keeps the two files naming one setting.
+MIGRATION_SETTING_BINDING = (
+    "DATABASE_URL_SETTING = db_contract.DATABASE_URL_SETTING"
 )
 
 #: One expansion of a name, braced or bare. ``$(``, ``$((`` and the
@@ -535,9 +532,16 @@ def _migration_overrides():
 
 
 def _migration_setting():
-    """Return the one setting a migration run reads."""
-    found = MIGRATION_SETTING_DECLARATION.search(_text(MIGRATION_ENVIRONMENT))
-    assert found is not None, "the environment declares no setting to read"
+    """Return the one setting a migration run reads.
+
+    The name is declared by :data:`DATABASE_CONTRACT` and bound by
+    :data:`MIGRATION_ENVIRONMENT`, so both are read: the declaration
+    supplies the name and the binding proves the environment reads that
+    name rather than one of its own.
+    """
+    found = MIGRATION_SETTING_DECLARATION.search(_text(DATABASE_CONTRACT))
+    assert found is not None, "the contract declares no setting to read"
+    assert MIGRATION_SETTING_BINDING in _text(MIGRATION_ENVIRONMENT)
     return found.group(1)
 
 
@@ -567,9 +571,7 @@ def test_every_action_is_referenced_by_a_commit(path):
     unpinned = [
         action
         for action, _release in references
-        if not COMMIT_SHA.match(action)
-        and not action.startswith("./")
-        and action.split("@")[0] not in TAG_PINNED_ACTIONS
+        if not COMMIT_SHA.match(action) and not action.startswith("./")
     ]
     assert unpinned == [], unpinned
 
@@ -582,7 +584,6 @@ def test_every_action_records_the_release_it_pins(path):
         for action, release in ACTION_REFERENCE.findall(_text(path))
         if not RELEASE_TAG.match(release or "")
         and not action.startswith("./")
-        and action.split("@")[0] not in TAG_PINNED_ACTIONS
     ]
     assert undocumented == [], undocumented
 
@@ -824,12 +825,12 @@ def test_the_migration_pod_carries_only_the_database_setting():
         ), entry
     assert setting not in [entry["name"] for entry in declared], declared
 
-    #: What the container reads without a credential in it is the settings
-    #: map, which carries no secret, and the one secret the deployment
-    #: publishes rather than the cluster holding it permanently: the shared
-    #: rate-limit store's address, which the application refuses to default
-    #: outside a local run. Both are required, so a container cannot start
-    #: without either.
+    #: What the container reads is the settings map, which carries no
+    #: credential, and it is required, so the pod cannot start without it.
+    #: It reads no cluster Secret at all: the one the serving workload also
+    #: reads carries the shared rate-limit address, which a migration run
+    #: never reads, and the database credential it does read arrives as a
+    #: mounted file rather than through the environment.
     configured = [
         source["configMapRef"]["name"]
         for source in container["envFrom"]
@@ -843,7 +844,7 @@ def test_the_migration_pod_carries_only_the_database_setting():
     assert configured == [
         _one_prerequisite("ConfigMap")["metadata"]["name"]
     ], configured
-    assert published == ["backend-rate-limit-store"], published
+    assert published == [], published
     for source in container["envFrom"]:
         for kind in source:
             assert source[kind].get("optional") is False, source

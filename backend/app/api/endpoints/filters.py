@@ -52,7 +52,6 @@ def create_filter(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(Role.REGISTERED)),
 ):
-    # Validate filter data
     if not filter.name or not filter.criteria:
         raise HTTPException(
             status_code=400,
@@ -69,7 +68,6 @@ def create_filter(
         ZipCodeModel(code=z.code) for z in filter.zip_codes
     ]
 
-    # Create new filter in database
     new_filter = FilterModel(
         name=filter.name,
         criteria=criteria_rows,
@@ -110,14 +108,16 @@ def get_user_filters(
     ``skip`` and ``limit`` are applied in SQL, and both are bounded:
     ``limit`` by ``settings.MAX_PAGE_SIZE`` and ``skip`` by
     ``settings.MAX_PAGINATION_OFFSET``, so an offset above the configured
-    cap is refused by request validation. The postal codes and the predicates
+    cap is refused by request validation. The page is ordered by
+    ``id``, so the boundary between one page and the next is the same on
+    every read and a filter is neither repeated across pages nor omitted
+    from all of them. The postal codes and the predicates
     of the returned filters are loaded by two further statements for the
     whole page rather than by two per filter, so the number of
     statements does not follow the page size. The number of children per
     filter is bounded by the creation contract in
     :mod:`backend.app.schema.filter`.
     """
-    # Query database for user's filters
     filters = (
         db.query(FilterModel)
         .options(
@@ -125,10 +125,10 @@ def get_user_filters(
             selectinload(FilterModel.criteria),
         )
         .filter(FilterModel.user_id == current_user.id)
+        .order_by(FilterModel.id)
         .offset(skip)
         .limit(limit)
         .all()
     )
 
-    # Return list of filters
     return [Filter.from_orm(filter) for filter in filters]

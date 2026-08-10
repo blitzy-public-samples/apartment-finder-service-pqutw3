@@ -11,8 +11,8 @@ revisions under test are
 
 What is asserted:
 
-* both revisions apply to an empty database, and to a database already
-  carrying the six tables that precede revision 0001
+* every revision in the chain applies to an empty database, and to a
+  database already carrying the six tables that precede revision 0001
 * the columns, uniqueness constraints and table revision 0001 adds are
   present afterwards, and an account and a subscription row stored before
   the upgrade read the server defaults
@@ -86,9 +86,15 @@ SCHEMA_REVISION = "0001"
 #: Revision identifier of the administrative-grant revision.
 GRANT_REVISION = "0002"
 
-#: Revision identifier of the workload-index revision, the head of the
-#: chain.
+#: Revision identifier of the workload-index revision.
 INDEX_REVISION = "0003"
+
+#: Revision identifier of the open-intent uniqueness revision.
+UNIQUENESS_REVISION = "0004"
+
+#: Revision identifier of the login-throttling slot revision, the head of
+#: the chain.
+SLOT_REVISION = "0005"
 
 #: Logger the administrative grant records its outcome on.
 GRANT_LOGGER = "alembic.runtime.migration"
@@ -264,15 +270,23 @@ def _unique_columns(connection, table):
 
 
 def test_the_revision_chain_is_the_schema_revision_then_the_grant():
-    """Assert the revisions are ordered additive, grant, then indexes."""
+    """Assert the order: additive, grant, indexes, uniqueness, slots."""
     directory = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
     revisions = list(directory.walk_revisions())
 
     assert [revision.revision for revision in revisions] == [
+        SLOT_REVISION,
+        UNIQUENESS_REVISION,
         INDEX_REVISION,
         GRANT_REVISION,
         SCHEMA_REVISION,
     ]
+    assert directory.get_revision(SLOT_REVISION).down_revision == (
+        UNIQUENESS_REVISION
+    )
+    assert directory.get_revision(UNIQUENESS_REVISION).down_revision == (
+        INDEX_REVISION
+    )
     assert directory.get_revision(INDEX_REVISION).down_revision == (
         GRANT_REVISION
     )
@@ -285,7 +299,7 @@ def test_the_revision_chain_is_the_schema_revision_then_the_grant():
 def test_upgrade_head_builds_the_schema_on_an_empty_database(
     migration_connection, alembic_config
 ):
-    """Assert both revisions apply to a database carrying no table."""
+    """Assert the whole chain applies to a database carrying no table."""
     assert inspect(migration_connection).get_table_names() == []
 
     command.upgrade(alembic_config(migration_connection), "head")
@@ -583,12 +597,21 @@ def test_the_schema_revision_downgrades_to_the_preceding_shape(
 def test_the_chain_upgrades_again_after_a_full_downgrade(
     migration_connection, alembic_config
 ):
-    """Assert the documented upgrade, thrice-down, upgrade cycle holds."""
+    """Assert the documented upgrade, full-down, upgrade cycle holds.
+
+    The reversal names ``base`` rather than counting steps back from the
+    head. Nothing is asserted between the reversals here, so a count that
+    stopped short of ``base`` would leave this case passing while
+    covering less than a full reversal: the re-upgrade that follows
+    restores whatever the reversal left behind, so every assertion below
+    would still hold. Reversal one revision at a time is asserted
+    separately: by ``test_the_grant_revision_downgrades_to_the_default_role``
+    in this module, and step by step against the recorded revision by
+    ``test_migration_revisions.py``.
+    """
     config = alembic_config(migration_connection)
     command.upgrade(config, "head")
-    command.downgrade(config, "-1")
-    command.downgrade(config, "-1")
-    command.downgrade(config, "-1")
+    command.downgrade(config, "base")
 
     command.upgrade(config, "head")
 

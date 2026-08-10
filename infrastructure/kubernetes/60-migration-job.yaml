@@ -6,9 +6,14 @@
 # 30-backend-secrets.yaml. It copies nothing from a running Deployment, so
 # it applies to a first deployment as well as to a later one.
 #
-# The name carries ${IMAGE_TAG}, so each release applies its own job and
-# the record of a previous release's migration is retained. A job that has
-# already run to completion for a tag is left alone rather than replaced.
+# The name is derived from ${IMAGE_TAG} by
+# `scripts/render_kubernetes_manifests.sh job-name migration`, which folds
+# the tag to the alphabet and length a Kubernetes object name accepts. Both
+# delivery paths ask that script for the name they apply, wait on, read logs
+# from and describe, so all of them name this object. One name per release,
+# so the record of a previous release's migration is retained; a job that
+# has already run to completion for a tag is left alone rather than
+# replaced.
 #
 # The deployment path waits for this job to succeed before it changes any
 # serving image, so the new code never reads a schema the migration has
@@ -16,7 +21,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: backend-migrate-${IMAGE_TAG}
+  name: ${MIGRATION_JOB_NAME}
   namespace: ${K8S_NAMESPACE}
   labels:
     app.kubernetes.io/name: backend-migrate
@@ -25,7 +30,11 @@ spec:
   # Wall-clock bound on the whole Job, matching the wait the two delivery
   # paths place on it, so a migration that never finishes stops itself at
   # the moment the release gives up on it rather than staying live behind a
-  # release that has already been reported as failed.
+  # release that has already been reported as failed. One statement inside
+  # the run is bounded separately, by the
+  # DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS entry of backend-config, which is
+  # below this deadline: a stalled schema statement is cancelled by the
+  # server while the Job is still able to report why it failed.
   activeDeadlineSeconds: 900
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400
@@ -61,12 +70,14 @@ spec:
                 export "$name=$(cat "$file")"
               done
               exec python -m alembic -c backend/alembic.ini upgrade head
+          # The non-credential configuration map alone. The run resolves
+          # the database URL, the connection bounds and the schema
+          # statement bound and reads no other setting, so the shared
+          # rate-limit address the serving pods are given is not among
+          # the values this pod receives.
           envFrom:
             - configMapRef:
                 name: backend-config
-                optional: false
-            - secretRef:
-                name: backend-rate-limit-store
                 optional: false
           env:
             - name: ENV_FILE

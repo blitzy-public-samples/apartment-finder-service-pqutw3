@@ -42,14 +42,19 @@ twelve that were closed, and the mechanism that closed each, are recorded in
 [Dispositions that are not residual](#dispositions-that-are-not-residual) so the
 arithmetic is checkable rather than merely stated.
 
-The development manifest carries **7 advisories across 5 packages**, all of them
-in test and scanning tooling that no deployed process installs. They are recorded
-in the
-[Development register](#development-register-seven-accepted-development-advisories).
-**Fourteen identifiers are suppressed in total** across the two audit
-invocations, and
-[The total-suppression accounting](#the-total-suppression-accounting) reconciles
-that figure against both registers.
+The development manifest carries **1 advisory in 1 package**, in test tooling that
+no deployed process installs. It is recorded in the
+[Development register](#development-register-one-accepted-development-advisory).
+**Eight identifiers are suppressed in total** across the two audit invocations,
+and [The total-suppression accounting](#the-total-suppression-accounting)
+reconciles that figure against both registers.
+
+That figure was fourteen until this round, when the audit instrument was moved out
+of the audited development manifest into `backend/requirements-audit.txt`. Six of
+the seven advisories the Development register then carried were `pip-audit`'s own
+supply chain rather than anything this repository tests or ships;
+[The audit instrument's own tree](#the-audit-instruments-own-tree) records the
+measurement and what bounds the instrument's exposure.
 
 Static analysis moved from **1** finding at Medium severity or above to **0**
 over the same change.
@@ -68,7 +73,7 @@ each accepted advisory and each compensating control.
 | [`docs/security/CREDENTIAL_ROTATION.md`](CREDENTIAL_ROTATION.md) | **Sequences** — the operational steps for the exposed credentials |
 
 One consequence of that division is worth stating plainly, because it shapes
-how this file is written. The *decision* to accept these fourteen advisories
+how this file is written. The *decision* to accept these eight advisories
 rather than advance the interpreter is a logged decision, recorded as **row 1.9 of
 [`docs/security/DECISION_LOG.md`](DECISION_LOG.md)** along with the alternative
 that was rejected and the risk the choice carries. This register does not
@@ -147,25 +152,25 @@ service — the service does not run there — but it does remove a deployment p
 infrastructure previously claimed, and a reader assessing operational readiness needs it.
 See [The runtime pin's second consequence](#the-runtime-pins-second-consequence-a-decommissioned-hosting-runtime).
 
-Seven **development** advisories remain open alongside them, in five packages that
-exist only to test and scan this codebase. Their fixes are unreachable for the
-same reason and their compensating control is stronger, because none of the five
-packages is declared in the runtime manifest and so none is installed into the
-deployed image or reachable from any request at all. They are the subject of the
-[Development register](#development-register-seven-accepted-development-advisories).
+One **development** advisory remains open alongside them, in the test framework.
+Its fix is unreachable for the same reason and its compensating control is
+stronger, because the package is not declared in the runtime manifest and so is
+not installed into the deployed image or reachable from any request at all. It is
+the subject of the
+[Development register](#development-register-one-accepted-development-advisory).
 
 | | Runtime | Development | Total |
 |---|---|---|---|
 | Manifest | `backend/requirements.txt` | `backend/requirements-dev.txt` | both |
-| Advisories accepted | 7 | 7 | **14** |
-| Packages affected | 3 | 5 | 8 |
+| Advisories accepted | 7 | 1 | **8** |
+| Packages affected | 3 | 1 | 4 |
 | Present in the deployed image | Yes | No | |
 | Reachable from a request | No, by compensating control | No, by absence | |
 
-**Fourteen** is therefore the number of identifiers a reader will count in the
-audit gate, and it is the sum of two registers rather than a single accepted set.
+**Eight** is therefore the number of identifiers a reader will count in the audit
+gate, and it is the sum of two registers rather than a single accepted set.
 
-## Scope: two registers, fourteen suppressions
+## Scope: two registers, eight suppressions
 
 Two manifests are audited, so this file carries two registers and one shared
 accounting. Neither register is a subset of the other and neither is documented
@@ -176,8 +181,22 @@ comment true.
 | Register | Manifest | Identifiers | Where the audit runs |
 |---|---|---|---|
 | [Runtime](#runtime-register-seven-accepted-runtime-advisories) | `backend/requirements.txt` | 7 | `.github/workflows/ci.yml` and `.github/workflows/cd.yml` |
-| [Development](#development-register-seven-accepted-development-advisories) | `backend/requirements-dev.txt` | 7 | the same two gates, as a second invocation |
-| **Total** | both | **14** | |
+| [Development](#development-register-one-accepted-development-advisory) | `backend/requirements-dev.txt` | 1 | the same two gates, as a second invocation |
+| **Total** | both | **8** | |
+
+**A third manifest exists and is deliberately not audited.**
+`backend/requirements-audit.txt` declares the audit instrument itself,
+`pip-audit`, and nothing else. `pip-audit` resolves a dependency tree of its own
+through `CacheControl[filecache]` — `msgpack`, `requests`, `urllib3` and
+`filelock` — and every advisory in that tree is reported when the manifest
+declaring it is audited. Declared beside the test and lint tooling, as it was
+until this round, the instrument's own tree was counted as this project's
+accepted development risk: six of the seven identifiers formerly in the
+Development register belonged to `pip-audit`, not to anything this repository
+tests or ships. Declared apart, it is counted as what it is. The instrument is
+installed by the gate, is present in no image and in no audited resolution, and
+is the subject of
+[The audit instrument's own tree](#the-audit-instruments-own-tree) below.
 
 The split is not cosmetic. A runtime advisory sits in a package that is installed
 into the deployed image and could in principle be reached by an HTTP request, so
@@ -190,12 +209,11 @@ beside both.
 
 An auditor comparing this file against the continuous-integration configuration
 should find an exact set match in each direction: the seven identifiers in the
-runtime audit invocation against the Runtime register, the seven in the
-development invocation against the Development register, and no fifteenth
-identifier anywhere. Two tests in
-`backend/tests/security/test_release_automation_contract.py` assert precisely
-that, so a suppression added to a workflow without a register entry fails the
-build.
+runtime audit invocation against the Runtime register, the one in the development
+invocation against the Development register, and no ninth identifier anywhere.
+Two tests in `backend/tests/security/test_release_automation_contract.py` assert
+precisely that, so a suppression added to a workflow without a register entry
+fails the build.
 
 ### What the runtime register covers
 
@@ -207,18 +225,18 @@ repeated in `.github/workflows/cd.yml`, whose comments name this file as their
 registry.
 
 The **development manifest**, `backend/requirements-dev.txt`, carries a separate
-set of seven advisories in its test and scanning tooling. Where they are
-documented was an open question between this register and the decision log, and
-it is now settled by a single recorded decision — **row 35.3 of
+set of one advisory in its test framework. Where it is documented was an open
+question between this register and the decision log, and it is now settled by a
+single recorded decision — **row 35.3 of
 [`docs/security/DECISION_LOG.md`](DECISION_LOG.md)** — which this section states
 and does not relitigate:
 
 - **This register is the index of every accepted advisory, runtime and
-  development.** The [development-manifest advisories](#the-development-manifest-advisories)
-  section below lists all seven by identifier, package, unreachable fix and route
-  into the graph, so an auditor comparing this file against the pipeline's two
+  development.** The [development-manifest advisory](#the-development-manifest-advisory)
+  section below lists it by identifier, package, unreachable fix and route into
+  the graph, so an auditor comparing this file against the pipeline's two
   suppression lists finds both sets here.
-- **The manifest header remains the authority for their detail.** The full
+- **The manifest header remains the authority for its detail.** The full
   compensating-control argument for the development set lives in
   `backend/requirements-dev.txt`'s own accepted-advisory section, beside the pins
   it governs, and is not duplicated here. A duplicate would be a second place to
@@ -226,8 +244,8 @@ and does not relitigate:
 - **The two sets are counted separately and never added together.** Every
   headline figure in this register — the nineteen, the seven, the 63% — describes
   the **runtime** manifest alone, because that is the set installed into the
-  deployed image and reachable from a request. None of the five development
-  packages is declared in the runtime manifest.
+  deployed image and reachable from a request. The development package is not
+  declared in the runtime manifest.
 
 ## Reproducing these measurements
 
@@ -414,29 +432,37 @@ unreachable under Constraint 2 even once that metadata stops refusing them.
 
 ### The runtime pin
 
-The CPython 3.9 pin is a hard constraint of this work. It was load-bearing in
-**five** places at baseline and is load-bearing in **three** in the delivered tree,
-each verified by reading the file. The reduction is not a relaxation — two places
-that *declared* the pin ceased to exist along with the resources they configured, and
-the constraint itself is untouched.
+The CPython 3.9 pin is a hard constraint of this work. It is load-bearing in
+**five** places in the delivered tree — four version declarations and one code-level
+constraint — each verified by reading the file, and it is unchanged from the baseline.
+**This table is the single authoritative inventory**, named as such by every sibling
+document, and row 91.2.1 of the decision log records the measurement behind it.
 
 | # | Pin site | What pins it |
 |---|---|---|
 | 1 | `infrastructure/docker/Dockerfile.backend:1` | `FROM python:3.9-slim` |
-| 2 | `.github/workflows/ci.yml:88` | `python-version: '3.9'` |
-| 3 | `infrastructure/terraform/main.tf:386` | `runtime = "python39"` |
-| 4 | `scripts/deploy.sh:669` | `--runtime python39` |
-| 5 | `backend/app/tasks/listing_updater.py:370` | `@asyncio.coroutine` |
+| 2 | `.github/workflows/ci.yml:108` | `python-version: '3.9'` |
+| 3 | `infrastructure/terraform/main.tf:384` | `runtime = "python39"` |
+| 4 | `scripts/deploy.sh:768` | `--runtime python39` |
+| 5 | `backend/app/tasks/listing_updater.py:329` | `@asyncio.coroutine` |
 
-So the delivered pin is **two version declarations plus one code-level constraint**:
-entries 1, 2 and 5. Any document quoting "five sites" is describing the baseline;
-`docs/security/DECISION_LOG.md` §35.27.1 reconciles the two counts and is the
-authority for the current figure.
+So the delivered pin is **four version declarations plus one code-level constraint**:
+entries 1 to 4 are configuration and entry 5 is a language construct. `.github/workflows/ci.yml`
+declares the interpreter in five jobs and is counted once as one file.
+
+**One intermediate count is superseded, and is stated so that a citation of it lands
+here.** `docs/security/DECISION_LOG.md` §82.27.1 withdrew row 1.9's five-site list and
+published **three** — two declarations plus the code constraint — on the ground that
+§82.1 had deleted both the managed-function resource in `infrastructure/terraform/main.tf`
+and the runtime flag in `scripts/deploy.sh`. That was accurate for the tree it measured.
+A later round reinstated both behind an authorization gate rather than deleting them, so
+the tree carries four declarations again, and row 91.2.1 is the current authority. Every
+sibling document states **five**, and so does this table.
 
 The fifth entry differs in kind from the version declarations and is the reason the
-pin is self-reinforcing rather than merely declared. Entries 1 to 4 are configuration.
-Entry 5 is a language construct removed in CPython 3.11, so the application code would
-itself stop working on a newer interpreter. The pin describes what this code can run
+pin is self-reinforcing rather than merely declared: it is a language construct removed
+in CPython 3.11, so the application code would itself stop working on a newer
+interpreter, whatever the configuration said. The pin describes what this code can run
 on, not only what it is configured to run on — and that entry was re-verified by
 execution rather than by reading, because the delivered ingestion workload now invokes
 that coroutine directly from a scheduled job: the exact command that job runs was
@@ -454,10 +480,20 @@ section is where it is maintained. Four of the five are version declarations &md
 `@asyncio.coroutine` construct in `backend/app/tasks/listing_updater.py`, which pins the
 interpreter in code rather than in configuration. The delivery workflow declares no
 interpreter of its own: it calls the verification workflow, so the pin governs both runs
-from one declaration and cannot drift between them.
+from one declaration and cannot drift between them. That was re-verified for this
+correction by searching `.github/workflows/cd.yml` for any interpreter declaration at
+baseline and as delivered, and finding none in either.
+
+One further file names the version without pinning a delivered artefact, and it is
+recorded here so the inventory is exhaustive about what an interpreter change must
+touch: `scripts/setup_dev_environment.sh:21` sets `REQUIRED_PYTHON_VERSION="3.9"` and
+refuses to build a developer environment on any other interpreter. It is deliberately
+not one of the five, because it configures neither a delivered artefact nor a
+verification run — but anyone raising the interpreter has to edit it as well, or every
+developer environment refuses to build while every deployed artefact succeeds.
 
 Advancing the interpreter is therefore not treated as an available remediation
-anywhere in this file. The decision to hold the pin and accept all fourteen
+anywhere in this file. The decision to hold the pin and accept all eight
 advisories, the alternative that was considered, and the risk the choice carries
 are recorded as **row 1.9 of [`docs/security/DECISION_LOG.md`](DECISION_LOG.md)**,
 whose site list that log's §35.27.1 supersedes.
@@ -481,25 +517,35 @@ of risk and is counted separately.
 | **What** | The provider's managed serverless functions product retired its Python 3.9 runtime |
 | **When** | 5 April 2026. This register was last measured on 9 August 2026, so the date is **past**, not upcoming |
 | **Effect after the date** | Under that provider's runtime-support policy, a retired runtime can no longer be used to create or update a function, and existing deployments on it become liable to be disabled |
-| **Where it applied here** | `infrastructure/terraform/main.tf` declared a function with `runtime = "python39"`, and `scripts/deploy.sh` deployed one with `--runtime python39` — pin sites 3 and 4 of the table above |
+| **Where it applies here** | `infrastructure/terraform/main.tf:384` declares a function with `runtime = "python39"` and `scripts/deploy.sh:768` passes `--runtime python39` — pin sites 3 and 4 of the table above. Both are **withheld rather than removed**: the resource and its invoker binding each carry `count = var.cloud_function_deployment_authorized ? 1 : 0`, which defaults to `false`, and the script refuses the deploy step unless `CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED=true`. So the declaration exists, is reviewable, and no apply or release attempts a create that the provider would refuse |
 | **Why it could not be fixed by upgrading the runtime** | The pin is a hard constraint, and pin site 5 makes it more than a preference: `@asyncio.coroutine` was removed in CPython 3.11, so the ingestion code would break on the newer runtimes the product still offers |
 
-### The evidence that made deletion the honest response rather than the convenient one
+### The evidence behind withholding the resource rather than applying or deleting it
 
-Three facts were read from the repository rather than assumed, and together they
-establish that nothing was lost by removing the resource:
+Three facts about the **baseline** resource were read from the repository rather than
+assumed, and together they establish that nothing usable was being deployed:
 
 1. **There was no function source.** The resource named an archive `function-source.zip`
-   that exists nowhere in the repository, and no `functions/` directory exists.
+   that existed nowhere in the repository, and no `functions/` directory existed.
 2. **There was no entry point.** It named `hello_world`, which no module in this
-   repository defines, and carried the display name "My function".
-3. **Nothing scheduled the workload it purported to run.** `run_listing_updater()` is
-   referenced by no scheduler — the application's lifespan creates no task — so the
+   repository defined, and it carried the display name "My function".
+3. **Nothing scheduled the workload it purported to run.** `run_listing_updater()` was
+   referenced by no scheduler — the application's lifespan created no task — so the
    periodic ingestion the function was nominally for was not running anywhere.
 
-A resource that names a decommissioned runtime, a source archive that does not exist
-and an entry point that is not defined is a broken claim, not a deployment. Leaving it
-in place would have meant an infrastructure configuration that cannot be applied.
+A resource naming a decommissioned runtime, a source archive that does not exist and an
+entry point that is not defined is a broken claim rather than a deployment.
+
+**All three are addressed in the delivered tree, and the runtime is still the blocker.**
+The source is real: `data.archive_file.function_source` packages
+`infrastructure/functions/health/`, which carries `main.py` and its own pinned
+`requirements.txt`. The entry point, the name and the description are variables with
+validation rather than placeholders. And the ingestion schedule the function was
+nominally for is a delivered CronJob, described below. What remains unresolvable inside
+this scope is the runtime identifier itself, so the resource is **withheld** — declared
+and reviewable, excluded from every plan until a release owner authorizes either a
+supported runtime or the function's retirement. Row 91.6.3 records the invoker form the
+declaration uses, and the escalation is stated in the configuration beside the resource.
 
 ### The alternative strategy adopted
 
@@ -514,16 +560,19 @@ moved and the runtime did not.
 executed under CPython 3.9.25 in this working tree and exited 0, emitting one structured
 ingestion-pass record. That simultaneously confirms the workload functions and that the
 `@asyncio.coroutine` construct of pin site 5 remains callable on the pinned interpreter.
+The same command was then run against a provider read that could not be completed and
+exited **non-zero**, which is what makes the schedule's `backoffLimit` and its failed-job
+history meaningful; O-8 records why that outcome had to be corrected.
 
 ### Compensating position, and what remains open
 
 | Aspect | Position |
 |---|---|
 | **Exposure to the running service** | None. The service does not run on the retired product, and no request path reaches it |
-| **Compensating control** | The infrastructure no longer declares any managed-runtime resource, so the configuration cannot claim a hosting path it does not have. An absence sweep over all three Terraform files and both delivery paths reports zero occurrences of the retired runtime identifier, the phantom source archive, the placeholder entry point and the placeholder display name |
-| **Residual operational risk** | A managed function may still exist in a live project from an earlier apply, carrying an anonymous invoker binding that removing the resource does **not** revoke. This is handled as an explicit, idempotent revocation step in `scripts/deploy.sh` and is called out for the operations reviewer in [`docs/review/CRITICAL_DECISIONS.md`](../review/CRITICAL_DECISIONS.md) |
+| **Compensating control** | The declaration is gated closed by default in both delivery paths — `var.cloud_function_deployment_authorized` in Terraform and `CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED` in `scripts/deploy.sh`, each defaulting to `false` — so no apply and no release attempts a create the provider would refuse, and the conflict is visible in the configuration rather than discovered at the API. An absence sweep over all three Terraform files and both delivery paths reports zero occurrences of the phantom source archive, the placeholder entry point and the placeholder display name; the retired runtime identifier remains, deliberately, because the pin forbids changing it and the gate is what makes that safe |
+| **Residual operational risk** | A managed function may still exist in a live project from an earlier apply, carrying an anonymous invoker binding that neither withholding the resource nor removing it would revoke. This is handled as an explicit, idempotent revocation step in `scripts/deploy.sh` and is called out for the operations reviewer in [`docs/review/CRITICAL_DECISIONS.md`](../review/CRITICAL_DECISIONS.md) |
 | **Forward-compatibility debt** | Pin site 5 will fail on CPython 3.11 or later. It is retained deliberately, is among the findings reported for confirmation rather than fixed, and is the reason the pin is self-reinforcing. It is the item to discharge first if the pin is ever lifted |
-| **Reasoning and alternatives** | `docs/security/DECISION_LOG.md` §35.1, which records four rejected alternatives — advancing the runtime, keeping the resource and noting the issue, commenting the resource out, and migrating to a second-generation function or container service |
+| **Reasoning and alternatives** | `docs/security/DECISION_LOG.md` §35.1, which records four rejected alternatives — advancing the runtime, keeping the resource ungated and noting the issue, commenting the resource out, and migrating to a second-generation function or container service |
 
 One clarification the pin table invites, stated so it is not inferred wrongly:
 lifting the pin would make `python-dotenv` 1.2.2 and `click` 8.3.3 installable
@@ -699,22 +748,71 @@ the pre-filter are the form-handling constructs — `UploadFile`, `File(`,
 the package level and the semantic assertion covers at the symbol level, and
 `TrustedHost`, which is a control rather than a risk.
 
-## Development register: seven accepted development advisories
+## Development register: one accepted development advisory
 
-`backend/requirements-dev.txt` declares the test, lint and audit tooling. Nothing
-in it is installed into the runtime image: the backend container installs
-`backend/requirements.txt` only, and no name in the development manifest appears
-there. Every advisory below is therefore confined to a developer workstation or a
-continuous-integration runner and serves no request.
+`backend/requirements-dev.txt` declares the test, lint and static-analysis
+tooling. Nothing in it is installed into the runtime image: the backend container
+installs `backend/requirements.txt` only, and no name in the development manifest
+appears there. The advisory below is therefore confined to a developer
+workstation or a continuous-integration runner and serves no request.
 
-`pip-audit -r backend/requirements-dev.txt` reports exactly these seven, in five
-packages:
+`pip-audit --strict -r backend/requirements-dev.txt` reports exactly this one, in
+one package:
 
 ```text
-Found 7 known vulnerabilities in 5 packages
+Found 1 known vulnerability in 1 package
+Name   Version ID              Fix Versions
+------ ------- --------------- ------------
+pytest 8.4.2   PYSEC-2026-1845 9.0.3
+```
+
+| Advisory | Package @ pin | Unreachable fix | How it enters the development set | Named compensating control |
+|---|---|---|---|---|
+| PYSEC-2026-1845 | `pytest` 8.4.2 | 9.0.3 | Declared directly as the test framework | The framework runs only when a developer or a runner invokes it against this repository's own test tree. It is declared in no runtime manifest, so it is absent from the deployed image, and it accepts no network input. |
+
+### Evidence that no fix is reachable
+
+The fix version above was measured, not inferred. It was offered to pip under
+CPython 3.9.25 with dependency resolution disabled and refused, because its
+metadata declares `Requires-Python >=3.10`. Every release of the fixed major was
+refused for the same reason:
+
+```bash
+pip install --dry-run --no-deps pytest==9.0.3
+```
+
+The interpreter pin that refusal rests on is fixed at five sites and is not
+advanced by this work; the sites are enumerated once, in
+[The runtime pin](#the-runtime-pin). A pin in the development manifest is raised
+only when the raised version installs under CPython 3.9, which is re-measurable
+with the command above.
+
+### The audit instrument's own tree
+
+Until this round the Development register carried **seven** identifiers rather
+than one, and six of them were not this repository's. They arrived through
+`pip-audit`, which was declared in `backend/requirements-dev.txt` and therefore
+audited when that manifest was: `msgpack` and `filelock` through
+`CacheControl[filecache]`, and `requests` with `urllib3` beneath it, required by
+both `pip-audit` and `CacheControl`. Auditing a manifest that declares the
+auditor reports the auditor's own supply chain as the project's.
+
+The instrument now lives in `backend/requirements-audit.txt`, which is installed
+by the gate and audited by nothing. That is a change to what is measured, not a
+suppression: the identifiers are not moved to another ignore list, and no
+`--ignore-vuln` flag anywhere names one of them. Measured after the change,
+`pip-audit --strict -r backend/requirements-dev.txt` reports one advisory in one
+package where it reported seven in five.
+
+The six are identified rather than described, because a reviewer checking that
+they have not been quietly re-suppressed needs their identifiers. Auditing the
+instrument's own manifest attributes each one to the package that carries it:
+
+```text
+$ pip-audit --strict -r backend/requirements-audit.txt
+Found 6 known vulnerabilities in 4 packages
 Name     Version ID              Fix Versions
 -------- ------- --------------- ------------
-pytest   8.4.2   PYSEC-2026-1845 9.0.3
 msgpack  1.1.2   PYSEC-2026-3625 1.2.1
 filelock 3.19.1  PYSEC-2026-1375 3.20.1
 filelock 3.19.1  PYSEC-2026-1374 3.20.3
@@ -723,90 +821,67 @@ urllib3  2.6.3   PYSEC-2026-142  2.7.0
 urllib3  2.6.3   PYSEC-2026-141  2.7.0
 ```
 
-| Advisory | Package @ pin | Unreachable fix | How it enters the development set | Named compensating control |
-|---|---|---|---|---|
-| PYSEC-2026-1845 | `pytest` 8.4.2 | 9.0.3 | Declared directly as the test framework | The framework runs only when a developer or a runner invokes it against this repository's own test tree. It is declared in no runtime manifest, so it is absent from the deployed image, and it accepts no network input. |
-| PYSEC-2026-3625 | `msgpack` 1.1.2 | 1.2.1 | `pip-audit` &rarr; `CacheControl` &rarr; `msgpack` | Reached only by the audit scanner's on-disk HTTP cache, which stores responses the scanner itself fetched from the advisory service. Absent from the deployed image; no request path reaches it. |
-| PYSEC-2026-1375 | `filelock` 3.19.1 | 3.20.1 | `pip-audit` &rarr; `CacheControl` &rarr; `filelock` | Same scanner stack. The lock file is created under the runner's own cache directory for the duration of one audit invocation. Absent from the deployed image. |
-| PYSEC-2026-1374 | `filelock` 3.19.1 | 3.20.3 | `pip-audit` &rarr; `CacheControl` &rarr; `filelock` | Same control as PYSEC-2026-1375. Two advisories are recorded against the same package because their fixes land in different releases, and the later of the two sets the ceiling. |
-| PYSEC-2026-2275 | `requests` 2.32.5 | 2.33.0 | `pip-audit` and `CacheControl` both require it | Deliberately **removed** from the runtime manifest, where the single call site moved to `httpx`; it survives only inside the scanner stack. Absent from the deployed image, and the runtime HTTP client is `httpx`. |
-| PYSEC-2026-142 | `urllib3` 2.6.3 | 2.7.0 | `requests` &rarr; `urllib3`, under `pip-audit` | Departed the runtime graph with its parent. Reached only by the scanner's own outbound calls to the advisory service. Absent from the deployed image. |
-| PYSEC-2026-141 | `urllib3` 2.6.3 | 2.7.0 | `requests` &rarr; `urllib3`, under `pip-audit` | Same control as PYSEC-2026-142; both fixes land in the same release, which is refused under the pin. |
+Six is the whole of the difference: the development manifest reported seven
+before and one after, and this manifest reports exactly the six that separate
+those figures. No advisory was lost between the two measurements, and `pytest`
+PYSEC-2026-1845 is absent here because it never belonged to the instrument.
+`backend/tests/security/test_release_automation_contract.py` pins these six as
+`WITHDRAWN_DEVELOPMENT_SUPPRESSIONS` and fails if any is named on an ignore list
+in either workflow again.
 
-### Evidence that no fix is reachable
+What bounds the instrument's own exposure:
 
-Every fix version above was measured, not inferred. Each was offered to pip under
-CPython 3.9.25 with dependency resolution disabled, and each was refused because
-its metadata declares `Requires-Python >=3.10`:
-
-```bash
-pip install --dry-run --no-deps pytest==9.0.3
-pip install --dry-run --no-deps msgpack==1.2.1
-pip install --dry-run --no-deps filelock==3.20.3
-pip install --dry-run --no-deps requests==2.33.0
-pip install --dry-run --no-deps urllib3==2.7.0
-```
-
-The interpreter pin those refusals rest on is fixed at five sites and is not
-advanced by this work; the sites are enumerated once, in
-[The runtime pin](#the-runtime-pin). A pin in the development manifest is raised
-only when the raised version installs under CPython 3.9, which is re-measurable
-with the commands above.
-
-### Compensating controls, stated once for the set
-
-The runtime register argues each control against a specific defective code path,
-because a runtime package is installed where requests are served. The development
-set does not need that argument, and claiming it would overstate the analysis. Its
-controls are these:
-
-1. **Absence from the deployed image.** None of the five packages is declared in
-   `backend/requirements.txt`. The backend container installs that manifest alone,
-   so no deployed process contains any of them and no HTTP request can reach one.
-   This is verifiable from the two manifests without trusting this register.
-2. **No request path, even on the machines that do install them.** Six of the
-   seven arrive through the `pip-audit` scanner stack, which runs against a
-   manifest on a developer workstation or a runner and serves nothing. The
-   seventh, `pytest`, executes this repository's own test tree.
-3. **The two packages with runtime history are gone from the runtime graph.**
+1. **It is not in any image.** `pip-audit` is named in neither
+   `backend/requirements.txt` nor `backend/requirements-dev.txt`, and
+   `infrastructure/docker/Dockerfile.backend` installs the runtime manifest
+   alone. No deployed process contains it or anything beneath it.
+2. **It runs once, on input it fetched itself.** The advisories concern an
+   on-disk HTTP response cache, a lock file in the runner's cache directory, and
+   the HTTP client the scanner uses to reach the advisory service. All three are
+   exercised only by the scanner's own invocation against a manifest in this
+   repository. None reads a request, and none reads attacker-supplied input.
+3. **The two packages with runtime history stay out of the runtime graph.**
    `requests` and `urllib3` were removed from `backend/requirements.txt`
-   deliberately, and a continuous-integration audit of that manifest would fail if
-   either returned, because neither identifier is suppressed for it.
-4. **The suppression set is asserted, not trusted.** Both audit invocations are
-   pinned to exact identifier lists, and
+   deliberately, and the runtime audit suppresses neither identifier, so it fails
+   if either returns. That property is unchanged by this move and is what makes
+   the move safe: it does not launder a runtime dependency into a tooling
+   manifest.
+4. **The boundary is asserted rather than trusted.**
    `backend/tests/security/test_release_automation_contract.py` asserts that each
-   invocation suppresses exactly the set registered here. Adding a suppression
-   without registering it fails the build; registering one without suppressing it
-   fails the same test.
+   audit invocation suppresses exactly the set registered here, so a suppression
+   added to a workflow without a register entry fails the build, and a register
+   entry with no suppression fails the same test.
 
-### Three identifiers appear in both accountings, and are counted once
+The alternatives weighed — replacing the instrument, leaving the six accepted,
+and advancing the interpreter — are recorded in
+[`docs/security/DECISION_LOG.md`](DECISION_LOG.md) rather than here.
 
-PYSEC-2026-2275, PYSEC-2026-142 and PYSEC-2026-141 appear twice in this file, and
-the two appearances say different things about different manifests. They are
-listed under [Eliminated by package removal](#eliminated-by-package-removal-4)
-because `requests` and `urllib3` left the **runtime** manifest, which genuinely
-closed them there; the runtime audit does not suppress them, and would fail if
-they reappeared. They are listed in the Development register because the scanner
-stack still installs both packages on the machine that runs the audit.
+### One identifier, counted once
 
-They are counted **once** in the total, inside the development seven. Nothing in
-this register counts an identifier twice, and the runtime figure of seven does not
-include them.
+The Runtime and Development registers are disjoint. No identifier appears in both
+audit invocations, and nothing in this register counts an identifier twice.
+
+PYSEC-2026-2275, PYSEC-2026-142 and PYSEC-2026-141 still appear once each in this
+file, under [Eliminated by package removal](#eliminated-by-package-removal-4),
+because `requests` and `urllib3` left the **runtime** manifest and that genuinely
+closed them there: the runtime audit suppresses neither, and would fail if either
+reappeared. They are no longer accepted anywhere, because the manifest that
+brought them back onto the audited surface is no longer audited.
 
 ### The total-suppression accounting
 
 | Line | Count |
 |---|---|
 | Runtime register entries | 7 |
-| Development register entries | 7 |
-| **Identifiers suppressed across both audit invocations** | **14** |
-| Distinct identifiers among those fourteen | 14 |
+| Development register entries | 1 |
+| **Identifiers suppressed across both audit invocations** | **8** |
+| Distinct identifiers among those eight | 8 |
 | Identifiers suppressed anywhere in continuous integration but absent from this file | **0** |
 
 The fourth line is worth its own sentence: the two registers are disjoint, so the
-fourteen suppressions are fourteen distinct advisories rather than a set with
-overlap. The fifth line is the property the audit gate's comment asserts, and the
-one a reviewer should re-check after any change to either manifest.
+eight suppressions are eight distinct advisories rather than a set with overlap.
+The fifth line is the property the audit gate's comment asserts, and the one a
+reviewer should re-check after any change to either manifest.
 
 ## Dispositions that are not residual
 
@@ -839,13 +914,14 @@ choice to stand still.
 
 One point of precision, because an auditor reading the continuous-integration
 configuration will encounter it. `requests` and `urllib3` left the **runtime**
-manifest, which is what these figures measure. Both are still reached by the
-development-only scanning tooling, so their three advisories reappear in the
-[Development register](#development-register-seven-accepted-development-advisories)
-rather than disappearing entirely, as
-[Three identifiers appear in both accountings](#three-identifiers-appear-in-both-accountings-and-are-counted-once)
-records. Nothing in the deployed image installs them, which is what makes their
-removal effective for the runtime figures.
+manifest, which is what these figures measure. Both are still installed on the
+machine that runs the audit, because the audit instrument requires them — but
+that instrument's manifest is not audited, so their three advisories are reported
+nowhere and suppressed nowhere. They are closed here and accepted in neither
+register, as
+[The audit instrument's own tree](#the-audit-instruments-own-tree) records.
+Nothing in the deployed image installs them, which is what makes their removal
+effective for the runtime figures.
 
 ### Eliminated by omission — 6
 
@@ -931,31 +1007,26 @@ accounted for exactly once; and `6 + 1 = 7`, which is the count the delivered
 audit reports. Both figures are reproducible with the commands in
 [Reproducing these measurements](#reproducing-these-measurements).
 
-### The development-manifest advisories
+### The development-manifest advisory
 
 Counted separately, never added to the figures above, and listed here because
 this register is the index of every accepted advisory. The compensating-control
-argument for each lives in `backend/requirements-dev.txt`'s own accepted-advisory
-section, which is the authority for their detail.
+argument is stated in full in the
+[Development register](#development-register-one-accepted-development-advisory),
+and inventoried beside the pins it governs in `backend/requirements-dev.txt`.
 
 | Advisory | Package @ pin | Unreachable fix | Route into the graph |
 |---|---|---|---|
 | PYSEC-2026-1845 | `pytest` 8.4.2 | 9.0.3 | The test framework itself |
-| PYSEC-2026-3625 | `msgpack` 1.1.2 | 1.2.1 | `CacheControl` → `pip-audit` |
-| PYSEC-2026-1375 | `filelock` 3.19.1 | 3.20.1 | `CacheControl` → `pip-audit` |
-| PYSEC-2026-1374 | `filelock` 3.19.1 | 3.20.3 | `CacheControl` → `pip-audit` |
-| PYSEC-2026-2275 | `requests` 2.32.5 | 2.33.0 | `pip-audit`, `CacheControl` |
-| PYSEC-2026-142 | `urllib3` 2.6.3 | 2.7.0 | `requests` → `pip-audit` |
-| PYSEC-2026-141 | `urllib3` 2.6.3 | 2.7.0 | `requests` → `pip-audit` |
 
-Two of these identifiers also appear in the runtime ledger above, as rows 4 and 5
-and 6, and that is not a double count. They were **removed from the runtime
-manifest** and are still reached by the development-only scanning tooling, so the
-same advisory is closed for the deployed image and accepted for a developer or
-pipeline machine. Nothing in the deployed image installs `requests` or `urllib3`;
-the runtime HTTP client is `httpx`.
+No identifier in this register appears in the runtime ledger above, so nothing is
+double counted. The three that did — PYSEC-2026-2275, PYSEC-2026-142 and
+PYSEC-2026-141 — reached the development surface only through `pip-audit`, and
+that instrument's manifest is no longer audited, so they are now closed in the
+runtime ledger and accepted nowhere. `requests` and `urllib3` are absent from the
+deployed image; the runtime HTTP client is `httpx`.
 
-Each of the seven declares `Requires-Python >=3.10` at its fix version, so the
+The one identifier declares `Requires-Python >=3.10` at its fix version, so the
 interpreter ceiling applies to this set exactly as it does to the runtime set.
 
 ### The least obvious lever
@@ -991,7 +1062,7 @@ replaced rather than pinned, and it is the one advisory in the original set that
 no version change of any kind could have closed.
 
 The distinction between that case and this register matters. `ecdsa` had **no fix
-at all**; the fourteen advisories recorded here each have a published fix that is
+at all**; the eight advisories recorded here each have a published fix that is
 merely **unreachable under the runtime pin**. Both are unfixable by upgrading,
 for entirely different reasons, and only the second kind belongs in a residual
 register. The decision to replace the token library rather than pin it is
@@ -1042,45 +1113,36 @@ manifest.
 
 ## Development-only accepted advisories
 
-Seven further advisories are accepted in `backend/requirements-dev.txt`. They are
-registered here so that the fourteen suppressions the audit gate carries all have
-a record in one place; the same seven are tabulated in that manifest's header
-beside the pins they attach to.
-
-Every fix version below was measured with `pip install --dry-run --no-deps`
-under CPython 3.9.25 and refused: each declares `Requires-Python >=3.10`. The
-runtime pin is not advanced, so none is reachable.
+**One** advisory is accepted in `backend/requirements-dev.txt`, and it is
+registered in one place rather than two: the
+[Development register](#development-register-one-accepted-development-advisory)
+carries the identifier, the unreachable fix, the measurement that establishes it
+unreachable and the named compensating control, and
+`backend/requirements-dev.txt`'s own header inventories it beside the pin it
+attaches to. This section previously repeated that table; the repetition was a
+second place to keep in agreement and is now a pointer.
 
 | # | Advisory | Package and pin | Fix version | Reached through |
 |---|---|---|---|---|
 | 1 | PYSEC-2026-1845 | `pytest` 8.4.2 | 9.0.3 | the test framework itself |
-| 2 | PYSEC-2026-3625 | `msgpack` 1.1.2 | 1.2.1 | CacheControl, a dependency of `pip-audit` |
-| 3 | PYSEC-2026-1375 | `filelock` 3.19.1 | 3.20.1 | CacheControl, a dependency of `pip-audit` |
-| 4 | PYSEC-2026-1374 | `filelock` 3.19.1 | 3.20.3 | CacheControl, a dependency of `pip-audit` |
-| 5 | PYSEC-2026-2275 | `requests` 2.32.5 | 2.33.0 | `pip-audit` and CacheControl |
-| 6 | PYSEC-2026-142 | `urllib3` 2.6.3 | 2.7.0 | `requests`, a dependency of `pip-audit` |
-| 7 | PYSEC-2026-141 | `urllib3` 2.6.3 | 2.7.0 | `requests`, a dependency of `pip-audit` |
 
-**Compensating controls for the set.**
+**Six advisories that this section previously listed are no longer accepted
+anywhere.** They were `pip-audit`'s own dependency tree — `msgpack` and
+`filelock` through `CacheControl[filecache]`, and `requests` with `urllib3`
+beneath it — reported because the manifest declaring the instrument was the
+manifest being audited. The instrument now lives in
+`backend/requirements-audit.txt`, which no audit reads, so those six are neither
+reported nor suppressed. They are not moved to another ignore list; no
+`--ignore-vuln` flag in either workflow names one of them.
+[The audit instrument's own tree](#the-audit-instruments-own-tree) records the
+measurement, what bounds the instrument's exposure and where the alternatives are
+argued.
 
-1. **None of the five packages is declared in `backend/requirements.txt`.** The
-   backend image installs the runtime manifest only, so none of them is present
-   in any deployed process and none is reachable from a request.
-2. **Six of the seven arrive through the audit scanner's own dependency tree.**
-   That scanner runs on a developer machine or a continuous-integration runner,
-   against a manifest, and serves no request. The seventh is the test framework.
-3. **`requests` and `urllib3` were deliberately removed from the runtime
-   manifest** during this remediation; the runtime HTTP client is `httpx`. Their
-   reappearance here is in the scanner's tree, not the service's.
-4. **The two sets are audited separately and gated separately.** The runtime
-   audit is what the seven entries in
-   [The seven accepted advisories](#runtime-register-seven-accepted-runtime-advisories) belong to; a
-   development-only advisory can therefore never be mistaken for a runtime one.
-
-**Note on the two `filelock` entries.** They name the same package and pin but
-different fix versions, which is not a transcription error: they are two distinct
-advisories against one release, remediated in two different subsequent releases.
-Both are suppressed and both are recorded.
+**The two audited sets remain audited and gated separately.** The runtime audit
+is what the seven entries in
+[the runtime register](#runtime-register-seven-accepted-runtime-advisories)
+belong to, so a development-only advisory can never be mistaken for a runtime
+one.
 
 ## Findings outside this register
 
@@ -1096,41 +1158,71 @@ operator-owned items were added by the infrastructure and release-path round.
 
 Four of those ten are also open items in their own right rather than only
 observations awaiting confirmation, because something a reader would expect to
-work does not. Those four, and four more of the same kind, are set out in
+work does not. Those four, and five more of the same kind, are set out in
 [Open items that are not dependency advisories](#open-items-that-are-not-dependency-advisories)
 below. That section is likewise outside every count here.
 
 ## Open items that are not dependency advisories
 
 The seven entries above are dependency advisories, and every count in this
-register describes that set alone. This section is a **separate register of eight
+register describes that set alone. This section is a **separate register of nine
 open items that are not advisories** — two platform end-of-life dates, a third
 that has already passed, three cross-layer contract gaps, an absent delivery
-prerequisite, an absent schedule, and an operational step that has deliberately
-not been executed. They are recorded here because a reader of this file is
-looking for what was *not* closed, and answering that question only for
+prerequisite, an unverified external provider contract, a schedule that is now
+delivered but conditional on that contract, and an operational step that has
+deliberately not been executed. They are recorded here because a reader of this
+file is looking for what was *not* closed, and answering that question only for
 dependency advisories would answer it too narrowly.
+
+**One item was split and half of it closed, in the round that produced this
+revision.** O-7 previously bundled two unrelated statements: that no Kubernetes
+workload objects existed, and that the frontend build platform was
+end-of-life with an undeclared dependency. The first is no longer true of this
+tree — the manifests are committed and both release paths apply them — so O-7 now
+states only what is still open about the cluster, and the frontend half is
+carried on its own as O-9. Nothing was decided to close the first half; the tree
+changed.
 
 Each entry states what is open, why this remediation did not close it with the
 governing clause of the Agent Action Plan (AAP) named, what an operator must do,
-and how the item is detectable. **None is fixed. None is a dependency advisory,
-so none enters any count above.** The reasoning behind leaving each open is
+and how the item is detectable. **None is a dependency advisory, so
+none enters any count above.** The reasoning behind leaving each open is
 logged in [`docs/security/DECISION_LOG.md`](DECISION_LOG.md) §36.6, in the same
 way the ten flagged findings above are logged at row 34.6.3. Four are also
 carried into
 [`../review/CRITICAL_DECISIONS.md`](../review/CRITICAL_DECISIONS.md), which
 assigns each to a named reviewer with the checks that reviewer should perform.
 
+**Two of these eight were restated because the delivered tree contradicted them,
+and the correction is recorded rather than applied silently.** O-7 claimed that no
+Kubernetes workload object exists for a deployment to update and O-8 that nothing
+schedules the ingestion task. `infrastructure/kubernetes/` carries twelve manifests
+— both Deployments and their Services, both autoscalers, the migration Job, the
+administrator-credential Job and `65-ingestion-cronjob.yaml` — and both delivery
+paths render and apply them. The Kubernetes half of O-7 is therefore closed by
+delivery, and O-8 is restated as an **applied-state unknown**: the schedule exists
+as a delivered manifest and whether it runs anywhere is outside what this repository
+can establish. Rows 91.3.1 and 91.3.2 of the decision log record both restatements,
+and row 91.7.1 is the wording rule that keeps delivered, locally verified and
+applied state apart.
+
+**What "open" means for each of the nine.** Seven are wholly open. O-7 is open in
+two narrower senses than when it was written: the workload inventory exists and both
+release paths apply it, but the first cluster still needs one apply out of band, and
+the item's frontend half is untouched. O-8 is open in the sense that no evidence here
+shows the delivered schedule applied anywhere.
+
 | # | Open item | Kind | Why this remediation did not close it | Decision log |
 |---|-----------|------|---------------------------------------|--------------|
-| O-1 | The exposed database credential and service-account key are not rotated, and a credential-bearing `DATABASE_URL` stays reachable in history | Operational, irreversible | AAP §0.10.3 sequences rotation **last**, after every other change is verified, because it cannot be rolled back. It needs provider consoles and a change window | 36.6.6 |
+| O-1 | The exposed database credential and service-account key are **not rotated by this work**, and a credential-bearing `DATABASE_URL` stays reachable in this repository's history. Whether an operator has since rotated them, and whether the exposed values still authenticate, are issuer-side facts nothing here can establish | Operational, irreversible | AAP §0.10.3 sequences rotation **last**, after every other change is verified, because it cannot be rolled back. It needs provider consoles and a change window | 36.6.6, and 91.7.1 for the wording |
 | O-2 | CPython 3.9 is end-of-life and stays pinned at five sites | Platform end-of-life | AAP §0.1.2 makes the pin a hard constraint, names the five sites, and directs that a fix needing a newer interpreter be documented as residual risk rather than taken | 36.6.1 |
 | O-3 | The Cloud Function declares the `python39` runtime, which the provider has decommissioned | Platform end-of-life, **blocking** | AAP §0.1.2, the same hard pin as O-2 — the runtime identifier is one of the five pin sites it names | 36.6.1 |
 | O-4 | The provisioned database is PostgreSQL 13, which is past end of life | Platform end-of-life | AAP §0.9.2 records it as held for confirmation. A major upgrade is a data-migration event no gate here covers | 36.6.2 |
 | O-5 | The browser client posts to a login path this backend does not serve and reads fields it does not return | Cross-layer contract | AAP §0.9.2 places `frontend/src/**` out of scope and names this reported rather than fixed; AAP §0.1.2 freezes the login response shape, so the backend cannot move either | 36.6.3 |
 | O-6 | The client drives the provider's subscription product while the backend implements orders, and the two name subscription fields differently | Cross-layer contract | AAP §0.9.2 and §0.1.2, the same pair as O-5: the client side is out of scope and the backend's shape is frozen | 36.6.3 |
-| O-7 | No Kubernetes workload objects exist for the deployment to update, and the frontend builds on an end-of-life Node major with one undeclared dependency | Delivery prerequisite | AAP §0.6.1 is an exhaustive 68-entry mapping holding no Kubernetes manifest; AAP §0.9.2 places `frontend/package.json` out of scope and holds the Node pin for confirmation | 36.2.4, 36.6.4 |
-| O-8 | The ingestion task has no production trigger, so listings never refresh once deployed | Absent schedule | AAP §0.9.2 excludes feature additions unrelated to security, and AAP §0.6.1 declares no scheduler resource | 36.6.5 |
+| O-7 | The workload objects **are** versioned here now and both release paths apply them, but each path's preflight requires the two Deployments to exist before it changes anything, so the very first cluster still needs a one-time apply out of band; and the frontend builds on an end-of-life Node major with one undeclared dependency | Delivery prerequisite, narrowed | AAP §0.6.1 is an exhaustive 68-entry mapping holding no Kubernetes manifest, which is why the inventory arrived later than the plan; AAP §0.9.2 places `frontend/package.json` out of scope and holds the Node pin for confirmation | 36.2.4, 36.6.4, 82.28, 88.1, 92.9 |
+| O-8 | The ingestion schedule is delivered as a Kubernetes CronJob, and an operator must not enable it until O-9 is closed, because an unverified adapter on a schedule fails every hour rather than once | Delivered, conditional | AAP §0.9.2 excludes feature additions unrelated to security, so the schedule exists only because the runtime it replaced was decommissioned; the provider contract it calls stays out of scope under the same clause | 36.6.5, 82.2, 88.2, 92.1, 92.7 |
+| O-9 | The listing provider's request shape, parameter names and response fields are a declaration of this repository rather than a contract verified against a provider, so the adapter may not work against a real one | External contract | AAP §0.6.1.2 authorises exactly three security changes to this adapter — the credential into a header, an explicit timeout and the redacting logger — and AAP §0.9.2 excludes feature additions and directs that findings outside scope be reported rather than fixed | 80.5.3, 92.1 |
 
 ### O-1 — the rotation and the history rewrite
 
@@ -1159,11 +1251,15 @@ promotes the runbook into a completion claim fails that case.
 
 CPython 3.9 is past end of life and receives no further security fixes. It is
 pinned at five sites, and the pin is a property of the code as well as the
-configuration: `backend/app/tasks/listing_updater.py:370` uses
+configuration: `backend/app/tasks/listing_updater.py:329` uses
 `@asyncio.coroutine`, removed in Python 3.11, so the ingestion task would not run
 on a newer interpreter even if every configuration pin were raised.
-[`TRACEABILITY_MATRIX.md`](TRACEABILITY_MATRIX.md) carries all five sites with
-both their baseline and their delivered line numbers.
+[`TRACEABILITY_MATRIX.md`](TRACEABILITY_MATRIX.md) carries all five sites, at
+their baseline line numbers: that file states its own convention, which is that
+every number in it resolves against revision `a26f7fb` rather than against the
+delivered tree. The delivered numbers are the ones quoted here and in
+[`../review/CRITICAL_DECISIONS.md`](../review/CRITICAL_DECISIONS.md), and
+`test_deployment_contract.py` reads each of them back from the file it names.
 
 **O-3 is the sharper half and is stated separately because its consequence is
 present rather than future.** The Cloud Function is declared with the `python39`
@@ -1190,7 +1286,7 @@ the same one.
 
 **What an operator must do.** Treat the interpreter migration as its own piece of
 work and expect it to be the largest item remaining. Its first step is the
-decorator at `backend/app/tasks/listing_updater.py:370`; its second is the four
+decorator at `backend/app/tasks/listing_updater.py:329`; its second is the four
 configuration sites. It invalidates this whole register, because all seven
 accepted advisories become installable at once — see
 [Maintaining this register](#maintaining-this-register), event 3.
@@ -1248,71 +1344,153 @@ no artefact here should be read as implying otherwise.
 to the backend rather than the reverse, because the backend's shape is the frozen
 one.
 
-### O-7 — the delivery prerequisites
+### O-7 — the first cluster apply, and the frontend build's two prerequisites
 
-Two items, both prerequisites rather than defects in delivered code. The
-deployment updates Kubernetes workloads with `kubectl set image`, which requires
-the Deployment, Service and Ingress objects to exist already; nothing in this
-repository creates them. Separately, the frontend job builds on an end-of-life
-Node major and `frontend/package.json` omits a dependency the source imports.
+**One half of this item is closed by a change of state, and it is recorded that
+way rather than removed.** An earlier revision of this register said that no
+Kubernetes workload objects existed for the deployment to update and that
+nothing in this repository created them. That is no longer true of this tree.
+`infrastructure/kubernetes/` carries the whole inventory — namespace, service
+accounts, settings map, two secret deliveries, the backend and frontend
+Deployments and Services, both autoscalers, the schema-migration Job, the
+ingestion CronJob and the administrator-credential Job.
+`scripts/render_kubernetes_manifests.sh` is the one substitution pass over them,
+and both `.github/workflows/cd.yml` and `scripts/deploy.sh` invoke it and apply
+its output, so the manifests that are validated are the manifests that are
+applied. `infrastructure/k8s/README.md` records the consolidation that produced
+that single inventory. Nothing was decided to close this half; the tree changed.
 
-AAP §0.6.1 is exhaustive at 30 CREATE, 29 UPDATE, 0 DELETE and 9 REFERENCE
-entries, and no Kubernetes manifest appears anywhere in it, so authoring one
-would add a delivery surface the plan does not describe. AAP §0.9.2 places
-`frontend/package.json` out of scope and names the Node pin as held for
-confirmation.
+**What remains open.** The objects are declared here; they are not present in a
+cluster. `scripts/deploy.sh` asserts that the `backend` and `frontend`
+Deployments already exist, and that each declares a container of its own name,
+before it changes anything — it publishes into an inventory that exists and
+creates no workload. So the first application of the prerequisite manifests is
+an operator action: no release path in this repository can reach a cluster,
+because the control plane has no public endpoint and this repository has no
+credential for one. A release run before that first application stops and names
+the missing Deployment rather than creating it implicitly.
 
-**What was done instead.** `.github/workflows/cd.yml` gained a preflight that
-asserts the workload objects exist and **fails closed naming the missing
-prerequisite**, and `scripts/deploy.sh` asserts project, cluster, region and
-namespace and obtains credentials before mutating anything. The gap is not
-closed; what changed is that no artefact now implies it is. Row 36.2.4 records
-the alternatives, and
+AAP §0.6.1 contains no step that applies a manifest to a cluster, and a release
+that created its own workloads would silently define the running specification
+from whichever path ran last. Row 36.2.4 records the alternatives.
 `test_pipeline_contract.py::test_every_mutated_workload_is_confirmed_to_exist_first`
-holds the preflight in place.
+holds the assertion in place, and
+`.github/scripts/check_manifest_settings_contract.py` checks the committed
+manifests against the settings contract in the `infrastructure` job.
 
-**What an operator must do.** Supply the workload manifests, or create the
-objects once out of band, before the first deployment. Declare the missing
-frontend dependency and raise the Node major under a separate frontend
-authorization.
+**The second half of this item is untouched, and is a frontend concern rather than
+a backend one.** The frontend continuous-integration job builds on an end-of-life Node
+major, and `frontend/package.json` omits a dependency the source imports, so a clean
+install resolves it only by accident of the tree it lands in. Neither is a defect in
+the backend this remediation hardened, and neither is fixable inside its boundary: AAP
+§0.9.2 places the frontend source out of scope, holds the Node pin for confirmation,
+and directs that a finding outside scope be reported rather than fixed. Both are
+therefore reported here and carried in this item's row rather than closed, which is why
+this entry stays open after its cluster half narrowed.
 
-### O-8 — the ingestion schedule
+**What an operator must do.** Render the `prerequisites` group with
+`scripts/render_kubernetes_manifests.sh` and apply it once, then apply the
+`workloads` group, before the first release. Both release paths take over from
+there. Separately, and under a frontend authorization this work does not carry,
+declare the missing dependency in `frontend/package.json` and raise the Node major.
 
-`backend/app/tasks/listing_updater.py` refreshes the listings corpus and has no
-production trigger. Nothing schedules it, so once deployed the corpus is
-populated only when something invokes the task directly.
+### O-8 — the ingestion schedule is delivered but not applied
 
-Both available options — a Cloud Scheduler job with an invocation path, or a
-Kubernetes CronJob — are feature additions. AAP §0.9.2 excludes feature additions
-unrelated to security and AAP §0.6.1 declares neither a scheduler resource nor a
-manifest. The task itself is in scope and was changed only at its logging
-boundary, routing failures through the redacting logger instead of a bare
-`print()`.
+**This entry previously said no production trigger existed. That is no longer
+true, and the correction matters more than the entry itself: an operator sent to
+solve a scheduling gap that has been closed would not look at the two risks the
+delivered schedule actually carries.**
 
-**What was done instead.** The executive summary's architecture diagram shows
-ingestion as an on-demand task rather than a running service, so no delivered
-artefact implies a schedule that does not exist.
+`infrastructure/kubernetes/65-ingestion-cronjob.yaml` runs
+`backend.app.tasks.listing_updater.update_listings` once per
+`${INGESTION_SCHEDULE}` on the backend image, under the same CSI secret mount and
+the same non-root security context as the API. It exists because the managed
+`python39` Cloud Function that was supposed to provide the periodic refresh is on
+a decommissioned runtime and was deleted; the decision is
+[`DECISION_LOG.md`](DECISION_LOG.md) §82.2, and §88.2 records carrying it onto the
+surviving manifest inventory. Row 80.6.5 — "do not add a production scheduler" —
+is **withdrawn** by row 92.7.
 
-**What an operator must do.** Decide the refresh cadence and add the trigger —
-but confirm the provider contract first, for the reason below, because an
-unverified client on a schedule fails repeatedly rather than once.
+Two risks remain, and neither is the one this entry used to describe.
 
-### A related boundary: the Zillow contract is unverified
+- **The pass it runs calls an adapter whose contract is unverified.** That is O-9.
+  A schedule multiplies an unverified contract by its frequency: hourly, an
+  adapter that does not match the provider fails every hour rather than once.
+- **The schedule's cadence is an operator input.** `${INGESTION_SCHEDULE}` is a
+  required substitution token, so `scripts/render_kubernetes_manifests.sh` refuses
+  to render until the operator sets it. There is no default cadence to inherit.
 
-Not an open item in its own right, and recorded here because it conditions O-8.
-The request shape, parameter names and response fields
-`backend/app/services/zillow_service.py` reads were never verified against the
-real provider; the client is correct against itself and against its tests.
+**What was fixed rather than left open.** A failed pass used to exit **0**. Every
+provider failure — a transport error, a refused status, an oversized body, a body
+that is not decodable, and every response that does not satisfy the adapter's
+declared contract — was converted to an empty list, and `update_listings` caught
+and swallowed anything raised, so `asyncio.run(update_listings())` completed
+successfully and logged `Completed an ingestion pass`. The CronJob's
+`backoffLimit: 2` and its failed-job history could therefore never engage, and a
+provider outage was indistinguishable from a quiet corpus. `fetch_listings` now
+raises `ListingProviderError` carrying a stable `reason`, `update_listings` rolls
+back and re-raises, and the process exits non-zero. A provider that answered and
+reported no listings is still a completed pass.
+`backend/tests/security/test_delivery_pipeline.py::test_the_ingestion_schedule_can_observe_a_failed_pass`
+holds both halves of that contract together — the manifest's attempt limit and
+failure history, and the task's rollback-then-raise.
 
-The **security** properties of that boundary are delivered and verified: the API
-key travels in a request header rather than the query string, every call carries
-an explicit timeout, and failures are recorded through the redacting logger —
-asserted by `backend/tests/test_services.py::test_api_key_travels_in_a_request_header`,
-`::test_api_key_is_absent_from_the_query_string` and
-`::test_every_request_carries_a_timeout`. What is unverified is the *functional*
-contract. Row 36.5.3 records the position.
+**What an operator must do.** Close O-9 before setting `INGESTION_SCHEDULE`, or
+accept a schedule whose jobs fail visibly until it is closed — and monitor
+failed-job history, which is now the signal it was always supposed to be.
 
-### Why these eight sit here rather than in the count above
+### O-9 — the listing provider's contract is unverified
+
+`backend/app/services/zillow_service.py` declares the request shape, the
+parameter names and the response fields it reads. **None of them was verified
+against a listing provider.** The adapter is correct against its own declaration
+and against its tests, and that is the whole of what can be claimed for it.
+
+This is an open item in its own right, promoted from a note that previously said
+it was "not an open item ... recorded here because it conditions O-8". That
+framing understated it: a delivered integration whose wire contract has never been
+checked against the far side is a gap, not a footnote, and the code review that
+prompted this correction was right to say so.
+
+**Why it was not closed here.** AAP §0.6.1.2 enumerates this file's entire
+authorised change set — the credential into a request header, an explicit timeout,
+and the redacting logger — and AAP §0.9.2 excludes feature additions unrelated to
+security and directs that findings outside that scope be reported for confirmation
+rather than fixed. Choosing a provider is also not a code decision: Zillow retired
+its public Web Services API in September 2021, and its official successor is an
+approval-gated RESO Web API requiring a multiple-listing-service membership or an
+approved partnership, so there is no self-serve contract to implement and any
+substitute is a licensing and product choice an operator owns. Row 92.1 records
+the alternatives.
+
+**What is delivered and verified.** The *security* properties of the boundary, all
+asserted by tests: the credential travels in a request header and appears in no
+URL, query string or log record; every call carries an explicit timeout; the
+response body is size-capped before it is read; the listing count is capped; the
+postal-code chunk is capped; a destination outside the provider allowlist is
+refused without a request being issued; and no search value or credential reaches
+a log record or a raised message.
+
+**What changed here to make the gap discoverable rather than silent.** The whole
+declared contract is now published as one immutable object,
+`DECLARED_PROVIDER_CONTRACT`, naming the method, the credential header, the
+postal-code parameter, the response collection key and the per-field source map —
+so an operator re-pointing the adapter has one place to look and one place to
+change. And a response that does not satisfy that declaration now **fails**,
+naming the element that did not match, where it previously read as a corpus with
+nothing in it. The first live call against a real provider therefore reports the
+difference instead of hiding it.
+`backend/tests/test_services.py::TestTheDeclaredListingProviderContract` states in
+its own docstring that its payloads encode the declared contract rather than a
+verified one, so the provenance is visible in the test that would otherwise be
+mistaken for evidence of a working integration.
+
+**What an operator must do.** Identify the provider and obtain its specification
+and credentials, then align the five entries of `DECLARED_PROVIDER_CONTRACT` and
+`PROVIDER_FIELD_SOURCES` to it and replace the contract fixtures with ones derived
+from that specification. Do this before enabling the schedule in O-8.
+
+### Why these nine sit here rather than in the count above
 
 A reader could reasonably ask why this section is not folded into the seven.
 Three reasons, and they are the same three that keep every count in this register
@@ -1322,47 +1500,53 @@ describing dependency advisories alone.
   or a CVSS vector, so none can be audited, suppressed or re-measured by
   `pip-audit`. Counting them beside the seven would make this register's headline
   figures unreproducible from the command that produced them.
-- **They are not all risks in the same sense.** O-5 through O-8 are functional
+- **They are not all risks in the same sense.** O-5 through O-9 are functional
   gaps rather than security weaknesses: the delivered system refuses or omits
   work rather than performing it unsafely. Presenting them as accepted security
   risk would overstate the exposure while understating the functional shortfall,
   which is the more accurate criticism of this delivery.
 - **They have different owners.** The seven above are closed by one interpreter
-  migration. These eight are closed by an operator action, a platform upgrade, a
-  frontend authorization and a scheduling decision — four pieces of work with
-  four different approvers.
+  migration. These nine are closed by an operator action, a platform upgrade, a
+  frontend authorization, a provider agreement and a scheduling decision — five
+  pieces of work with five different approvers.
 
-## Two workflow actions pinned by release tag rather than by commit
+## Workflow toolchain references: closed, and how it was closed
 
-Every action either workflow references is pinned to a commit, with the release
-it was published as recorded beside it, except two: `actions/setup-node` in the
-`frontend` job of `.github/workflows/ci.yml`, and `hashicorp/setup-terraform` in
-the `infrastructure` job of the same workflow. Both carry a major release tag,
-which the publisher can move.
+**Current state.** Every action either workflow references is pinned to a full
+commit with the release it was published as recorded beside it, and no action is
+exempt. `backend/tests/security/test_pipeline_audit_contract.py` asserts both
+properties over both workflows with no exemption set, so a tag reference or an
+undocumented commit fails the build.
 
-**Why they are not pinned.** A commit pin has to name a commit that exists. The
-identifiers for these two releases are not derivable in the environment this
-repository is verified in, and writing a plausible-looking one would reference a
-commit that does not exist — a worse outcome than a tag, because the workflow
-would fail at the reference rather than run a reviewed action.
+The Terraform binary is pinned with it: the `infrastructure` job passes an exact
+`terraform_version` to `hashicorp/setup-terraform`, so the binary that runs
+`terraform validate` is the release the configuration is verified with rather
+than whichever one the action resolves. That version satisfies the
+`required_version` constraint `infrastructure/terraform/main.tf` declares.
 
-**What bounds the exposure.** Neither action runs anywhere a moved tag could
-reach anything of value. Both jobs declare no `env`, request no `permissions`,
-authenticate to no cloud, name no secret and reach neither the cluster nor a
-registry. The `frontend` job lints and tests read-only source and uploads a
-coverage artefact; the `infrastructure` job runs `terraform fmt -check`,
-`terraform init -backend=false` and `terraform validate`, which contacts no
-backend and holds no state. A compromised action in either job could fail the
-build or read the public source it was given, and nothing else. Every job that
-does hold a credential — the `backend` gate, and every job of
-`.github/workflows/cd.yml` — references only commit-pinned actions.
+| Reference | Commit | Release |
+|---|---|---|
+| `actions/setup-node` | `249970729cb0ef3589644e2896645e5dc5ba9c38` | v6.5.0 |
+| `hashicorp/setup-terraform` | `b9cd54a3c349d3f38e8881555d616ced269862dd` | v3.1.2 |
 
-**How to close it.** Resolve each release tag to its commit and replace the
-reference with `owner/action@<commit> # <release>`, matching the convention the
-rest of both workflows already follow.
-`backend/tests/security/test_pipeline_audit_contract.py` names the two in
-`TAG_PINNED_ACTIONS`; removing a name from that set is what makes its pin
-mandatory again.
+**Superseded record.** This section previously carried these two references as an
+open item, on the stated ground that their commit identifiers were not derivable
+in the environment this repository is verified in. That ground was wrong. Both
+resolve from `git ls-remote --tags --refs`, and the method was cross-checked
+against the `actions/setup-python` pin the `backend` gate already carried, which
+it reproduces exactly. The item is closed rather than re-scoped, and the
+bounded-exposure argument it rested on is withdrawn with it: neither reference is
+tag-pinned any longer, so nothing depends on where those two jobs run.
+
+**Bootstrap installer.** The five jobs that read a manifest install the
+bootstrap installer before they do, and it is pinned to one exact version
+declared once at workflow scope in `.github/workflows/ci.yml` as `PIP_VERSION`
+and read from there by every install. It is inventoried in
+`backend/requirements-dev.txt`. It is a toolchain reference rather than a
+dependency of the delivered application: it is installed by the gate, is present
+in no image and no manifest resolution, and is therefore not audited by either
+`pip-audit` invocation. Its pin is what keeps an installer outside both audited
+manifests from resolving a new release at the moment the gate runs.
 
 ## Maintaining this register
 

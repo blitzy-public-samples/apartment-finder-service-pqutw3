@@ -28,11 +28,32 @@ from alembic import command
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
+from backend.tests.support import REVISION_IDS
+
+
 #: Revision the additive schema change is recorded under.
 SCHEMA_REVISION = "0001"
 
-#: Revision the administrative grant is recorded under, and the head.
+#: Revision the administrative grant is recorded under.
 GRANT_REVISION = "0002"
+
+#: Revision the workload indexes are recorded under.
+INDEX_REVISION = "0003"
+
+#: Revision at the top of the chain, read from the chain rather than
+#: restated, so a revision added above the indexes one moves this with
+#: it instead of leaving a stale identifier asserted here.
+HEAD_REVISION = REVISION_IDS[-1]
+
+#: The indexes revision 0003 creates, none of them unique.
+WORKLOAD_INDEXES = (
+    "ix_filters_user_id_id",
+    "ix_zip_codes_filter_id",
+    "ix_criteria_filter_id",
+    "ix_subscriptions_user_id_status_end_date",
+    "ix_subscriptions_user_id_plan_id_status",
+    "ix_listings_zillow_url",
+)
 
 #: Address revision 0002 leaves holding the administrative role.
 ADMIN_EMAIL = "test@blitzy.com"
@@ -114,6 +135,27 @@ def _uniqueness_names(connection, table):
         if index.get("unique")
     )
     return names
+
+
+def _index_names(connection):
+    """Return every index name the connected schema holds."""
+    inspector = inspect(connection)
+    names = set()
+    for table in inspector.get_table_names():
+        names.update(
+            index.get("name") for index in inspector.get_indexes(table)
+        )
+    return names
+
+
+def _stamped_revision(connection):
+    """Return the revision Alembic records, or ``None`` when none is."""
+    if VERSION_TABLE not in _table_names(connection):
+        return None
+    row = connection.execute(
+        text("SELECT version_num FROM {0}".format(VERSION_TABLE))
+    ).fetchone()
+    return None if row is None else row[0]
 
 
 def _administrators(connection):
@@ -202,33 +244,39 @@ def test_upgrade_head_builds_the_mapped_schema(
 def test_the_documented_round_trip_settles_on_postgresql(
     postgres_migration_connection, alembic_config
 ):
-    """Upgrade, two reversals and a re-upgrade leave one administrator.
+    """Upgrade, reversal to the base and a re-upgrade leave one admin.
 
     This is the gate the project's own verification table names, run
-    against the deployed dialect. The recorded revision is read after
-    each step, and the reversals are asserted to leave the schema empty
-    so the additive revision is symmetric on the path a first deployment
-    takes.
+    against the deployed dialect. Each reversal names the revision it
+    reverses down to rather than counting steps back from the head, so
+    every assertion states the schema state it means and stays true as
+    revisions are added above it. The reversals are asserted to leave
+    the schema empty, so the additive revision is symmetric on the path
+    a first deployment takes.
     """
     connection = postgres_migration_connection
     config = alembic_config(connection)
 
     command.upgrade(config, "head")
+    assert _stamped_revision(connection) == HEAD_REVISION
     assert _administrators(connection) == [ADMIN_EMAIL]
+    assert set(WORKLOAD_INDEXES) <= _index_names(connection)
 
-    command.downgrade(config, "-1")
+    command.downgrade(config, SCHEMA_REVISION)
     assert _administrators(connection) == []
     assert _role_of(connection, ADMIN_EMAIL) == REGISTERED_ROLE
     assert "role" in _column_names(connection, "users")
 
-    command.downgrade(config, "-1")
+    command.downgrade(config, "base")
     remaining = _table_names(connection)
     for table in APPLICATION_TABLES:
         assert table not in remaining, table
 
     command.upgrade(config, "head")
+    assert _stamped_revision(connection) == HEAD_REVISION
     assert _administrators(connection) == [ADMIN_EMAIL]
     assert "webhook_events" in _table_names(connection)
+    assert set(WORKLOAD_INDEXES) <= _index_names(connection)
 
 
 def test_the_added_columns_take_their_server_defaults(
@@ -285,7 +333,9 @@ def test_the_reversal_leaves_the_legacy_baseline_as_it_found_it(
 
     The six tables that precede the revision remain, carrying exactly
     their preceding columns, and the row stored before it is still
-    stored.
+    stored. The reversal names ``base`` rather than counting steps, so
+    it reverses the whole chain however long the chain becomes; the
+    legacy tables survive because no revision created them.
     """
     connection = postgres_migration_connection
     postgres_legacy_schema(connection)
@@ -293,13 +343,14 @@ def test_the_reversal_leaves_the_legacy_baseline_as_it_found_it(
     config = alembic_config(connection)
     command.upgrade(config, "head")
 
-    command.downgrade(config, "-1")
-    command.downgrade(config, "-1")
+    command.downgrade(config, "base")
 
+    assert _stamped_revision(connection) is None
     tables = _table_names(connection)
     for table in APPLICATION_TABLES[:-1]:
         assert table in tables, table
     assert "webhook_events" not in tables
+    assert set(WORKLOAD_INDEXES) & _index_names(connection) == set()
 
     users = _column_names(connection, "users")
     for column in USERS_ADDED_COLUMNS:

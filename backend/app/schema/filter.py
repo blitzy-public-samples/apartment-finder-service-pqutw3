@@ -99,7 +99,6 @@ _CriteriaValueField = constr(
 
 
 class ZipCode(BaseModel):
-    # Projection of a zip_codes row.
     code: str
 
     class Config:
@@ -107,7 +106,6 @@ class ZipCode(BaseModel):
 
 
 class Criteria(BaseModel):
-    # Projection of a criteria row.
     field: str
     operator: str
     value: str
@@ -135,7 +133,6 @@ class ZipCodeCreate(BaseModel):
     code: _ZipCodeField
 
     class Config:
-        # Rejects any field outside the allowlist above.
         extra = "forbid"
 
 
@@ -147,7 +144,6 @@ class CriteriaCreate(BaseModel):
     value: _CriteriaValueField
 
     class Config:
-        # Rejects any field outside the allowlist above.
         extra = "forbid"
 
     @validator("operator")
@@ -166,8 +162,6 @@ class CriteriaCreate(BaseModel):
 
 
 class FilterCreate(BaseModel):
-    # Allowlist of client-settable fields. This contract carries no id,
-    # user_id, created_at or last_used.
     name: _NameField
     zip_codes: conlist(ZipCodeCreate, max_items=MAX_ZIP_CODES) = []
     criteria: conlist(

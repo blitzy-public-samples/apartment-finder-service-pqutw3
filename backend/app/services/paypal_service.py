@@ -1,106 +1,5 @@
-"""PayPal REST integration: order creation, capture and webhook checks.
-
-Every call addresses the REST API base named by
-``settings.PAYPAL_API_BASE``, carries a Bearer token obtained from the
-OAuth2 client-credentials grant, and applies the timeout named by
-``settings.HTTP_TIMEOUT_SECONDS``. The base and the grant credentials are
-read from validated settings, and no environment name or host is written
-here.
-
-Every call is issued through an asynchronous client and blocks no event
-loop the API handlers run on. The client is opened by
-:func:`open_http_client` while the application starts and released by
-:func:`close_http_client` while it stops. It is recorded against the
-event loop it was opened on and is issued only from that loop; a call
-made outside that lifetime, or on another loop, gets a client of its own.
-
-Four operations are published:
-
-* :func:`create_order` opens an order whose amount and currency come from
-  the plan catalog. It takes a plan identifier, the two hosted redirect
-  URLs and an idempotency key, and it takes no amount, currency, price
-  or date. :func:`approval_url` reads the payer-approval target out of
-  the created order, which is what the hosted redirect sends the payer
-  to; the order is not captured here.
-* :func:`capture_order` captures an order the payer has approved. The
-  stored order identifier is resolved to its ``subscriptions`` row
-  through :func:`backend.app.core.authorization.load_owned`, which
-  records the decision, the route and the object; an order that does not
-  resolve to a row owned by the principal is refused before any request
-  leaves the process. The capture asks for a complete representation and
-  reads the order back when the response carries no settled capture, and
-  what it returns always states the amount, the currency and the capture
-  identifier.
-* :func:`read_capture` reads a capture response and reports whether the
-  provider completed it for the expected order, amount and currency. A
-  response that does not satisfy every one of those is not a completed
-  capture, and the reason names the check that failed.
-* :func:`verify_webhook_signature` checks an inbound notification
-  against PayPal's verify-webhook-signature endpoint. It takes the **raw
-  request bytes** and transmits them verbatim as the postback's
-  ``webhook_event``, and PayPal therefore checks the signature against
-  the notification as it arrived and not against a re-encoded copy of it.
-  The host named by the ``PAYPAL-CERT-URL`` header is checked against
-  ``settings.PAYPAL_CERT_HOST_ALLOWLIST`` before that value is used,
-  transmitted or logged, and all five ``PAYPAL-*`` headers are required.
-  The function reads and writes no database state on any path, emits no
-  record of its own, and returns a :class:`WebhookVerification`; its
-  caller records the outcome once and records the returned
-  ``transmission_id`` under the uniqueness constraint that rejects a
-  replay. A rejected signature is reported only for an explicit
-  :data:`VERIFICATION_FAILURE`; every answer that leaves the check
-  incomplete -- an unanswered postback, a body that is not an object, an
-  absent or non-string status, and a status outside
-  :data:`VERIFICATION_STATUSES` -- is reported as
-  :data:`REASON_VERIFIER_UNAVAILABLE` with ``retryable`` True, which the
-  caller answers ``503`` so PayPal delivers the notification again.
-
-Order creation and capture both carry the ``PayPal-Request-Id`` header
-their caller supplies, and a repeat of an uncertain call resolves to the
-same order and the same capture rather than to a second charge.
-
-Every failure is raised as a :class:`PayPalAPIError` carrying a
-:data:`ERROR_CATEGORIES` category, the provider status, the provider's
-``PayPal-Debug-Id``, the provider's own issue code and whether the
-failure is worth retrying, from which a caller can answer a dependency
-failure differently from a rejected request, and can distinguish
-:data:`ISSUE_ORDER_ALREADY_CAPTURED` from every other refusal the
-provider answers with the same status. The issue code is read only from
-:data:`PROVIDER_ISSUE_FIELDS` and only in the shape
-:data:`PROVIDER_ISSUE_PATTERN` accepts. No response body, URL or
-credential reaches the message.
-
-Every call is issued through one shared HTTP client, whose pooled
-connections and TLS sessions serve all four operations. The pool is
-bounded by :data:`MAX_CONNECTIONS` and
-:data:`MAX_KEEPALIVE_CONNECTIONS`, and :func:`close_http_client` releases
-it when the application stops.
-
-No function here writes, flushes, commits or discards database state on
-any path, and a caller's own transaction is exactly as it left it when a
-call returns.
-
-The access token is held in a process-wide cache for the lifetime the
-grant reports, less :data:`EXPIRY_MARGIN_SECONDS`, and
-:func:`reset_access_token_cache` discards it. A call the provider answers
-``401`` discards the cached token and is retried exactly once with a
-fresh grant. When no usable token is held, one caller performs the
-exchange behind a single-flight lock and the others re-read the cache
-once it has finished; the exchange itself runs with no cache lock held. A
-failed exchange is held back for :data:`FAILURE_BACKOFF_SECONDS`, during
-which callers are refused with that same failure and no request is sent,
-and a successful exchange ends the window. No credential, no token and no
-``Authorization`` value is written to a log record.
-
-Usage::
-
-    order = await create_order(
-        "premium_monthly", return_url, cancel_url,
-        idempotency_key=order_request_id(subscription.id),
-    )
-    captured = await capture_order(db, order["id"], current_user)
-    outcome = read_capture(captured, order["id"], plan.amount, plan.currency)
-    result = await verify_webhook_signature(headers, raw_body)
+"""Bounded PayPal REST order, capture, and webhook-verification
+operations.
 """
 
 import asyncio
@@ -629,22 +528,8 @@ class OrderOwnershipError(PayPalError):
 
 
 class PayPalAPIError(PayPalError):
-    """Raised when a REST call fails or returns an unusable body.
-
-    ``category`` is one of :data:`ERROR_CATEGORIES` and describes what
-    went wrong without naming the request. ``status_code`` is the status
-    the provider answered, or ``None`` when no response arrived.
-    ``debug_id`` is the provider's ``PayPal-Debug-Id``, which support
-    correlates a call by. ``issue`` is the provider's own issue code for
-    the failure, read from the allowlisted fields
-    :data:`PROVIDER_ISSUE_FIELDS` and carried only in the shape
-    :data:`PROVIDER_ISSUE_PATTERN` accepts, or ``None`` when the body
-    named none; it is what a caller distinguishes
-    :data:`ISSUE_ORDER_ALREADY_CAPTURED` from every other refusal by.
-    ``retryable`` reports whether a later attempt may succeed.
-
-    The message carries no response body, no URL and no credential, so
-    the exception is safe to translate into a client-facing error.
+    """Provider failure with sanitized category, status, debug
+    identifier, issue code, and retryability metadata.
     """
 
     def __init__(
@@ -834,25 +719,8 @@ async def _read_bounded(
     operation: Optional[str] = None,
     **arguments: Any
 ) -> Any:
-    """Returns a response whose body was never held past the cap.
-
-    The body is read in chunks and the read stops as soon as the total
-    reaches one byte past :data:`MAX_RESPONSE_BYTES`, so a body larger
-    than the cap is abandoned mid-transfer. The bytes kept are the one
-    past the cap that :func:`_decoded_object` then measures and refuses.
-
-    A transfer declaring a ``Content-Length`` past the cap is refused
-    before a single chunk is taken, raising :class:`PayPalAPIError`
-    carrying :data:`CATEGORY_MALFORMED_RESPONSE`, which is the error a
-    body measured past the cap raises as well.
-
-    The response returned carries the status, the headers and the request
-    of the real one, so status handling, debug-identifier extraction and
-    decoding all behave as they do for a buffered response.
-
-    A client offering no ``stream`` method is called directly, through its
-    method named for the verb where it has one and through ``request``
-    otherwise.
+    """Stream a response only up to MAX_RESPONSE_BYTES and raise a
+    malformed-response error when exceeded.
     """
     opener = getattr(client, "stream", None)
     if opener is None:
@@ -1253,28 +1121,8 @@ def _held_back_failure() -> Optional[PayPalAPIError]:
 
 
 async def _bearer_credential() -> str:
-    """Return a cached access token, exchanging credentials if needed.
-
-    A held token is reused until its trimmed lifetime elapses, so a run
-    of calls inside one lifetime performs one exchange. The exchange
-    itself is awaited outside the cache lock, so no coroutine holds the
-    lock across a network call.
-
-    Only one exchange is in flight at a time: concurrent callers that
-    find no held token wait on a single-flight lock and then re-read the
-    cache, so a burst arriving as a token expires performs one exchange
-    rather than one per caller.
-
-    A failed exchange is held back for :data:`FAILURE_BACKOFF_SECONDS`,
-    during which callers are refused with that same failure and no
-    request is sent. A successful exchange ends the window.
-
-    The generation of the cache is read before the exchange begins and
-    passed to whichever of :func:`_store_cached_token` and
-    :func:`_record_exchange_failure` follows it, so neither writes over a
-    :func:`reset_access_token_cache` that ran while the exchange was in
-    flight. The grant itself is still returned to the caller that asked
-    for it.
+    """Return a cached bearer token or perform one single-flight
+    credential exchange.
     """
     cached = _read_cached_token()
     if cached is not None:
@@ -1328,29 +1176,8 @@ async def _post_json(
     document: Optional[bytes] = None,
     order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Return the decoded object from a Bearer-authenticated POST.
-
-    ``path`` is appended to ``settings.PAYPAL_API_BASE`` and the call
-    carries ``settings.HTTP_TIMEOUT_SECONDS``. ``body`` is serialised to
-    JSON by the client; ``document``, when supplied, is sent as the
-    request content exactly as given and takes the place of ``body``, so a
-    caller that has already assembled its own bytes transmits those bytes
-    unchanged. ``idempotency_key``, when supplied, is sent as
-    :data:`IDEMPOTENCY_HEADER`, so a repeat of the call resolves to the
-    result of the first one. ``extra_headers``, when supplied, is sent
-    alongside the headers built here and cannot displace the
-    authorization, content or idempotency headers.
-
-    The response is streamed and measured against
-    :data:`MAX_RESPONSE_BYTES` before any of it is decoded.
-
-    A ``401`` discards the cached access token and repeats the call once
-    with a fresh grant; the repeat runs with ``allow_refresh`` cleared,
-    so it cannot recurse, and the body of the rejected call is closed
-    without being read. Every other failure raises
-    :class:`PayPalAPIError` carrying the failure category, the provider
-    status and the provider's debug identifier. No response body, URL or
-    credential reaches the raised message or a log record.
+    """Issue a bounded authenticated POST, retry one 401 after cache
+    reset, and return a decoded object.
     """
     headers = {}  # type: Dict[str, str]
     if extra_headers:
@@ -1522,28 +1349,8 @@ async def create_order(
     cancel_url: str,
     idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Open a PayPal order for the plan named by ``plan_id``.
-
-    The charge amount and currency are read from the plan catalog and
-    rendered by its two-decimal formatter.
-
-    ``return_url`` and ``cancel_url`` are the hosted redirect targets the
-    payer is returned to, carried in the payer experience context. No
-    card number, verification value or expiry is accepted here or sent
-    from here, and the order is not captured here: the payer approves it
-    at PayPal first.
-
-    ``idempotency_key`` is sent as :data:`IDEMPOTENCY_HEADER`, so a
-    repeat of an uncertain call resolves to the order the first call
-    opened.
-
-    Returns the created order object, whose ``id`` is the value stored
-    on ``Subscription.paypal_order_id`` and whose ``links`` carry the
-    approval target :func:`approval_url` reads.
-
-    Raises :class:`backend.app.core.plans.UnknownPlanError` when
-    ``plan_id`` is not a catalog identifier, and :class:`PayPalAPIError`
-    when the call fails.
+    """Create a catalog-priced PayPal order using configured
+    hosted-return URLs and an idempotency key.
     """
     plan = get_plan(plan_id)
     body = {
@@ -1655,48 +1462,8 @@ async def capture_order(
     request: Optional[Any] = None,
     idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Capture ``order_id`` for the principal that owns it.
-
-    ``order_id`` is resolved against the stored
-    ``Subscription.paypal_order_id`` column through
-    :func:`backend.app.core.authorization.load_owned`, which compares the
-    resolved row's owner with ``current_user`` and emits the one
-    centralized authorization record naming the route, the method, the
-    decision and the object. ``request`` supplies the route and method
-    for that record. The capture call is issued only after that check
-    passes.
-
-    ``db`` is the caller's request-scoped session and is only read here.
-    Nothing is written, flushed, committed or rolled back, so the
-    caller's transaction -- including work it has already flushed, such
-    as a webhook delivery record -- is still open and intact when this
-    returns, and the caller remains free to commit that work together
-    with the state change this capture drives. An order that resolves to
-    no row or to another principal's row is refused with
-    :class:`OrderOwnershipError` before any request leaves the process.
-    The row the lookup resolves must already be durable when this is
-    called; the endpoint commits the pending row before it opens the
-    order.
-
-    The lookup is issued on a worker thread, so this coroutine occupies
-    the event loop for none of it. The session is used by one thread at a
-    time: the lookup completes before the provider call is awaited.
-
-    ``idempotency_key`` defaults to the key derived from the resolved
-    row, so a repeated capture resolves to the capture already performed.
-
-    The call carries :data:`PREFER_HEADER` set to
-    :data:`PREFER_REPRESENTATION`, so the response carries the settled
-    amount, currency and capture identifier. A response that still
-    carries no capture object is followed by :func:`fetch_order`, and the
-    order read back is returned in its place, so the envelope handed to
-    the caller always describes what the provider settled.
-
-    The caller's transaction is neither committed nor discarded here, so
-    a caller that has already claimed state in it -- the webhook's
-    delivery record -- still holds that claim when this returns.
-
-    The lookup is read-only: nothing is written, flushed or committed.
+    """Capture only an order owned by the current user and validate it
+    against the catalog amount and currency.
     """
     subscription = await run_in_threadpool(
         _resolve_owned_order, db, order_id, current_user, request
@@ -1749,25 +1516,8 @@ async def verify_settled_order(
     expected_currency: str,
     request: Optional[Any] = None,
 ) -> CaptureOutcome:
-    """Reports what an already-settled order settled, for its owner.
-
-    The order is resolved and its ownership checked through
-    :func:`_resolve_owned_order` before any request leaves the process,
-    then read back with :func:`fetch_order` and measured by
-    :func:`read_capture` against the catalog amount and currency the
-    caller supplies. No capture is issued, so this is the path for a
-    notification reporting a capture that has already settled and for a
-    repeated capture of an order the API reports as captured.
-
-    ``db`` is the caller's request-scoped session and is only read here:
-    nothing is written, flushed, committed or rolled back, so the
-    caller's transaction is intact when this returns. The lookup is issued
-    on a worker thread and completes before the read is awaited, so this
-    coroutine occupies the event loop for none of it and the session is
-    used by one thread at a time.
-
-    Raises :class:`OrderOwnershipError` when the order resolves to no
-    owned row and :class:`PayPalAPIError` when the read fails.
+    """Read and validate an already-settled order after the same
+    ownership check used for capture.
     """
     await run_in_threadpool(
         _resolve_owned_order, db, order_id, current_user, request
@@ -2140,61 +1890,11 @@ async def verify_webhook_signature(
     headers: Mapping[str, str],
     body: bytes,
 ) -> WebhookVerification:
-    """Check an inbound PayPal notification and report the outcome.
-
-    ``headers`` is the inbound header mapping, matched without regard to
-    letter case, and ``body`` is the **raw request bytes**. Text is
-    accepted too and is encoded as UTF-8, so the same bytes are both
-    decoded and transmitted whichever form the caller holds; a value of
-    any other type is rejected as :data:`REASON_MALFORMED_BODY`. The
-    checks are applied in this order:
-
-    1. the host of the ``PAYPAL-CERT-URL`` header is checked against
-       ``settings.PAYPAL_CERT_HOST_ALLOWLIST``, before that value is
-       transmitted or logged
-    2. every header of :data:`REQUIRED_WEBHOOK_HEADERS` must be present
-       and non-blank
-    3. ``body`` must decode to a JSON object; a body that does not is
-       rejected as :data:`REASON_MALFORMED_BODY` and no request is sent
-    4. the document assembled by :func:`_postback_document`, carrying
-       ``body`` verbatim under ``webhook_event``, is posted to PayPal's
-       verify-webhook-signature endpoint, and its answer is classified
-       by the three-way rule below
-
-    The bytes that arrived are what the verifier is sent, so PayPal
-    checks the signature against the notification as it was signed rather
-    than against a re-encoded copy of it. No field of the notification is
-    read until step 4 has passed, and the only one read then is the event
-    type.
-
-    The verifier's answer resolves to exactly one of three outcomes, and
-    a rejected signature is one of them rather than the default:
-
-    * :data:`VERIFICATION_SUCCESS` -- the check passed.
-    * :data:`VERIFICATION_FAILURE` -- the check rejected the signature,
-      returned as :data:`REASON_SIGNATURE` with ``retryable`` False.
-    * anything else -- a postback the provider could not answer, a
-      response body that is not an object, an absent
-      :data:`VERIFICATION_STATUS_FIELD`, a value of another type, and a
-      value outside :data:`VERIFICATION_STATUSES` are each a check that
-      could not be completed, returned as
-      :data:`REASON_VERIFIER_UNAVAILABLE` with ``retryable`` True.
-
-    Reads and writes no database state on any path and emits no record of
-    its own. Every failed check is *returned* rather than raised, as a
-    :class:`WebhookVerification` whose ``verified`` is False, whose
-    ``reason`` names the failed check and whose ``retryable`` reports
-    whether the check itself could not be completed. A
-    :class:`PayPalError` from the postback is returned as
-    :data:`REASON_VERIFIER_UNAVAILABLE` rather than propagating, and its
-    own retryability does not narrow that outcome.
-    ``transmission_id`` is returned only on a passing check, and the
-    caller records it under the uniqueness constraint that rejects a
-    replayed notification.
+    """Validate required headers and certificate host, then submit the
+    raw event bytes to PayPal's signature verifier.
     """
     lookup = _header_lookup(headers)
 
-    # Validates the certificate host against the allowlist.
     certificate_url = lookup.get(CERT_URL_HEADER)
     if not _is_allowed_certificate_url(certificate_url):
         return _rejected(REASON_CERTIFICATE_HOST)

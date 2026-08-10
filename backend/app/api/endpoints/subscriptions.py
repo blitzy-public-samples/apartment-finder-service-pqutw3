@@ -1,106 +1,5 @@
-"""Subscription lifecycle and PayPal notification intake.
-
-Three routes are published under the ``/subscriptions`` prefix that
-:mod:`backend.app.api.router` already applies:
-
-* ``POST /`` opens a PayPal order priced by the plan catalog, records the
-  subscription that order belongs to as :data:`PENDING_STATUS`, and
-  returns it together with the PayPal-hosted approval target the payer
-  must be sent to. The addresses PayPal returns the payer to are
-  ``settings.PAYPAL_RETURN_URL`` for an approval and
-  ``settings.PAYPAL_CANCEL_URL`` for an abandoned checkout, each
-  validated configuration of its own. The request contract carries a plan
-  identifier only,
-  and **no payment is captured here**: PayPal's own sequence is create,
-  then payer approval, then capture. The row is committed *before* the
-  order is opened, so the ownership the later capture is bound to is
-  durable and a settled charge always has a stored row -- pending at
-  worst -- that reconciliation can complete. A repeat of the request
-  reuses the open row already recorded for that account and plan, and
-  presents PayPal the idempotency key derived from that row's own
-  identifier, so the repeat resolves to the order the first attempt
-  opened.
-* ``GET /`` returns the caller's own subscription carrying
-  :data:`ACTIVE_STATUS` whose window is still open. A pending, failed,
-  cancelled or refunded row grants nothing and is not returned.
-* ``POST /webhook`` processes one verified PayPal notification exactly
-  once, and is the single path that captures a payment and grants an
-  entitlement. The signature is checked before any business field is
-  read, and the delivery identifier is recorded under the uniqueness
-  constraint that detects a repeated delivery.
-
-No route accepts a PayPal identifier from a client. An order identifier
-enters this service only as the value PayPal returns to the order this
-service opened, and it is stored on the row that opened it.
-
-The charge amount, the currency, the entitlement window, the stored
-status, the PayPal order identifier and the role a subscriber holds are
-all assigned here from the plan catalog, the server clock and PayPal's
-own responses. No request field takes part in any of them.
-
-Entitlement is granted by the webhook alone, and only once PayPal has
-reported the order captured for the plan's exact amount and currency. A
-notification reporting the payer's approval and one reporting a settled
-capture both run through the same :func:`_activate`, which returns
-without a second grant when the row already carries
-:data:`ACTIVE_STATUS`, so the two notifications cannot entitle one row
-twice. An order is captured under an idempotency key derived from the
-identifier of the already-committed ``subscriptions`` row, so a repeated
-delivery resolves to the capture already performed rather than to a
-second charge, and an order PayPal reports as already captured is read
-back and measured rather than settled again. A verified notification's
-delivery record and the state transition it drives are written in one
-transaction, so a failure part-way leaves neither behind and PayPal's
-redelivery processes the event once.
-
-A verified delivery already recorded is answered ``200`` without being
-processed again, because PayPal redelivers every notification it is not
-answered ``2xx``.
-
-The row created by ``POST /`` carries :data:`PENDING_STATUS` and no end
-date until a settlement is proven. A settlement that cannot be recorded
-leaves that pending row in place and is answered ``503`` carrying
-:data:`RECONCILIATION_DETAIL`, so a charge that PayPal took is never
-silently forgotten; an order that could not be opened at all is marked
-:data:`FAILED_STATUS`, which grants nothing, retains any provider
-identifier already known for it, and stays open to a later attempt.
-
-A row reaches :data:`ACTIVE_STATUS` only after its charge has settled,
-and that status combined with an open window is the single condition
-both ``GET /`` and
-:func:`backend.app.core.authorization.entitled_role` read, so the
-entitlement a plan grants lapses with the row and nothing has to demote
-the account. The role this module writes onto the account records the
-entitlement the row carries; it is not what grants it, because
-:func:`backend.app.core.authorization.stored_credit` credits a stored
-subscriber role at the baseline and every decision that turns on it
-reads the unexpired row instead.
-
-The two authenticated routes resolve their principal through
-:func:`backend.app.core.authorization.require_role`, which reads the role
-from the stored user row. ``POST /webhook`` declares no role dependency
-and is admitted on its signature alone; the account whose entitlement it
-grants is resolved from the stored order identifier, never from the
-notification.
-
-``POST /`` and ``POST /webhook`` are ``async`` routes that each await a
-provider call, and the session they hold is the synchronous one
-:func:`backend.app.db.database.get_db` yields. Every statement these two
-routes issue therefore runs through :func:`_in_session`, which hands it
-to a worker thread, so a statement waiting on a database lock never
-occupies the event loop and the completion of a provider call awaited by
-another request stays deliverable. The ownership resolution inside
-:mod:`backend.app.services.paypal_service` runs on the same kind of
-worker-thread boundary. The session is used by one thread at a time and
-never by two at once.
-
-A transition is applied to the row as it stands when the transition is
-written, not as it stood when the notification arrived: :func:`_activate`
-and :func:`_revoke` each re-read the row under a write lock held for the
-rest of the transaction. A subscription already in one of
-:data:`TERMINAL_STATUSES` is never moved out of it, so an approval whose
-capture was still in flight when a refund or a cancellation was recorded
-leaves that outcome in place.
+"""Subscription creation, entitlement reads, and verified PayPal
+webhook handling.
 """
 
 import re
@@ -219,6 +118,30 @@ UNTYPED_EVENT = "UNKNOWN"
 
 #: Reason recorded for a delivery identifier already recorded.
 REASON_REPLAY = "duplicate_transmission_id"
+
+#: Reason recorded when the delivery record could not be written and the
+#: delivery identifier was not found recorded either.
+REASON_DELIVERY_NOT_RECORDED = "delivery_not_recorded"
+
+#: Detail returned when the delivery record could not be written.
+WEBHOOK_NOT_RECORDED_DETAIL = "Webhook delivery not recorded"
+
+#: Arbitration outcome reported when this request recorded the delivery.
+RECORD_NEW = "recorded"
+
+#: Arbitration outcome reported when the delivery is already recorded by
+#: another request that committed it.
+RECORD_DUPLICATE = "already_recorded"
+
+#: Arbitration outcome reported when the delivery could neither be
+#: recorded nor found recorded within :data:`MAX_RECORD_ATTEMPTS`.
+RECORD_UNRESOLVED = "unresolved"
+
+#: Number of times the delivery record is attempted. Each attempt after
+#: the first follows a write that the server ended without deciding the
+#: uniqueness, and each is preceded by a read that answers whether
+#: another request has committed the same delivery.
+MAX_RECORD_ATTEMPTS = 3
 
 #: Rejection reason recorded for an order carrying no usable identifier
 #: or no allowlisted approval target.
@@ -519,52 +442,8 @@ async def create_subscription(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(Role.REGISTERED))
 ) -> SubscriptionCreated:
-    """Opens a subscription for the caller and returns its approval target.
-
-    The request carries a plan identifier only. The amount, the currency
-    and the entitlement period are read from the plan catalog.
-
-    The subscription row is written and committed as
-    :data:`PENDING_STATUS` **before** the PayPal order is opened, so the
-    attempt is durably recorded whatever the provider then does, and the
-    idempotency key the order is opened under is derived from that
-    committed row's own identifier by
-    :func:`backend.app.services.paypal_service.order_request_id`. A
-    repeat of the request reuses the open row already recorded for this
-    account and plan -- pending or failed -- and presents the key derived
-    from it, so the repeat resolves to the order the first attempt opened
-    rather than opening a second one. The order is not captured here and
-    the caller holds no entitlement yet: the payer must approve the order
-    at the returned ``approval_url``, and PayPal's notification of that
-    approval is what captures the payment and grants the role.
-
-    No ORM attribute is read between the commit that makes the row
-    durable and the provider call, so the transaction is closed and its
-    connection is back in the pool for the duration of that call. The row
-    is read again afterwards. Each statement runs through
-    :func:`_in_session`, so none of them occupies the event loop.
-
-    The entitlement window is left empty until a settlement is proven, so
-    the row that exists across the approval window entitles nothing by
-    either the ``GET /`` predicate or
-    :func:`backend.app.core.authorization.entitled_role`.
-
-    A plan the catalog does not publish is answered ``400`` with
-    :data:`INVALID_SUBSCRIPTION_DETAIL`. A row that cannot be committed
-    before the provider is called at all, and an order identifier the
-    uniqueness constraint rejects, are each answered ``400`` with
-    :data:`PAYMENT_FAILED_DETAIL` after one record naming the reason --
-    never with a database error reaching the caller. An order that cannot
-    be opened is answered by :func:`_provider_status`, and the row it was
-    opened for is left recorded as :data:`FAILED_STATUS` carrying
-    whatever provider identifier is already known for it. An order
-    carrying no usable identifier or no allowlisted approval target is
-    answered ``400`` after one record naming
-    :data:`REASON_UNUSABLE_ORDER`, with the row left
-    :data:`FAILED_STATUS`, because neither can be carried through to a
-    settlement. An opened order whose identifier cannot be stored is
-    answered ``503`` carrying :data:`RECONCILIATION_DETAIL`, because the
-    provider holds an order this service could not finish recording.
+    """Create or reuse a pending subscription intent, open a
+    catalog-priced PayPal order, and return its approval URL.
     """
     if not subscription.plan_id:
         raise HTTPException(
@@ -580,9 +459,6 @@ async def create_subscription(
             detail=INVALID_SUBSCRIPTION_DETAIL,
         ) from None
 
-    # Record the attempt durably before the provider is asked to do
-    # anything, reusing the open attempt already recorded for this
-    # account and plan.
     try:
         subscription_id, idempotency_key = await _in_session(
             _open_intent, db, current_user, plan
@@ -614,9 +490,6 @@ async def create_subscription(
     order_id = _provider_order_id(order)
     target = approval_url(order)
     if order_id is None or target is None:
-        # An order with no acceptable identifier cannot be captured, and
-        # one with no allowlisted approval target cannot be approved, so
-        # neither is handed back as an opened subscription.
         await _in_session(_mark_failed, db, subscription_id)
         logger.error(
             "PayPal order carried no usable identifier or no allowlisted "
@@ -651,8 +524,6 @@ async def create_subscription(
     try:
         await _in_session(db.commit)
     except IntegrityError:
-        # The uniqueness constraint rejected the order identifier, so it
-        # is already recorded against another row.
         await _in_session(db.rollback)
         await _in_session(_mark_failed, db, subscription_id)
         _payment_failure(REASON_DUPLICATE_ORDER, current_user, plan)
@@ -710,28 +581,74 @@ def _reusable_intent(
     )
 
 
+def _lock_account(db: Session, current_user: User) -> None:
+    """Takes a write lock on the account row for the rest of the work.
+
+    The row is re-read under ``FOR UPDATE``, so a second attempt for the
+    same account waits here until the attempt holding the lock has
+    committed, and then reads the row that attempt recorded. The lock is
+    released by the commit :func:`_open_intent` issues, which happens
+    before any provider call. A backend that does not implement row
+    locking issues the read without it.
+    """
+    (
+        db.query(User)
+        .filter(User.id == current_user.id)
+        .with_for_update()
+        .first()
+    )
+
+
+def _reuse_intent(
+    db: Session, existing: SubscriptionModel
+) -> "Tuple[int, str]":
+    """Returns an already-recorded attempt to :data:`PENDING_STATUS`.
+
+    The identifier and the idempotency key are read before the commit and
+    returned as plain values, so no ORM attribute is read after it.
+    """
+    subscription_id = existing.id
+    idempotency_key = order_request_id(subscription_id)
+    existing.status = PENDING_STATUS
+    db.commit()
+    return subscription_id, idempotency_key
+
+
 def _open_intent(
     db: Session, current_user: User, plan: Plan
 ) -> "Tuple[int, str]":
     """Commits the attempt an order will be opened for and describes it.
 
-    The open attempt already recorded for this account and plan is
-    reused and returned to :data:`PENDING_STATUS`; otherwise a row is
-    added and flushed to obtain its identifier. Either way the
-    idempotency key is derived from that identifier, so the same key is
-    presented on every attempt for the row, and the returned identifier
-    and key are plain values, so no ORM attribute has to be read after
-    the commit.
+    The account row is locked by :func:`_lock_account` before the open
+    attempt is looked up, so two simultaneous creates for one account
+    resolve to one row and one idempotency key rather than to two rows
+    and two provider orders. The open attempt already recorded for this
+    account and plan is reused and returned to :data:`PENDING_STATUS`;
+    otherwise a row is added and flushed to obtain its identifier.
+    Either way the idempotency key is derived from that identifier, so
+    the same key is presented on every attempt for the row, and the
+    returned identifier and key are plain values, so no ORM attribute
+    has to be read after the commit.
+
+    Raises ``SQLAlchemyError`` when the attempt cannot be committed, and
+    when a wait for the account lock is cancelled by the server-side
+    bound that applies to it.
+    The read for a reusable attempt and the insert that follows it are
+    not one atomic step, so two requests arriving together can both read
+    nothing and both insert. The partial unique index
+    :data:`~backend.app.db.models.OPEN_INTENT_UNIQUE_INDEX_NAME` admits
+    one of them and refuses the other with ``IntegrityError``; the refused
+    request discards its own row, reloads the committed one and reuses it.
+    Both requests therefore return the same identifier and the same key,
+    and one order is opened for the pair. An ``IntegrityError`` that no
+    reusable row explains is raised rather than retried.
 
     Raises ``SQLAlchemyError`` when the attempt cannot be committed.
     """
+    _lock_account(db, current_user)
     existing = _reusable_intent(db, current_user, plan)
     if existing is not None:
-        subscription_id = existing.id
-        idempotency_key = order_request_id(subscription_id)
-        existing.status = PENDING_STATUS
-        db.commit()
-        return subscription_id, idempotency_key
+        return _reuse_intent(db, existing)
 
     pending = SubscriptionModel(
         user_id=current_user.id,
@@ -744,12 +661,27 @@ def _open_intent(
         paypal_order_id=None,
     )
     db.add(pending)
-    # The identifier the idempotency key is derived from is assigned by
-    # the flush, so the key is available in that same transaction.
-    db.flush()
-    subscription_id = pending.id
-    idempotency_key = order_request_id(subscription_id)
-    db.commit()
+    try:
+        # The identifier the idempotency key is derived from is assigned
+        # by the flush, so the key is available in that same transaction.
+        db.flush()
+        subscription_id = pending.id
+        idempotency_key = order_request_id(subscription_id)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        winner = _reusable_intent(db, current_user, plan)
+        if winner is None:
+            raise
+        logger.info(
+            "subscription.intent.reloaded",
+            extra={
+                "subscription_id": winner.id,
+                "plan_id": plan.plan_id,
+                "subscription_status": winner.status,
+            },
+        )
+        return _reuse_intent(db, winner)
     return subscription_id, idempotency_key
 
 
@@ -819,32 +751,8 @@ def get_user_subscription(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role(Role.REGISTERED))
 ) -> Optional[Subscription]:
-    """Returns the caller's own entitling subscription.
-
-    The query is scoped to the authenticated principal's identifier, to
-    :data:`ACTIVE_STATUS` and to a window that has not closed, which is
-    the same set of conditions
-    :func:`backend.app.core.authorization.entitled_role` resolves a role
-    from -- so the row this route reports and the role that route grants
-    cannot disagree. A row belonging to another account is not reachable
-    here, and ``None`` is returned when the caller holds no such row --
-    including when the only row they hold is awaiting payer approval,
-    cancelled, refunded or failed, none of which entitles anything.
-
-    The row whose entitlement runs longest is returned when several
-    qualify, and the identifier breaks a tie, so the result is
-    deterministic rather than whichever row the database happened to
-    return first.
-
-    A caller whose window has closed also has the role stored on its
-    account lowered back to the baseline by :func:`_revoke_role` here,
-    so the column stops naming an entitlement the caller no longer
-    holds. That write only brings the record into line: the closed
-    window already withdrew the entitlement itself, because
-    :func:`backend.app.core.authorization.stored_credit` credits a
-    stored subscriber role at the baseline and no authorization decision
-    reads it as more. An administrator is never lowered, and a caller
-    another subscription still entitles is left as it is.
+    """Return the caller's active, unexpired subscription, withdrawing
+    stale stored role state if needed.
     """
     subscription = db.query(SubscriptionModel).filter(
         SubscriptionModel.user_id == current_user.id,
@@ -898,69 +806,11 @@ async def receive_paypal_webhook(
     request: Request,
     db: Session = Depends(get_db)
 ) -> Dict[str, str]:
-    """Processes one verified PayPal notification exactly once.
-
-    The route declares no role dependency and is admitted on its
-    signature alone, so it carries ``settings.RATE_LIMIT_WEBHOOK`` per
-    caller address to bound the verification work an unauthenticated
-    caller can start. The steps run in this order, and no later step runs
-    before an earlier one passes.
-
-    1. the raw request bytes are read, bounded by the request-body-size
-       cap :mod:`backend.app.main` applies
-    2. the notification is checked by the PayPal service, which is handed
-       those bytes and transmits them verbatim, validates the host of the
-       ``PAYPAL-CERT-URL`` header against
-       ``settings.PAYPAL_CERT_HOST_ALLOWLIST`` before that value is used
-       or transmitted, requires every ``PAYPAL-*`` header, and requires
-       the bytes to decode to an object
-    3. the bytes are decoded, which is the first time any field of the
-       notification is read
-    4. the delivery identifier is added to ``webhook_events`` and
-       flushed, whose uniqueness constraint detects a repeated delivery
-    5. the notification is applied to the subscription it names
-    6. the delivery record and the transition are committed together
-
-    Every statement of steps 4 to 6 runs through :func:`_in_session`, and
-    the flush that waits on the uniqueness constraint while a concurrent
-    delivery of the same identifier is still open waits in a worker
-    thread, holding no event-loop time. That concurrent delivery is parked
-    in the provider call of step 5 with its own delivery row uncommitted,
-    and its completion is delivered by the event loop. The wait resolves
-    either way: a commit raises ``IntegrityError`` and the repeat is
-    acknowledged, a rollback lets the waiting insert succeed and the
-    notification is still settled.
-
-    A notification the check *rejects* -- a certificate host outside the
-    allowlist, an absent header, a body that does not decode to an
-    object, or an explicit
-    :data:`backend.app.services.paypal_service.VERIFICATION_FAILURE`
-    from PayPal -- is answered ``400``. A notification that could not be
-    checked at all is answered ``503``: that covers a verifier which
-    could not be reached or did not answer, and a verifier answer that
-    carries no recognised status, and it is decided by
-    :func:`_could_not_be_checked` from the reason itself rather than from
-    the retryability of any provider failure beneath it. PayPal delivers
-    a ``503`` again, as it redelivers every notification it is not
-    answered ``2xx`` for. A delivery identifier already recorded is
-    answered ``200`` and is **not** processed again. Nothing is written on
-    any rejected path.
-
-    A transition that cannot be committed is answered ``503`` carrying
-    :data:`RECONCILIATION_DETAIL` after one record naming
-    :data:`REASON_ACTIVATION_NOT_RECORDED`, and the notification is
-    delivered again.
-
-    Only the rejection reason, the request path and safe identifiers are
-    recorded; no header value, signature or notification body reaches a
-    log record. The record for a repeated delivery names the verified
-    delivery identifier and the provider's order identifier, so it is
-    correlated with the delivery that was processed.
+    """Verify and deduplicate a PayPal notification, then commit its
+    delivery record and subscription transition atomically.
     """
     raw_body = await request.body()
 
-    # Check the signature against the bytes that arrived, before any
-    # business field is read
     verification = await verify_webhook_signature(
         request.headers, raw_body
     )
@@ -990,17 +840,10 @@ async def receive_paypal_webhook(
 
     event_type = verification.event_type or UNTYPED_EVENT
 
-    # Record the delivery under the uniqueness constraint
-    db.add(
-        WebhookEvent(
-            transmission_id=verification.transmission_id,
-            event_type=event_type,
-        )
+    recorded = await _record_delivery(
+        db, verification.transmission_id, event_type
     )
-    try:
-        await _in_session(db.flush)
-    except IntegrityError:
-        await _in_session(db.rollback)
+    if recorded == RECORD_DUPLICATE:
         logger.warning(
             "Acknowledged a repeated PayPal delivery without "
             "processing it again",
@@ -1008,17 +851,21 @@ async def receive_paypal_webhook(
                 "reason": REASON_REPLAY,
                 "path": request.scope.get("path"),
                 "event_type": event_type,
-                # Delivery identity from the verified headers, and the
-                # provider's own order identifier when the notification
-                # names one.
                 "transmission_id": verification.transmission_id,
                 "paypal_order_id": _order_id_from(notification),
             },
         )
         return {"status": OUTCOME_DUPLICATE}
+    if recorded == RECORD_UNRESOLVED:
+        raise _reject_webhook(
+            request,
+            REASON_DELIVERY_NOT_RECORDED,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            WEBHOOK_NOT_RECORDED_DETAIL,
+            transmission_id=verification.transmission_id,
+            event_type=event_type,
+        )
 
-    # Apply the notification, then commit the delivery record and the
-    # transition together
     try:
         outcome = await _apply_notification(
             db, request, notification, event_type
@@ -1044,6 +891,76 @@ async def receive_paypal_webhook(
             event_type=event_type,
         ) from None
     return {"status": outcome}
+
+
+def _delivery_recorded(db: Session, transmission_id: Any) -> bool:
+    """Reports whether a delivery identifier is already recorded.
+
+    The read is a plain select over the uniquely constrained column. It
+    matches only a row another transaction has committed, and it waits on
+    no lock, so it answers while a concurrent delivery of the same
+    identifier is still open.
+    """
+    return (
+        db.query(WebhookEvent.id)
+        .filter(WebhookEvent.transmission_id == transmission_id)
+        .first()
+    ) is not None
+
+
+async def _record_delivery(
+    db: Session, transmission_id: Any, event_type: str
+) -> str:
+    """Records this delivery once and reports what the record decided.
+
+    Returns :data:`RECORD_NEW` when this request wrote the delivery row,
+    :data:`RECORD_DUPLICATE` when the identifier is already recorded by a
+    request that committed it, and :data:`RECORD_UNRESOLVED` when
+    :data:`MAX_RECORD_ATTEMPTS` writes each ended without the uniqueness
+    being decided and no committed record was found. On
+    :data:`RECORD_DUPLICATE` and :data:`RECORD_UNRESOLVED` the
+    transaction is rolled back, so neither leaves anything written.
+
+    The write waits on the uniqueness constraint while a concurrent
+    delivery of the same identifier holds an uncommitted row. That wait
+    is bounded by the server's own statement bound, which ends the
+    statement without deciding the constraint; the identifier is then
+    read back, which distinguishes a delivery another request committed
+    from one it rolled back, and the write is attempted again when
+    nothing is found recorded. Every statement runs through
+    :func:`_in_session`.
+    """
+    for attempt in range(MAX_RECORD_ATTEMPTS):
+        db.add(
+            WebhookEvent(
+                transmission_id=transmission_id,
+                event_type=event_type,
+            )
+        )
+        try:
+            await _in_session(db.flush)
+            return RECORD_NEW
+        except IntegrityError:
+            await _in_session(db.rollback)
+            return RECORD_DUPLICATE
+        except SQLAlchemyError as ended:
+            await _in_session(db.rollback)
+            if await _in_session(
+                _delivery_recorded, db, transmission_id
+            ):
+                return RECORD_DUPLICATE
+            if attempt == MAX_RECORD_ATTEMPTS - 1:
+                logger.error(
+                    "Could not record a verified PayPal delivery",
+                    extra={
+                        "reason": REASON_DELIVERY_NOT_RECORDED,
+                        "event_type": event_type,
+                        "transmission_id": transmission_id,
+                        "attempts": MAX_RECORD_ATTEMPTS,
+                        "error_type": type(ended).__name__,
+                    },
+                )
+    return RECORD_UNRESOLVED
 
 
 def _order_id_from(notification: Any) -> Optional[str]:
@@ -1197,36 +1114,8 @@ async def _settle(
     plan: Plan,
     order_id: str,
 ) -> CaptureOutcome:
-    """Captures an approved order and reports what it settled.
-
-    The capture is issued through
-    :func:`backend.app.services.paypal_service.capture_order`, which
-    resolves ``order_id`` to the stored row it belongs to and compares
-    that row's owner with the principal passed to it before the call
-    leaves the process, under an idempotency key derived from the stored
-    row's identifier. The capture is measured against the plan's own
-    amount and currency.
-
-    An order the provider rejects as already settled is read back through
-    :func:`backend.app.services.paypal_service.verify_settled_order`,
-    which repeats the same ownership resolution and issues no capture,
-    and whose complete outcome is returned unchanged. A redelivery of an
-    approval PayPal has already settled therefore resolves to that
-    settlement rather than to a second charge or a refusal, recovered
-    from the provider's own representation rather than a reconstructed
-    one.
-
-    That recovery is entered only for a refusal the provider identifies
-    as :data:`ISSUE_ORDER_ALREADY_CAPTURED`, which
-    :func:`_is_already_captured` decides from the failure's issue code
-    rather than from its category. Every other provider failure --
-    including every other refusal answered with the same status -- is
-    raised for the caller to answer, and the caller discards the
-    delivery record it had claimed, so the notification is delivered
-    again rather than consumed as one nothing applied to.
-
-    The owning account is loaded through :func:`_in_session`, so the read
-    the relationship issues does not run on the event loop.
+    """Capture or recover an approved order for its owner and return the
+    resulting transition outcome.
     """
     owner = await _in_session(_owner_of, subscription)
     try:
@@ -1346,27 +1235,8 @@ def _activate(
     outcome: CaptureOutcome,
     event_type: str,
 ) -> str:
-    """Grants entitlement once the capture is confirmed complete.
-
-    ``outcome`` is the complete measurement its caller made of what the
-    provider settled, against the order identifier, the settled status
-    and the plan's own amount and currency. An outcome that fails any of
-    those leaves the subscription in the status it already held and grants
-    no role, so a redelivery or a later attempt can still settle the row
-    correctly.
-
-    The row is re-read under a write lock before it is written, and the
-    status read back decides the transition: a row now in one of
-    :data:`TERMINAL_STATUSES` is left as it is, a row already in
-    :data:`ACTIVE_STATUS` is reported as processed without being written
-    again, and a row in any other status outside :data:`_OPEN_STATUSES` is
-    left as it is. A concurrent revocation recorded while the capture was
-    in flight therefore stands.
-
-    The provider's own capture identifier is recorded in the activation
-    record, and a settled capture carrying none activates nothing, so
-    every row reaching :data:`ACTIVE_STATUS` can be reconciled against
-    the provider afterwards.
+    """Activate a nonterminal subscription only after a complete
+    catalog-matching capture outcome.
     """
     if not outcome.completed:
         logger.warning(

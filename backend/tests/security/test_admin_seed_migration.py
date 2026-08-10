@@ -79,9 +79,15 @@ REVISION_ID = "0002"
 #: Identifier of the additive revision it follows.
 ADDITIVE_REVISION_ID = "0001"
 
-#: Identifier of the workload-index revision that follows it, which is
-#: the head of the chain.
+#: Identifier of the workload-index revision that follows it.
 INDEX_REVISION_ID = "0003"
+
+#: Identifier of the open-intent uniqueness revision.
+UNIQUENESS_REVISION_ID = "0004"
+
+#: Identifier of the login-throttling slot revision, which is the head of
+#: the chain.
+HEAD_REVISION_ID = "0005"
 
 #: The revision module under test, loaded through Alembic so the
 #: identifier, the filename and the chain are the ones
@@ -659,11 +665,22 @@ def test_the_round_trip_promotes_the_target_again(
 def test_the_revision_sits_in_the_chain_the_head_reaches():
     """Assert the chain that puts this revision in ``upgrade head``.
 
-    The head is the workload-index revision, which revises this one,
-    which in turn revises the additive revision, so ``upgrade head``
-    applies all three in that order.
+    The head is the login-throttling slot revision, which revises the
+    open-intent uniqueness revision, which revises the workload-index
+    revision, which revises this one, which in turn revises the additive
+    revision, so ``upgrade head`` applies all five in that order.
     """
-    assert SCRIPT_DIRECTORY.get_heads() == [INDEX_REVISION_ID]
+    assert SCRIPT_DIRECTORY.get_heads() == [HEAD_REVISION_ID]
+    assert (
+        SCRIPT_DIRECTORY.get_revision(HEAD_REVISION_ID).down_revision
+        == UNIQUENESS_REVISION_ID
+    )
+    assert (
+        SCRIPT_DIRECTORY.get_revision(
+            UNIQUENESS_REVISION_ID
+        ).down_revision
+        == INDEX_REVISION_ID
+    )
     assert (
         SCRIPT_DIRECTORY.get_revision(INDEX_REVISION_ID).down_revision
         == REVISION_ID

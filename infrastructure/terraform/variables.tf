@@ -398,14 +398,13 @@ variable "gke_node_service_account_id" {
 }
 
 variable "gke_node_service_account_roles" {
-  description = "IAM roles granted to the dedicated GKE node service account, applied as one google_project_iam_member binding per role. The node pool carries the cloud-platform access scope, so this list is what bounds the node identity. Only the node-pool roles named in the validation below are accepted. roles/container.defaultNodeServiceAccount is the base role a GKE node identity requires and is granted by default. The two read roles are both present because a gcr.io image name resolves to Artifact Registry in a redirected project and to a Cloud Storage bucket in a project still served by Container Registry"
+  description = "IAM roles granted to the dedicated GKE node service account, applied as one google_project_iam_member binding per role. The node pool carries the cloud-platform access scope, so this list is what bounds the node identity. Only the node-pool roles named in the validation below are accepted. roles/container.defaultNodeServiceAccount is the base role a GKE node identity requires and is granted by default. roles/storage.objectViewer is not granted and is not accepted: it reads every object in every bucket in the project, including the bucket holding the Cloud Function source archive, and it was present only to resolve a gcr.io image name in a project still served by Container Registry. The release publishes to Artifact Registry, which roles/artifactregistry.reader covers, so the Cloud Storage role bought nothing this deployment uses"
   type        = list(string)
   default = [
     "roles/container.defaultNodeServiceAccount",
     "roles/logging.logWriter",
     "roles/monitoring.metricWriter",
     "roles/artifactregistry.reader",
-    "roles/storage.objectViewer",
   ]
 
   validation {
@@ -427,10 +426,9 @@ variable "gke_node_service_account_roles" {
         "roles/monitoring.viewer",
         "roles/stackdriver.resourceMetadata.writer",
         "roles/artifactregistry.reader",
-        "roles/storage.objectViewer",
       ], trimspace(role))
     ])
-    error_message = "Only the node-pool roles roles/container.defaultNodeServiceAccount, roles/logging.logWriter, roles/monitoring.metricWriter, roles/monitoring.viewer, roles/stackdriver.resourceMetadata.writer, roles/artifactregistry.reader and roles/storage.objectViewer are accepted. Broader roles such as roles/editor and roles/owner are rejected."
+    error_message = "Only the node-pool roles roles/container.defaultNodeServiceAccount, roles/logging.logWriter, roles/monitoring.metricWriter, roles/monitoring.viewer, roles/stackdriver.resourceMetadata.writer and roles/artifactregistry.reader are accepted. roles/storage.objectViewer is rejected because it reads every object in every bucket in the project, and the images are pulled from Artifact Registry. Broader roles such as roles/editor and roles/owner are rejected."
   }
 }
 
@@ -477,17 +475,6 @@ variable "backend_kubernetes_namespace" {
   }
 }
 
-variable "cloud_function_source_archive_object" {
-  description = "Object name of the source archive inside google_storage_bucket.static_assets, applied as source_archive_object on google_cloudfunctions_function.function. scripts/deploy.sh deploys from the same object, addressed as gs://<bucket>/<object>"
-  type        = string
-  default     = "function-source.zip"
-
-  validation {
-    condition     = can(regex("^[^[:space:]]+\\.zip$", var.cloud_function_source_archive_object))
-    error_message = "The source archive object must be a whitespace-free object name ending in .zip."
-  }
-}
-
 variable "cloud_function_entry_point" {
   description = "Name of the function inside the deployed source archive that the HTTP trigger calls, applied as entry_point on google_cloudfunctions_function.function and required by scripts/deploy.sh as CLOUD_FUNCTION_ENTRY_POINT so one value names the handler for both tools. The default is not a placeholder: infrastructure/functions/health/main.py, the directory var.cloud_function_source_dir packages, exports exactly this name"
   type        = string
@@ -500,9 +487,9 @@ variable "cloud_function_entry_point" {
 }
 
 variable "gke_dns_endpoint_external_traffic" {
-  description = "Whether a caller outside the cluster's VPC may reach the control plane over its DNS-based endpoint, applied as control_plane_endpoints_config.dns_endpoint_config.allow_external_traffic on google_container_cluster.primary. The endpoint authorizes by the IAM permission container.clusters.connect rather than by source address, and the IP-based endpoint stays private either way. Set it to false for a deployer that runs inside the VPC"
+  description = "Whether a caller outside the cluster's VPC may reach the control plane over its DNS-based endpoint, applied as control_plane_endpoints_config.dns_endpoint_config.allow_external_traffic on google_container_cluster.primary. The endpoint authorizes by the IAM permission container.clusters.connect rather than by source address, and the IP-based endpoint stays private either way. It defaults to false so the control plane is reachable from outside the VPC only where a deployment says so: a default of true made every deployment externally reachable unless it opted out, which is the opposite of the posture the private control plane is configured for. Set it to true only for a deployer that runs outside the VPC and cannot be moved inside it"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "artifact_registry_repository_id" {
@@ -542,47 +529,10 @@ variable "artifact_registry_writer_members" {
   }
 }
 
-variable "secret_accessor_members" {
-  description = "IAM principals granted roles/secretmanager.secretAccessor on every secret in local.application_secrets, applied as one google_secret_manager_secret_iam_member per secret per principal. These are the identities the backend Deployment and the one-shot migration pod run as; without a binding the workload cannot read the secret. Expected form: prefixed principal identifiers such as serviceAccount:<name>@<project>.iam.gserviceaccount.com"
-  type        = list(string)
-
-  validation {
-    condition     = length(var.secret_accessor_members) > 0
-    error_message = "At least one principal must be able to read the secrets, or the application cannot start."
-  }
-
-  validation {
-    condition = alltrue([
-      for member in var.secret_accessor_members :
-      !contains(["allusers", "allauthenticatedusers"], lower(trimspace(member)))
-    ])
-    error_message = "Every accessor must name a specific IAM principal. Public principals that grant access to anyone are rejected."
-  }
-
-  validation {
-    condition = alltrue([
-      for member in var.secret_accessor_members :
-      can(regex("^(serviceAccount|user|group|principal|principalSet):[^[:space:]]+$", member))
-    ])
-    error_message = "Every accessor must be a prefixed principal identifier such as serviceAccount:<name>@<project>.iam.gserviceaccount.com. Blank, unprefixed and whitespace-bearing values are rejected."
-  }
-}
-
 variable "cloud_function_deployment_authorized" {
   description = "Whether google_cloudfunctions_function.function and its invoker binding are created. It defaults to false because the function's runtime pin names a runtime Cloud Functions has decommissioned for create and update, so an apply that reached the resource would fail at the API. It stays false until a release owner decides that conflict, as recorded in docs/security/RESIDUAL_RISK.md"
   type        = bool
   default     = false
-}
-
-variable "cloud_function_source_object" {
-  description = "Object within the static-assets bucket holding the function's source archive, applied as source_archive_object on google_cloudfunctions_function.function. scripts/deploy.sh names the same object as CLOUD_FUNCTION_SOURCE_OBJECT, so both paths deploy one artefact"
-  type        = string
-  default     = "function-source.zip"
-
-  validation {
-    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]*\\.zip$", var.cloud_function_source_object))
-    error_message = "The Cloud Function source object must be a bucket object name ending in .zip, carrying no whitespace and no leading separator."
-  }
 }
 
 variable "cloud_function_invoker_member" {
@@ -843,16 +793,6 @@ variable "cloud_function_description" {
   validation {
     condition     = length(trimspace(var.cloud_function_description)) > 0
     error_message = "The description must not be blank."
-  }
-}
-
-variable "cloud_function_source_archive" {
-  description = "Path to the built source archive on the machine running Terraform, applied as source on google_storage_bucket_object.cloud_function_source. The archive is built outside Terraform; a path that does not exist fails the plan rather than deploying a function with no source"
-  type        = string
-
-  validation {
-    condition     = can(regex("\\.zip$", trimspace(var.cloud_function_source_archive)))
-    error_message = "The archive path must name a .zip file."
   }
 }
 

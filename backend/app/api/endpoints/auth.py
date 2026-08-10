@@ -1,46 +1,5 @@
-"""Registration and login endpoints.
-
-Both endpoints accept a JSON body and are rate limited per remote
-address. The token subject is the user's integer identifier rendered as
-a string; the role claim beside it is descriptive, because an
-authorization decision reads the role from the stored row.
-
-Registration stores the creation timestamp taken from the server clock,
-and returns the created user beside the token. An address already taken
-is answered ``400`` carrying :data:`DUPLICATE_EMAIL_DETAIL`, whether the
-address is found by the lookup or by the unique constraint on the
-insert. The ``users.email`` unique constraint is the authority on
-whether an address is taken: of two registrations racing for one
-address, the loser is rolled back and answered exactly as the ordinary
-duplicate is.
-
-Login answers with one response -- ``401`` carrying
-:data:`INVALID_CREDENTIALS_DETAIL` -- for an address that names no
-account, for an account whose lock is still in force, and for a password
-that does not match. Each of those three paths runs one password
-comparison, against :data:`backend.app.core.security.DECOY_HASH` where
-there is no stored hash to compare with, and each is held until
-:data:`backend.app.core.security.MIN_LOGIN_REFUSAL_SECONDS` have elapsed
-since the handler was entered, so the attempt-counting statements the
-wrong-password path issues and the lookup every path issues are covered
-by one budget and no branch answers sooner than another. A password that
-does not match is counted on the row, reaching
-``settings.LOGIN_MAX_ATTEMPTS`` locks the account for
-``settings.LOGIN_LOCKOUT_MINUTES`` minutes, and a login that succeeds
-clears both the count and the lock. Both of those writes
-re-read the row under a write lock held for the transaction, so
-attempts arriving at once are counted one by one and no count is lost.
-Neither write can change the response: a failure to persist one is
-rolled back and recorded, and the caller answers as it would have
-anyway.
-
-:data:`limiter` is defined here and is the object the application binds
-to ``app.state.limiter``.
-
-Usage::
-
-    POST /auth/register  {"email": ..., "password": ...}
-    POST /auth/login     {"email": ..., "password": ...}
+"""Authentication endpoints with uniform login refusals and
+per-address throttling.
 """
 
 import time
@@ -56,15 +15,17 @@ from backend.app.core.security import (
     create_access_token,
     equalize_login_refusal,
     get_password_hash,
+    login_attempt_slot,
     verify_credential,
 )
 from backend.app.db.database import get_db
 from backend.app.schema.user import UserCreate, UserLogin
-from backend.app.db.models import User
+from backend.app.db.models import LoginAttemptSlot, User
 
 __all__ = [
     "DECISION_ACCOUNT_LOCKED",
     "DECISION_ADDRESS_CONFLICT",
+    "DECISION_BUCKETED_REFUSAL",
     "DECISION_FAILED_ATTEMPT",
     "DECISION_INVALID_PASSWORD",
     "DECISION_LOCK_APPLIED",
@@ -99,9 +60,9 @@ DECISION_FAILED_ATTEMPT = "failed_attempt"
 DECISION_SUCCESSFUL_ATTEMPT = "successful_attempt"
 
 #: Decision recorded when the address carries no account. The record
-#: carries no address and no identifier, because there is no account to
-#: name; the code is what distinguishes this refusal from the others in a
-#: query, and the response is identical to every other refusal.
+#: carries no address and no identifier; this code is what distinguishes
+#: the refusal from the others in a query, and the response it accompanies
+#: is identical to every other refusal.
 DECISION_UNKNOWN_ACCOUNT = "login_unknown_account"
 
 #: Decision recorded when the account lock is still in force.
@@ -114,6 +75,11 @@ DECISION_INVALID_PASSWORD = "login_invalid_password"
 #: Decision recorded when a counted failure reaches the threshold and the
 #: lock is applied.
 DECISION_LOCK_APPLIED = "login_lock_applied"
+
+#: Decision recorded when a refusal is counted against a throttling
+#: bucket. It names no account, since the branches that record it either
+#: found none or hold one whose lock is already in force.
+DECISION_BUCKETED_REFUSAL = "login_bucketed_refusal"
 
 #: Decision recorded when a registration loses the address to a
 #: concurrent request that committed first.
@@ -134,15 +100,8 @@ router = APIRouter()
 
 
 def _invalid_credentials(started: float) -> HTTPException:
-    """Return the ``HTTPException`` every rejected login raises.
-
-    It carries status ``401`` and :data:`INVALID_CREDENTIALS_DETAIL`
-    whatever the reason for the rejection. ``started`` is the
-    ``time.monotonic()`` reading taken on entering the handler, and the
-    exception is returned only once
-    :data:`backend.app.core.security.MIN_LOGIN_REFUSAL_SECONDS` have
-    elapsed since then, so every refusal branch takes the same time
-    whatever work it did.
+    """Return the 401 every rejected login raises, once the shared
+    refusal timing budget has elapsed.
     """
     equalize_login_refusal(started)
     return HTTPException(
@@ -152,15 +111,7 @@ def _invalid_credentials(started: float) -> HTTPException:
 
 
 def _as_aware(moment: datetime) -> datetime:
-    """Return ``moment`` as an offset-aware instant.
-
-    ``users.locked_until`` is declared ``DateTime(timezone=True)``, so a
-    value read back over PostgreSQL already carries its offset and is
-    returned unchanged. A backend that does not store an offset returns
-    the value naive; UTC is attached to it, which is the instant it
-    holds, because the engine opens every PostgreSQL session with its
-    time zone set to UTC and this module only ever writes UTC.
-    """
+    """Return moment as an offset-aware UTC instant."""
     if moment.tzinfo is None:
         return moment.replace(tzinfo=timezone.utc)
     return moment
@@ -174,13 +125,8 @@ def _is_locked(user: User, moment: datetime) -> bool:
 
 
 def _lock_row(db: Session, user_id: int) -> Optional[User]:
-    """Return the account row held under a write lock, or ``None``.
-
-    The row is re-read inside the current transaction and the lock is
-    held until that transaction ends, and two requests touching the same
-    account are serialised. ``populate_existing`` discards the copy the
-    request loaded earlier, and the attributes returned are the persisted
-    ones.
+    """Return the account row re-read under a write lock held to the end
+    of the transaction, or None.
     """
     return (
         db.query(User)
@@ -192,10 +138,8 @@ def _lock_row(db: Session, user_id: int) -> Optional[User]:
 
 
 def _abandon(db: Session, decision: str, user: User) -> None:
-    """Discard the pending change and record that it did not persist.
-
-    The session is left clean and the request is still answerable. The
-    record names the decision and the account, and no credential.
+    """Roll back the pending change and record that the attempt outcome
+    did not persist.
     """
     db.rollback()
     logger.error(
@@ -209,18 +153,8 @@ def _record_refusal(
     decision: str,
     user_id: Optional[int],
 ) -> None:
-    """Record one refused login under a stable decision code.
-
-    Every refusal is recorded, so a run of them against one account can be
-    counted and told apart from a run spread across many. The record
-    carries the decision code, the path and the account identifier when an
-    account was found -- never the submitted address, the submitted
-    password or the stored credential. ``user_id`` is ``None`` for an
-    address carrying no account, because there is no account to name.
-
-    The record is emitted before the response is built, so the equalized
-    refusal the caller receives is unchanged by it: every refusal returns
-    one detail whatever the decision was.
+    """Record one refused login under its decision code, carrying no
+    address and no credential.
     """
     logger.warning(
         LOGIN_REFUSED_MESSAGE,
@@ -232,24 +166,77 @@ def _record_refusal(
     )
 
 
+def _lock_slot(db: Session, bucket: int) -> Optional[LoginAttemptSlot]:
+    """Return the throttling slot row held under a write lock.
+
+    The row is re-read inside the current transaction and the lock is
+    held until that transaction ends, exactly as :func:`_lock_row` does
+    for an account. ``None`` means the seeded row is absent.
+    """
+    return (
+        db.query(LoginAttemptSlot)
+        .filter(LoginAttemptSlot.bucket == bucket)
+        .populate_existing()
+        .with_for_update()
+        .one_or_none()
+    )
+
+
+def _record_bucketed_refusal(
+    db: Session,
+    email: str,
+    moment: datetime,
+) -> None:
+    """Count one refusal against the bucket ``email`` falls in.
+
+    This is the write the two refusal branches that hold no countable
+    account row perform: the address carrying no account, and the account
+    whose lock is already in force. It takes one write lock, issues one
+    update and commits once, which is the same shape and the same number
+    of statements :func:`_record_failed_attempt` issues against an
+    account row.
+
+    No address, credential or account identifier is written. The bucket is
+    a keyed digest and the row records only a count and an instant.
+
+    A persistence failure is rolled back and recorded rather than raised.
+    The caller is answered the same
+    :data:`INVALID_CREDENTIALS_DETAIL` either way.
+    """
+    bucket = login_attempt_slot(email)
+    try:
+        row = _lock_slot(db, bucket)
+        if row is None:
+            db.rollback()
+            logger.error(
+                "Login throttling slot is absent",
+                extra={
+                    "decision": DECISION_BUCKETED_REFUSAL,
+                    "login_attempt_bucket": bucket,
+                },
+            )
+            return
+        row.attempts = (row.attempts or 0) + 1
+        row.observed_at = moment
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.error(
+            "Failed to persist a login refusal observation",
+            extra={
+                "decision": DECISION_BUCKETED_REFUSAL,
+                "login_attempt_bucket": bucket,
+            },
+        )
+
+
 def _record_failed_attempt(
     db: Session,
     user: User,
     moment: datetime,
 ) -> None:
-    """Count one failed attempt, locking the account at the threshold.
-
-    The count is read back from the locked row and incremented in the
-    same transaction, and concurrent failures each advance it once.
-
-    A lock that has already expired restarts the count at one, and a
-    lock still in force is left in place. Reaching
-    ``settings.LOGIN_MAX_ATTEMPTS`` sets ``locked_until`` to
-    ``settings.LOGIN_LOCKOUT_MINUTES`` minutes after ``moment``.
-
-    A persistence failure is rolled back and recorded rather than
-    raised. The caller is answered the same
-    :data:`INVALID_CREDENTIALS_DETAIL` either way.
+    """Count one failed attempt on the locked row and apply the lockout
+    at the configured threshold.
     """
     try:
         row = _lock_row(db, user.id)
@@ -282,16 +269,7 @@ def _record_failed_attempt(
 
 
 def _record_successful_attempt(db: Session, user: User) -> None:
-    """Clear the failed-attempt count and the lock on the account.
-
-    The row is re-read under the same write lock the failure path takes,
-    so a failure running alongside this one cannot reinstate the count
-    it clears.
-
-    A persistence failure is rolled back and recorded rather than raised,
-    because the credential has already been verified and the login
-    stands.
-    """
+    """Clear the failed-attempt count and the lock on the locked row."""
     try:
         row = _lock_row(db, user.id)
         if row is None:
@@ -314,17 +292,10 @@ def register_user(
     user: UserCreate,
     db: Session = Depends(get_db),
 ):
-    """Register one account and return it beside a token.
-
-    The ``users.email`` unique constraint is the authority on whether the
-    address is taken. The pre-check below answers the ordinary case
-    without a failed insert, and the constraint answers the race two
-    concurrent registrations for one address can win together: the loser
-    is rolled back and receives the same
-    :data:`DUPLICATE_EMAIL_DETAIL` response as the pre-check, so the two
-    outcomes are indistinguishable.
+    """Register one account and return it beside a token, refusing a
+    taken address identically from the pre-check and the unique
+    constraint.
     """
-    # Check if user already exists
     existing_user = db.query(User).filter(User.email == user.email).first()
     if existing_user:
         raise HTTPException(
@@ -338,8 +309,6 @@ def register_user(
         created_at=datetime.now(timezone.utc),
     )
     db.add(new_user)
-    # A conflict on the unique address constraint is answered with the
-    # same status and detail as the lookup above.
     try:
         db.commit()
     except IntegrityError:
@@ -389,15 +358,22 @@ def login_user(
     attempted_at = datetime.now(timezone.utc)
     if db_user is None:
         verify_credential(user.password, None)
+        _record_bucketed_refusal(db, user.email, attempted_at)
         _record_refusal(request, DECISION_UNKNOWN_ACCOUNT, None)
         raise _invalid_credentials(started)
+    # Read before any write commits. Committing expires the loaded
+    # instance, so an attribute read after the commit issues another
+    # select against the account, which the branch holding no account
+    # cannot issue.
+    account_id = db_user.id
     if _is_locked(db_user, attempted_at):
         verify_credential(user.password, db_user.hashed_password)
-        _record_refusal(request, DECISION_ACCOUNT_LOCKED, db_user.id)
+        _record_bucketed_refusal(db, user.email, attempted_at)
+        _record_refusal(request, DECISION_ACCOUNT_LOCKED, account_id)
         raise _invalid_credentials(started)
     if not verify_credential(user.password, db_user.hashed_password):
         _record_failed_attempt(db, db_user, attempted_at)
-        _record_refusal(request, DECISION_INVALID_PASSWORD, db_user.id)
+        _record_refusal(request, DECISION_INVALID_PASSWORD, account_id)
         raise _invalid_credentials(started)
     _record_successful_attempt(db, db_user)
 

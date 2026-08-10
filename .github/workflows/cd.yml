@@ -1,12 +1,6 @@
 name: Continuous Deployment
 
-# Deployment is triggered by a completed run of the CI workflow rather than
-# by the push itself, and every job below is conditional on that run having
-# concluded successfully. CI is the single complete gate -- lint, both
-# dependency audits, static analysis, the residual-advisory guards, the
-# secret and ignore-policy gate, the full backend suite with its coverage
-# floor, the security suite and the PostgreSQL integration suite -- so a
-# deployment cannot proceed past a subset of it.
+# Deploy only the commit from a successful completed CI run.
 on:
   workflow_run:
     workflows: ["CI"]
@@ -61,6 +55,15 @@ env:
   # matching the cloud_function_name output of
   # infrastructure/terraform/outputs.tf.
   CLOUD_FUNCTION_NAME: ${{ vars.CLOUD_FUNCTION_NAME || 'apartment-finder-probe' }}
+  # Whether the function exists to be verified. It mirrors the Terraform
+  # variable and the release script's input of the same name, and defaults
+  # to false for the same reason both of those do: the function's runtime
+  # pin names a runtime Cloud Functions has decommissioned, so the resource
+  # is not created until a release owner decides that conflict. The invoker
+  # policy check below is gated on it, because a check that describes a
+  # function nothing created fails the deployment over infrastructure the
+  # default configuration deliberately does not provision.
+  CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED: ${{ vars.CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED || 'false' }}
   # Kubernetes service account the workloads run as, and the Google
   # identity its workload-identity annotation must name. The second is
   # the backend_runtime_service_account_email output.
@@ -74,17 +77,24 @@ env:
   # relying on a default one that does not exist.
   BACKEND_DOCKERFILE: infrastructure/docker/Dockerfile.backend
   FRONTEND_DOCKERFILE: infrastructure/docker/Dockerfile.frontend
+  # The two build arguments infrastructure/docker/Dockerfile.frontend
+  # declares. Create React App inlines them into the published bundle, so
+  # both are public values and both are repository variables -- the same
+  # context the manifest-rendering step below reads PAYPAL_CLIENT_ID from,
+  # and the context README.md documents them under. Neither is a secret,
+  # and the PayPal client secret is never a build argument.
+  REACT_APP_API_BASE_URL: ${{ vars.REACT_APP_API_BASE_URL }}
+  REACT_APP_PAYPAL_CLIENT_ID: ${{ vars.PAYPAL_CLIENT_ID }}
 
 jobs:
-  # Reached before the gate re-runs and before anything is built, so a
-  # release target that cannot be deployed to stops here rather than after
-  # images have been published. This job carries the conclusion condition
-  # for the whole workflow: workflow_run fires on every completed run,
-  # including a failed one, and every job below reaches this one through
-  # its needs chain.
+  # Validate the release target before any build or deployment job runs.
   preflight:
     name: Confirm the deployment path exists
-    if: github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == 'main'
+      && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -131,18 +141,45 @@ jobs:
         done
         echo "Cluster jobs will run on the self-hosted label ${RUNNER_LABEL}."
 
+    - name: Confirm the public frontend build values are present
+      env:
+        # Both are inlined into the built bundle and read by the browser, so
+        # neither is a credential and both are repository variables. The
+        # manifest-render step in the deploy job reads PAYPAL_CLIENT_ID from
+        # vars as well, and README.md documents both as variables.
+        REACT_APP_API_BASE_URL: ${{ vars.REACT_APP_API_BASE_URL }}
+        PAYPAL_CLIENT_ID: ${{ vars.PAYPAL_CLIENT_ID }}
+      run: |
+        set -euo pipefail
+
+        # An undefined repository variable expands to the empty string, and
+        # `react-scripts build` inlines an empty value without complaint, so
+        # the bundle would be published addressing "/api/..." with no origin
+        # and offering no PayPal client id. Neither failure is visible until a
+        # browser runs the bundle, which is after the release has reported
+        # success. This step names the missing value before anything is built.
+        missing=""
+        for name in REACT_APP_API_BASE_URL PAYPAL_CLIENT_ID; do
+          eval "value=\${$name}"
+          if [ -z "${value}" ]; then
+            missing="${missing} ${name}"
+          fi
+        done
+
+        if [ -n "${missing}" ]; then
+          echo "::error::The repository variable(s)${missing} are unset or" \
+            "empty. Both are public build arguments for the frontend image," \
+            "not secrets: set them as repository variables. See the" \
+            "Deployment section of README.md."
+          exit 1
+        fi
+        echo "Both public frontend build values are set."
+
     - name: Confirm every frontend import is a declared dependency
       run: |
         set -euo pipefail
 
-        # The frontend image build runs `npm run build`, which resolves
-        # every import from the declared dependency set. A scoped package
-        # imported by the source but absent from package.json fails that
-        # build, and the failure reads as a bundler error rather than as a
-        # missing declaration. This step names it instead.
-        # Read one import per line rather than splitting the whole result
-        # on whitespace, and read it through a redirect rather than a pipe so
-        # the loop runs in this shell and the name it collects survives it.
+        # Report undeclared scoped frontend imports before the image build.
         missing=""
         while IFS= read -r package; do
           [ -n "${package}" ] || continue
@@ -164,15 +201,41 @@ jobs:
         fi
         echo "Every scoped frontend import is declared."
 
-  # The whole continuous-integration workflow, not a subset of it. Every
-  # gate it declares -- lint, dependency audit, static analysis, the unit
-  # suite, the security suite and the PostgreSQL migration and persistence
-  # suite -- must pass before the deploy job below starts, and a gate added
-  # to that workflow is added to this one with it.
+    - name: Confirm the frontend build values are populated
+      run: |
+        set -euo pipefail
+
+        # Both values are inlined into the browser bundle at build time, so
+        # an unset one produces an image that builds successfully and then
+        # cannot reach the API or open hosted checkout -- a failure that
+        # surfaces to an end user rather than to this pipeline. They are
+        # checked here, before anything is built, because an empty
+        # --build-arg is not an error to docker.
+        for name in REACT_APP_API_BASE_URL REACT_APP_PAYPAL_CLIENT_ID; do
+          eval "value=\${${name}:-}"
+          if [ -z "${value}" ]; then
+            echo "::error::The repository variable behind ${name} is not" \
+              "set. Both frontend build values are repository variables," \
+              "not secrets: set vars.REACT_APP_API_BASE_URL and" \
+              "vars.PAYPAL_CLIENT_ID. The same vars.PAYPAL_CLIENT_ID is" \
+              "read when the manifests are rendered, so one value reaches" \
+              "both the bundle and the backend configuration."
+            exit 1
+          fi
+        done
+        echo "Both frontend build values are populated."
+
+  # Deploy only the commit from a successful completed CI run.
   verify:
     name: Verify
     needs: preflight
     uses: ./.github/workflows/ci.yml
+    # A reusable workflow runs the definition its caller holds and, left to
+    # itself, checks out the caller's revision. The commit being released
+    # is passed in, and every checkout in that workflow resolves it, so the
+    # gate runs against that commit.
+    with:
+      verified_ref: ${{ github.event.workflow_run.head_sha }}
     permissions:
       contents: read
 
@@ -213,14 +276,27 @@ jobs:
         # context and Dockerfile.frontend copies package-lock.json from the
         # root of its own. The frontend receives the two non-secret build
         # arguments its image declares, so the bundle is not built blind.
+        # Both come from the workflow environment, which resolves them from
+        # repository variables, and the preflight job has already refused
+        # the run if either is empty.
+        for name in REACT_APP_API_BASE_URL REACT_APP_PAYPAL_CLIENT_ID; do
+          eval "value=\${${name}:-}"
+          if [ -z "${value}" ]; then
+            echo "::error::${name} is empty at build time. The bundle" \
+              "would be published unable to reach the API or open hosted" \
+              "checkout."
+            exit 1
+          fi
+        done
+
         docker build \
           -f infrastructure/docker/Dockerfile.backend \
           -t "$REGISTRY/backend:${VERIFIED_SHA}" \
           ./backend
         docker build \
           -f infrastructure/docker/Dockerfile.frontend \
-          --build-arg "REACT_APP_API_BASE_URL=${{ secrets.REACT_APP_API_BASE_URL }}" \
-          --build-arg "REACT_APP_PAYPAL_CLIENT_ID=${{ secrets.PAYPAL_CLIENT_ID }}" \
+          --build-arg "REACT_APP_API_BASE_URL=${REACT_APP_API_BASE_URL}" \
+          --build-arg "REACT_APP_PAYPAL_CLIENT_ID=${REACT_APP_PAYPAL_CLIENT_ID}" \
           -t "$REGISTRY/frontend:${VERIFIED_SHA}" \
           ./frontend
 
@@ -418,13 +494,10 @@ jobs:
           echo "REGISTRY=${registry}"
           echo "BACKEND_IMAGE=${registry}/backend@${backend_digest}"
           echo "FRONTEND_IMAGE=${registry}/frontend@${frontend_digest}"
-          # The name the rendered migration Job carries. It must be the
-          # whole tag rather than a prefix of it: the manifest renders
-          # backend-migrate-${IMAGE_TAG}, and a wait on a shortened name
-          # would never find the object that was applied. One name per
-          # release, so a completed migration for a tag is left in place
-          # rather than replaced, and its record is retained.
-          echo "MIGRATION_JOB_NAME=backend-migrate-${IMAGE_TAG}"
+          # The migration Job name comes from its renderer, which folds the tag
+          # to the alphabet a Kubernetes name accepts, so the name
+          # applied and the name waited on are always one name.
+          echo "MIGRATION_JOB_NAME=$(scripts/render_kubernetes_manifests.sh job-name migration)"
         } >> "$GITHUB_ENV"
 
     - name: Configure the Docker credential helper
@@ -535,8 +608,8 @@ jobs:
         scripts/render_kubernetes_manifests.sh prerequisites \
           | kubectl apply --request-timeout=60s -f -
 
-    # Runs after the prerequisites, because the namespace the secret
-    # is created in is one of them.
+    # Runs after the prerequisites, which create the namespace the secret
+    # below is created in.
     - name: Publish the shared rate-limit store address
       env:
         # One name for the setting the application reads, the Secret Manager
@@ -571,8 +644,7 @@ jobs:
           exit 1
         fi
 
-        # Refuse an in-process scheme here rather than letting every pod fail
-        # its own startup validation with the same message.
+        # An in-process scheme is refused here, before any pod starts.
         if grep -Eq '^(bounded-memory|memory|async\+memory)://' "$address"; then
           echo "$RATE_LIMIT_SETTING names a store held inside one process;"
           echo "it must name storage shared by every process"
@@ -581,8 +653,8 @@ jobs:
 
         # Both halves name the namespace: neither the kubeconfig this job
         # writes nor the cluster's default context carries one, so a secret
-        # created without it would land beside the workloads rather than
-        # beside them and no pod would ever read it.
+        # created without it lands in the default namespace instead of
+        # beside the workloads, where no pod reads it.
         kubectl create secret generic "$RATE_LIMIT_STORE_SECRET" \
           --namespace="$K8S_NAMESPACE" \
           --from-file="$RATE_LIMIT_SETTING=$address" \
@@ -625,13 +697,11 @@ jobs:
           --tail=200 --request-timeout=60s
 
     # Gives the seeded administrator a credential, replacing the value
-    # 0002_seed_single_admin.py stores, which no password produces. It runs
-    # only when the PROVISION_ADMIN_CREDENTIAL repository variable is set to
-    # true, and is placed after the migration step that creates the account.
-    # Repeating it is safe: the module leaves a credential already in place
-    # alone unless ADMIN_CREDENTIAL_RESET is true, and re-asserts that
-    # exactly one account holds the role before committing. The conditions
-    # are recorded in docs/security/CREDENTIAL_ROTATION.md.
+    # 0002_seed_single_admin.py stores, which no password produces. It
+    # runs only when the PROVISION_ADMIN_CREDENTIAL repository variable
+    # is true, after the migration step that creates the account.
+    # Repeating it is safe: the module leaves a credential already in
+    # place alone unless ADMIN_CREDENTIAL_RESET is true.
     - name: Provision the administrator credential
       if: vars.PROVISION_ADMIN_CREDENTIAL == 'true'
       env:
@@ -641,7 +711,26 @@ jobs:
       run: |
         set -euo pipefail
 
-        JOB_NAME="backend-admin-credential-${IMAGE_TAG:0:12}"
+        # The name the rendered Job carries, taken from the renderer that
+        # renders it, so the object applied is the object waited on.
+        JOB_NAME="$(scripts/render_kubernetes_manifests.sh job-name admin-credential)"
+
+        # A completed Job is retained by ttlSecondsAfterFinished and a Job's
+        # pod template cannot be changed in place, so a reset on an image tag
+        # that has already provisioned would be refused. Any previous run of
+        # this name is removed first and its removal confirmed, so the apply
+        # below creates the object it then waits on.
+        if kubectl -n "$K8S_NAMESPACE" get "job/$JOB_NAME" \
+             --request-timeout=60s >/dev/null 2>&1; then
+          kubectl -n "$K8S_NAMESPACE" delete "job/$JOB_NAME" \
+            --wait=true --timeout=5m --request-timeout=60s
+        fi
+        if kubectl -n "$K8S_NAMESPACE" get "job/$JOB_NAME" \
+             --request-timeout=60s >/dev/null 2>&1; then
+          echo "$JOB_NAME still exists after deletion; it was not" \
+            "recreated." >&2
+          exit 1
+        fi
 
         # The credential is delivered by its own Secret Manager secret
         # under its own identity, so no credential is written into a
@@ -787,6 +876,7 @@ jobs:
           http://127.0.0.1:8000/health/ready
 
     - name: Confirm no public principal may invoke the Cloud Function
+      if: env.CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED == 'true'
       run: |
         set -euo pipefail
 
@@ -809,6 +899,22 @@ jobs:
           exit 1
         fi
         echo "no public principal holds roles/cloudfunctions.invoker"
+
+    # A skipped step with no explanation reads as a check that passed. This
+    # says which decision suppressed it, in the same terms
+    # scripts/deploy.sh reports its own unperformed function step.
+    - name: Report the Cloud Function check as not performed
+      if: env.CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED != 'true'
+      run: |
+        set -euo pipefail
+
+        echo "The Cloud Function invoker check was not performed."
+        echo "CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED is" \
+          "\"$CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED\", so Terraform creates" \
+          "no function and there is no invoker policy to read."
+        echo "Set the repository variable of that name to \"true\" once a" \
+          "release owner has decided the runtime conflict recorded as O-3" \
+          "in docs/security/RESIDUAL_RISK.md."
 
     - name: Remove the generated credential file
       if: always()

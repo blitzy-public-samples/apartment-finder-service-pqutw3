@@ -1,101 +1,4 @@
-"""Centralized role and ownership authorization for the API surface.
-
-This module is the application's single authorization decision point.
-It publishes an ordered four-role model, a dependency factory that
-guards a route on a minimum role, and two helpers that bind a stored row
-to the principal that owns it.
-
-The role every decision is taken against is read from the
-:data:`ROLE_ATTRIBUTE` of the stored user row that authentication
-returned, raised by any paid entitlement the principal's own stored
-``subscriptions`` rows carry. No request body field, query parameter,
-header or token claim is consulted, and no function here writes a role.
-
-A paid entitlement is resolved by :func:`entitled_role`: a subscription
-row belonging to the principal, carrying the active status and not yet
-past its end date, grants the role its plan registers in
-:mod:`backend.app.core.plans`. The grant is derived from the row and not
-read off the user, and it lapses when the row expires with no account
-being demoted.
-
-The unexpired subscription is the authority for every role a plan can
-grant, and the stored column alone never carries one. A stored value
-naming a member of :data:`SUBSCRIPTION_DERIVED_ROLES` is credited by
-:func:`stored_credit` as :data:`BASELINE_ROLE`: a decision that turns on
-such a role reads the subscription, and a closed window admits nothing
-beyond that baseline. A stored role no plan grants --
-:data:`LOWEST_ROLE`, :data:`BASELINE_ROLE` and ``Role.ADMIN`` -- is
-never lowered, and :func:`require_role` resolves an entitlement only
-when the credited stored role does not already satisfy the minimum: a
-route no entitlement can affect issues no extra query.
-
-A subscription that cannot be read grants nothing:
-:func:`entitled_role` records the failure and reports no entitlement, and
-the decision rests on the credited stored role alone.
-
-Resolution denies by default. A stored value is matched only when it
-equals a :class:`Role` member's value exactly: no whitespace is stripped
-and no letter case is folded. Every other value -- absent, ``None``,
-blank, whitespace-padded such as ``" admin"``, differently cased such as
-``"Admin"`` or ``"ADMIN"``, unrecognised, or of an unexpected type --
-resolves to no role at all, and the request is refused before any rank
-comparison is made. Such a value satisfies no minimum, including
-:data:`LOWEST_ROLE`. Resolution raises nothing.
-
-An unrecognised minimum handed to :func:`require_role` raises
-``ValueError`` while the route is being declared.
-
-Refusals carry these statuses:
-
-* an absent or invalid credential is answered ``401`` by
-  :func:`backend.app.core.security.get_current_user`, and that response
-  passes through unchanged
-* an authenticated principal whose role is unrecognised, or which ranks
-  below the minimum role, is answered ``403``
-* every ownership refusal is answered ``404``, whether the lookup
-  matched no row or the matching row carries another owner
-
-Every refusal emits one structured record through
-:func:`backend.app.core.logging.get_logger` carrying the request method
-and path, the principal identifier, the required, effective and claimed
-role names and the decision. The method and the path are read from
-``request.scope``. The claimed role is the verified token's own role
-claim and decides nothing. Emitting a record raises nothing into the
-request path and touches no database session.
-
-No refusal is ever emitted silently. When the structured record cannot
-be written, the same fields are written to standard error through
-:func:`backend.app.core.logging.log_audit_fallback` and
-:data:`AUDIT_FAILURE_MESSAGE` is counted;
-:func:`audit_failure_count` reports that count as a health signal, and a
-non-zero value means the primary audit sink degraded even though no
-denial event was lost. The exception each refusal raises is marked
-audited, so a generic handler further out leaves the refusal at the one
-record emitted here.
-
-This module installs no middleware and guards no route on its own: a
-route is guarded where it declares the dependency, and a route
-declaring none stays reachable.
-
-The dependency :func:`require_role` returns is a synchronous callable,
-so the framework runs it in a worker thread rather than on the event
-loop. Every session statement this module issues -- the entitlement
-lookup in :func:`entitled_role` and the ownership lookup in
-:func:`load_owned` -- therefore runs off the loop, whether the guarded
-route is declared with ``def`` or with ``async def``.
-
-Usage::
-
-    @router.post('/')
-    def create_listing(
-        current_user: User = Depends(require_role(Role.ADMIN)),
-    ) -> Listing:
-        ...
-
-    subscription = load_owned(
-        db, Subscription, current_user, paypal_order_id=order_id
-    )
-"""
+"""Centralized role and ownership authorization dependencies."""
 
 import threading
 from datetime import datetime, timezone
@@ -321,27 +224,8 @@ def entitled_role(
     user: Any,
     moment: Optional[datetime] = None,
 ) -> Optional[Role]:
-    """Returns the role a paid entitlement grants ``user``.
-
-    A ``subscriptions`` row grants an entitlement when it belongs to the
-    principal, carries :data:`backend.app.core.plans.STATUS_ACTIVE`, and
-    has an ``end_date`` still ahead of ``moment`` -- which defaults to
-    the current UTC instant. The role granted is the ``required_role``
-    the plan catalog registers for that row's plan, and the highest
-    ranking role across the qualifying rows is returned.
-
-    The decision reads stored rows only. No token claim, request field
-    or catalog value supplied by a client takes part in it, and an
-    expired row grants nothing without anything having to demote it.
-
-    ``None`` is returned when the principal carries no identifier, when
-    no row qualifies, and when no qualifying row names a plan the
-    catalog publishes.
-
-    ``None`` is also returned when the lookup itself fails, after one
-    record naming :data:`ENTITLEMENT_UNRESOLVED_MESSAGE`, so a
-    subscription that cannot be read grants nothing and the caller's
-    session is left exactly as it was found.
+    """Return the highest role granted by the user's active, unexpired
+    subscriptions; return None on lookup failure or no entitlement.
     """
     principal_id = _principal_id(user)
     if principal_id is None:
@@ -382,30 +266,11 @@ def effective_role(
     user: Any,
     moment: Optional[datetime] = None,
 ) -> Optional[Role]:
-    """Returns the role every decision about ``user`` is taken against.
-
-    The role stored on the row is resolved by :func:`resolve_role` and
-    credited by :func:`stored_credit`, and a paid entitlement resolved
-    by :func:`entitled_role` raises that credit when the entitlement
-    ranks higher.
-
-    A stored value naming a member of
-    :data:`SUBSCRIPTION_DERIVED_ROLES` is credited as
-    :data:`BASELINE_ROLE`, so such a role holds only while an unexpired
-    active subscription grants it and lapses with that subscription's
-    window. A stored role that no entitlement grants --
-    :data:`LOWEST_ROLE`, :data:`BASELINE_ROLE` and ``Role.ADMIN`` -- is
-    never lowered.
-
-    Resolution still denies by default: a row whose stored role names no
-    member resolves to ``None``, which satisfies no minimum, and an
-    entitlement is an addition to a recognised stored role, never a
-    substitute for one.
+    """Resolve the recognized stored role and raise it with any active
+    subscription entitlement.
     """
     stored = resolve_role(user)
     if stored is None:
-        # A stored role naming no member satisfies no minimum, and an
-        # entitlement is never a substitute for it.
         return None
     credited = stored_credit(stored)
     granted = entitled_role(db, user, moment)
@@ -484,28 +349,8 @@ def _log_refusal(
     request: Optional[Request],
     context: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Attempts one record describing a refused request.
-
-    The record carries the request method and path, the principal
-    identifier, the required, effective and claimed role names and the
-    decision, followed by any fields ``context`` supplies.
-
-    ``required`` is ``None`` for a decision that names no minimum role,
-    and ``effective`` is ``None`` when the stored role names no member of
-    :class:`Role`. ``claimed_role`` is the role claim of the verified
-    token, read through
-    :func:`backend.app.core.security.claimed_role`; it records what the
-    caller asserted, so a record where it differs from ``effective_role``
-    shows a token issued before the stored role changed. It takes part in
-    no decision.
-
-    No token, no credential and no request body value is included.
-
-    Nothing here reads from or writes to a database session. When the
-    structured record cannot be written, the same fields are written to
-    standard error and :func:`audit_failure_count` is incremented, so
-    the refusal is recorded on every path. No exception leaves this
-    function.
+    """Emit one sanitized authorization-refusal record, falling back to
+    stderr on logger failure.
     """
     fields = _request_fields(request)
     fields["principal_id"] = _principal_id(current_user)
@@ -586,48 +431,8 @@ def _not_found() -> HTTPException:
 
 
 def require_role(minimum: Any) -> Callable[..., User]:
-    """Returns a dependency admitting ``minimum`` and every role above.
-
-    ``minimum`` accepts a :class:`Role` or the value the column stores,
-    and ``ValueError`` is raised here when it names no member.
-
-    The returned dependency resolves the principal through
-    :func:`backend.app.core.security.get_current_user`, so an absent or
-    invalid credential is answered ``401`` by that function before this
-    check runs. The role stored on that row is read by
-    :func:`resolve_role`, credited by :func:`stored_credit` and compared
-    with ``minimum`` by :func:`role_satisfies`. Only when that credit
-    falls short is :func:`effective_role` consulted, so a paid
-    entitlement can raise a principal to the declared minimum without a
-    query being spent on the principals the stored role already admits.
-
-    Because :func:`stored_credit` credits a stored value naming a member
-    of :data:`SUBSCRIPTION_DERIVED_ROLES` as :data:`BASELINE_ROLE`, any
-    decision that turns on such a role reads the principal's unexpired
-    active subscription, and a stored value whose subscription window
-    has closed admits nothing beyond the baseline.
-
-    The stored row is returned unchanged when the comparison passes, so
-    a route may declare this dependency in place of
-    ``Depends(get_current_user)`` without altering its body.
-
-    Three outcomes are refused with ``403`` and
-    :data:`FORBIDDEN_DETAIL`, each after one record is emitted: a
-    principal that resolution finds absent, a stored role that names no
-    member of :class:`Role`, and a recognised role ranking below
-    ``minimum``. The invalid-role outcome is refused before any rank
-    comparison is made, so an unrecognised value satisfies no minimum,
-    not even :data:`LOWEST_ROLE`.
-
-    The request is read only to build that record, and no value carried
-    by the request takes part in the decision.
-
-    The dependency is declared with ``def`` rather than ``async def``,
-    so the framework runs it in a worker thread. The session statement
-    :func:`effective_role` may issue therefore never runs on the event
-    loop, and it runs on whichever worker thread serves the dependency,
-    sequentially and never concurrently with another statement on the
-    same session.
+    """Return a dependency that authenticates the user and enforces the
+    minimum database-backed role.
     """
     required = _coerce_minimum(minimum)
 
@@ -657,8 +462,6 @@ def require_role(minimum: Any) -> Callable[..., User]:
             raise _forbidden()
         if role_satisfies(stored_credit(stored), required):
             return current_user
-        # The credit the stored role carries on its own does not satisfy
-        # the minimum, so the paid entitlement is resolved as well.
         effective = effective_role(db, current_user)
         if not role_satisfies(effective, required):
             _log_refusal(
@@ -688,25 +491,8 @@ def require_ownership(
     request: Optional[Request] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> _ModelT:
-    """Returns ``obj`` when ``current_user`` owns it.
-
-    ``obj`` is a row already loaded from the database, and its owner is
-    read from ``owner_attribute``. The row is returned unchanged when
-    that value equals the principal's identifier.
-
-    Every refusal answers ``404`` with :data:`NOT_FOUND_DETAIL`, whatever
-    the reason: no row matched, the row carries a different owner, the
-    row carries no such attribute, or the principal carries no
-    identifier. A caller therefore cannot tell a row that does not exist
-    from one it is not entitled to, so the response discloses no
-    identifier belonging to another principal. The two cases stay
-    distinguishable in the emitted record, which names either
-    :data:`DECISION_OBJECT_MISSING` or
-    :data:`DECISION_OWNERSHIP_DENIED` and is extended by any fields
-    ``context`` supplies.
-
-    The comparison reads attributes only. No session is queried,
-    flushed or committed here, so a refusal leaves no change behind.
+    """Return the object when owned; otherwise audit and raise the
+    uniform 404 response.
     """
     details: Dict[str, Any] = {"owner_attribute": owner_attribute}
     if obj is not None:
@@ -751,13 +537,10 @@ def _preferred_row(
     principal_id: Optional[Any],
     owner_attribute: str,
 ) -> Optional[_ModelT]:
-    """Returns the row the principal owns, else the first, else ``None``.
+    """Return an owned row when present, otherwise the first match or None.
 
-    Preferring an owned row is what keeps a non-unique lookup from
-    refusing a row the caller owns because another owner's row was
-    ordered ahead of it. Returning the first unowned row when none is
-    owned is what lets :func:`require_ownership` still tell ``403``
-    apart from ``404``.
+    Returning an unowned match preserves the audit distinction while both
+    HTTP refusals remain 404.
     """
     if not rows:
         return None
@@ -830,30 +613,8 @@ def load_owned(
     request: Optional[Request] = None,
     **criteria: Any
 ) -> _ModelT:
-    """Loads the row matching ``criteria`` and returns it when owned.
-
-    ``criteria`` names mapped columns of ``model`` and the values they
-    must equal; at least one is required, and a name that is not one of
-    that model's mapped columns raises ``ValueError``. The identifier of
-    the owner is never taken from ``criteria``: it is read from
-    ``current_user`` alone.
-
-    ``criteria`` that is not unique can match more than one row. Up to
-    :data:`LOOKUP_CANDIDATE_LIMIT` matches are read and the one the
-    principal owns is preferred, so a row the caller owns is never
-    refused because a row belonging to somebody else was ordered ahead
-    of it. When no match is owned, the first is handed on so the record
-    still distinguishes the two cases.
-
-    The selected row is handed to :func:`require_ownership`, which
-    answers ``404`` whether no row matched or the selected row carries
-    another owner, so a caller cannot tell the two apart. The record
-    either refusal emits names the model, the criteria fields and how
-    many rows matched; the criteria values are not recorded.
-
-    The lookup is read-only. Nothing is added, flushed or committed
-    here, so a refusal leaves no change behind and every caller may run
-    it before it mutates anything.
+    """Load bounded candidates by mapped-column criteria, prefer the
+    caller-owned row, and apply uniform ownership refusal.
     """
     conditions = _lookup_conditions(model, criteria)
     rows = (

@@ -1,38 +1,6 @@
-# Development and verification tooling. Requires CPython 3.9.
-# Install with:
-#   pip install -r backend/requirements.txt -r backend/requirements-dev.txt
-#
-# Nothing in this file is installed into the runtime image: the backend
-# container installs backend/requirements.txt only, and no name below
-# appears there.
-#
-# --- Accepted residual advisories, development only --------------------------
-#
-# `pip-audit -r backend/requirements-dev.txt` reports seven advisories in
-# five packages, and all seven are accepted. This manifest declares which
-# they are, because a reader holding it needs to know what installing from
-# it accepts:
-#
-#   PYSEC-2026-1845  pytest       PYSEC-2026-2275  requests
-#   PYSEC-2026-3625  msgpack      PYSEC-2026-141   urllib3
-#   PYSEC-2026-1374  filelock     PYSEC-2026-142   urllib3
-#   PYSEC-2026-1375  filelock
-#
-# The identifiers above are an inventory and nothing more. Each one's
-# unreachable fix version, the measurement proving it unreachable and its
-# compensating control are held once, in the "Development register" section
-# of docs/security/RESIDUAL_RISK.md, so no analysis is written twice. The
-# reasoning behind accepting them rather than advancing the interpreter is
-# row 1.9 of docs/security/DECISION_LOG.md. This set is exactly the set
-# suppressed by the development audit invocation in
-# .github/workflows/ci.yml and .github/workflows/cd.yml.
-#
-# The Python 3.9 pin is load-bearing in five places, which the register
-# inventories. It is not advanced, so no fix above it is reachable.
-#
-# A pin below is raised only when the raised version installs under
-# CPython 3.9. Re-measure with:
-#   pip install --dry-run --no-deps <name>==<fix version>
+# Development and verification dependencies for CPython 3.9.
+# Install with: pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+# Accepted advisory details are documented in docs/security/RESIDUAL_RISK.md.
 
 # --- Test framework ----------------------------------------------------------
 pytest==8.4.2
@@ -40,8 +8,7 @@ pytest-asyncio==1.2.0
 pytest-cov==7.1.0
 httpx==0.28.1
 
-# --- Security scanning -------------------------------------------------------
-pip-audit==2.9.0
+# --- Static analysis ---------------------------------------------------------
 bandit==1.8.6
 
 # --- Lint --------------------------------------------------------------------
@@ -52,3 +19,16 @@ flake8==7.3.0
 # backend/tests/security/test_deployment_contract.py. Resolved as a
 # dependency of bandit and pinned here at the resolved version.
 PyYAML==6.0.3
+
+# --- Bootstrap installer, inventoried rather than declared --------------------
+#
+#   pip==26.0.1
+#
+# The installer that reads this file. It is not a requirement line: pip
+# cannot install itself from a manifest it is resolving, and a line here
+# would place it inside the audited set it is the tool for. It is pinned
+# once, at workflow scope in .github/workflows/ci.yml as PIP_VERSION, and
+# every job that installs a manifest reads that value, so the five installs
+# cannot drift and none resolves whatever release the index serves at the
+# moment the gate runs. Its inventory entry is here and its record is in
+# docs/security/RESIDUAL_RISK.md.

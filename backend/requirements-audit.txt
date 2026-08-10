@@ -1,0 +1,21 @@
+# The dependency-audit instrument. Requires CPython 3.9.
+# Install with:
+#   pip install -r backend/requirements-audit.txt
+#
+# This manifest holds one entry, and it is held apart from
+# backend/requirements-dev.txt for a single reason of fact: pip-audit
+# resolves a dependency tree of its own -- CacheControl[filecache], and
+# through it msgpack, requests, urllib3 and filelock -- and every advisory
+# in that tree is reported when the manifest declaring pip-audit is
+# audited. Declared beside the test and lint tooling, the instrument's own
+# tree is counted as this project's accepted residual risk; declared here,
+# it is counted as what it is, the tooling that performs the measurement.
+#
+# Nothing here is installed into the runtime image, and nothing here is
+# audited: the two audited manifests are backend/requirements.txt and
+# backend/requirements-dev.txt. The reasoning behind that boundary, and the
+# alternatives weighed against it, are recorded in
+# docs/security/DECISION_LOG.md; the instrument's own tree and what bounds
+# its exposure are recorded in docs/security/RESIDUAL_RISK.md.
+
+pip-audit==2.9.0

@@ -1,51 +1,4 @@
-"""Seed the single administrator account
-
-Leaves the address :data:`ADMIN_EMAIL` holding the role
-:data:`ADMIN_ROLE`, and every other account holding the role it already
-held. That address is the only address this revision names, and it is
-fixed in this module.
-
-``upgrade`` stores that address when no row carries it. The insert is one
-statement whose guard against an already-stored address is part of the
-statement, so nothing is read back: the row lands at the role
-:data:`REGISTERED_ROLE` carrying :data:`LOCKED_CREDENTIAL`, which is not
-a hash any password produces, so the account cannot be signed in to until
-an operator sets a credential on it.
-
-The promotion is then one conditional statement. The two statements'
-affected-row counts separate the four outcomes from one another: the
-account was stored here and granted the role, an account already stored
-was granted it, an account already held it, or the driver reported no
-count. The addresses holding :data:`ADMIN_ROLE` are read afterwards and
-must be exactly one entry naming :data:`ADMIN_EMAIL`. Any other result
-raises, and the transaction is rolled back.
-
-``downgrade`` returns that one account to the role
-:data:`REGISTERED_ROLE` and requires that the address no longer holds
-:data:`ADMIN_ROLE` afterwards. It touches no other account, no other
-column, no row's existence, and no table or column definition, so an
-account another grant made an administrator is left as it stands.
-
-Each outcome is recorded on the ``alembic`` logger with the counts it was
-decided from. The logger is governed by
-:mod:`backend.app.core.logging`, which renders every record as redacted
-JSON, and no record and no raised message names the address: each carries
-:data:`ADMIN_REFERENCE` instead, the non-reversible reference
-:func:`account_reference` derives from it. A record therefore carries no
-credential and no personal datum, and stays correlatable across runs
-because the reference is stable.
-
-``--sql`` emits both statements of each direction with their values
-inline, so the emitted stream does carry the address the ``WHERE`` clause
-matches on: a statement stream has to be complete on its own to be
-applicable. ``backend/migrations/env.py`` marks that stream accordingly.
-No count is read in that mode, so no post-condition is checked there.
-
-Revision ID: 0002
-Revises: 0001
-Create Date: 2026-08-08 09:31:48.204617
-
-"""
+"""Seed and promote the single configured administrator account."""
 import hashlib
 import logging
 
@@ -175,7 +128,6 @@ def _seed():
 
 
 def _promotion():
-    """Build the statement that grants the target address the role."""
     return sa.text(
         "UPDATE users SET role = :role"
         " WHERE email = :email AND role <> :role"
@@ -183,7 +135,6 @@ def _promotion():
 
 
 def _demotion():
-    """Build the statement that returns the target to the default role."""
     return sa.text(
         "UPDATE users SET role = :registered"
         " WHERE email = :email AND role = :admin"
@@ -221,7 +172,6 @@ def _rows_written(result) -> int:
 
 
 def _grant_outcome(stored: int, promoted: int) -> str:
-    """Return what the seed and the promotion wrote, as one phrase."""
     if stored > 0:
         return "inserted the account and granted it the role"
     if promoted > 0:
@@ -232,7 +182,6 @@ def _grant_outcome(stored: int, promoted: int) -> str:
 
 
 def _upgrade_offline() -> None:
-    """Emit the seed and the promotion, each carrying its values."""
     op.execute(_seed())
     op.execute(_promotion())
     logger.info(
@@ -251,7 +200,6 @@ def _upgrade_offline() -> None:
 
 
 def _upgrade_online() -> None:
-    """Store and promote the target account, then check the count."""
     connection = op.get_bind()
 
     stored = _rows_written(connection.execute(_seed()))
@@ -302,7 +250,6 @@ def upgrade() -> None:
 
 
 def _downgrade_offline() -> None:
-    """Emit the demotion as one statement carrying its values."""
     op.execute(_demotion())
     logger.info(
         "Returned account %s to the role %s; a statement stream reads no "
@@ -313,7 +260,6 @@ def _downgrade_offline() -> None:
 
 
 def _downgrade_online() -> None:
-    """Return the target account to the default role."""
     connection = op.get_bind()
 
     demoted = _rows_written(connection.execute(_demotion()))

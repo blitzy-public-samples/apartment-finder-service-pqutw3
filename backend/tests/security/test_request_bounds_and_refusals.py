@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -585,6 +585,99 @@ class TestSavedFilterHoldsSeveralPredicates:
             headers=bearer(registered_user),
         )
         assert response.status_code == expected
+
+    def test_the_page_is_ordered_in_sql_by_the_primary_key(
+        self, client, registered_user, db
+    ):
+        """The statement the page is read by carries the order.
+
+        An offset and a limit select a window of an ordered result, so
+        the order has to be part of the statement rather than left to
+        whatever the backend returns. The statement the request issues is
+        recorded and required to order by the filters table's own
+        identifier.
+        """
+        created = client.post(
+            "/filters/",
+            json=criteria_body(2, name="Ordered page"),
+            headers=bearer(registered_user),
+        )
+        assert created.status_code == 200
+
+        statements = []
+        engine = db.get_bind()
+
+        def record(
+            connection, cursor, statement, parameters, context, executemany
+        ):
+            """Append one executed statement to the recording."""
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            listed = client.get(
+                "/filters/",
+                params={"skip": "0", "limit": "1"},
+                headers=bearer(registered_user),
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+
+        assert listed.status_code == 200
+        paged = [
+            statement
+            for statement in statements
+            if "FROM filters" in statement and "LIMIT" in statement
+        ]
+        assert paged, statements
+        for statement in paged:
+            assert "ORDER BY filters.id" in statement, statement
+
+    def test_the_page_boundary_is_the_same_on_every_read(
+        self, client, registered_user
+    ):
+        """Paging the saved filters covers each one exactly once.
+
+        The route applies ``skip`` and ``limit`` in SQL, so without an
+        order the boundary between two pages is whatever the backend
+        happens to return and a filter can appear on both pages or on
+        neither. Three filters are read as three pages of one and then
+        as one page of three, and the two readings are required to agree
+        with each other and with a repeat of the first page.
+        """
+        saved = []
+        for index in range(3):
+            created = client.post(
+                "/filters/",
+                json=criteria_body(2, name="Paged %d" % index),
+                headers=bearer(registered_user),
+            )
+            assert created.status_code == 200
+            saved.append(created.json()["id"])
+
+        def page(skip):
+            """Returns the identifiers one page of one carries."""
+            response = client.get(
+                "/filters/",
+                params={"skip": str(skip), "limit": "1"},
+                headers=bearer(registered_user),
+            )
+            assert response.status_code == 200
+            return [entry["id"] for entry in response.json()]
+
+        pages = [page(offset) for offset in range(3)]
+
+        assert pages == [[identifier] for identifier in sorted(saved)]
+        assert page(0) == pages[0]
+        assert page(3) == []
+
+        whole = client.get(
+            "/filters/",
+            params={"limit": "3"},
+            headers=bearer(registered_user),
+        )
+        assert whole.status_code == 200
+        assert [entry["id"] for entry in whole.json()] == sorted(saved)
 
     def test_a_filter_stays_scoped_to_the_account_that_saved_it(
         self, client, registered_user, db

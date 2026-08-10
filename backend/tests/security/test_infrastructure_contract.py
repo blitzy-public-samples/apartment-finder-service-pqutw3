@@ -124,13 +124,19 @@ RECORDED_UNUSED_VARIABLES = frozenset(
         #: already reads under another name. Each names a property whose
         #: value is supplied by the variable beside it -- the network and
         #: subnetwork by var.network_name and var.subnetwork_name, the
-        #: private-services range by its own pair, the store size and
+        #: private-services range by its own pair, and the store size and
         #: version by var.rate_limit_store_memory_size_gb and the instance
-        #: default, and the function archive object by
-        #: var.cloud_function_source_object. Removing a declared input is a
-        #: change to the configuration's interface, which no finding calls
-        #: for, so each is recorded rather than deleted.
-        "cloud_function_source_archive_object",
+        #: default. Removing a declared input is a change to the
+        #: configuration's interface, which no finding calls for, so each
+        #: is recorded rather than deleted.
+        #:
+        #: The function's archive inputs were the exception and are gone:
+        #: cloud_function_source_archive_object was read by nothing, and
+        #: cloud_function_source_object and cloud_function_source_archive
+        #: fed a second bucket object at a fixed name whose contents came
+        #: from a path on the machine running Terraform. Deleting them is
+        #: the interface change the source-artefact finding asks for, so
+        #: they are absent here rather than recorded.
         "database_private_network",
         "database_private_services_access_prefix_length",
         "database_private_services_access_range_name",
@@ -238,14 +244,28 @@ def _default(body):
 
 
 def _migration_setting():
-    """Return the one setting a migration run resolves."""
+    """Return the one setting a migration run resolves.
+
+    The name is declared by the shared database contract and bound by the
+    migration environment, so both files are read: one supplies the name
+    and the other proves the environment resolves that name rather than
+    one of its own.
+    """
+    contract = (
+        REPO_ROOT / "backend" / "app" / "core" / "db_contract.py"
+    ).read_text(encoding="utf-8")
+    environment = (
+        REPO_ROOT / "backend" / "migrations" / "env.py"
+    ).read_text(encoding="utf-8")
+
     found = re.search(
-        r'(?m)^DATABASE_URL_SETTING\s*=\s*"([^"]+)"\s*$',
-        (REPO_ROOT / "backend" / "migrations" / "env.py").read_text(
-            encoding="utf-8"
-        ),
+        r'(?m)^DATABASE_URL_SETTING\s*=\s*"([^"]+)"\s*$', contract
     )
-    assert found is not None, "the environment declares no setting to read"
+    assert found is not None, "the contract declares no setting to read"
+    assert (
+        "DATABASE_URL_SETTING = db_contract.DATABASE_URL_SETTING"
+        in environment
+    )
     return found.group(1)
 
 

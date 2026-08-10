@@ -111,11 +111,32 @@ WITHDRAWAL_ROW = "35.1.1"
 #: Paths the plan's mapping marks CREATE or UPDATE.
 PLANNED_CHANGED_PATHS = 59
 
-#: Paths delivered beyond that mapping, enumerated in matrix section 6.
+#: Paths matrix section 6 reaches from the finding side, enumerated by its
+#: sections 6.2 and 6.3. A subset of the beyond-plan population, not the
+#: whole of it: the rounds after the one that wrote section 6 delivered
+#: more, and those are reached forward by section 2.9 and backward by 4.3.
 UNPLANNED_DELIVERED_PATHS = 27
 
-#: Sum of the two figures above.
-DELIVERED_PATHS = PLANNED_CHANGED_PATHS + UNPLANNED_DELIVERED_PATHS
+#: Paths the rounds after that one delivered beyond the plan, carried by
+#: the matrix's section 2.9 second table and its section 4.3.
+LATER_ROUND_PATHS = 60
+
+#: Of those, the ones later rounds withdrew: sixteen retired by the
+#: manifest consolidation and one, the provider lock file, withdrawn with
+#: the provider version constraint it locked. They were delivered and then
+#: retired, so they are indexed with their withdrawal stated and are absent
+#: from the tree the delivered total measures.
+RETIRED_PATHS = 17
+
+#: Delivered paths in the current tree, which is the figure the matrix
+#: publishes as its one authoritative baseline. Measured by
+#: ``git diff --name-status a26f7fb HEAD`` against a clean working tree.
+DELIVERED_PATHS = (
+    PLANNED_CHANGED_PATHS
+    + UNPLANNED_DELIVERED_PATHS
+    + LATER_ROUND_PATHS
+    - RETIRED_PATHS
+)
 
 #: Section reference prefix belonging to the Agent Action Plan. The plan
 #: is not one of these documents, so a reference to it resolves nowhere
@@ -132,6 +153,15 @@ ROW_NUMBER = re.compile(r"^\|\s*(\d+(?:\.\d+)+)\s*\|", re.MULTILINE)
 RECORD_REFERENCE = re.compile(
     r"(?:\u00a7|[Rr]ows?\s+|[Ss]ections?\s+)(\d+(?:\.\d+)*)"
 )
+
+#: Section numbers the decision log removed when it was consolidated onto
+#: one decision set. They held a duplicate re-issue of sections 1 to 34,
+#: with 44 added to every section prefix. The log publishes the rule for
+#: resolving a citation in this band and row 91.5.1 records the removal.
+REMOVED_SECTION_BAND = (45, 78)
+
+#: Offset the published rule applies to a citation in that band.
+REMOVED_SECTION_OFFSET = 44
 
 #: A same-document fragment link, as a reader's browser resolves it.
 FRAGMENT_LINK = re.compile(r"\]\(#([^)\s]+)\)")
@@ -152,14 +182,22 @@ TOLERATED_JOB = "Frontend checks (known blocker, gates nothing)"
 
 #: Deployment inputs that are new or renamed by this work. A deployment
 #: configured before it will not have them, so the readme has to say so.
+#:
+#: The three the Cloud Function step reads replace an earlier trio. The
+#: function's name and entry point stopped being inputs when they became
+#: constants in the script that match the Terraform configuration owning
+#: the function, and ``CLOUD_FUNCTION_SOURCE_ARCHIVE`` was replaced by the
+#: object name and its digest, because the object is named after the
+#: archive's content digest and a single ``gs://`` string cannot be
+#: compared against what the bucket actually holds.
 DEPLOYMENT_INPUTS = (
     "GKE_CLUSTER_REGION",
     "GKE_DEPLOY_RUNNER",
     "GCP_WORKLOAD_IDENTITY_PROVIDER",
     "REACT_APP_API_BASE_URL",
-    "CLOUD_FUNCTION_NAME",
-    "CLOUD_FUNCTION_SOURCE_ARCHIVE",
-    "CLOUD_FUNCTION_ENTRY_POINT",
+    "CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED",
+    "CLOUD_FUNCTION_SOURCE_OBJECT",
+    "CLOUD_FUNCTION_SOURCE_MD5",
 )
 
 
@@ -373,10 +411,29 @@ def test_every_section_and_row_reference_resolves(path):
 
     References beginning ``0.`` address the Agent Action Plan, which is
     not part of this set, and are excluded rather than reported.
+
+    A citation naming a section in :data:`REMOVED_SECTION_BAND` resolves
+    through the rule the decision log publishes: the section 44 lower
+    carries the same decision. Those citations are resolved that way here,
+    so a reconciliation may name a removed identifier while a citation of
+    something never written still fails.
     """
     defined = set()
     for other in DOCUMENTS:
         defined |= _identifiers(_text(other))
+
+    def resolves(reference):
+        if reference in defined:
+            return True
+        head, _, tail = reference.partition(".")
+        if not head.isdigit():
+            return False
+        section = int(head)
+        low, high = REMOVED_SECTION_BAND
+        if not low <= section <= high:
+            return False
+        moved = str(section - REMOVED_SECTION_OFFSET)
+        return (moved + "." + tail if tail else moved) in defined
 
     unresolved = sorted(
         {
@@ -384,11 +441,28 @@ def test_every_section_and_row_reference_resolves(path):
             for paragraph in re.split(r"\n\s*\n", _text(path))
             for reference in RECORD_REFERENCE.findall(paragraph)
             if not reference.startswith(PLAN_SECTION_PREFIX)
-            and reference not in defined
+            and not resolves(reference)
         }
     )
 
     assert unresolved == [], (path.name, unresolved)
+
+
+def test_the_decision_log_publishes_the_rule_for_the_removed_band():
+    """The band rule is stated, not assumed by this suite alone.
+
+    A reader meeting a citation between 45 and 78 has to be able to
+    resolve it from the document, and a reconciliation row has to record
+    that the sections were removed rather than lost.
+    """
+    text = _text(DECISION_LOG)
+    low, high = REMOVED_SECTION_BAND
+
+    assert "Sections %d to %d" % (low, high) in text
+    assert "subtract 44" in text.lower()
+    assert "| 91.5.1 |" in text
+    for section in range(low, high + 1):
+        assert "\n## %d. " % section not in text, section
 
 
 @pytest.mark.parametrize("path", DOCUMENTS, ids=lambda p: p.name)
@@ -448,19 +522,30 @@ def test_the_matrix_carries_the_withdrawal_pointer():
 
 
 def test_the_matrix_states_the_delivered_counts():
-    """Asserts the reconciliation totals are stated and add up."""
+    """Asserts section 6 quotes one published total, not a rival one.
+
+    It used to publish ``59 + 27 = 86`` while section 2.10 published 141,
+    so a reader could take either and be wrong. Section 6 now states the
+    figures that belong to its own tables and names section 2.10 for the
+    delivered total.
+    """
     section = _section(
         TRACEABILITY_MATRIX,
-        "### 6.1 The delivered counts",
+        "### 6.1 What this section counts",
         "### 6.2 ",
     )
     flowed = _flowed(section)
 
-    assert "**{0}**".format(PLANNED_CHANGED_PATHS) in section
     assert "**{0}**".format(UNPLANNED_DELIVERED_PATHS) in section
+    assert "**{0}**".format(LATER_ROUND_PATHS) in section
+    assert "**{0}**".format(RETIRED_PATHS) in section
     assert "**{0}**".format(DELIVERED_PATHS) in section
-    assert "{0} + {1} = {2}".format(
-        PLANNED_CHANGED_PATHS, UNPLANNED_DELIVERED_PATHS, DELIVERED_PATHS
+    assert "{0} + {1} + {2} - {3} = {4}".format(
+        PLANNED_CHANGED_PATHS,
+        UNPLANNED_DELIVERED_PATHS,
+        LATER_ROUND_PATHS,
+        RETIRED_PATHS,
+        DELIVERED_PATHS,
     ) in flowed
 
 
@@ -523,7 +608,7 @@ def test_the_matrix_reaches_the_same_set_from_the_finding_side():
     for cells in _row_cells(
         _section(
             TRACEABILITY_MATRIX,
-            "### 6.4 The same",
+            "### 6.4 Twenty-seven of those paths",
             "### 6.5 ",
         )
     ):

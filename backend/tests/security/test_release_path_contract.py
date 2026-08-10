@@ -282,6 +282,102 @@ def test_each_build_pairs_the_image_with_its_own_dockerfile(image):
         )
 
 
+def _frontend_build_arguments():
+    """Returns the ``ARG`` names Dockerfile.frontend declares."""
+    declared = re.findall(
+        r"^ARG\s+([A-Za-z_][A-Za-z0-9_]*)",
+        DOCKERFILES["frontend"].read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert declared, "Dockerfile.frontend declares no build argument"
+    return sorted(declared)
+
+
+def _passed_build_arguments(label, text):
+    """Returns the frontend build-argument names one release path passes.
+
+    A path either writes each ``--build-arg`` literally, or passes one per
+    name in a table its build loop reads. Both forms resolve to the same
+    kind of answer -- a set of names -- so a path is compared against the
+    Dockerfile rather than against the other path's spelling.
+    """
+    literal = set(
+        re.findall(r'--build-arg\s+"([A-Za-z_][A-Za-z0-9_]*)=', text)
+    )
+    if literal:
+        return literal
+
+    assert "--build-arg" in text, label
+    table = re.search(
+        r"WORKLOAD_BUILD_ARGUMENTS=\((?P<body>.*?)\n\)", text, re.S
+    )
+    assert table, label
+    entry = re.search(
+        r'\["frontend"\]="(?P<names>[^"]*)"', table.group("body")
+    )
+    assert entry, label
+    return set(entry.group("names").split())
+
+
+@pytest.mark.parametrize("label", sorted(_release_sources()))
+def test_each_release_path_passes_every_frontend_build_argument(label):
+    """Both paths supply every value the browser bundle is built with.
+
+    The bundler inlines each ``REACT_APP_*`` value present at build time
+    into the published bundle, so an argument a path does not pass is a
+    bundle that cannot reach the API or open hosted checkout -- and docker
+    accepts an absent argument without complaint, so nothing in the build
+    itself reports it. One path passed both and the other passed none at
+    all, which is the shape this asserts against: the Dockerfile is the
+    authority for the list, and each path is checked against it rather
+    than against the other.
+    """
+    text = _release_sources()[label]
+
+    assert _passed_build_arguments(label, text) == set(
+        _frontend_build_arguments()
+    ), label
+
+
+@pytest.mark.parametrize("label", sorted(_release_sources()))
+def test_each_release_path_refuses_an_empty_frontend_build_value(label):
+    """Both paths fail closed when a build value is not populated.
+
+    Passing the argument is not enough: docker accepts an empty value, so
+    the bundle is published and fails for an end user rather than for the
+    pipeline. Each path is asserted to test emptiness by name, over the
+    same set of names it passes to the build.
+    """
+    text = _release_sources()[label]
+
+    assert _passed_build_arguments(label, text), label
+    assert re.search(r'-z\s+"\$\{value(?::-)?\}"', text), label
+    assert "for name in " in text, label
+
+
+def test_the_frontend_build_values_are_repository_variables():
+    """The workflow reads both from the variable context, not secrets.
+
+    Both values are inlined into a published bundle, so neither is a
+    secret and both are documented as repository variables. Reading one
+    from the secrets context and the other from the variables context is
+    what left the bundle built with an empty client identifier while the
+    backend configuration carried a populated one, so the same context
+    supplies both here -- and the PayPal client identifier is read from
+    the identical expression the manifest rendering reads it from, so the
+    bundle and the backend cannot name two different applications.
+    """
+    text = _cd_text()
+    client_identifier = "${{ vars.PAYPAL_CLIENT_ID }}"
+
+    assert "secrets.PAYPAL_CLIENT_ID" not in text
+    assert "secrets.REACT_APP_API_BASE_URL" not in text
+    assert "${{ vars.REACT_APP_API_BASE_URL }}" in text
+    assert text.count(client_identifier) >= 2, text.count(
+        client_identifier
+    )
+
+
 @pytest.mark.parametrize("image", sorted(CONTEXT_REQUIREMENTS))
 def test_each_build_context_carries_the_paths_its_image_needs(image):
     context = BUILD_CONTEXTS[image]

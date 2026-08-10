@@ -161,6 +161,35 @@ SUPERSEDED_ABSENCE_ROWS = ("26.19", "29.11", "30.15", "32.12", "33.11")
 #: concordance, and 35.26 now carries an unrelated row.
 SUPERSEDING_ROW = "35.1.1"
 
+#: Rows whose claim about the system a later row made untrue. Each states
+#: a decision that still stands, so the row is left as it was written and
+#: the claim is withdrawn by the section named below. A reader landing on
+#: one of these first has to be able to reach the withdrawal from it.
+#:
+#: Two entries have been removed rather than fixed. The log carried its
+#: sections 1 to 34 a second time as sections 45 to 78, so rows 50.14 and
+#: 59.4 were byte-identical re-issues of 6.14 and 15.4 and were named here
+#: alongside them. Consolidating the log to one copy removed the duplicate
+#: half, which leaves each withdrawn claim asserted exactly once, at the
+#: row that made it.
+SUPERSEDED_BEHAVIOUR_ROWS = (
+    "6.14",
+    "15.4",
+    "81.10",
+    "81.39",
+    "84.6.3",
+    "38.7",
+    "86.1.2",
+    "43.5.6",
+    "82.16",
+    "83.16",
+    "86.5.8",
+)
+
+#: The section that withdraws those claims and names each row it withdraws
+#: one from.
+WITHDRAWING_SECTION = "## 89."
+
 #: Values an operator must provision that no bootstrap can supply.
 PROVIDER_CREDENTIALS = (
     "ZILLOW_API_KEY",
@@ -260,10 +289,13 @@ DECK_ONBOARDING_CLAIMS = (
     "five provider credentials",
 )
 
-#: The two asset residuals the presentation states beside its own tags.
+#: The two asset residuals the presentation retains rather than closes. Rule 1
+#: puts a residual's reasoning in the decision log, so that is where each is
+#: asserted rather than in a comment inside the presentation itself.
 DECK_RESIDUALS = (
-    "The typeface stylesheet carries no integrity attribute.",
-    "import-map integrity is a recent addition that older browsers ignore.",
+    "the typeface stylesheet is negotiated per browser so no hash describes"
+    " it",
+    "import-map integrity is a recent addition that an older browser ignores",
 )
 
 #: One markdown heading, by level and text.
@@ -435,11 +467,38 @@ def test_the_absence_rows_are_superseded_rather_than_rewritten():
         assert row in superseding[0], row
 
 
+def test_each_withdrawn_claim_names_the_row_that_made_it():
+    """Every withdrawn claim stands where written and is named in one place.
+
+    The alternative to naming them is a log that reads as though it had
+    always described the delivered system, which loses what was believed
+    when each decision was taken. A row named nowhere in the withdrawing
+    section is a claim a reader would still take as current.
+    """
+    body = _text(DECISION_LOG)
+    section = body[body.index(WITHDRAWING_SECTION):]
+
+    for row in SUPERSEDED_BEHAVIOUR_ROWS:
+        assert "| " + row + " |" in body, row
+        assert row in section, row
+
+
 def test_the_matrix_no_longer_records_the_deliverables_as_absent():
-    """Its paragraph is superseded in place and points at the log."""
+    """Its paragraph is superseded in place and points at the log.
+
+    The correction was once stated twice, in two paragraphs naming four
+    withdrawn rows in one and five in the other. One paragraph naming all
+    five replaces both, so what is asserted here is the property rather
+    than the sentence: the absence claim is gone, the record of it having
+    been made is kept, and the withdrawing row is named.
+    """
     body = _text(TRACEABILITY)
+    #: The prose is hard-wrapped, so a sentence is matched against the
+    #: whitespace-collapsed form rather than around a line break.
+    flowed = " ".join(body.split())
     assert "were not yet present in this working tree" not in body
-    assert "supersedes the one it replaces" in body
+    assert "stays visible rather than being" in flowed
+    assert "recorded five of those paths as absent" in flowed
     assert SUPERSEDING_ROW in body
 
 
@@ -628,7 +687,7 @@ def test_the_presentation_states_how_an_environment_is_brought_up(claim):
 @pytest.mark.parametrize("residual", DECK_RESIDUALS)
 def test_the_presentation_states_each_retained_asset_residual(residual):
     """An unpinnable asset is recorded, not left to be discovered."""
-    collapsed = re.sub(r"\s+", " ", _text(DECK))
+    collapsed = re.sub(r"\s+", " ", _text(DECISION_LOG))
     assert re.sub(r"\s+", " ", residual) in collapsed, residual
 
 

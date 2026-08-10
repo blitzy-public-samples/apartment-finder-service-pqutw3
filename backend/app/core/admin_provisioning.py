@@ -38,30 +38,49 @@ What the run does, and refuses to do:
   the address, the outcome and the number of administrators. No record
   carries the credential or its hash
 
+**This command reads no setting that has no default beside the database
+URL and the credential itself.** It resolves ``DATABASE_URL`` through
+:mod:`backend.app.core.db_contract` and builds its own session on it, and
+it hashes through :mod:`backend.app.core.hashing`, so it imports neither
+:mod:`backend.app.core.config` nor any module that does. A process
+running it may therefore be given the database credential and the seed
+password alone, which is what
+``infrastructure/kubernetes/70-admin-credential-job.yaml`` mounts. The
+connection bounds and the hashing cost are read from the same two sources
+the application reads them from, each with the application's own default,
+so none of them has to be supplied.
+
 Exit codes: ``0`` when the credential is in place, ``1`` when the run was
 refused. Every refusal names its reason on standard error.
+
+The record that says a credential is in place is emitted by :func:`main`
+after the transaction commits. :func:`provision_admin_credential` records
+the attempt, marked as not yet durable, because at that point the change
+is visible to nothing outside the caller's transaction.
 """
 
 import os
 import sys
 from typing import Optional, Tuple
 
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
-from backend.app.core.authorization import Role
+from backend.app.core import db_contract
+from backend.app.core.hashing import hash_password
 from backend.app.core.logging import get_logger, redact, register_secret_values
-from backend.app.core.security import get_password_hash
-from backend.app.db.database import SessionLocal
 from backend.app.db.models import User
 from backend.app.schema.user import UserCreate
 
 __all__ = [
     "ADMIN_EMAIL",
+    "ADMIN_ROLE",
     "LOCKED_CREDENTIAL",
     "PASSWORD_VARIABLE",
     "RESET_VALUE",
     "RESET_VARIABLE",
     "AdminProvisioningError",
+    "SessionLocal",
     "main",
     "provision_admin_credential",
 ]
@@ -71,8 +90,10 @@ __all__ = [
 ADMIN_EMAIL = "test@blitzy.com"
 
 #: Role the target account must already hold. This module never writes
-#: it.
-ADMIN_ROLE = Role.ADMIN.value
+#: it. The value is the one the grant revision stores and the one
+#: ``Role.ADMIN`` carries; ``test_admin_provisioning.py`` asserts all
+#: three are equal.
+ADMIN_ROLE = "admin"
 
 #: Value the grant revision stores in ``users.hashed_password``. A row
 #: carrying it has no usable credential.
@@ -102,13 +123,101 @@ OUTCOME_UNCHANGED = "unchanged"
 #: and a ``python -m`` run.
 LOGGER_NAME = "app.core.admin_provisioning"
 
+#: Field every outcome record carries, reporting whether the state the
+#: record describes has been committed.
+DURABLE_FIELD = "durable"
+
+#: Message of the refusal raised when no source names the database.
+MISSING_URL_MESSAGE = (
+    "DATABASE_URL is not set. This command reads it from the process "
+    "environment, from the file named by ENV_FILE, or from .env at the "
+    "repository root."
+)
+
 #: Logger this module records on. It sits under the application logger, so
 #: the redacting filter applies to every record.
 logger = get_logger(LOGGER_NAME)
 
+#: Session factory built on first use. It is ``None`` until then, so
+#: importing this module opens no connection and resolves no setting.
+_session_factory = None
+
 
 class AdminProvisioningError(RuntimeError):
     """Raised when a provisioning run is refused."""
+
+
+def _database_url() -> str:
+    """Return the database URL this command runs against.
+
+    The value is resolved from the process environment and then from the
+    environment file, and is held to
+    :func:`backend.app.core.db_contract.validate_database_url` under the
+    environment the same two sources name, so a target the application
+    would refuse is refused here. Neither refusal message names a value.
+    """
+    supplied = db_contract.resolve_setting(db_contract.DATABASE_URL_SETTING)
+    if supplied is None:
+        raise AdminProvisioningError(MISSING_URL_MESSAGE)
+    try:
+        environment = db_contract.environment_name()
+        return db_contract.validate_database_url(supplied, environment)
+    except ValueError as refused:
+        raise AdminProvisioningError(
+            "{0} is refused: {1}".format(
+                db_contract.DATABASE_URL_SETTING, refused
+            )
+        )
+
+
+def _connect_args(url: str) -> dict:
+    """Return the driver arguments this command connects with.
+
+    The bounds are the request-path ones, each with the default the
+    application declares and each held to the same range, because the
+    statements below are row reads and one row update rather than schema
+    changes.
+    """
+    return db_contract.connect_args(
+        url,
+        db_contract.read_bound(
+            "DB_CONNECT_TIMEOUT_SECONDS",
+            db_contract.DEFAULT_DB_CONNECT_TIMEOUT_SECONDS,
+        ),
+        db_contract.read_bound(
+            "DB_STATEMENT_TIMEOUT_SECONDS",
+            db_contract.DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS,
+        ),
+        db_contract.read_bound(
+            "DB_TCP_USER_TIMEOUT_SECONDS",
+            db_contract.DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS,
+        ),
+    )
+
+
+def SessionLocal() -> Session:
+    """Return a session on the configured database.
+
+    The engine is built on first call and reused afterwards, and it hides
+    bound values from driver errors. Raises
+    :class:`AdminProvisioningError` when no source names the database or
+    when the named target is refused.
+    """
+    global _session_factory
+    if _session_factory is None:
+        url = _database_url()
+        try:
+            engine = create_engine(
+                url, hide_parameters=True, connect_args=_connect_args(url)
+            )
+        except ValueError as refused:
+            raise AdminProvisioningError(
+                "A connection bound is refused: {0}".format(refused)
+            )
+        _session_factory = sessionmaker(
+            bind=engine, autocommit=False, autoflush=False
+        )
+    return _session_factory()
 
 
 def _requested_reset() -> bool:
@@ -244,11 +353,15 @@ def provision_admin_credential(
             RESET_VARIABLE,
             RESET_VALUE,
             count,
-            extra={"outcome": OUTCOME_UNCHANGED, "email": ADMIN_EMAIL},
+            extra={
+                "outcome": OUTCOME_UNCHANGED,
+                "email": ADMIN_EMAIL,
+                DURABLE_FIELD: True,
+            },
         )
         return OUTCOME_UNCHANGED
 
-    account.hashed_password = get_password_hash(password)
+    account.hashed_password = hash_password(password)
     account.failed_login_attempts = 0
     account.locked_until = None
     session.flush()
@@ -256,15 +369,42 @@ def provision_admin_credential(
     count = _assert_single_administrator(session)
     outcome = OUTCOME_PROVISIONED if locked else OUTCOME_RESET
     logger.info(
-        "Stored a credential for %s; the previous value %s the locked "
+        "Prepared a credential for %s; the previous value %s the locked "
         "marker, the failed-attempt count and any lock were cleared, and "
-        "the administrator count is %d.",
+        "the administrator count is %d. The change is not durable until "
+        "the caller commits.",
         ADMIN_EMAIL,
         "was" if locked else "was not",
         count,
-        extra={"outcome": outcome, "email": ADMIN_EMAIL},
+        extra={
+            "outcome": outcome,
+            "email": ADMIN_EMAIL,
+            DURABLE_FIELD: False,
+        },
     )
     return outcome
+
+
+def _record_committed(session: Session, outcome: str) -> None:
+    """Record the outcome of a committed run.
+
+    The administrator count is read back after the commit, so the record
+    describes state the database holds rather than state a transaction was
+    holding.
+    """
+    count = len(_administrator_addresses(session))
+    logger.info(
+        "The credential for %s is committed; the outcome is %s and the "
+        "administrator count is %d.",
+        ADMIN_EMAIL,
+        outcome,
+        count,
+        extra={
+            "outcome": outcome,
+            "email": ADMIN_EMAIL,
+            DURABLE_FIELD: True,
+        },
+    )
 
 
 def main(argv: Optional[Tuple[str, ...]] = None) -> int:
@@ -282,7 +422,12 @@ def main(argv: Optional[Tuple[str, ...]] = None) -> int:
         )
         return 1
 
-    session = SessionLocal()
+    try:
+        session = SessionLocal()
+    except AdminProvisioningError as refused:
+        sys.stderr.write("{0}\n".format(redact(str(refused))))
+        return 1
+
     try:
         outcome = provision_admin_credential(session)
         session.commit()
@@ -292,7 +437,15 @@ def main(argv: Optional[Tuple[str, ...]] = None) -> int:
         return 1
     except Exception:
         session.rollback()
+        logger.error(
+            "The credential for %s was not committed; the transaction was "
+            "rolled back and the stored value is unchanged.",
+            ADMIN_EMAIL,
+            extra={"email": ADMIN_EMAIL, DURABLE_FIELD: False},
+        )
         raise
+    else:
+        _record_committed(session, outcome)
     finally:
         session.close()
 

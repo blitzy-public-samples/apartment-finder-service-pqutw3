@@ -857,8 +857,8 @@ class TestNoGateIsAPlaceholder:
         """Asserts the integration job does real work against real parts.
 
         Each marker below is a thing the gate could not assert without a
-        database and a served application: applying both revisions,
-        stepping them back, importing the entrypoint, and reading the
+        database and a served application: applying the revision chain,
+        stepping it back, importing the entrypoint, and reading the
         routes over HTTP.
         """
         integration = [

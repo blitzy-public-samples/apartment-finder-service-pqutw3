@@ -1,5 +1,9 @@
 # Non-secret settings the backend and the migration job read.
 #
+# The two statement bounds below are separate values: the migration job runs
+# schema statements under DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS, while the
+# backend holds a request-path statement to DB_STATEMENT_TIMEOUT_SECONDS.
+#
 # Every entry here is a value the browser or an operator may see. The six
 # settings that are credentials are absent from this document: they are
 # delivered separately by 30-backend-secrets.yaml, which reads them from
@@ -41,6 +45,7 @@ data:
   ENVIRONMENT: ${BACKEND_ENVIRONMENT}
   DB_CONNECT_TIMEOUT_SECONDS: "3"
   DB_STATEMENT_TIMEOUT_SECONDS: "3"
+  DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS: "600"
   DB_TCP_USER_TIMEOUT_SECONDS: "4"
   DB_POOL_TIMEOUT_SECONDS: "10.0"
   DB_POOL_RECYCLE_SECONDS: "1800"
@@ -79,3 +84,4 @@ data:
   FROM_EMAIL: ${FROM_EMAIL}
   SECRET_BACKEND: "gcp-secret-manager"
   LOG_LEVEL: "INFO"
+  SENTRY_DSN: ""

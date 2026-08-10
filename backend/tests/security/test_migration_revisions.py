@@ -1,9 +1,11 @@
-"""Regression tests for the three Alembic revisions.
+"""Regression tests for the five Alembic revisions.
 
 The units under test are
 ``backend/migrations/versions/0001_add_rbac_and_subscription_columns.py``,
-``backend/migrations/versions/0002_seed_single_admin.py`` and
-``backend/migrations/versions/0003_add_workload_indexes.py``. Every case
+``backend/migrations/versions/0002_seed_single_admin.py``,
+``backend/migrations/versions/0003_add_workload_indexes.py``,
+``backend/migrations/versions/0004_add_open_intent_uniqueness.py`` and
+``backend/migrations/versions/0005_add_login_attempt_slots.py``. Every case
 applies a revision through ``alembic.command`` against an isolated
 database and reads the result back with SQL, so each assertion is about
 what a revision did to a database rather than about what the model
@@ -84,16 +86,24 @@ from typing import Any
 from alembic.config import Config
 from sqlalchemy import UniqueConstraint, create_engine
 
+from backend.app.core import db_contract
+from backend.app.core.config import settings
 from backend.app.core.logging import flush_log_queue, redirect_log_stream
 from backend.app.db import database as database_module
 from backend.app.db.models import (
     Base,
     Listing,
+    LOGIN_ATTEMPT_SLOT_COUNT,
+    LoginAttemptSlot,
+    OPEN_INTENT_INDEX_PREDICATE,
+    OPEN_INTENT_STATUSES,
+    OPEN_INTENT_UNIQUE_INDEX_NAME,
     WORKLOAD_INDEX_NAMES,
 )
 from backend.tests.support import (
     MIGRATION_LOGGER_NAMESPACE,
     REPO_ROOT,
+    REVISION_IDS,
     enforce_sqlite_foreign_keys,
 )
 
@@ -104,9 +114,15 @@ SCHEMA_REVISION = "0001"
 #: Revision identifier of the administrator grant.
 ADMIN_REVISION = "0002"
 
-#: Revision identifier of the workload-index change, the head of the
-#: chain.
+#: Revision identifier of the workload-index change.
 INDEX_REVISION = "0003"
+
+#: Revision identifier of the open-intent uniqueness change.
+UNIQUENESS_REVISION = "0004"
+
+#: Revision identifier of the login-throttling slot change, the head of
+#: the chain.
+SLOT_REVISION = "0005"
 
 #: Logger the administrator grant records its outcome on.
 #: Logger the administrator grant records its outcome on. It sits inside
@@ -116,6 +132,18 @@ MIGRATION_LOGGER = "alembic.runtime.migration"
 
 #: Path of the migration environment module.
 ENVIRONMENT_PATH = REPO_ROOT / "backend" / "migrations" / "env.py"
+
+#: Path of the module the migration environment resolves and validates
+#: every value through, and which the settings class validates through
+#: as well.
+CONTRACT_PATH = (
+    REPO_ROOT / "backend" / "app" / "core" / "db_contract.py"
+)
+
+#: Key carrying the libpq runtime parameters inside a connect-argument
+#: mapping. It is the one entry the migration environment and the
+#: application are expected to differ on.
+SESSION_OPTIONS_KEY = "options"
 
 #: The one setting the migration environment reads, and the variable that
 #: switches its environment-file fallback off.
@@ -626,19 +654,31 @@ def seeded_pre_revision(pre_revision_database, alembic_config):
 # --- The revision chain ----------------------------------------------
 
 
-def test_the_repository_holds_exactly_the_three_expected_revisions(
+def test_the_repository_holds_exactly_the_five_expected_revisions(
     alembic_config,
 ):
-    """The chain is the schema change, the grant, the indexes, and ends."""
-    assert revision_heads(alembic_config) == (INDEX_REVISION,)
+    """The chain is schema, grant, indexes, uniqueness, slots, and ends."""
+    assert revision_heads(alembic_config) == (SLOT_REVISION,)
 
     schema = revision_module(alembic_config, SCHEMA_REVISION)
     grant = revision_module(alembic_config, ADMIN_REVISION)
     indexes = revision_module(alembic_config, INDEX_REVISION)
+    uniqueness = revision_module(alembic_config, UNIQUENESS_REVISION)
+    slots = revision_module(alembic_config, SLOT_REVISION)
 
     assert schema.down_revision is None
     assert grant.down_revision == SCHEMA_REVISION
     assert indexes.down_revision == ADMIN_REVISION
+    assert uniqueness.down_revision == INDEX_REVISION
+    assert slots.down_revision == UNIQUENESS_REVISION
+
+    assert REVISION_IDS == (
+        SCHEMA_REVISION,
+        ADMIN_REVISION,
+        INDEX_REVISION,
+        UNIQUENESS_REVISION,
+        SLOT_REVISION,
+    )
 
 
 def test_the_revision_role_names_are_the_application_role_names(
@@ -1220,10 +1260,15 @@ def test_0003_declares_the_indexes_the_models_declare(alembic_config):
     ))
 
     assert declared == set(WORKLOAD_INDEX_NAMES)
+    # The mapped side is filtered to the non-unique indexes, which is what
+    # this revision creates and what WORKLOAD_INDEX_NAMES documents. A
+    # uniqueness the models declare is created by the revision that owns
+    # it, and is asserted against that revision.
     assert declared == set(
         index.name
         for table in Base.metadata.sorted_tables
         for index in table.indexes
+        if not index.unique
     )
     for _name, _table, columns in indexes.WORKLOAD_INDEXES:
         assert columns, "every declared index covers at least one column"
@@ -1283,7 +1328,9 @@ def test_0003_reverses_without_reversing_the_revisions_below_it(
     grant = revision_module(alembic_config, ADMIN_REVISION)
     indexes = revision_module(alembic_config, INDEX_REVISION)
     migration_target(seeded_pre_revision)
-    command.upgrade(alembic_config, "head")
+    # Applied to this revision rather than to the head, so the single
+    # reversal below is this revision's own however many follow it.
+    command.upgrade(alembic_config, INDEX_REVISION)
     before = index_names(seeded_pre_revision)
 
     command.downgrade(alembic_config, "-1")
@@ -1312,12 +1359,21 @@ def test_the_documented_round_trip_applies_and_reverses_in_order(
 ):
     """The documented gate leaves the recorded revision at each step.
 
-    The sequence is one upgrade to the head followed by three reversals,
-    and the recorded revision is read after each step.
+    The sequence is one upgrade to the head followed by one reversal per
+    revision, and the recorded revision is read after each step. Each
+    reversal is taken one step at a time deliberately: a named target
+    would reach the base in one call and would stop asserting that every
+    revision reverses on its own.
     """
     migration_target(seeded_pre_revision)
 
     command.upgrade(alembic_config, "head")
+    assert stamped_revision(seeded_pre_revision) == SLOT_REVISION
+
+    command.downgrade(alembic_config, "-1")
+    assert stamped_revision(seeded_pre_revision) == UNIQUENESS_REVISION
+
+    command.downgrade(alembic_config, "-1")
     assert stamped_revision(seeded_pre_revision) == INDEX_REVISION
 
     command.downgrade(alembic_config, "-1")
@@ -1330,8 +1386,158 @@ def test_the_documented_round_trip_applies_and_reverses_in_order(
     assert stamped_revision(seeded_pre_revision) is None
 
     command.upgrade(alembic_config, "head")
-    assert stamped_revision(seeded_pre_revision) == INDEX_REVISION
+    assert stamped_revision(seeded_pre_revision) == SLOT_REVISION
     grant = revision_module(alembic_config, ADMIN_REVISION)
+    assert administrator_emails(
+        seeded_pre_revision, grant.ADMIN_ROLE
+    ) == [grant.ADMIN_EMAIL]
+
+
+# --- 0004: open-intent uniqueness ------------------------------------
+
+
+def test_0004_declares_the_uniqueness_the_models_declare(alembic_config):
+    """The revision and the mapped metadata agree on the uniqueness."""
+    uniqueness = revision_module(alembic_config, UNIQUENESS_REVISION)
+
+    assert uniqueness.INDEX_NAME == OPEN_INTENT_UNIQUE_INDEX_NAME
+    assert uniqueness.INDEX_PREDICATE == OPEN_INTENT_INDEX_PREDICATE
+    assert tuple(uniqueness.OPEN_STATUSES) == tuple(OPEN_INTENT_STATUSES)
+    assert uniqueness.TABLE_NAME == "subscriptions"
+
+    mapped = {
+        index.name: index
+        for table in Base.metadata.sorted_tables
+        for index in table.indexes
+        if index.unique
+    }
+    assert OPEN_INTENT_UNIQUE_INDEX_NAME in mapped
+    assert tuple(
+        column.name
+        for column in mapped[OPEN_INTENT_UNIQUE_INDEX_NAME].columns
+    ) == tuple(uniqueness.INDEX_COLUMNS)
+
+
+def test_0004_creates_the_uniqueness_over_the_open_window(
+    seeded_pre_revision, alembic_config, migration_target
+):
+    """The head carries the uniqueness, keyed by owner and plan."""
+    uniqueness = revision_module(alembic_config, UNIQUENESS_REVISION)
+    migration_target(seeded_pre_revision)
+
+    command.upgrade(alembic_config, "head")
+
+    assert index_definition(
+        seeded_pre_revision,
+        uniqueness.TABLE_NAME,
+        uniqueness.INDEX_NAME,
+    ) == (tuple(uniqueness.INDEX_COLUMNS), True)
+
+
+def test_0004_reverses_without_reversing_the_revisions_below_it(
+    seeded_pre_revision, alembic_config, migration_target
+):
+    """Reversing the uniqueness removes it and nothing else.
+
+    The workload indexes the earlier revision created, the columns the
+    additive revision added and the administrator the grant promoted are
+    all asserted still in place, which is what makes this revision
+    independently reversible.
+    """
+    grant = revision_module(alembic_config, ADMIN_REVISION)
+    indexes = revision_module(alembic_config, INDEX_REVISION)
+    uniqueness = revision_module(alembic_config, UNIQUENESS_REVISION)
+    migration_target(seeded_pre_revision)
+    # Applied to this revision rather than to the head, so the single
+    # reversal below is this revision's own however many follow it.
+    command.upgrade(alembic_config, UNIQUENESS_REVISION)
+    before = index_names(seeded_pre_revision)
+
+    command.downgrade(alembic_config, "-1")
+
+    assert stamped_revision(seeded_pre_revision) == INDEX_REVISION
+    remaining = index_names(seeded_pre_revision)
+    assert uniqueness.INDEX_NAME not in remaining
+    assert remaining == before - {uniqueness.INDEX_NAME}
+    for name, _table, _columns in indexes.WORKLOAD_INDEXES:
+        assert name in remaining
+    columns = column_names(seeded_pre_revision, "users")
+    for added in ADDED_USER_COLUMNS:
+        assert added in columns
+    assert administrator_emails(
+        seeded_pre_revision, grant.ADMIN_ROLE
+    ) == [grant.ADMIN_EMAIL]
+
+
+# --- 0005: login throttling slots -------------------------------------
+
+
+def test_0005_seeds_the_slot_count_the_model_declares(alembic_config):
+    """The seeded set and the buckets the application computes agree.
+
+    The revision states its own count so that what it seeded stays fixed
+    for a database that has applied it. This is the assertion that makes
+    raising the model's count without adding a revision fail, rather than
+    leaving the application able to compute a bucket with no row.
+    """
+    slots = revision_module(alembic_config, SLOT_REVISION)
+
+    assert slots.SLOT_COUNT == LOGIN_ATTEMPT_SLOT_COUNT
+    assert slots.TABLE_NAME == LoginAttemptSlot.__tablename__
+
+
+def test_0005_creates_the_table_fully_seeded(
+    seeded_pre_revision, alembic_config, migration_target
+):
+    """Every bucket has a row once the head is reached."""
+    slots = revision_module(alembic_config, SLOT_REVISION)
+    migration_target(seeded_pre_revision)
+
+    command.upgrade(alembic_config, "head")
+
+    with seeded_pre_revision.connect() as connection:
+        buckets = set(
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT bucket FROM %s" % slots.TABLE_NAME
+                )
+            )
+        )
+    assert buckets == set(range(slots.SLOT_COUNT))
+
+
+def test_0005_reverses_without_reversing_the_revisions_below_it(
+    seeded_pre_revision, alembic_config, migration_target
+):
+    """Reversing the slots drops that table and nothing else.
+
+    The uniqueness the previous revision created, the workload indexes,
+    the added columns and the promoted administrator are all asserted
+    still in place, which is what makes this revision independently
+    reversible.
+    """
+    grant = revision_module(alembic_config, ADMIN_REVISION)
+    indexes = revision_module(alembic_config, INDEX_REVISION)
+    uniqueness = revision_module(alembic_config, UNIQUENESS_REVISION)
+    slots = revision_module(alembic_config, SLOT_REVISION)
+    migration_target(seeded_pre_revision)
+    command.upgrade(alembic_config, "head")
+
+    command.downgrade(alembic_config, "-1")
+
+    assert stamped_revision(seeded_pre_revision) == UNIQUENESS_REVISION
+    with seeded_pre_revision.connect() as connection:
+        tables = set(inspect(connection).get_table_names())
+    assert slots.TABLE_NAME not in tables
+
+    remaining = index_names(seeded_pre_revision)
+    assert uniqueness.INDEX_NAME in remaining
+    for name, _table, _columns in indexes.WORKLOAD_INDEXES:
+        assert name in remaining
+    columns = column_names(seeded_pre_revision, "users")
+    for added in ADDED_USER_COLUMNS:
+        assert added in columns
     assert administrator_emails(
         seeded_pre_revision, grant.ADMIN_ROLE
     ) == [grant.ADMIN_EMAIL]
@@ -1392,7 +1598,12 @@ def test_the_environment_declares_the_names_the_suite_uses(
 
 
 def _imported_modules(path):
-    """Return every module name the file at ``path`` imports."""
+    """Return every module name the file at ``path`` imports.
+
+    A ``from package import name`` statement contributes the package and
+    the dotted path of each name it binds, so a module imported that way
+    is named here exactly as a module imported outright is.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     imported = set()
     for node in ast.walk(tree):
@@ -1401,6 +1612,8 @@ def _imported_modules(path):
                 imported.add(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module)
+            for alias in node.names:
+                imported.add("{0}.{1}".format(node.module, alias.name))
     return imported
 
 
@@ -1437,17 +1650,26 @@ def test_the_environment_reads_no_application_setting(
     """Assert the environment resolves the database URL and nothing else.
 
     A migration process may therefore be given the database credential
-    alone. The module's imports and its evaluated string literals are
-    both read: an import of the settings module, or a literal naming a
-    setting that has no default, would make the process depend on a
-    credential it has no use for.
+    alone. The imports and the evaluated string literals of the module
+    and of the contract module it resolves through are both read: an
+    import of the settings module, or a literal naming a setting that has
+    no default, would make the process depend on a credential it has no
+    use for.
     """
     imported = _imported_modules(ENVIRONMENT_PATH)
-    literals = _literal_strings(ENVIRONMENT_PATH)
+    contract_imports = _imported_modules(CONTRACT_PATH)
+    literals = _literal_strings(ENVIRONMENT_PATH) | _literal_strings(
+        CONTRACT_PATH
+    )
 
     assert "backend.app.core.config" not in imported
     assert "backend.app.db.database" not in imported
+    assert "backend.app.core.db_contract" in imported
     assert "backend.app.db.models" in imported
+
+    for module in contract_imports:
+        assert not module.startswith("backend."), module
+
     for setting in APPLICATION_ONLY_SETTINGS:
         assert setting not in literals, setting
     assert migration_environment.DATABASE_URL_SETTING in literals
@@ -1456,12 +1678,15 @@ def test_the_environment_reads_no_application_setting(
 def test_the_environment_connects_on_the_same_terms_as_the_application(
     migration_environment
 ):
-    """Assert the environment's connect arguments match the application's.
+    """Assert the two connect mappings agree apart from the statement bound.
 
     The environment builds its own engine so that it needs no application
     setting, which means the mapping exists in two places. This case is
     what keeps them in step: a change to either side without the other
-    fails here.
+    fails here. The libpq runtime parameters are the one entry that is
+    expected to differ, because a revision's statements are schema changes
+    and are held to the migration bound rather than to the request-path
+    one.
     """
     urls = (
         "postgresql://user:pw@localhost:5432/apartment_finder",
@@ -1472,9 +1697,161 @@ def test_the_environment_connects_on_the_same_terms_as_the_application(
     )
 
     for url in urls:
-        assert migration_environment.connect_args(url) == (
-            database_module._connect_args(url)
-        ), url
+        migration = migration_environment.connect_args(url)
+        application = database_module._connect_args(url)
+
+        assert set(migration) == set(application), url
+        for name in set(migration) - {SESSION_OPTIONS_KEY}:
+            assert migration[name] == application[name], (url, name)
+
+        if SESSION_OPTIONS_KEY in migration:
+            assert migration[SESSION_OPTIONS_KEY] == (
+                migration_environment.session_options()
+            ), url
+            assert migration[SESSION_OPTIONS_KEY] != (
+                application[SESSION_OPTIONS_KEY]
+            ), url
+
+
+def test_the_schema_statements_run_under_their_own_bound(
+    migration_environment, monkeypatch
+):
+    """Assert the statement bound is the migration one, in milliseconds.
+
+    The bound the environment renders is read from
+    ``DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS`` and the one the application
+    renders from ``DB_STATEMENT_TIMEOUT_SECONDS``, so a schema statement
+    and a request-path read are held to separate budgets. Both defaults
+    are read from the contract module the settings class declares them
+    from, so a change there is reflected on both sides.
+    """
+    monkeypatch.delenv(
+        migration_environment.STATEMENT_TIMEOUT_SETTING, raising=False
+    )
+    monkeypatch.setenv(ENV_FILE_VARIABLE, "")
+
+    budget = db_contract.DEFAULT_DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS
+
+    assert budget > db_contract.DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS
+    assert migration_environment.session_options() == (
+        db_contract.POSTGRESQL_SESSION_OPTIONS_TEMPLATE.format(
+            statement_timeout_ms=(
+                budget * db_contract.MILLISECONDS_PER_SECOND
+            )
+        )
+    )
+    assert settings.DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS == budget
+
+
+@pytest.mark.parametrize(
+    "supplied", ["", "   ", "not-a-number", "0", "3601", "-1", "12.5"]
+)
+def test_the_environment_refuses_a_bound_it_cannot_accept(
+    migration_environment, monkeypatch, supplied
+):
+    """Assert a refused bound stops the run rather than being defaulted.
+
+    A value the settings class would refuse is refused here as well, so a
+    migration never runs under a bound the application would not start
+    under. The message names the setting and the accepted range.
+    """
+    monkeypatch.setenv(ENV_FILE_VARIABLE, "")
+    monkeypatch.setenv(
+        migration_environment.STATEMENT_TIMEOUT_SETTING, supplied
+    )
+
+    with pytest.raises(RuntimeError) as refused:
+        migration_environment.session_options()
+
+    message = str(refused.value)
+    assert message.startswith(migration_environment.REFUSED_VALUE_PREFIX)
+    assert migration_environment.STATEMENT_TIMEOUT_SETTING in message
+    assert str(db_contract.DB_MIGRATION_TIMEOUT_CEILING_SECONDS) in (
+        message
+    )
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        "postgres://user:pw@localhost:5432/apartment_finder",
+        "mysql://user:pw@localhost/apartment_finder",
+        "postgresql:///apartment_finder",
+        "postgresql://user:pw@localhost:5432/",
+    ],
+)
+def test_the_environment_refuses_a_url_the_application_would_refuse(
+    migration_environment, monkeypatch, supplied
+):
+    """Assert an unsupported target is refused rather than connected to."""
+    monkeypatch.setenv(ENV_FILE_VARIABLE, "")
+    monkeypatch.setenv(DATABASE_URL_SETTING, supplied)
+
+    with pytest.raises(RuntimeError) as refused:
+        migration_environment.database_url()
+
+    message = str(refused.value)
+    assert message.startswith(migration_environment.REFUSED_VALUE_PREFIX)
+    assert "pw@" not in message
+
+
+@pytest.mark.parametrize("supplied", ["", "  ", "prod", "LOCALHOST"])
+def test_the_environment_refuses_a_name_it_does_not_recognise(
+    migration_environment, monkeypatch, supplied
+):
+    """Assert an unrecognised environment name stops the run.
+
+    The environment name decides whether a local database scheme is
+    accepted, so a name no posture recognises is refused rather than
+    compared against the local one and found unequal.
+    """
+    monkeypatch.setenv(ENV_FILE_VARIABLE, "")
+    monkeypatch.setenv(
+        migration_environment.ENVIRONMENT_SETTING, supplied
+    )
+
+    with pytest.raises(RuntimeError) as refused:
+        migration_environment.environment_name()
+
+    message = str(refused.value)
+    assert message.startswith(migration_environment.REFUSED_VALUE_PREFIX)
+    assert migration_environment.ENVIRONMENT_SETTING in message
+
+
+@pytest.mark.parametrize(
+    "environment", ["development", "staging", "production"]
+)
+def test_a_local_target_is_refused_outside_the_local_environment(
+    migration_environment, monkeypatch, environment
+):
+    """Assert the environment gate on a local scheme is applied here too.
+
+    ``sqlite://`` is a local development target. The settings class
+    accepts it only while ``ENVIRONMENT`` names the local environment, and
+    the migration environment resolves that same setting so that a
+    deployment cannot migrate a file when it believes it is migrating the
+    database.
+    """
+    monkeypatch.setenv(ENV_FILE_VARIABLE, "")
+    monkeypatch.setenv(DATABASE_URL_SETTING, "sqlite+pysqlite:///./x.db")
+
+    monkeypatch.setenv(
+        migration_environment.ENVIRONMENT_SETTING,
+        db_contract.LOCAL_ENVIRONMENT,
+    )
+    assert migration_environment.database_url() == (
+        "sqlite+pysqlite:///./x.db"
+    )
+
+    monkeypatch.setenv(
+        migration_environment.ENVIRONMENT_SETTING, environment
+    )
+    with pytest.raises(RuntimeError) as refused:
+        migration_environment.database_url()
+
+    assert str(refused.value).startswith(
+        migration_environment.REFUSED_VALUE_PREFIX
+    )
 
 
 def test_the_environment_refuses_an_absent_url_without_naming_a_value(

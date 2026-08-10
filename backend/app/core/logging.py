@@ -1,146 +1,5 @@
-"""Structured JSON logging with credential redaction.
-
-This module is the application's single logging entry point. It emits one
-JSON object per record on standard output and rewrites credential-shaped
-substrings to a fixed placeholder before a record leaves the process.
-
-Redaction covers ``key``, ``token``, ``secret`` and ``password`` style
-names -- including compound spellings such as ``api_key``, ``apikey``,
-``access_token``, ``refresh_token``, ``client_secret``, ``passwd`` and
-``pwd`` -- in the following shapes:
-
-* ``k=v`` and ``k: v`` assignments, quoted or bare, as they appear in
-  query strings and in free text
-* ``"k": "v"`` and ``'k': 'v'`` JSON and dict mappings
-* ``Authorization: Bearer <credential>`` headers and bare
-  ``Bearer <credential>`` values
-* ``scheme://user:<credential>@host`` URL user information
-
-Alongside credential shapes, two further classes of value are rewritten:
-
-* internal filesystem paths -- traceback frame paths are reduced to the
-  file's base name, drive-letter absolute paths are replaced, and
-  POSIX paths that name a file are replaced. A request path such as
-  ``/subscriptions/webhook`` names no file and is left intact, so audit
-  fields keep their route values.
-* electronic mail addresses, replaced whole.
-
-Both the log message and the formatted exception traceback are covered,
-as are values nested inside fields supplied through ``extra={...}``.
-Every field passed through ``extra={...}`` is emitted under the
-``context`` key of the JSON object.
-
-:func:`log_exception` is the supported way to report a caught error. It
-emits the exception's type, defining module and redacted message as
-discrete fields at the caller's level, and emits the formatted traceback
-only at ``DEBUG``, which the level applied by :func:`configure_logging`
-suppresses.
-
-:func:`bind_request_id` records an identifier for the current task or
-thread, and every record emitted while it is bound carries it under
-``context.request_id``, joining an inbound request to the outbound calls
-and database transitions it caused. The identifier is read from the
-record's own logging thread, before the record is queued, so a record
-drained by the listener thread carries the value that was bound where the
-call was made. :func:`mark_audited` records that an exception's rejection
-has already been written to the audit trail, so a generic handler
-downstream can leave it at one record.
-
-:func:`bind_trace_context` binds a W3C trace context the same way, and
-every record emitted while it is bound carries ``context.trace_id`` and
-``context.span_id`` beside the request identifier.
-:func:`parse_traceparent` reads an inbound ``traceparent`` header,
-rejecting a malformed version, an all-zero identifier and a value with
-the wrong field count, so a caller cannot inject a value into a record;
-:func:`current_traceparent` and :func:`outbound_trace_headers` render the
-bound context for an outbound call, which is what carries one trace
-across this service and the providers it calls.
-
-A record the configured handler cannot emit is neither written raw nor
-discarded. :func:`report_emit_failure` replaces the standard library's
-own error path on both handlers this module installs: it counts the
-failure, which :func:`logging_failure_count` reports as a health signal,
-and writes one redacted structured line carrying the logger, the level,
-the record's redacted message and :data:`EMIT_FAILURE_SIGNAL` under
-:data:`SIGNAL_FIELD`.
-
-Alongside the shapes above, a value registered through
-:func:`register_secret_values` is replaced wherever it appears, whatever
-surrounds it. Shape matching needs a credential-shaped key name next to
-the value, so it cannot reach a credential quoted inside free prose --
-the text of a provider error, for instance. A registered value is matched
-literally, which covers that case. The module holds the values it is
-given and reads none for itself: each caller registers the credential it
-handles. :func:`register_secret_values` reports how many values the
-registry holds and never raises;
-:func:`register_required_secret_values` registers the same way and then
-raises when a value it was given is not held, so a caller that depends
-on a credential being redacted is told when it is not.
-
-Redaction runs twice. Every part of a record -- message, interpolated
-arguments, formatted exception text and each ``extra`` value, walked
-recursively through mappings and sequences -- is rewritten before the
-JSON payload is serialised, and the serialised payload is rewritten once
-more before it leaves the process. A credential-shaped key name is
-matched after percent-decoding, and a mapping is matched whether its
-quotes are plain or backslash-escaped.
-
-The handler is installed on the ``backend`` logger and on every
-namespace named by :data:`GOVERNED_LOGGER_NAMES`: at WARNING on
-``python_http_client`` and ``sendgrid``, whose records carry outbound
-request headers and bodies, and on ``httpx`` and ``httpcore``, whose
-records carry the full request target of every outbound call; at INFO on
-``alembic``, which carries each migration revision's own record of what
-it changed; and at WARNING on ``sqlalchemy``, whose records carry
-executed statement text. Propagation is disabled on each, so no record
-reaches a handler installed elsewhere, whatever level the root logger is
-configured at. Loggers outside those namespaces are not governed by this
-module. Discovery and installation run under a lock and are idempotent:
-repeated or concurrent calls leave exactly one handler per logger, and a
-handler found under the reserved name whose type, target, formatter,
-filter or stream does not match is replaced.
-
-Governance covers *every* handler each of those loggers carries, not
-only one found under the reserved name: exactly one handler configured
-as this module builds it is kept and every other handler is removed, so
-no handler without the redacting formatter and filter can emit a record
-from a governed namespace. Descendant loggers of a governed namespace
-are governed too -- each has its own handlers removed and is made to
-propagate, so its records reach the one governed handler.
-:func:`unredacted_handler_names` reports any handler that was removed,
-so a caller may treat the condition as a startup failure.
-
-Emission is queue-backed. The handler installed on each governed logger
-places the record on a bounded queue and returns; a single listener
-thread then applies the redaction filter, renders the JSON payload and
-writes it to standard output. Redaction, formatting, the write and the
-flush therefore run on that thread rather than on the thread that logged
--- which for this application is the request path, including its
-asynchronous middleware, dependencies and handlers. A record placed on a
-full queue is emitted inline instead, so the queue caps memory without
-discarding a record. :func:`flush_log_queue` waits for the queue to
-drain and reports whether it emptied within the timeout. At interpreter
-exit, and before a listener is replaced, the queue is drained and the
-listener thread is then stopped.
-
-The record object itself is queued, so a mutable value passed through
-``extra={...}`` is read at emission rather than at the call.
-
-The module uses only the Python standard library and reads no
-configuration and no environment variable.
-
-Usage::
-
-    configure_logging()
-    logger = get_logger(__name__)
-    logger.info("listing refresh finished", extra={"count": 12})
-    token = bind_request_id("d34db33f")
-    try:
-        ...
-    except OSError as error:
-        log_exception(logger, "listing refresh failed", error)
-    finally:
-        reset_request_id(token)
+"""Structured JSON logging with credential redaction and bounded queue
+handling.
 """
 
 import atexit
@@ -836,7 +695,6 @@ def registered_secret_count() -> int:
 
 
 def _replace_secret_values(rendered: str) -> str:
-    """Replaces every registered secret value found in ``rendered``."""
     for secret in _SECRET_VALUES:
         if secret in rendered:
             rendered = rendered.replace(secret, REDACTION_PLACEHOLDER)
@@ -1273,7 +1131,6 @@ def _emit_fallback(message: str, fields: Dict[str, Any]) -> None:
 
 
 def _count_emit_failure() -> None:
-    """Increments the count of records a handler could not emit."""
     global _EMIT_FAILURES
     with _EMIT_FAILURE_LOCK:
         _EMIT_FAILURES += 1
@@ -1541,7 +1398,6 @@ class RedactingJsonFormatter(logging.Formatter):
 
 
 def _handler_label(handler: Any) -> str:
-    """Returns a printable identifier for ``handler``."""
     try:
         named = getattr(handler, "name", None)
         if named:
@@ -1695,13 +1551,11 @@ def _build_stream_handler() -> logging.Handler:
 
 
 def _thread_is_alive(listener: Any) -> bool:
-    """Reports whether ``listener`` carries a live monitor thread."""
     thread = getattr(listener, "_thread", None)
     return thread is not None and thread.is_alive()
 
 
 def _listener_is_running() -> bool:
-    """Reports whether the installed listener's thread is alive."""
     return _thread_is_alive(_listener)
 
 
@@ -1730,7 +1584,6 @@ def _ensure_listener() -> None:
 
 
 def _record_stop_failure(reason: str) -> None:
-    """Records that a listener shutdown did not complete."""
     if reason in _STOP_FAILURES:
         return
     _STOP_FAILURES.append(reason)
@@ -1771,22 +1624,8 @@ def _offer_sentinel(listener: Any, timeout: float) -> bool:
 
 
 def _stop_listener() -> None:
-    """Drains the queue and stops the listener thread, if one is running.
-
-    Registered to run at interpreter exit, and called before a listener
-    is replaced. Whether a listener is running is read from the saved
-    reference, and the drain runs while that listener is still installed,
-    so the records already queued are written.
-
-    Every wait the shutdown makes is bounded: the drain by
-    :data:`QUEUE_DRAIN_TIMEOUT_SECONDS`, the sentinel by
-    :data:`LISTENER_SENTINEL_TIMEOUT_SECONDS` and the thread by
-    :data:`LISTENER_JOIN_TIMEOUT_SECONDS`. A step that does not finish
-    within its bound is recorded by :func:`listener_stop_failures` and
-    leaves the module reference pointing at the still-running listener,
-    so the live thread is neither hidden nor collected while it writes.
-    The reference is released, and the module left ready to build a fresh
-    listener, only once the thread has actually exited.
+    """Drain and stop the listener using bounded queue, sentinel, and
+    thread waits; record any incomplete step.
     """
     global _listener
     listener = _listener
@@ -1883,7 +1722,6 @@ def _install_handler(logger: logging.Logger) -> bool:
 def _record_removed_handler(
     logger_name: str, handler: Any
 ) -> None:
-    """Records that a handler was removed from a governed logger."""
     label = "{0}:{1}".format(logger_name, _handler_label(handler))
     if label in _REMOVED_HANDLERS:
         return
@@ -1903,7 +1741,6 @@ def unredacted_handler_names() -> Tuple[str, ...]:
 
 
 def _governed_descendants() -> List[logging.Logger]:
-    """Returns every existing descendant of a governed namespace."""
     prefixes = tuple(name + "." for name in GOVERNED_LOGGER_NAMES)
     descendants: List[logging.Logger] = []
     try:
@@ -1977,27 +1814,8 @@ def _configure_third_party_loggers() -> None:
 def configure_logging(
     level: Optional[Union[int, str]] = None,
 ) -> logging.Logger:
-    """Installs the dispatching handler on the governed loggers.
-
-    Discovery and installation are performed under a lock, so repeated or
-    concurrent calls from different modules in one process leave exactly
-    one handler per logger, one queue and one listener thread, and
-    produce no duplicated output. A handler found under the reserved name
-    whose type, queue, target, formatter, filter or stream does not
-    match, or whose listener thread has stopped, is replaced.
-
-    Passing ``level`` sets the base logger's level and is the supported
-    way to apply a deployment's configured level: the application passes
-    ``settings.LOG_LEVEL`` on startup. A name and a number are both
-    accepted, and an unrecognised value falls back on
-    :data:`DEFAULT_LOG_LEVEL`. Omitting ``level`` keeps the level already
-    in effect, or applies :data:`DEFAULT_LOG_LEVEL` on the first call.
-    Every governed namespace outside the base logger is always held at
-    the level :func:`_governed_namespace_levels` records for it, so a
-    configured level cannot lower the threshold that keeps an outbound
-    request target or an executed statement out of the log.
-
-    Returns the base logger.
+    """Install one queue-backed redacting handler on each governed logger
+    and normalize descendants.
     """
     with _CONFIGURE_LOCK:
         logger = logging.getLogger(BASE_LOGGER_NAME)

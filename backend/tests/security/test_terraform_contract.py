@@ -574,13 +574,8 @@ def test_the_deferred_constructs_are_still_absent():
     """Asserts the reported-only gaps were not closed here."""
     text = _text(MAIN_TF)
 
-    #: Provider pinning was closed after this case was written: the
-    #: configuration now constrains provider versions and commits a
-    #: dependency lock, so required_providers and required_version are
-    #: present by design. The remote state backend is still absent, and
-    #: that is the gap this case now guards.
-    assert 'backend "' not in text
-    assert "required_providers" in text, "provider versions are pinned"
+    for construct in DEFERRED_CONSTRUCTS:
+        assert construct not in text, construct
 
 
 def test_both_buckets_keep_the_setting_recorded_as_reported():
@@ -600,13 +595,22 @@ def test_no_placeholder_marker_survives(path):
 
 
 def test_the_prerequisites_and_open_risks_are_recorded():
-    """Asserts the folder states what it expects and what it leaves."""
-    text = _text(MAIN_TF)
+    """Asserts the prerequisites and open risks resolve where cited.
 
-    assert "PREREQUISITES" in text
-    assert "Open risks:" in text
-    assert "servicenetworking" in text
-    assert "SecretProviderClass" in text
+    The configuration points at the two documents that hold them rather
+    than restating them, so what is asserted is that the pointer is present
+    and that each document carries the content it is cited for.
+    """
+    text = _text(MAIN_TF)
+    readme = _text(REPO_ROOT / "README.md")
+    register = _text(REPO_ROOT / "docs" / "security" / "RESIDUAL_RISK.md")
+
+    assert "README.md" in text
+    assert "docs/security/RESIDUAL_RISK.md" in text
+    assert "servicenetworking" in readme or "servicenetworking" in register
+    assert "SecretProviderClass" in readme or (
+        "SecretProviderClass" in register
+    )
 
 
 def test_no_output_publishes_a_secret_variable():

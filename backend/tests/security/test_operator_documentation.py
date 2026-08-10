@@ -37,6 +37,8 @@ import subprocess
 import pytest
 from conftest import REPO_ROOT
 
+from backend.tests.support import REVISION_COUNT, REVISION_IDS
+
 #: Documents under test.
 README = REPO_ROOT / "README.md"
 SECURITY_POLICY = REPO_ROOT / "SECURITY.md"
@@ -58,12 +60,14 @@ CRITICAL_DECISIONS = (
 #: artifacts cite it, and the delivered set is measured against it.
 BASELINE_REVISION = "a26f7fb"
 
-#: Rows the reverse index carries across its three tables: the plan's 69
-#: entries, the 26 delivered beyond the plan, and the 55 delivered by later
-#: rounds. 141 of the 151 are paths in the delivered change set and the other
-#: ten are the nine read-only references plus the provider lock file the
-#: measurement excludes, which is the arithmetic section 2.10 publishes.
-MATRIX_REVERSE_ROWS = 151
+#: Rows the reverse index carries across its three tables: the 69 rows it
+#: renders for the plan's 68 entries, the 26 delivered beyond the plan, and
+#: the 60 delivered by later rounds. 129 of the 155 are paths in the
+#: delivered change set; of the remaining 26, nine are read-only references
+#: confirmed unmodified and seventeen were withdrawn -- sixteen by the
+#: manifest consolidation and one by the provider-pinning revert -- which is
+#: the arithmetic section 2.10 publishes.
+MATRIX_REVERSE_ROWS = 155
 
 #: Paths produced while verifying, never delivered, and removed
 #: before commit. ``blitzy/`` is where the browser-validation
@@ -89,10 +93,43 @@ PIN_SITES = (
 #: Construct that pins the interpreter in code.
 CODE_LEVEL_PIN = "@asyncio.coroutine"
 
+
+def _delivered_revision_head() -> str:
+    """Returns the head of the delivered Alembic chain.
+
+    The chain is read from the revision files rather than fixed here, so
+    a revision added later cannot leave a documented head standing
+    without this assertion noticing.
+    """
+    parents = {}
+    versions = REPO_ROOT / "backend" / "migrations" / "versions"
+    for path in sorted(versions.glob("[0-9]*.py")):
+        text = path.read_text(encoding="utf-8")
+        identifier = re.search(
+            r'^revision = "([^"]+)"', text, re.MULTILINE
+        )
+        parent = re.search(
+            r'^down_revision = (?:"([^"]+)"|None)', text, re.MULTILINE
+        )
+        assert identifier is not None, path
+        assert parent is not None, path
+        parents[identifier.group(1)] = parent.group(1)
+
+    assert parents, "the migrations directory holds no revision"
+    revised = set(parent for parent in parents.values() if parent)
+    heads = sorted(set(parents) - revised)
+    assert len(heads) == 1, heads
+    return heads[0]
+
+
 #: Head Alembic revision. A documented reversibility check has to end
-#: here, not two downgrades below it. The delivered chain is
-#: 0001 -> 0002 -> 0003, so the head is the workload-index revision.
-HEAD_REVISION = "0003"
+#: here, not some number of downgrades below it.
+HEAD_REVISION = _delivered_revision_head()
+
+#: Number of revisions the delivered chain carries, read from the chain. A
+#: documented reversal is one step per revision, so a count stated in the
+#: readme is checked against this rather than against a written figure.
+REVERSAL_STEPS = REVISION_COUNT
 
 #: Seconds an extracted command is allowed.
 EXECUTION_TIMEOUT_SECONDS = 60
@@ -369,8 +406,12 @@ def test_the_runbook_names_the_secret_terraform_actually_provisions():
 def test_the_documented_reversibility_check_ends_at_head():
     """The sequence finishes upgraded, and says which revision that is.
 
-    It previously ended after two downgrades, which removes the RBAC
-    column and the administrator seed while every command exits zero.
+    A sequence that ends on a reversal leaves the RBAC column and the
+    administrator seed removed while every command exits zero, so the row is
+    read for the order of its calls as well as their presence. The number of
+    reversals it states is compared against the delivered chain, and every
+    revision the reader steps through is named, so a chain that grows makes
+    this row fail rather than quietly under-count.
     """
     flat = _flattened(README)
     row = [
@@ -387,17 +428,23 @@ def test_the_documented_reversibility_check_ends_at_head():
     assert "alembic current" in row[0]
     assert HEAD_REVISION + " (head)" in row[0]
     assert "disposable database" in row[0]
+    assert "per revision in the chain" in row[0]
+    assert "(%d today" % REVERSAL_STEPS in row[0]
+    for revision in REVISION_IDS:
+        assert revision in row[0], revision
+    assert "base" in row[0]
     assert "downgrade -1` twice |" not in flat
 
 
 def test_the_readme_warns_that_the_downgrades_are_destructive():
-    """The cost of the two downgrades is stated, not implied."""
+    """The cost of the reversals is stated, with their number, not implied."""
     flat = _flattened(README)
 
     assert "must not be run against a database you intend to keep" in flat
     assert "`role` column" in flat
     assert "seeds the single administrator" in flat
     assert "exits 0 while doing it" in flat
+    assert "per revision in the chain, %d today" % REVERSAL_STEPS in flat
 
 
 # --- Facts must agree with the tree and with each other -------------------
@@ -555,9 +602,14 @@ def test_the_readme_records_the_retired_and_required_pipeline_inputs():
         "ARTIFACT_REGISTRY_REPOSITORY",
         "GCP_WORKLOAD_IDENTITY_PROVIDER",
         "artifact_registry_writer_members",
-        "secret_accessor_members",
+        "cloud_function_invoker_member",
+        "database_private_network",
     ):
         assert name in flat, name
+
+    # The generic accessor input is gone, so the readme must not send an
+    # operator looking for a variable this configuration no longer declares.
+    assert "secret_accessor_members" not in flat
 
 
 def test_the_readme_states_both_deliberate_release_blockers():
@@ -701,17 +753,26 @@ def test_the_matrix_publishes_a_reconcilable_delivered_total():
     assert "### 2.10 Delivered-path reconciliation" in _text(
         TRACEABILITY_MATRIX
     )
-    #: The identity the document publishes for the index it delivers. It read
-    #: `69 + 24 = 93` when the index was one table; three tables and the later
-    #: rounds' paths make it this, and section 2.10 states both.
-    assert "`141 + 10 = 151`" in flat
-    assert "`59 + 1 + 25 + 56 = 141`" in flat
+    #: The identity the document publishes for the index it delivers. Four
+    #: earlier totals were published in succession -- 86, 91, 93 and 141 --
+    #: each correct for the tree it measured and each left standing beside the
+    #: next. Section 2.10 now carries one current measurement and lists those
+    #: four as superseded snapshots, so both halves are asserted: the current
+    #: identity has to be present and each snapshot has to be labelled.
+    assert "`129 + 9 + 17 = 155`" in flat
+    assert "`69 + 26 + 60 = 155`" in flat
+    assert "`59 + 27 + 60 - 17 = 129`" in flat
     assert "Delivered paths absent from the reverse index | **0**" in flat
+    for snapshot in ("**86**", "**91**", "**93**", "**141**"):
+        assert snapshot + " " in flat, snapshot
+    assert flat.count("| **Superseded** |") >= 4
 
-    # The plan's own figure is untouched, since other documents quote it. It
-    # counts ten reference entries because the plan renders one of them inside
-    # its application-core group, which section 2.8 states and counts.
-    assert "`30 + 29 + 0 + 10 = 69`" in flat
+    # The plan's own figure is the one the frozen plan publishes: nine
+    # reference entries and 68 in total. The plan additionally renders
+    # backend/app/api/router.py as a reference row inside its application-core
+    # group, which section 2.8 records as indexed and not counted.
+    assert "`30 + 29 + 0 + 9 = 68`" in flat
+    assert "`30 + 29 + 0 + 10 = 69`" not in flat
 
     # The boundary that used to disclaim a delivered total is withdrawn.
     assert (
@@ -861,49 +922,70 @@ def test_this_round_traces_every_finding_it_answered():
 
 
 def test_the_critical_decision_document_still_carries_exactly_five():
-    """Rule 3's artifact is not extended by this round.
+    """Rule 3's artifact carries the plan's five entries and no more.
 
-    It passed review with five decision entries ordered highest risk
-    first, so adding a sixth would break a rule already satisfied. The
-    numbered section after them is the review-sequencing note, not an
-    entry, and the summary table is what fixes the count at five.
+    Only the five decisions are numbered sections, and the
+    review-sequencing note that follows them is deliberately unnumbered
+    so that it cannot be read as a sixth. An earlier revision numbered it
+    six and additionally carried an appendix with its own Decision,
+    Rationale and Reviewer sections, which was a sixth entry in
+    everything but its heading.
     """
     text = CRITICAL_DECISIONS.read_text(encoding="utf-8")
     numbered = re.findall(r"(?m)^##\s+(\d+)\.", text)
+    #: Only the summary table's rows, because an entry's own tables are
+    #: numbered too -- the pin-site inventory among them -- and sweeping
+    #: the whole document would count those as decisions.
+    overview = text[text.index("## Summary"):text.index("## 1. ")]
     summary = [
         line
-        for line in text.split("\n")
+        for line in overview.split("\n")
         if re.match(r"^\|\s*[1-9]\s*\|", line)
     ]
 
-    assert numbered == ["1", "2", "3", "4", "5", "6"]
-    assert "## 6. Review sequencing and companion artefacts" in text
+    assert numbered == ["1", "2", "3", "4", "5"]
+    assert "## Review sequencing and companion artefacts" in text
+    assert "## 6." not in text
+    assert "## Appendix" not in text
     assert len(summary) == 5, len(summary)
 
-    # Every entry is ranked High. The runtime-pin entry was raised from
-    # Medium to High and moved to second place once its second
-    # consequence -- the retirement of the pinned managed-functions
-    # runtime, a current deployment blocker -- was included, and the
-    # document records that re-ranking beneath its summary table. The
-    # ordering within the band still runs highest risk first.
+    #: The order and the risk framing are the Agent Action Plan's own, so
+    #: they are asserted against it rather than against a ranking this
+    #: document argued for itself: four authorization-and-irreversibility
+    #: decisions at High, then the advisory acceptance at Medium.
     risks = [row.split("|")[3].strip() for row in summary]
-    assert risks == ["**High**"] * 5, risks
+    assert risks == ["**High**"] * 4 + ["**Medium**"], risks
+
+    headings = re.findall(r"(?m)^##\s+\d+\.\s+(.*)$", text)
+    assert headings[0].startswith("Rotate the exposed credentials")
+    assert headings[1].startswith("Seed exactly one administrator")
+    assert headings[2].startswith("Restrict `POST /listings/`")
+    assert headings[3].startswith("Verify PayPal webhook signatures")
+    assert headings[4].startswith(
+        "Accept eight residual dependency advisories"
+    )
 
 
 def test_the_critical_decision_document_states_the_reconciled_total():
-    """Its fifth entry sends a reviewer to check fourteen, not seven.
+    """Its fifth entry sends a reviewer to check eight, not seven.
 
     The entry's own checks are executable instructions, so a stale count
-    there would have a reviewer verify half the accepted set.
+    there would have a reviewer verify part of the accepted set. Two
+    counts are wrong in opposite directions and both are refused: seven
+    omits the development advisory, and fourteen is the figure from
+    before the audit instrument moved to a manifest no audit reads, when
+    six of the scanner's own dependencies were reported as this
+    project's.
     """
     text = CRITICAL_DECISIONS.read_text(encoding="utf-8")
     flat = " ".join(text.split())
 
-    assert "Accept fourteen residual dependency advisories" in flat
+    assert "Accept eight residual dependency advisories" in flat
     assert "Accept seven residual dependency advisories" not in flat
-    assert "each of the fourteen has a compensating control" in flat
+    assert "Accept fourteen residual dependency advisories" not in flat
+    assert "each of the eight has a compensating control" in flat
     assert "seven for `backend/requirements.txt`" in flat
-    assert "seven for `backend/requirements-dev.txt`" in flat
+    assert "one for `backend/requirements-dev.txt`" in flat
 
 
 # ---------------------------------------------------------------------
@@ -948,7 +1030,12 @@ RELEASE_GATES = (
     ("private control plane", "Access is granted by permission"),
     ("image registry", "must be created and the release identity"),
     ("function runtime", "no longer accepts for new or updated"),
-    ("external cluster objects", "defined outside this repository"),
+    #: The gate is real -- each path refuses to create the serving objects
+    #: and stops if they are absent -- but the reason it used to give was
+    #: not: the definitions are versioned here. The phrase pinned now is
+    #: the corrected statement, so a reappearance of the old one is caught
+    #: as the regression it would be. Row 92.13 of the decision log.
+    ("external cluster objects", "cluster objects it will not create"),
 )
 
 #: Bounds Rule 2 places on the deck.
@@ -984,8 +1071,22 @@ DECK_VISUAL = re.compile(
     r'|class="icon-row"|class="accent-bar"'
 )
 
-#: One numbered slide marker comment.
-DECK_MARKER = re.compile(r"<!--\s*(\d+)\.\s*([^>]*?)\s*-->")
+#: One heading rendered inside a slide.
+DECK_HEADING = re.compile(r"<h[1-4][^>]*>(.*?)</h[1-4]>", re.S)
+
+#: The heading text that identifies each slide these cases address. A slide
+#: is addressed by what it renders rather than by a marker comment, so a
+#: case cannot pass against a label the slide itself does not carry.
+DECK_SLIDE_HEADINGS = {
+    "title": "apartment-finder-service",
+    "headline metrics": "What the work delivered",
+    "architecture overview": "Where the new controls sit",
+    "secrets and platform": "Credentials are out of the code",
+    "risk and mitigation": "Residual risk, and what holds it in check",
+    "first release": "Four things an operator must settle first",
+    "onboarding": "Everything needed to pick this up",
+    "closing": "Ready for review",
+}
 
 
 def _deck():
@@ -1000,20 +1101,27 @@ def _deck_sections():
     )
 
 
+def _deck_slide_headings():
+    """Yields ``(section, headings)`` for every slide, in document order."""
+    for section in re.findall(
+        r"<section\b[^>]*>.*?</section>", _deck(), re.S
+    ):
+        yield section, [
+            " ".join(re.sub(r"<[^>]+>", " ", heading).split())
+            for heading in DECK_HEADING.findall(section)
+        ]
+
+
 def _deck_slide(marker):
-    """Returns the one slide whose marker comment holds ``marker``."""
-    text = _deck()
-    marks = [(m.start(), m.group(2)) for m in DECK_MARKER.finditer(text)]
+    """Returns the one slide whose own heading identifies ``marker``."""
+    heading = DECK_SLIDE_HEADINGS[marker]
     matched = [
-        (index, start)
-        for index, (start, label) in enumerate(marks)
-        if marker in label
+        section
+        for section, headings in _deck_slide_headings()
+        if any(heading in rendered for rendered in headings)
     ]
-    assert len(matched) == 1, marker + " marks " + str(len(matched))
-    index, start = matched[0]
-    following = index + 1
-    end = marks[following][0] if following < len(marks) else len(text)
-    return text[start:end]
+    assert len(matched) == 1, marker + " matches " + str(len(matched))
+    return matched[0]
 
 
 def _deck_budget(body):
@@ -1040,12 +1148,17 @@ def test_the_deck_title_hands_deployment_and_rotation_to_an_operator():
     """The opening scope line says what is done and what is not.
 
     It is the only line some readers will take away, so it carries the
-    distinction rather than leaving it to a later slide.
+    distinction rather than leaving it to a later slide. An earlier
+    revision of this case required the line to say every finding was
+    covered by an automated test, which the metric grid three lines later
+    contradicted with fifteen and five.
     """
     slide = " ".join(_deck_slide("title").split())
 
     assert "remediated in code" in slide
-    assert "each covered by an automated test" in slide
+    assert "fifteen proven by automated test" in slide
+    assert "five carrying an operational step" in slide
+    assert "each covered by an automated test" not in slide
     assert "Deployment and credential rotation remain for an operator" in (
         slide
     )
@@ -1057,27 +1170,66 @@ def test_the_deck_metrics_disclaim_a_deployed_environment():
     Every number on that slide comes from a static scan, a manifest or
     a test run. Presented without that attribution they read as
     production telemetry.
+
+    The disclaimer is bounded by what this repository can establish. It
+    once read "nothing here has been released yet", which is a claim
+    about a deployed environment rather than a disclaimer about one, and
+    nothing here can verify it either way.
     """
     slide = " ".join(_deck_slide("headline metrics").split())
 
     assert "measured in code and tests" in slide
-    assert "nothing here has been released yet" in slide
+    assert "None of it is a statement about a deployed environment" in slide
+    assert "which this repository cannot see" in slide
+    assert "nothing here has been released yet" not in _deck()
 
 
 def test_the_deck_counts_findings_as_remediated_and_tested():
     """The headline count states what was achieved, precisely.
 
-    Twenty findings have a fix and a test. Calling them closed claims
-    an operational outcome that rotation and deployment still gate.
+    Twenty findings have a delivered fix. Calling them closed claims an
+    operational outcome that rotation and deployment still gate, and
+    claiming all twenty are covered by test contradicts the two cards
+    beside the count, which report fifteen and five.
     """
     slide = " ".join(_deck_slide("headline metrics").split())
 
-    assert "findings remediated in code and covered by tests" in slide
+    assert "findings remediated in code" in slide
+    assert "covered by tests" not in slide
 
 
-def test_the_deck_states_plainly_that_nothing_has_been_deployed():
-    """One unambiguous sentence, not an inference across slides."""
-    assert "No part of this has been deployed" in _deck()
+#: The three places row 44.2.1 of the decision log requires the split to
+#: appear, each with the deck marker of the slide that carries it. An
+#: earlier revision reported twenty as covered by test on the title and
+#: closing slides while the metric grid beside them reported fifteen and
+#: five, so the artefact contradicted itself twice over.
+ASSURANCE_SPLIT_SLIDES = ("title", "headline metrics", "closing")
+
+
+@pytest.mark.parametrize("marker", ASSURANCE_SPLIT_SLIDES)
+def test_the_assurance_split_is_reported_wherever_the_total_is(marker):
+    """Fifteen proven by test and five needing an operator, everywhere."""
+    slide = " ".join(_deck_slide(marker).split()).lower()
+
+    assert "fifteen" in slide, marker
+    assert "five" in slide, marker
+    assert "proven by" in slide, marker
+
+
+def test_the_deck_bounds_its_release_claim_to_what_it_can_show():
+    """One unambiguous sentence, and one it is entitled to make.
+
+    "No part of this has been deployed" reads as a verified fact about
+    every environment this code could be running in, and this repository
+    has no visibility into any of them. What it can state is that four
+    gates stand before a first release and that none of them can be
+    settled from inside a commit, which is checkable here.
+    """
+    deck = _deck()
+
+    assert "Four gates stand before a first release" in deck
+    assert "none can be settled from inside a commit" in deck
+    assert "No part of this has been deployed" not in deck
 
 
 def test_the_deck_closing_offers_review_rather_than_release():
@@ -1088,7 +1240,10 @@ def test_the_deck_closing_offers_review_rather_than_release():
     """
     slide = " ".join(_deck_slide("closing").split())
 
-    assert "Remediated and tested. Ready for your review, not yet" in slide
+    assert (
+        "Remediated and tested. Ready for your review, with four release"
+        in slide
+    )
     assert "settling the four release gates come next" in slide
 
 
@@ -1253,11 +1408,15 @@ def test_the_release_gate_slide_stands_on_its_own():
     They are the reason nothing has shipped, so they carry the same
     weight as the risk table rather than sitting inside it.
     """
-    labels = [m.group(2) for m in DECK_MARKER.finditer(_deck())]
+    headings = [
+        rendered
+        for _, headings in _deck_slide_headings()
+        for rendered in headings
+    ]
     slide = " ".join(_deck_slide("first release").split())
 
-    assert "what stands between this and a first release" in labels
-    assert "risk and mitigation" in labels
+    assert "Four things an operator must settle first" in headings
+    assert "Residual risk, and what holds it in check" in headings
     assert "Four things an operator must settle first" in slide
 
 
@@ -1311,17 +1470,18 @@ def test_the_deck_and_the_readme_name_the_same_release_blockers():
 
 
 def test_the_deck_holds_the_section_count_rule_2_allows():
-    """Twelve to eighteen slides, with the markers matching them."""
+    """Twelve to eighteen slides, each identified by its own heading."""
     sections = _deck_sections()
-    markers = list(DECK_MARKER.finditer(_deck()))
+    headings = [headings for _, headings in _deck_slide_headings()]
     low, high = DECK_SECTION_BOUNDS
 
     assert low <= len(sections) <= high, len(sections)
-    assert len(markers) == len(sections)
+    assert len(headings) == len(sections)
     assert _deck().count("<section") == _deck().count("</section>")
 
-    numbered = [int(m.group(1)) for m in markers]
-    assert numbered == list(range(1, len(sections) + 1)), numbered
+    leading = [group[0] for group in headings if group]
+    assert len(leading) == len(sections), leading
+    assert len(set(leading)) == len(leading), leading
 
 
 def test_every_deck_slide_carries_a_non_text_visual():

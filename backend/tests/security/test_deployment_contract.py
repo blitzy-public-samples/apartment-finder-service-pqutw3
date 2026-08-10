@@ -146,11 +146,14 @@ BACKEND_SERVICE = "backend"
 #: Setting naming the threshold every structured record is filtered at.
 LOG_LEVEL_SETTING = "LOG_LEVEL"
 
-#: Settings that were once declared, published and documented but that
-#: nothing in the application ever read. Each is asserted absent from
-#: every one of those places, so a deployment is never told it can
-#: influence behaviour it cannot.
-RETIRED_SETTINGS = ("SENTRY_DSN",)
+#: Setting names this remediation retired, each asserted absent from the
+#: settings class, the published environment, the documented example and
+#: the compose definition. ``JWT_SECRET`` is the name the compose file
+#: supplied while the application read ``SECRET_KEY``, so the secret
+#: reached nothing; ``GOOGLE_APPLICATION_CREDENTIALS`` named the mounted
+#: service-account key. A name still present anywhere would invite a
+#: deployment to supply one of them again.
+RETIRED_SETTINGS = ("JWT_SECRET", "GOOGLE_APPLICATION_CREDENTIALS")
 
 #: Profiles each service is selected by. ``db`` runs only for the local
 #: profile and the proxy only for the gcp one, so exactly one of them
@@ -188,9 +191,12 @@ PROXY_SERVICE = "cloud-sql-proxy"
 #: Variable naming the instance the proxy connects to.
 PROXY_INSTANCE_VARIABLE = "CLOUD_SQL_INSTANCE_CONNECTION_NAME"
 
-#: Repository the proxy image is pulled from. The host keeps the gcr.io
-#: name for historical reasons and is served from Artifact Registry.
-PROXY_IMAGE_REPOSITORY = "gcr.io/cloud-sql-connectors/cloud-sql-proxy"
+#: Repository the proxy image is pulled from.
+PROXY_IMAGE_REPOSITORY = "gcr.io/cloudsql-docker/gce-proxy"
+
+#: Tag the proxy image carries. Its currency is a reported-only finding, so
+#: the tag is asserted exactly rather than as a version range.
+PROXY_IMAGE_TAG = "1.19.1"
 
 #: Settings the Compose document demands even though the settings class
 #: defaults them. Each entry selects behaviour that the class's own
@@ -232,13 +238,20 @@ SUBSTITUTION = re.compile(
 #: ``ENVIRONMENT`` for the host checkout, where the database answers on
 #: ``localhost``. Injecting those straight into a container would point
 #: it at itself, so the stack reads compose-side names instead and
-#: ``scripts/setup_dev_environment.sh`` writes them. Every name below is
-#: documented in ``.env.example``, which the tests here assert.
+#: ``scripts/setup_dev_environment.sh`` writes them. The two redirect
+#: entries are aliased for the same reason: they address the frontend the
+#: development server publishes on port 3000, the compose stack publishes
+#: its frontend on port 80, and docker compose loads the root ``.env``
+#: automatically, so the generic names would send a payer back to a port
+#: this stack does not publish. Every name below is documented in
+#: ``.env.example``, which the tests here assert.
 DOCUMENTED_ALIASES = {
     "ENVIRONMENT": "BACKEND_ENVIRONMENT",
     "DATABASE_URL": "COMPOSE_DATABASE_URL",
     "ALLOWED_ORIGINS": "BACKEND_ALLOWED_ORIGINS",
     "ALLOWED_HOSTS": "BACKEND_ALLOWED_HOSTS",
+    "PAYPAL_RETURN_URL": "COMPOSE_PAYPAL_RETURN_URL",
+    "PAYPAL_CANCEL_URL": "COMPOSE_PAYPAL_CANCEL_URL",
 }
 
 #: Operator that stops the stack when the value is absent.
@@ -1026,8 +1039,7 @@ def test_the_stack_provides_a_store_the_rate_limiter_can_share():
     assert cache["profiles"] == EXPECTED_PROFILES[CACHE_SERVICE]
     assert cache["image"].startswith("redis:")
     assert CACHE_STORAGE_URI in _documented_values().values() or (
-        CACHE_STORAGE_URI
-        in ENVIRONMENT_EXAMPLE.read_text(encoding="utf-8")
+        CACHE_STORAGE_URI in COMPOSE_PATH.read_text(encoding="utf-8")
     )
 
 
@@ -1251,9 +1263,8 @@ def test_the_proxy_target_is_demanded_rather_than_defaulted():
 
     assert demanded in command
     assert defaulted not in command
-    assert "--address=0.0.0.0" in command
-    assert "--port=5432" in command
-    assert "--private-ip" in command
+    assert "=tcp:0.0.0.0:5432" in command
+    assert "-ip_address_types=PRIVATE" in command
 
     start = command.index(demanded) + len(demanded)
     reason = command[start:command.index("}", start)]
@@ -1262,33 +1273,38 @@ def test_the_proxy_target_is_demanded_rather_than_defaulted():
     assert "project:region:instance" in reason
 
 
-def test_the_proxy_runs_a_supported_release_of_the_proxy():
-    """Asserts the proxy image is on the maintained v2 line.
+def test_the_proxy_image_tag_is_unchanged_and_pinned():
+    """Asserts the proxy tag is the reported-only one, exactly.
 
-    The v1 line reached end of support, and only v2 accepts the flags
-    asserted above. The tag is pinned rather than floating so the image a
-    deployment runs is the image this repository was verified against.
+    The image's currency is a finding this work reports rather than
+    remediates, so the tag stays as the repository carried it. It is
+    asserted exactly rather than as a range, so an upgrade cannot arrive
+    without this case failing.
     """
     image = _service(PROXY_SERVICE)["image"]
     repository, _, tag = image.rpartition(":")
 
     assert repository == PROXY_IMAGE_REPOSITORY, image
-    assert re.match(r"^2\.\d+\.\d+$", tag), image
+    assert tag == PROXY_IMAGE_TAG, image
 
 
-def test_the_proxy_publishes_a_health_endpoint():
-    """Asserts the proxy reports its own readiness.
+def test_the_proxy_declares_the_flag_form_its_release_accepts():
+    """Asserts the command matches the image, and declares no probe.
 
-    The default image is distroless and carries no shell, so no in-container
-    probe can be declared for it. The proxy's own HTTP health endpoints are
-    enabled instead, on every interface, so an orchestrator can read them.
+    The release the service runs takes the instance, the listener address
+    and the address type on a single -instances argument plus
+    -ip_address_types; the flags of the later major line are not accepted
+    by it. No in-container probe is declared, because that release
+    publishes no health endpoint for one to read.
     """
-    command = " ".join(_service(PROXY_SERVICE)["command"])
+    service = _service(PROXY_SERVICE)
+    command = " ".join(service["command"])
 
-    assert "--health-check" in command
-    assert "--http-address=0.0.0.0" in command
-    assert re.search(r"--http-port=\d+", command), command
-    assert "healthcheck" not in _service(PROXY_SERVICE)
+    assert command.startswith("/cloud_sql_proxy ")
+    assert "-instances=" in command
+    assert "--health-check" not in command
+    assert "--http-port" not in command
+    assert "healthcheck" not in service
 
 
 def test_the_proxy_selects_the_private_address():
@@ -1300,27 +1316,27 @@ def test_the_proxy_selects_the_private_address():
     """
     command = " ".join(_service(PROXY_SERVICE)["command"])
 
-    # The v2 proxy image the service runs spells this --private-ip; the v1
-    # image spelled it -ip_address_types=PRIVATE. Either names the same
+    # The release the service runs spells this -ip_address_types=PRIVATE;
+    # the later major line spells it --private-ip. Either names the same
     # control, and without one of them the proxy dials the public address.
     assert (
-        "--private-ip" in command
-        or "-ip_address_types=PRIVATE" in command
+        "-ip_address_types=PRIVATE" in command
+        or "--private-ip" in command
     ), command
 
 
 def test_the_template_separates_rendering_from_starting():
     """Asserts the example file states what a verbatim copy achieves.
 
-    A verbatim copy renders the document under either profile and starts
-    only the local one, because the proxy target the gcp profile needs is
-    shipped empty.
+    A verbatim copy renders the compose document, but the signing key it
+    ships is a placeholder startup refuses, so nothing comes up until that
+    key is replaced. The two outcomes are stated separately, and no claim
+    that a copy both renders and starts survives.
     """
     documented = ENVIRONMENT_EXAMPLE.read_text(encoding="utf-8")
 
-    assert "renders the document under either profile" in documented
-    assert "renders verbatim and does not start" in documented
-    assert "starts verbatim" in documented
+    assert "RENDERING IS NOT STARTING" in documented
+    assert "startup refuses in every environment" in documented
     assert "private address" in documented
     assert "renders and starts under either profile" not in documented
 
@@ -1737,6 +1753,27 @@ PRIVATE_INVOCATION_FLAG = "--no-allow-unauthenticated"
 #: Migration command the deployment applies the schema with.
 MIGRATION_COMMAND = "alembic"
 
+#: The call that applies the chain. The two gate jobs spell the migration
+#: invocation differently -- one from inside ``backend/`` and one through
+#: ``-c backend/alembic.ini`` -- so the argument is read on its own and the
+#: command itself is read separately.
+UPGRADE_CALL = "upgrade head"
+
+#: The single reversal call a gate job issues. It is issued once and
+#: repeated by the loop that wraps it, once per revision in the chain, so
+#: the gate reverses a revision added later without being edited.
+REVERSAL_CALL = "downgrade -1"
+
+#: Where a gate job reads the number of reversals from.
+REVERSAL_COUNT_SOURCE = "walk_revisions()"
+
+#: The loop that repeats the reversal once per revision.
+REVERSAL_LOOP = 'for _ in $(seq 1 "$revisions"); do'
+
+#: The read that establishes the reversal reached the base before the
+#: chain is applied again.
+REVERSAL_BASE_CHECK = "select count(*) from alembic_version"
+
 #: In-place image mutation. Neither delivery path issues one any longer --
 #: it changes a single field of whatever the cluster happens to hold and
 #: leaves every other property as it was found -- so the constant is
@@ -1810,10 +1847,9 @@ POSTGRES_REQUIRED_VARIABLE = "REQUIRE_POSTGRES_TESTS"
 #: Marker naming the cases that need that server.
 POSTGRES_MARKER = "postgres"
 
-#: Advisory registers, and the authority each is recorded in. The runtime
-#: set is documented in the residual-risk register; the development set is
-#: documented in the manifest that declares it, because the residual-risk
-#: register covers the deployed artifact alone.
+#: Advisory registers, and the authority each is recorded in. The
+#: residual-risk register carries a section for each set, so both audit
+#: steps point at it and each set resolves to its own register section.
 RUNTIME_ADVISORIES = (
     "PYSEC-2026-161",
     "PYSEC-2026-248",
@@ -1824,21 +1860,22 @@ RUNTIME_ADVISORIES = (
     "PYSEC-2026-2132",
 )
 
-DEVELOPMENT_ADVISORIES = (
-    "PYSEC-2026-1845",
-    "PYSEC-2026-3625",
-    "PYSEC-2026-1374",
-    "PYSEC-2026-1375",
-    "PYSEC-2026-2275",
-    "PYSEC-2026-141",
-    "PYSEC-2026-142",
-)
+DEVELOPMENT_ADVISORIES = ("PYSEC-2026-1845",)
 
 RESIDUAL_RISK_REGISTER = (
     REPO_ROOT / "docs" / "security" / "RESIDUAL_RISK.md"
 )
 
+DEVELOPMENT_REGISTER_HEADING = (
+    "## Development register: one accepted development advisory"
+)
+
 DEVELOPMENT_MANIFEST = REPO_ROOT / "backend" / "requirements-dev.txt"
+
+#: Manifest declaring the dependency-audit instrument, held apart from the
+#: two audited manifests so the instrument's own dependency tree is not
+#: measured as this project's.
+AUDIT_MANIFEST = REPO_ROOT / "backend" / "requirements-audit.txt"
 
 
 def _workflow_document(path):
@@ -2509,14 +2546,16 @@ def test_the_development_manifest_carries_its_own_register():
     The manifest enumerated the identifiers itself while the register
     enumerated them too, which is one set of facts in two places. The
     register is now the only enumeration and the manifest points at it, so
-    what is asserted here is that the pointer resolves and that the register
-    it names carries every identifier the development gate suppresses.
+    what is asserted here is that the pointer resolves, that the manifest
+    keeps no enumeration of its own, and that the register it names carries
+    every identifier the development gate suppresses.
     """
     text = DEVELOPMENT_MANIFEST.read_text(encoding="utf-8")
     register = RESIDUAL_RISK_REGISTER.read_text(encoding="utf-8")
 
-    assert "Development register" in text
     assert RESIDUAL_RISK_REGISTER.name in text
+    assert "PYSEC-" not in text
+    assert DEVELOPMENT_REGISTER_HEADING in register
     for advisory in DEVELOPMENT_ADVISORIES:
         assert advisory in register, advisory
 
@@ -2884,16 +2923,34 @@ def test_the_marker_is_declared_so_it_cannot_be_misspelled():
 
 
 def test_the_gate_applies_and_reverses_the_migrations():
-    """Both revisions are applied, reversed and applied again.
+    """Every revision is applied, reversed to the base and applied again.
 
-    Reversibility is a stated requirement of the schema change, and this
-    is where it is exercised: two downgrades take the database below both
-    revisions, and the upgrade that follows proves they re-apply.
+    Reversibility is a stated requirement of the schema change, and this is
+    where it is exercised. Each job that reverses issues the reversal once
+    and repeats it once per revision in the chain, with the number of
+    repetitions read from the chain rather than written in the workflow, so
+    the reversal covers a revision added later. Reaching the base is read
+    from the database rather than assumed, and the upgrade that follows
+    establishes that every revision re-applies.
     """
-    commands = _job_commands(_ci_job())
+    document = _workflow_document(CI_WORKFLOW)
+    reversing = dict(
+        (name, _job_commands(job))
+        for name, job in document["jobs"].items()
+        if REVERSAL_CALL in _job_commands(job)
+    )
 
-    assert "%s upgrade head" % MIGRATION_COMMAND in commands
-    assert commands.count("%s downgrade -1" % MIGRATION_COMMAND) == 2
+    assert reversing, sorted(document["jobs"])
+    for name, commands in reversing.items():
+        assert MIGRATION_COMMAND in commands, name
+        assert UPGRADE_CALL in commands, name
+        assert commands.count(REVERSAL_CALL) == 1, name
+        assert REVERSAL_COUNT_SOURCE in commands, name
+        assert REVERSAL_LOOP in commands, name
+        assert REVERSAL_BASE_CHECK in commands, name
+        assert commands.index(REVERSAL_CALL) < commands.rindex(
+            UPGRADE_CALL
+        ), name
 
 
 def test_the_gate_counts_the_administrators_after_migrating():
@@ -2956,17 +3013,55 @@ def test_each_runtime_advisory_is_recorded_where_the_gate_says(advisory):
 
 
 @pytest.mark.parametrize("advisory", DEVELOPMENT_ADVISORIES)
-def test_each_development_advisory_is_recorded_in_its_manifest(advisory):
-    """The development register points at the manifest that declares it."""
+def test_each_development_advisory_is_recorded_in_the_register(advisory):
+    """Each suppressed development advisory resolves in the register.
+
+    The manifest points at the register rather than enumerating the set a
+    second time, so the register is where a reader following the gate's
+    comment has to find the entry.
+    """
     assert advisory in CI_WORKFLOW.read_text(encoding="utf-8")
-    assert advisory in DEVELOPMENT_MANIFEST.read_text(encoding="utf-8")
+    assert advisory in RESIDUAL_RISK_REGISTER.read_text(encoding="utf-8")
+
+
+def test_the_audit_instrument_has_a_manifest_no_audit_reads():
+    """The instrument is declared apart from the manifests it audits.
+
+    Declared beside the test and lint tooling, pip-audit's own dependency
+    tree -- CacheControl, and through it msgpack, requests, urllib3 and
+    filelock -- was reported when that manifest was audited, so the
+    scanner's supply chain was accepted as this project's residual risk.
+    """
+    assert AUDIT_MANIFEST.is_file(), AUDIT_MANIFEST
+    instrument = AUDIT_MANIFEST.read_text(encoding="utf-8")
+    development = DEVELOPMENT_MANIFEST.read_text(encoding="utf-8")
+    runtime = (
+        REPO_ROOT / "backend" / "requirements.txt"
+    ).read_text(encoding="utf-8")
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    pinned = [
+        line.strip()
+        for line in instrument.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert pinned == ["pip-audit==2.9.0"], pinned
+
+    for other in (development, runtime):
+        for line in other.splitlines():
+            assert not line.strip().startswith("pip-audit"), line
+
+    assert "pip install -r backend/requirements-audit.txt" in workflow
+    assert "pip-audit --strict -r backend/requirements-audit.txt" not in (
+        workflow
+    )
 
 
 def test_the_two_advisory_registers_are_suppressed_separately():
-    """Each manifest is audited by its own step, under its own comment.
+    """Each audited manifest has its own step, under its own comment.
 
-    One step suppressing all fourteen identifiers would point a reader at
-    a single authority that documents only half of them.
+    One step suppressing every identifier would point a reader at a single
+    authority that documents only some of them.
     """
     steps = _ci_job()["steps"]
     audits = [
@@ -2993,12 +3088,21 @@ def test_the_two_advisory_registers_are_suppressed_separately():
     for advisory in DEVELOPMENT_ADVISORIES:
         assert advisory in development[0]["run"], advisory
         assert advisory not in runtime[0]["run"], advisory
-    # Each comment names the authority for its own set and only that one.
-    # Pointing the development set at the residual-risk register is the
-    # misdirection L-04 named: that document records the runtime seven,
-    # so a reader following the reference finds seven entries missing.
+    # Each comment names the register section that covers its own set. The
+    # register carries a section per audited manifest, so naming the
+    # document is not enough on its own: a comment that named the document
+    # while the document covered only the other manifest was the
+    # misdirection L-04 reported, and the section name is what resolves it.
     assert RESIDUAL_RISK_REGISTER.name in runtime[0]["run"]
-    assert RESIDUAL_RISK_REGISTER.name not in development[0]["run"]
+    assert "Runtime register" in runtime[0]["run"]
+    assert "Development register" in development[0]["run"]
+
+    # The register itself has to carry the section those comments name,
+    # and the identifier the development step suppresses.
+    register = RESIDUAL_RISK_REGISTER.read_text(encoding="utf-8")
+    assert DEVELOPMENT_REGISTER_HEADING in register
+    for advisory in DEVELOPMENT_ADVISORIES:
+        assert advisory in register, advisory
     assert DEVELOPMENT_MANIFEST.name in development[0]["run"]
     assert DEVELOPMENT_MANIFEST.name not in runtime[0]["run"]
 

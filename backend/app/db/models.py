@@ -1,21 +1,13 @@
 from sqlalchemy import (
     Column, Index, Integer, String, Float, DateTime, ForeignKey, Numeric,
-    UniqueConstraint, func, text,
+    UniqueConstraint, event, func, text,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
 
-#: Names of the non-unique indexes these models declare, each supporting
-#: a predicate the application issues. Revision
-#: ``0003_add_workload_indexes`` creates the same set under the same
-#: names, so the mapped tables and the migrated tables agree.
-#:
-#: A column already covered by a uniqueness -- ``users.email``,
-#: ``subscriptions.paypal_order_id`` and
-#: ``webhook_events.transmission_id`` -- carries an index from that
-#: uniqueness and is not listed again here.
+#: Non-unique index names supporting application query predicates.
 WORKLOAD_INDEX_NAMES = (
     "ix_filters_user_id_id",
     "ix_zip_codes_filter_id",
@@ -24,6 +16,36 @@ WORKLOAD_INDEX_NAMES = (
     "ix_subscriptions_user_id_plan_id_status",
     "ix_listings_zillow_url",
 )
+
+#: Statuses marking a subscription row as an open payment intent: a
+#: charge its owner may still complete. These mirror ``STATUS_PENDING``
+#: and ``STATUS_FAILED`` in ``backend.app.core.plans``, which this module
+#: does not import so that it keeps importing nothing from the
+#: application. A contract test pins the two sets to each other.
+OPEN_INTENT_STATUSES = ("pending", "failed")
+
+#: Name of the partial unique index holding an owner to at most one open
+#: payment intent per plan. Revision ``0004_add_open_intent_uniqueness``
+#: creates the same index under the same name over the same predicate, so
+#: the mapped table and the migrated table carry the same uniqueness.
+OPEN_INTENT_UNIQUE_INDEX_NAME = "uq_subscriptions_open_intent_per_plan"
+
+#: The ``WHERE`` clause restricting ``OPEN_INTENT_UNIQUE_INDEX_NAME`` to
+#: rows in the open window. A row whose status records a settlement or a
+#: reversal, and a row whose entitlement window has been closed, falls
+#: outside the predicate and carries no uniqueness from it.
+OPEN_INTENT_INDEX_PREDICATE = "status IN ({0}) AND end_date IS NULL".format(
+    ", ".join("'{0}'".format(status) for status in OPEN_INTENT_STATUSES)
+)
+
+#: Number of rows :class:`LoginAttemptSlot` holds. The table is this size
+#: and no other: revision ``0005_add_login_attempt_slots`` seeds one row
+#: per bucket in ``range(LOGIN_ATTEMPT_SLOT_COUNT)``, and every login
+#: refusal updates one of those rows. The migration and
+#: :func:`backend.app.core.security.login_attempt_slot` read this same
+#: value, so a bucket the application computes always names a row that
+#: exists.
+LOGIN_ATTEMPT_SLOT_COUNT = 1024
 
 
 class User(Base):
@@ -64,12 +86,8 @@ class Listing(Base):
     bathrooms = Column(Integer)
     available_date = Column(DateTime)
     street_address = Column(String)
-    # Provider address a scheduled ingestion pass reconciles a record
-    # against. No uniqueness is declared over it, and revision 0001
-    # declares none either, so the mapped table and the migrated table
-    # agree: two rows may carry one address, and reconciliation is the
-    # query-then-write in
-    # backend/app/tasks/listing_updater.py rather than a constraint.
+    # Provider address used by scheduled reconciliation; duplicates are
+    # allowed.
     zillow_url = Column(String)
 
 
@@ -126,9 +144,6 @@ class Criteria(Base):
 
 class Subscription(Base):
     __tablename__ = 'subscriptions'
-    # The uniqueness over the provider order identifier is declared
-    # under the name revision 0001 gives it, so the mapped table and the
-    # migrated table carry the same constraint under the same name.
     # The two indexes support the predicates the entitlement decision
     # and the subscription routes issue: the owner with the status and
     # the entitlement window, and the owner with the plan and the status.
@@ -147,6 +162,14 @@ class Subscription(Base):
             "user_id",
             "plan_id",
             "status",
+        ),
+        Index(
+            OPEN_INTENT_UNIQUE_INDEX_NAME,
+            "user_id",
+            "plan_id",
+            unique=True,
+            postgresql_where=text(OPEN_INTENT_INDEX_PREDICATE),
+            sqlite_where=text(OPEN_INTENT_INDEX_PREDICATE),
         ),
     )
 
@@ -167,11 +190,54 @@ class Subscription(Base):
     user = relationship("User", back_populates="subscriptions")
 
 
+class LoginAttemptSlot(Base):
+    __tablename__ = 'login_attempt_slots'
+    # A fixed set of LOGIN_ATTEMPT_SLOT_COUNT rows, seeded by revision
+    # 0005 and never added to or removed from at runtime. A refused login
+    # takes a write lock on the one row its bucket names, updates it and
+    # commits, so the refusal branches that hold no account row still
+    # perform one locking read, one write and one commit.
+    #
+    # The bucket is a keyed digest of the submitted address, computed by
+    # backend.app.core.security.login_attempt_slot. No address, no
+    # credential and no account identifier is stored here: a row records
+    # only how many refusals landed on its bucket and when the last one
+    # did, and several addresses may share a bucket.
+
+    bucket = Column(Integer, primary_key=True, autoincrement=False)
+    attempts = Column(Integer, nullable=False, server_default="0")
+    # Instant the most recent refusal landed on this bucket, held with its
+    # offset. Null until one has.
+    observed_at = Column(
+        DateTime(timezone=True), nullable=True, server_default=text("NULL")
+    )
+
+
+@event.listens_for(LoginAttemptSlot.__table__, "after_create")
+def _seed_login_attempt_slots(target, connection, **kwargs) -> None:
+    """Seed one row per bucket as part of creating the table.
+
+    The full set of ``LOGIN_ATTEMPT_SLOT_COUNT`` rows is part of the
+    table's definition: the application updates one of them on a refused
+    login and never inserts one, so a bucket it computes has to name a row
+    that exists.
+
+    Revision ``0005_add_login_attempt_slots`` seeds this same set for a
+    schema built by migration. This listener seeds it for a schema built
+    by ``Base.metadata.create_all``, so both ways of building the schema
+    leave the same rows in place.
+    """
+    connection.execute(
+        target.insert(),
+        [
+            {"bucket": bucket, "attempts": 0}
+            for bucket in range(LOGIN_ATTEMPT_SLOT_COUNT)
+        ],
+    )
+
+
 class WebhookEvent(Base):
     __tablename__ = 'webhook_events'
-    # The uniqueness over the delivery identifier is declared under the
-    # name revision 0001 gives it, so the mapped table and the migrated
-    # table carry the same constraint under the same name.
     __table_args__ = (
         UniqueConstraint(
             'transmission_id', name='uq_webhook_events_transmission_id'

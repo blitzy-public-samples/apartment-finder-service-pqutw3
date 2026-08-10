@@ -64,6 +64,7 @@ from backend.app.services import zillow_service as zillow_service_module
 from backend.app.services.email_service import send_email
 from backend.app.services.zillow_service import (
     CONTENT_LENGTH_HEADER,
+    ListingProviderError,
     fetch_listings,
 )
 from backend.app.tasks import (
@@ -77,101 +78,62 @@ EMAIL_MODULE = 'backend.app.services.email_service'
 PLAN_ID = 'premium_monthly'
 ORDER_ID = 'ORDER-SERVICE-1'
 
-#: Path of the order the contract cases address.
 ORDER_PATH = PAYPAL_ORDERS_PATH + '/' + ORDER_ID
 
-#: Grant the contract cases present.
 STAND_IN_GRANT = 'contract-case-access-token'
 APPROVAL_URL = 'https://www.sandbox.paypal.com/checkoutnow?token=1'
 
-#: Header the listing provider credential is carried in.
 API_KEY_HEADER = 'X-API-Key'
 
-#: Query parameter name the cases below assert the credential is absent
-#: from, by name and by value.
 LEGACY_KEY_PARAM = 'api_key'
 
-#: Target the SendGrid package transmits a message to.
 SENDGRID_SEND_URL = 'https://api.sendgrid.com/v3/mail/send'
 
-#: Segments the package appends to reach that target. The service
-#: configures the timeout on the root client and the package copies it
-#: onto each chained sub-client it builds to walk them.
 SENDGRID_URL_PATH = ['mail', 'send']
 
-#: Address the delivery cases send to.
 RECIPIENT_EMAIL = 'test@example.com'
 
-#: Subject the delivery cases send.
 EMAIL_SUBJECT = 'Test Notification'
 
-#: Body the delivery cases send.
 EMAIL_CONTENT = '<p>This is a test notification.</p>'
 
-#: Status the provider reports for an accepted message.
 EMAIL_ACCEPTED_STATUS = 202
 
-#: The only status the service reports as a delivery.
 EMAIL_DELIVERED_STATUSES = (EMAIL_ACCEPTED_STATUS,)
 
-#: Statuses in the success range that the Mail Send endpoint does not
-#: report for a queued message. Reaching one means the request reached
-#: something other than that endpoint, so the service reports a failure.
 EMAIL_UNEXPECTED_SUCCESS_STATUSES = (200, 201, 203, 204)
 
-#: Status the rejection case reports.
 EMAIL_REJECTED_STATUS = 400
 
-#: Status the unreachable case reports.
 EMAIL_UNAVAILABLE_STATUS = 503
 
-#: Body the rejection case carries.
 EMAIL_REJECTION_BODY = b'{"errors":[{"message":"bad request"}]}'
 
-#: Message the service records when a delivery fails. Read from the
-#: module, so a message the module changes cannot leave these cases
-#: silently matching nothing.
 EMAIL_FAILURE_MESSAGE = email_service_module.EMAIL_FAILURE_MESSAGE
 
-#: Reason the service records beside that message.
 REASON_SEND_FAILED = email_service_module.REASON_SEND_FAILED
 
-#: Detail carried by the bound transport failure below. It is plain
-#: prose naming no credential and no key.
 PROVIDER_UNREACHABLE_DETAIL = 'the listing provider was unreachable'
 
-#: Correlation identifier the provider cases bind before calling.
 BOUND_REQUEST_ID = 'caller0trace0provider1'
 
-#: Address every notification case sends to.
 EMAIL_RECIPIENT = 'notified@example.com'
 
-#: Body every notification case sends.
 EMAIL_BODY = 'Three listings match your saved search.'
 
-#: Failure detail quoting the notification credential in free prose,
-#: with no key name beside it.
 EMAIL_FAILURE_DETAIL = (
     'the provider rejected the credential '
     + settings.SENDGRID_API_KEY
 )
 
-#: Failure detail naming the notification credential beside a
-#: credential-shaped key.
 EMAIL_KEYED_FAILURE_DETAIL = (
     'unauthorized: api_key=' + settings.SENDGRID_API_KEY
 )
 
-#: Exactly what a failed send wrote to standard output before its
-#: failure path was routed through the structured logger.
 BARE_PRINT_SIGNATURE = EMAIL_FAILURE_DETAIL
 
-#: Longest the assertions below wait for the queue-backed log listener
-#: to write every record one send produced.
 LOG_DRAIN_TIMEOUT = 5.0
 
-#: Modules whose bare output calls were replaced by the structured
-#: logger. None of them may write to a stream directly.
 BARE_OUTPUT_FREE_MODULES = (
     email_service_module,
     zillow_service_module,
@@ -180,7 +142,6 @@ BARE_OUTPUT_FREE_MODULES = (
 
 
 def _send_failing_with(detail):
-    """Runs one send whose provider construction raises ``detail``."""
     with patch(
         EMAIL_MODULE + '.SendGridAPIClient',
         side_effect=RuntimeError(detail),
@@ -239,7 +200,6 @@ def _provider_response(payload):
 
 
 class _LogCollector(logging.Handler):
-    """Holds every record the application logger emits while attached."""
 
     def __init__(self):
         super().__init__(level=logging.DEBUG)
@@ -282,7 +242,6 @@ def _collecting_application_logs():
 
 
 class _ProviderRecorder:
-    """Answers provider calls with ``responder`` and records each one."""
 
     def __init__(self, responder):
         self._responder = responder
@@ -294,7 +253,6 @@ class _ProviderRecorder:
 
     @property
     def sent(self):
-        """Returns the one request the provider received."""
         if len(self.requests) != 1:
             raise AssertionError(
                 "expected one provider call, got %d" % len(self.requests)
@@ -323,7 +281,6 @@ def _provider(responder):
 
 
 def _answering(payload, status_code=200):
-    """Returns a responder answering with ``payload`` as a JSON body."""
 
     def responder(request):
         return httpx.Response(status_code, json=payload)
@@ -367,7 +324,6 @@ def _answering_in_chunks(chunk, count, produced):
 
 
 def _raising(error_factory):
-    """Returns a responder that fails the way the provider would."""
 
     def responder(request):
         raise error_factory(request)
@@ -376,10 +332,169 @@ def _raising(error_factory):
 
 
 def _fetch(zip_codes=('12345',), filters=None):
-    """Runs one provider fetch with the module's own entry point."""
     return fetch_listings(
         zip_codes=list(zip_codes), filters=dict(filters or {})
     )
+
+
+def _refused(case, reason, zip_codes=('12345',), filters=None):
+    """Runs one fetch that must be refused, and returns the error.
+
+    The refusal is asserted to be a ``ListingProviderError`` carrying
+    ``reason``, so the case states which cause it expects rather than
+    only that nothing came back. An empty list is never accepted here:
+    that value means the provider answered and reported no listings.
+    """
+    with case.assertRaises(ListingProviderError) as raised:
+        _fetch(zip_codes=zip_codes, filters=filters)
+    case.assertEqual(raised.exception.reason, reason)
+    return raised.exception
+
+
+class TestTheDeclaredListingProviderContract(unittest.TestCase):
+    """The listing adapter's wire contract, and how it fails.
+
+    **These cases are written against the contract this repository
+    declares, not against one verified with a listing provider.** The
+    payloads below are the shape
+    ``zillow_service.DECLARED_PROVIDER_CONTRACT`` describes; no provider
+    specification was available to derive them from, and
+    ``docs/security/RESIDUAL_RISK.md`` carries that as an open item. What
+    they therefore establish is not that the adapter matches a provider,
+    but that it matches its own declaration -- and, more importantly, that
+    a response which does **not** match that declaration is reported as a
+    failure naming the element that did not match, rather than read as a
+    corpus with nothing in it. That is the property that makes a contract
+    difference discoverable on the first live call.
+    """
+
+    def test_the_whole_declared_contract_is_enumerable(self):
+        """Every element of the contract is reachable from one object.
+
+        An operator re-pointing this adapter at a provider whose contract
+        is known has one place to look, and a change to any element is
+        visible here rather than buried in a call site.
+        """
+        contract = zillow_service.DECLARED_PROVIDER_CONTRACT
+
+        self.assertEqual(
+            set(contract),
+            {
+                'method',
+                'credential_header',
+                'zip_codes_parameter',
+                'listings_collection_key',
+                'record_fields',
+            },
+        )
+        self.assertEqual(contract['method'], 'GET')
+        self.assertEqual(contract['credential_header'], API_KEY_HEADER)
+        self.assertEqual(
+            contract['zip_codes_parameter'],
+            zillow_service.ZIP_CODES_PARAMETER,
+        )
+        self.assertEqual(
+            contract['listings_collection_key'],
+            zillow_service.LISTINGS_COLLECTION_KEY,
+        )
+        self.assertEqual(
+            contract['record_fields'],
+            zillow_service.PROVIDER_FIELD_SOURCES,
+        )
+        with self.assertRaises(TypeError):
+            contract['method'] = 'POST'
+
+    def test_the_request_is_assembled_from_the_declared_contract(self):
+        """The sent request names the declared parameter and header."""
+        contract = zillow_service.DECLARED_PROVIDER_CONTRACT
+
+        with _provider(_answering({'listings': []})) as recorder:
+            _fetch(zip_codes=('11111', '22222'))
+
+        sent = recorder.sent
+        self.assertEqual(sent.method, contract['method'])
+        self.assertIn(contract['credential_header'], sent.headers)
+        self.assertEqual(
+            sent.url.params[contract['zip_codes_parameter']],
+            '11111,22222',
+        )
+
+    def test_a_provider_reporting_no_listings_is_not_a_failure(self):
+        """An empty collection is a result the pass completes on."""
+        key = zillow_service.LISTINGS_COLLECTION_KEY
+
+        with _provider(_answering({key: []})):
+            self.assertEqual(_fetch(), [])
+
+    def test_a_body_that_is_not_an_object_names_that_element(self):
+        with _provider(_answering(['not', 'an', 'object'])):
+            _refused(self, zillow_service.REASON_BODY_NOT_OBJECT)
+
+    def test_a_collection_that_is_not_a_list_names_that_element(self):
+        key = zillow_service.LISTINGS_COLLECTION_KEY
+
+        with _provider(_answering({key: {'unexpected': 'shape'}})):
+            _refused(self, zillow_service.REASON_COLLECTION_NOT_LIST)
+
+    def test_a_body_carrying_no_collection_names_that_element(self):
+        """A missing key is a contract difference, not an empty corpus.
+
+        This is the shape a provider with a different response contract
+        answers with, and reading it as zero listings is what made an
+        unverified contract indistinguishable from a quiet corpus.
+        """
+        with _collecting_application_logs() as collector:
+            with _provider(_answering({'results': [{'id': 1}]})):
+                _refused(self, zillow_service.REASON_COLLECTION_NOT_LIST)
+
+        contexts = _contexts(collector)
+        self.assertIn(
+            zillow_service.REASON_COLLECTION_NOT_LIST,
+            [context.get('reason') for context in contexts],
+        )
+
+    def test_an_endpoint_outside_the_allowlist_names_that_reason(self):
+        """A refusal to call at all is a failure, not an empty corpus."""
+        with patch.object(
+            zillow_service,
+            'ZILLOW_API_URL',
+            'https://attacker.invalid/collect',
+        ):
+            with _provider(_answering({'listings': []})) as recorder:
+                _refused(
+                    self, zillow_service.REASON_ENDPOINT_NOT_ALLOWED
+                )
+
+        self.assertEqual(recorder.requests, [])
+
+    def test_every_refusal_reason_is_distinct(self):
+        """No two causes share an identifier, so a query separates them."""
+        reasons = [
+            zillow_service.REASON_ENDPOINT_NOT_ALLOWED,
+            zillow_service.REASON_CHUNK_TOO_LARGE,
+            zillow_service.REASON_REQUEST_FAILED,
+            zillow_service.REASON_RESPONSE_TOO_LARGE,
+            zillow_service.REASON_BODY_NOT_DECODABLE,
+            zillow_service.REASON_BODY_NOT_OBJECT,
+            zillow_service.REASON_COLLECTION_NOT_LIST,
+        ]
+
+        self.assertEqual(len(set(reasons)), len(reasons))
+        for reason in reasons:
+            self.assertTrue(reason)
+
+    def test_a_refusal_is_not_confusable_with_a_mapping_failure(self):
+        """The two error kinds are separate types, caught separately."""
+        self.assertFalse(
+            issubclass(
+                ListingProviderError, zillow_service.ListingMappingError
+            )
+        )
+        self.assertFalse(
+            issubclass(
+                zillow_service.ListingMappingError, ListingProviderError
+            )
+        )
 
 
 class TestZillowService(unittest.TestCase):
@@ -399,7 +514,6 @@ class TestZillowService(unittest.TestCase):
         self.assertEqual(listings[1]['price'], 250000)
 
     def test_api_key_travels_in_a_request_header(self):
-        """The credential is carried in the provider request's headers."""
         with _provider(_answering({'listings': []})) as recorder:
             _fetch()
 
@@ -409,7 +523,6 @@ class TestZillowService(unittest.TestCase):
         )
 
     def test_api_key_is_absent_from_the_request_target(self):
-        """The credential appears nowhere in the sent target."""
         with _provider(_answering({'listings': []})) as recorder:
             _fetch()
 
@@ -418,12 +531,6 @@ class TestZillowService(unittest.TestCase):
         )
 
     def test_the_bound_request_identifier_is_sent_to_the_provider(self):
-        """The provider receives the identifier the local record carries.
-
-        Without it a provider-side record can only be matched to a local
-        one by timestamp, which is a guess. Sending it makes the join
-        exact from either side.
-        """
         token = bind_request_id('req-corr-1')
         try:
             with _provider(_answering({'listings': []})) as recorder:
@@ -437,11 +544,6 @@ class TestZillowService(unittest.TestCase):
         )
 
     def test_no_correlation_header_is_sent_when_none_is_bound(self):
-        """An unbound call sends no empty identifier.
-
-        A blank header would be indistinguishable from a real one on the
-        provider's side, so the header is omitted instead.
-        """
         token = bind_request_id(None)
         try:
             with _provider(_answering({'listings': []})) as recorder:
@@ -455,7 +557,6 @@ class TestZillowService(unittest.TestCase):
         )
 
     def test_the_correlation_header_carries_no_credential(self):
-        """The identifier is not a place a secret can leak into."""
         token = bind_request_id('req-corr-2')
         try:
             with _provider(_answering({'listings': []})) as recorder:
@@ -469,15 +570,6 @@ class TestZillowService(unittest.TestCase):
         self.assertNotIn(settings.ZILLOW_API_KEY, sent)
 
     def test_the_configured_endpoint_is_not_a_reserved_example_host(self):
-        """A deployed configuration cannot address the shipped default.
-
-        The endpoint this repository ships is a reserved documentation
-        domain, which stands in for a provider contract this repository
-        never verified against a real service. The settings refuse it
-        outside a local environment, so a deployment must name a real
-        endpoint before any call is made. This asserts that refusal from
-        the service's own side.
-        """
         from backend.app.core.config import (
             LOCAL_ENVIRONMENT,
             Settings,
@@ -493,11 +585,6 @@ class TestZillowService(unittest.TestCase):
         self.assertEqual(settings.ENVIRONMENT, LOCAL_ENVIRONMENT)
 
     def test_api_key_is_absent_from_the_query_string(self):
-        """The credential appears in no query parameter, name or value.
-
-        The parameter name the credential previously travelled under is
-        asserted absent alongside the value itself.
-        """
         with _provider(_answering({'listings': []})) as recorder:
             _fetch()
 
@@ -507,7 +594,6 @@ class TestZillowService(unittest.TestCase):
         self.assertNotIn(LEGACY_KEY_PARAM, query)
 
     def test_the_search_values_reach_the_provider(self):
-        """The caller's search terms are sent, and only sent."""
         with _provider(_answering({'listings': []})) as recorder:
             _fetch(zip_codes=('90210', '10001'), filters={'max_rent': 3000})
 
@@ -518,7 +604,6 @@ class TestZillowService(unittest.TestCase):
         self.assertIn('3000', query)
 
     def test_every_request_carries_a_timeout(self):
-        """The provider call is bounded by the configured timeout."""
         with _provider(_answering({'listings': []})) as recorder:
             _fetch()
 
@@ -529,7 +614,6 @@ class TestZillowService(unittest.TestCase):
         self.assertGreater(settings.HTTP_TIMEOUT_SECONDS, 0)
 
     def test_the_client_factory_carries_the_configured_timeout(self):
-        """The client the service builds is bounded before any call."""
         with zillow_service._client() as client:
             self.assertEqual(
                 client.timeout.read, settings.HTTP_TIMEOUT_SECONDS
@@ -539,12 +623,6 @@ class TestZillowService(unittest.TestCase):
             )
 
     def test_a_chunk_past_the_configured_size_is_refused_unsent(self):
-        """More postal codes than one request accepts issues no call.
-
-        The caller chunks to the same setting, so an oversized list is a
-        caller defect rather than provider input, and it is refused
-        before a request is assembled.
-        """
         ceiling = int(settings.INGESTION_ZIP_CODE_CHUNK)
         oversized = [
             '9{0:04d}'.format(index) for index in range(ceiling + 1)
@@ -552,7 +630,11 @@ class TestZillowService(unittest.TestCase):
 
         with _collecting_application_logs() as collector:
             with _provider(_answering({'listings': []})) as recorder:
-                self.assertEqual(_fetch(zip_codes=oversized), [])
+                _refused(
+                    self,
+                    zillow_service.REASON_CHUNK_TOO_LARGE,
+                    zip_codes=oversized,
+                )
 
         self.assertEqual(recorder.requests, [])
         self.assertIn(
@@ -560,7 +642,6 @@ class TestZillowService(unittest.TestCase):
         )
 
     def test_a_chunk_at_the_configured_size_is_sent(self):
-        """The configured size is the largest chunk accepted."""
         ceiling = int(settings.INGESTION_ZIP_CODE_CHUNK)
         allowed = ['9{0:04d}'.format(index) for index in range(ceiling)]
 
@@ -570,7 +651,6 @@ class TestZillowService(unittest.TestCase):
         self.assertEqual(len(recorder.requests), 1)
 
     def test_a_refused_chunk_carries_no_credential_into_the_record(self):
-        """The refusal names counts only, never the key or the codes."""
         ceiling = int(settings.INGESTION_ZIP_CODE_CHUNK)
         oversized = [
             '9{0:04d}'.format(index) for index in range(ceiling + 1)
@@ -578,12 +658,17 @@ class TestZillowService(unittest.TestCase):
 
         with _collecting_application_logs() as collector:
             with _provider(_answering({'listings': []})):
-                _fetch(zip_codes=oversized)
+                _refused(
+                    self,
+                    zillow_service.REASON_CHUNK_TOO_LARGE,
+                    zip_codes=oversized,
+                )
 
         for line in _rendered_log_lines(collector):
             self.assertNotIn(settings.ZILLOW_API_KEY, line)
 
-    def test_provider_failure_yields_an_empty_list(self):
+    def test_provider_failure_is_raised_rather_than_returned(self):
+        """A transport failure reaches the caller as a failure."""
         with _provider(
             _raising(
                 lambda request: httpx.ConnectError(
@@ -591,19 +676,18 @@ class TestZillowService(unittest.TestCase):
                 )
             )
         ):
-            self.assertEqual(_fetch(), [])
+            _refused(self, zillow_service.REASON_REQUEST_FAILED)
 
-    def test_a_rejected_status_yields_an_empty_list(self):
-        """A status the provider refuses with contributes nothing."""
+    def test_a_rejected_status_is_raised_rather_than_returned(self):
+        """A status the provider refuses with is not an empty corpus."""
         with _provider(_answering({'listings': []}, status_code=503)):
-            self.assertEqual(_fetch(), [])
+            _refused(self, zillow_service.REASON_REQUEST_FAILED)
 
-    def test_an_undecodable_body_yields_an_empty_list(self):
+    def test_an_undecodable_body_is_raised_rather_than_returned(self):
         with _provider(_answering_bytes(b'not json at all')):
-            self.assertEqual(_fetch(), [])
+            _refused(self, zillow_service.REASON_BODY_NOT_DECODABLE)
 
     def test_a_declared_length_past_the_cap_is_refused_unread(self):
-        """A body announcing itself as oversized is never read."""
         cap = zillow_service.MAX_PROVIDER_RESPONSE_BYTES
         with _collecting_application_logs() as collector:
             with _provider(
@@ -611,7 +695,9 @@ class TestZillowService(unittest.TestCase):
                     b'{"listings": [{"id": 1}]}', declared=cap + 1
                 )
             ):
-                self.assertEqual(_fetch(), [])
+                _refused(
+                    self, zillow_service.REASON_RESPONSE_TOO_LARGE
+                )
 
         self.assertIn(
             zillow_service.REASON_RESPONSE_TOO_LARGE,
@@ -620,7 +706,6 @@ class TestZillowService(unittest.TestCase):
         self.assertIn(cap + 1, _measured_sizes(collector))
 
     def test_a_body_past_the_cap_stops_being_read(self):
-        """An undeclared oversized body is abandoned mid-stream."""
         cap = zillow_service.MAX_PROVIDER_RESPONSE_BYTES
         chunk = b'x' * 65536
         produced = []
@@ -628,19 +713,18 @@ class TestZillowService(unittest.TestCase):
             with _provider(
                 _answering_in_chunks(chunk, 64, produced)
             ):
-                self.assertEqual(_fetch(), [])
+                _refused(
+                    self, zillow_service.REASON_RESPONSE_TOO_LARGE
+                )
 
         self.assertIn(
             zillow_service.REASON_RESPONSE_TOO_LARGE,
             _reasons(collector),
         )
-        # The read stopped as soon as the accumulated bytes passed the
-        # cap, rather than draining the whole body.
         self.assertLess(len(produced) * len(chunk), 2 * cap)
         self.assertGreater(len(produced) * len(chunk), cap)
 
     def test_a_body_at_the_cap_is_accepted(self):
-        """The cap is the largest body accepted, not the first refused."""
         cap = zillow_service.MAX_PROVIDER_RESPONSE_BYTES
         entry = {'id': 1, 'address': ''}
         empty = len(json.dumps({'listings': [entry]}).encode('utf-8'))
@@ -654,7 +738,6 @@ class TestZillowService(unittest.TestCase):
         self.assertEqual(len(listings), 1)
 
     def test_more_listings_than_the_cap_are_truncated(self):
-        """A response is capped at the accepted number of listings."""
         limit = zillow_service.MAX_PROVIDER_LISTINGS
         payload = {
             'listings': [{'id': index} for index in range(limit + 5)]
@@ -669,20 +752,12 @@ class TestZillowService(unittest.TestCase):
         )
 
     def test_listings_at_the_cap_are_all_returned(self):
-        """The listing cap is a maximum, not a threshold."""
         limit = zillow_service.MAX_PROVIDER_LISTINGS
         payload = {'listings': [{'id': index} for index in range(limit)]}
         with _provider(_answering(payload)):
             self.assertEqual(len(_fetch()), limit)
 
     def test_no_search_value_reaches_a_log_record(self):
-        """No postal code or filter value reaches a rendered line.
-
-        The failure the HTTP library raises names the full request
-        target, which carries every search value the caller supplied. The
-        record emitted for it carries the exception's class and nothing
-        else, and no traceback is attached.
-        """
         postal_code = '90210'
         neighbourhood = 'PRIVATEFILTERVALUE'
         target = '%s?zip_codes=%s&neighborhood=%s' % (
@@ -699,14 +774,17 @@ class TestZillowService(unittest.TestCase):
                     )
                 )
             ):
-                self.assertEqual(
-                    _fetch(
-                        zip_codes=(postal_code,),
-                        filters={'neighborhood': neighbourhood},
-                    ),
-                    [],
+                refusal = _refused(
+                    self,
+                    zillow_service.REASON_REQUEST_FAILED,
+                    zip_codes=(postal_code,),
+                    filters={'neighborhood': neighbourhood},
                 )
 
+        # The raised message travels to the caller, so it is held to the
+        # same rule as the record: it names neither search value.
+        self.assertNotIn(postal_code, str(refusal))
+        self.assertNotIn(neighbourhood, str(refusal))
         self.assertTrue(collector.records)
         for record in collector.records:
             self.assertIsNone(record.exc_info)
@@ -717,7 +795,6 @@ class TestZillowService(unittest.TestCase):
             self.assertNotIn(settings.ZILLOW_API_URL, line)
 
     def test_a_failure_is_recorded_as_its_class(self):
-        """A refused call stays observable without its message."""
         with _collecting_application_logs() as collector:
             with _provider(
                 _raising(
@@ -728,7 +805,7 @@ class TestZillowService(unittest.TestCase):
                     )
                 )
             ):
-                self.assertEqual(_fetch(), [])
+                _refused(self, zillow_service.REASON_REQUEST_FAILED)
 
         contexts = _contexts(collector)
         self.assertTrue(contexts)
@@ -736,12 +813,6 @@ class TestZillowService(unittest.TestCase):
         self.assertEqual(contexts[0]['exception_module'], 'httpx')
 
     def test_api_key_is_absent_from_every_log_record(self):
-        """The credential reaches no rendered log line.
-
-        The provider failure quotes the credential in free prose, with no
-        key name beside it, which is the shape no key-based rule would
-        catch.
-        """
         key = settings.ZILLOW_API_KEY
         with _collecting_application_logs() as collector:
             with _provider(
@@ -752,18 +823,16 @@ class TestZillowService(unittest.TestCase):
                     )
                 )
             ):
-                self.assertEqual(_fetch(), [])
+                refusal = _refused(
+                    self, zillow_service.REASON_REQUEST_FAILED
+                )
 
+        self.assertNotIn(key, str(refusal))
         self.assertTrue(collector.records)
         for line in _rendered_log_lines(collector):
             self.assertNotIn(key, line)
 
     def test_the_credential_is_registered_for_replacement(self):
-        """The credential is removed from any text carrying it.
-
-        Nothing in this module renders it. The registry covers every
-        other component that might, provider prose included.
-        """
         key = settings.ZILLOW_API_KEY
         rendered = redact('provider rejected ' + key + ' upstream')
 
@@ -801,7 +870,6 @@ def _contexts(collector):
 
 
 def _reasons(collector):
-    """Returns the reason each collected record names."""
     return [
         context['reason']
         for context in _contexts(collector)
@@ -810,7 +878,6 @@ def _reasons(collector):
 
 
 def _measured_sizes(collector):
-    """Returns the body size each collected record measured."""
     return [
         context['response_bytes']
         for context in _contexts(collector)
@@ -819,39 +886,22 @@ def _measured_sizes(collector):
 
 
 class _SendGridResponse(object):
-    """Stands in for the response ``python_http_client`` reads.
-
-    The three members the package's ``Response`` reads are provided, so
-    the value returned here travels the same path a real delivery does.
-    """
 
     def __init__(self, status_code=EMAIL_ACCEPTED_STATUS, body=b''):
         self.status_code = status_code
         self.body = body
 
     def getcode(self):
-        """Returns the status the provider reported."""
         return self.status_code
 
     def read(self):
-        """Returns the body the provider returned."""
         return self.body
 
     def info(self):
-        """Returns the headers the provider returned."""
         return {}
 
 
 class _SendGridBoundary(object):
-    """Records the request the SendGrid package would transmit.
-
-    The recorder replaces ``python_http_client.client.Client._make_request``,
-    the seam that package documents as the one to stand in for, so the
-    request asserted on is the one the package built: its method, target,
-    headers and serialised body. ``client_timeout`` is the timeout the
-    leaf client carries, which the package copies from the client the
-    service configured onto each chained sub-client it builds.
-    """
 
     def __init__(self, error=None, status_code=EMAIL_ACCEPTED_STATUS):
         self.error = error
@@ -859,7 +909,6 @@ class _SendGridBoundary(object):
         self.calls = []
 
     def install(self):
-        """Returns the patch that installs this recorder."""
         boundary = self
 
         def _make_request(client, opener, request, timeout=None):
@@ -879,22 +928,13 @@ class _SendGridBoundary(object):
         return patch.object(HttpClient, '_make_request', _make_request)
 
     def one_call(self):
-        """Returns the single recorded request."""
         assert len(self.calls) == 1, self.calls
         return self.calls[0]
 
 
 class TestEmailService(unittest.TestCase):
-    """Delivery through the pinned SendGrid package's own boundary."""
 
     def test_send_email_transmits_the_documented_request(self):
-        """The transmitted request is the one the provider documents.
-
-        The method, target, authorization, content type and serialised
-        message are asserted, together with the timeout the leaf client
-        carries -- which the package copies onto every chained sub-client,
-        so it is the timeout the delivery would have been bounded by.
-        """
         boundary = _SendGridBoundary()
 
         with boundary.install():
@@ -937,7 +977,6 @@ class TestEmailService(unittest.TestCase):
         )
 
     def test_send_email_reports_a_status_the_provider_accepts(self):
-        """Each accepted status is reported as a delivery."""
         for status_code in EMAIL_DELIVERED_STATUSES:
             with self.subTest(status_code):
                 boundary = _SendGridBoundary(status_code=status_code)
@@ -947,21 +986,12 @@ class TestEmailService(unittest.TestCase):
                     ))
 
     def test_the_accepted_status_is_the_one_the_endpoint_reports(self):
-        """The service names one status, and it is the documented one."""
         self.assertEqual(email_service_module.ACCEPTED_STATUS, 202)
         self.assertEqual(
             EMAIL_DELIVERED_STATUSES, (email_service_module.ACCEPTED_STATUS,)
         )
 
     def test_send_email_refuses_another_success_status(self):
-        """Another 2xx is a failure, not a delivery.
-
-        The Mail Send endpoint reports one status for a queued message.
-        Another success status means the request was answered by something
-        else -- a redirect target, a proxy or an error page returning 200 --
-        so treating it as a delivery would report a message as sent that
-        the provider never queued.
-        """
         for status_code in EMAIL_UNEXPECTED_SUCCESS_STATUSES:
             with self.subTest(status_code):
                 boundary = _SendGridBoundary(status_code=status_code)
@@ -982,12 +1012,6 @@ class TestEmailService(unittest.TestCase):
                 ))
 
     def test_send_email_reports_a_rejected_message(self):
-        """A non-2xx delivery raises in the package and is reported.
-
-        The pinned package raises :class:`BadRequestsError` for a ``400``
-        rather than returning a response, which is the shape asserted
-        here.
-        """
         rejection = BadRequestsError(
             EMAIL_REJECTED_STATUS,
             'Bad Request',
@@ -1016,7 +1040,6 @@ class TestEmailService(unittest.TestCase):
             self.assertNotIn(RECIPIENT_EMAIL, line)
 
     def test_send_email_swallows_a_transport_failure(self):
-        """A failure reaching the provider is reported, not raised."""
         boundary = _SendGridBoundary(
             error=HTTPError(
                 EMAIL_UNAVAILABLE_STATUS,
@@ -1040,7 +1063,6 @@ class TestEmailService(unittest.TestCase):
             self.assertNotIn(settings.SENDGRID_API_KEY, line)
 
     def test_send_email_swallows_a_client_construction_failure(self):
-        """A failure before the request is built is reported."""
         with patch(
             EMAIL_MODULE + '.SendGridAPIClient',
             side_effect=RuntimeError('transport down'),
@@ -1052,20 +1074,6 @@ class TestEmailService(unittest.TestCase):
             )
 
     def test_a_failed_send_records_the_failure_on_the_logger(self):
-        """A failed send emits one structured record naming the module.
-
-        The record carries the failure as discrete fields -- the class,
-        the defining module and the redacted message -- and carries **no**
-        exception information at error level, because attaching the
-        exception makes the handler render the whole traceback, and a
-        traceback of a provider client call embeds the request it was
-        making and the local frames it was making it from.
-
-        The provider's own message travels as a field, redacted as the
-        field is built rather than as the line is written, so the
-        credential is absent from the record object itself and not only
-        from the rendered output.
-        """
         with _collecting_application_logs() as collector:
             self.assertFalse(_send_failing_with(EMAIL_FAILURE_DETAIL))
 
@@ -1091,13 +1099,6 @@ class TestEmailService(unittest.TestCase):
         )
 
     def test_no_error_level_record_carries_a_traceback(self):
-        """No record at error level renders a traceback.
-
-        A traceback of the provider client names the request it was
-        issuing and every local frame, so it belongs at DEBUG -- where the
-        configured level suppresses it outside a local run -- and never at
-        the level a deployment collects.
-        """
         with _collecting_application_logs() as collector:
             self.assertFalse(_send_failing_with(EMAIL_FAILURE_DETAIL))
 
@@ -1112,15 +1113,6 @@ class TestEmailService(unittest.TestCase):
             self.assertNotIn('Traceback', repr(vars(record)))
 
     def test_a_failed_send_reaches_no_rendered_line_with_the_key(self):
-        """Neither the record nor any rendered line carries the key.
-
-        Two failures are driven. The first quotes the credential in free
-        prose, and the second names it beside a credential-shaped key.
-        Each case asserts the provider message was carried, that the
-        placeholder stands where the credential stood, and that the
-        credential appears in no field of the record and in no rendered
-        line.
-        """
         for label, detail in (
             ('quoted in free prose', EMAIL_FAILURE_DETAIL),
             ('named beside a key', EMAIL_KEYED_FAILURE_DETAIL),
@@ -1147,11 +1139,6 @@ class TestEmailService(unittest.TestCase):
                 ))
 
     def test_the_send_path_writes_no_bare_output(self):
-        """No module on the notification path calls ``print``.
-
-        The three modules whose bare calls were replaced by the
-        structured logger are read and asserted to contain none.
-        """
         for module in BARE_OUTPUT_FREE_MODULES:
             with self.subTest(module.__name__):
                 source = inspect.getsource(module)
@@ -1159,12 +1146,6 @@ class TestEmailService(unittest.TestCase):
 
 
 def test_a_failed_send_emits_one_redacted_structured_record():
-    """Every line a failed send emits is a redacted structured record.
-
-    The real logging path runs rather than a stand-in for it: the lines
-    read are the ones the handler the governed loggers dispatch to
-    actually wrote.
-    """
     with _collecting_emitted_lines() as lines:
         assert _send_failing_with(EMAIL_FAILURE_DETAIL) is False
 
@@ -1183,8 +1164,6 @@ def test_a_failed_send_emits_one_redacted_structured_record():
     failure = failures[0]
     assert failure['level'] == 'ERROR'
     assert failure['logger'] == EMAIL_MODULE
-    # The failure travels as discrete fields under the record's context,
-    # and no rendered traceback is emitted at this level.
     assert 'exception' not in failure
     context = failure['context']
     assert context['exception_type'] == 'RuntimeError'
@@ -1196,13 +1175,6 @@ def test_a_failed_send_emits_one_redacted_structured_record():
 
 
 def test_a_rejected_send_records_the_status_it_was_refused_with():
-    """A send the provider refuses is recorded with its status.
-
-    The refusal arrives as a reported status rather than as a raised
-    failure, so it carries no exception to record. One line is emitted
-    naming the status received and the status expected, which is what
-    makes a silent non-delivery visible.
-    """
     client = MagicMock()
     client.send.return_value = MagicMock(status_code=400)
 
@@ -1234,11 +1206,6 @@ def test_a_rejected_send_records_the_status_it_was_refused_with():
 
 
 def test_a_failed_send_writes_no_failure_detail_to_a_stream(capsys):
-    """A failed send writes the failure detail to no stream.
-
-    The real logging path runs rather than a stand-in for it, and the
-    streams are read once the queue-backed listener has drained.
-    """
     assert _send_failing_with(EMAIL_FAILURE_DETAIL) is False
 
     flush_log_queue(LOG_DRAIN_TIMEOUT)
@@ -1250,7 +1217,6 @@ def test_a_failed_send_writes_no_failure_detail_to_a_stream(capsys):
 
 
 def _run(coroutine):
-    """Runs ``coroutine`` on a fresh event loop and returns its result."""
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coroutine)
@@ -1265,7 +1231,6 @@ def _order(
     captured=True,
     capture_status=None,
 ):
-    """Returns a PayPal order object for the premium monthly plan."""
     plan = get_plan(PLAN_ID)
     amount = {
         'currency_code': currency or plan.currency,
@@ -1293,14 +1258,6 @@ def _order(
 
 
 class _Recorder:
-    """Answers PayPal REST calls and records every outbound call made.
-
-    Every call is asserted against the provider wire contract before a
-    response is served, so a call carrying the wrong method, host, path,
-    authentication, headers, body or timeout raises rather than receiving
-    a plausible answer. ``routes`` holds the contract route each recorded
-    call addressed.
-    """
 
     def __init__(self, responses):
         self.responses = responses
@@ -1309,7 +1266,6 @@ class _Recorder:
 
     @staticmethod
     def _path(sent):
-        """Returns the path of one outbound httpx call."""
         return sent.url.path
 
     def handle(self, sent):
@@ -1336,7 +1292,6 @@ class _Recorder:
 
 
 class TestPayPalService(unittest.TestCase):
-    """The payment chain settles in the order PayPal documents."""
 
     def setUp(self):
         paypal_service.reset_access_token_cache()
@@ -1387,7 +1342,6 @@ class TestPayPalService(unittest.TestCase):
         self.subscription_id = subscription.id
 
     def _settlement(self, payload):
-        """Returns what the service reports ``payload`` settled."""
         plan = get_plan(PLAN_ID)
         return paypal_service.read_capture(
             payload, ORDER_ID, plan.amount, plan.currency
@@ -1503,7 +1457,6 @@ class TestPayPalService(unittest.TestCase):
         )
 
     def test_a_complete_capture_response_is_not_read_back(self):
-        """A response already carrying the capture costs no extra call."""
         recorder, transport = self._transport(
             [('/capture', 201, _order())]
         )
@@ -1531,8 +1484,6 @@ class TestPayPalService(unittest.TestCase):
         self.assertEqual(outcome.currency, plan.currency)
         self.assertEqual(outcome.capture_id, 'CAP-1')
 
-        # The capture carries the idempotency identifier derived from
-        # the stored row.
         sent = recorder.matching('/capture')[0]
         self.assertEqual(
             sent.headers['PayPal-Request-Id'],
@@ -1549,7 +1500,6 @@ class TestPayPalService(unittest.TestCase):
             _run(paypal_service.capture_order(
                 self.db, ORDER_ID, self.stranger
             ))
-        # Nothing left the process.
         self.assertEqual(recorder.calls, [])
 
     def test_capture_refuses_an_order_with_no_stored_row(self):
@@ -1585,8 +1535,6 @@ class TestPayPalService(unittest.TestCase):
                 refused.exception.category,
                 paypal_service.CATEGORY_PROVIDER_CLIENT,
             )
-            # The decisive field: the provider's own issue code, which is
-            # what the endpoint discriminates the recovery on.
             self.assertEqual(
                 refused.exception.issue,
                 paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
@@ -1614,13 +1562,6 @@ class TestPayPalService(unittest.TestCase):
         ))
 
     def test_another_refusal_carries_its_own_issue_code(self):
-        """A refusal under the same status carries a different code.
-
-        The status and the failure category are identical to the
-        already-captured case above, so the issue code is the only field
-        that separates the two, and the endpoint's discriminator refuses
-        this one.
-        """
         _recorder, transport = self._transport([
             ('/capture', 422, {
                 'name': 'UNPROCESSABLE_ENTITY',
@@ -1644,7 +1585,6 @@ class TestPayPalService(unittest.TestCase):
         )
 
     def test_an_error_body_naming_no_issue_carries_no_code(self):
-        """A body with no allowlisted field yields no issue code."""
         _recorder, transport = self._transport([
             ('/capture', 422, {'message': 'the order was not settled'}),
         ])
@@ -1661,7 +1601,6 @@ class TestPayPalService(unittest.TestCase):
         )
 
     def test_the_error_name_is_read_when_no_detail_names_an_issue(self):
-        """The body's own name supplies the code when details do not."""
         _recorder, transport = self._transport([
             ('/capture', 422, {
                 'name': paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
@@ -1681,7 +1620,6 @@ class TestPayPalService(unittest.TestCase):
         )
 
     def test_only_an_allowlisted_field_of_the_error_body_is_read(self):
-        """No field outside the allowlist reaches the issue code."""
         _recorder, transport = self._transport([
             ('/capture', 422, {
                 'issue': paypal_service.ISSUE_ORDER_ALREADY_CAPTURED,
@@ -1701,7 +1639,6 @@ class TestPayPalService(unittest.TestCase):
         self.assertIsNone(refused.exception.issue)
 
     def test_an_issue_value_outside_the_accepted_shape_is_discarded(self):
-        """A code of another shape is dropped rather than carried."""
         for label, value in (
             ('lower case', 'order_already_captured'),
             ('punctuated', 'ORDER-ALREADY-CAPTURED'),
@@ -1824,17 +1761,14 @@ class TestPayPalService(unittest.TestCase):
 
 
 class TestProviderCorrelation(unittest.TestCase):
-    """An inbound identifier survives into the provider's own records."""
 
     def _contexts(self, collector):
-        """Returns the context of every rendered record."""
         return [
             json.loads(line).get(CONTEXT_FIELD, {})
             for line in _rendered_log_lines(collector)
         ]
 
     def test_the_bound_identifier_reaches_a_listing_provider_record(self):
-        """A provider failure records the identifier bound to the caller."""
         token = bind_request_id(BOUND_REQUEST_ID)
         try:
             with _collecting_application_logs() as collector:
@@ -1846,7 +1780,8 @@ class TestProviderCorrelation(unittest.TestCase):
                         )
                     )
                 ):
-                    fetch_listings(zip_codes=['12345'], filters={})
+                    with self.assertRaises(ListingProviderError):
+                        fetch_listings(zip_codes=['12345'], filters={})
         finally:
             reset_request_id(token)
 
@@ -1858,7 +1793,6 @@ class TestProviderCorrelation(unittest.TestCase):
         ))
 
     def test_the_bound_identifier_reaches_an_email_provider_record(self):
-        """A delivery failure records the identifier bound to the caller."""
         boundary = _SendGridBoundary(
             error=BadRequestsError(
                 EMAIL_REJECTED_STATUS,
@@ -1885,16 +1819,8 @@ class TestProviderCorrelation(unittest.TestCase):
 
 
 class TestProviderContractGuard(unittest.TestCase):
-    """The guard every provider stand-in in the suite validates through.
-
-    Each case hands :func:`assert_paypal_contract` a request that departs
-    from the provider contract in one respect and asserts it is refused,
-    so a stand-in cannot answer a malformed call with a plausible
-    response.
-    """
 
     def _authenticated(self, **overrides):
-        """Returns the arguments of a well-formed settle call."""
         arguments = {
             'method': 'POST',
             'url': settings.PAYPAL_API_BASE + ORDER_PATH + '/capture',
@@ -1911,33 +1837,28 @@ class TestProviderContractGuard(unittest.TestCase):
         return arguments
 
     def test_a_well_formed_settle_call_is_accepted(self):
-        """The positive control resolves to the settle route."""
         self.assertEqual(
             assert_paypal_contract(**self._authenticated()),
             PAYPAL_ROUTE_CAPTURE_ORDER,
         )
 
     def test_another_host_is_refused(self):
-        """A target outside the configured host is refused."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(**self._authenticated(
                 url='https://api-m.paypal.com' + ORDER_PATH + '/capture'
             ))
 
     def test_an_unknown_path_is_refused(self):
-        """A path the service never addresses is refused."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(**self._authenticated(
                 url=settings.PAYPAL_API_BASE + '/v2/checkout/refunds'
             ))
 
     def test_the_wrong_method_is_refused(self):
-        """A settle call sent as a read is refused."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(**self._authenticated(method='GET'))
 
     def test_a_missing_grant_is_refused(self):
-        """An authenticated call carrying no Bearer grant is refused."""
         headers = self._authenticated()['headers'].copy()
         del headers['Authorization']
         with self.assertRaises(PayPalContractError):
@@ -1946,7 +1867,6 @@ class TestProviderContractGuard(unittest.TestCase):
             )
 
     def test_an_empty_grant_is_refused(self):
-        """An authenticated call carrying a blank grant is refused."""
         headers = self._authenticated()['headers'].copy()
         headers['Authorization'] = 'Bearer  '
         with self.assertRaises(PayPalContractError):
@@ -1955,14 +1875,12 @@ class TestProviderContractGuard(unittest.TestCase):
             )
 
     def test_a_missing_body_is_refused(self):
-        """A write call carrying no body is refused."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(
                 **self._authenticated(json_body=None)
             )
 
     def test_a_missing_representation_preference_is_refused(self):
-        """A settle call carrying no preference header is refused."""
         headers = self._authenticated()['headers'].copy()
         del headers['Prefer']
         with self.assertRaises(PayPalContractError):
@@ -1971,19 +1889,16 @@ class TestProviderContractGuard(unittest.TestCase):
             )
 
     def test_a_missing_timeout_is_refused(self):
-        """A call carrying no timeout is refused."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(**self._authenticated(timeout=None))
 
     def test_another_timeout_is_refused(self):
-        """A call carrying a timeout other than the configured one."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(**self._authenticated(
                 timeout=settings.HTTP_TIMEOUT_SECONDS + 1
             ))
 
     def test_a_credential_exchange_without_the_grant_type_is_refused(self):
-        """A token call sending no client-credentials grant is refused."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(
                 method='POST',
@@ -1998,7 +1913,6 @@ class TestProviderContractGuard(unittest.TestCase):
             )
 
     def test_a_credential_exchange_without_credentials_is_refused(self):
-        """A token call sending no Basic credentials is refused."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(
                 method='POST',
@@ -2010,7 +1924,6 @@ class TestProviderContractGuard(unittest.TestCase):
             )
 
     def test_a_verifier_document_missing_a_field_is_refused(self):
-        """A verifier document short of one field is refused."""
         document = dict(
             (field, 'value') for field in PAYPAL_VERIFY_FIELDS
         )
@@ -2023,7 +1936,6 @@ class TestProviderContractGuard(unittest.TestCase):
             ))
 
     def test_a_verifier_document_naming_another_webhook_is_refused(self):
-        """A verifier document naming another webhook is refused."""
         document = dict(
             (field, 'value') for field in PAYPAL_VERIFY_FIELDS
         )
@@ -2036,7 +1948,6 @@ class TestProviderContractGuard(unittest.TestCase):
 
 
 def _created_order_body(plan_id=PLAN_ID):
-    """Returns the complete create-order document for ``plan_id``."""
     plan = get_plan(plan_id)
     return {
         'intent': 'CAPTURE',
@@ -2066,7 +1977,6 @@ def _created_order_body(plan_id=PLAN_ID):
 
 
 def _without(mapping, *path):
-    """Returns ``mapping`` with the member at ``path`` removed."""
     altered = copy.deepcopy(mapping)
     target = altered
     for key in path[:-1]:
@@ -2076,7 +1986,6 @@ def _without(mapping, *path):
 
 
 def _replacing(mapping, path, value):
-    """Returns ``mapping`` with the member at ``path`` set to ``value``."""
     altered = copy.deepcopy(mapping)
     target = altered
     for key in path[:-1]:
@@ -2085,24 +1994,14 @@ def _replacing(mapping, path, value):
     return altered
 
 
-#: Path of the payer experience context inside the created order.
 _CONTEXT = ('payment_source', 'paypal', 'experience_context')
 
-#: Path of the single purchase unit's amount.
 _AMOUNT = ('purchase_units', 0, 'amount')
 
 
 class TestTheCreateOrderBodyContract(unittest.TestCase):
-    """One departure per required create-order field is refused.
-
-    The positive control asserts the complete document is accepted, and
-    every case below alters exactly one required field or value and
-    asserts the guard refuses it, so no field of the outbound document is
-    asserted only by its presence.
-    """
 
     def _assert_refused(self, document):
-        """Assert the guard refuses ``document`` as a created order."""
         with self.assertRaises(PayPalContractError):
             assert_create_order_body(document)
 
@@ -2288,7 +2187,6 @@ class TestTheCreateOrderBodyContract(unittest.TestCase):
 
 
 class TestTheCaptureBodyContract(unittest.TestCase):
-    """The settle call's body is the empty object and nothing else."""
 
     def test_the_empty_object_is_accepted(self):
         assert_capture_body({})
@@ -2307,7 +2205,6 @@ class TestTheCaptureBodyContract(unittest.TestCase):
                     assert_capture_body(document)
 
     def test_the_guard_refuses_a_settle_call_carrying_a_body(self):
-        """The refusal reaches the shared guard, not only the helper."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(
                 method='POST',
@@ -2325,7 +2222,6 @@ class TestTheCaptureBodyContract(unittest.TestCase):
             )
 
     def test_the_guard_refuses_a_created_order_priced_elsewhere(self):
-        """The create-order refusal reaches the shared guard too."""
         with self.assertRaises(PayPalContractError):
             assert_paypal_contract(
                 method='POST',
@@ -2345,15 +2241,8 @@ class TestTheCaptureBodyContract(unittest.TestCase):
 
 
 class TestProviderCredentialRegistration(unittest.TestCase):
-    """Registration of the credentials each provider module handles."""
 
     def test_every_configured_provider_credential_is_registered(self):
-        """Each configured credential is replaced in free prose.
-
-        The value is quoted with no key name beside it, which shape
-        matching does not reach, so a rendered placeholder shows the
-        registry holds the value.
-        """
         for name in PROVIDER_SECRET_SETTINGS:
             configured = getattr(settings, name)
             with self.subTest(name):
@@ -2367,7 +2256,6 @@ class TestProviderCredentialRegistration(unittest.TestCase):
                 self.assertIn(REDACTION_PLACEHOLDER, rendered)
 
     def test_a_registrable_credential_is_accepted_and_held(self):
-        """A value at the floor is registered and reported held."""
         value = 'v' * MIN_SECRET_VALUE_LENGTH
         held = register_required_secret_values(value)
 
@@ -2375,11 +2263,6 @@ class TestProviderCredentialRegistration(unittest.TestCase):
         self.assertNotIn(value, redact('provider prose ' + value))
 
     def test_a_credential_the_registry_refuses_raises(self):
-        """A value below the floor raises rather than being ignored.
-
-        The raised message is asserted to name neither the value nor any
-        part of it, so the refusal itself discloses nothing.
-        """
         value = 'w' * (MIN_SECRET_VALUE_LENGTH - 1)
 
         with self.assertRaises(ValueError) as raised:
@@ -2391,22 +2274,11 @@ class TestProviderCredentialRegistration(unittest.TestCase):
         self.assertIn(value, redact('provider prose ' + value))
 
     def test_a_value_that_is_not_text_raises(self):
-        """A non-string value raises rather than being ignored."""
         with self.assertRaises(ValueError):
             register_required_secret_values(None)
 
 
 class TestProviderEventTaxonomy(unittest.TestCase):
-    """A partial success is a warning, and a routine success is not news.
-
-    Level is what a deployment alerts and pages on, so a record's level is
-    a claim about whether a human is needed. A discarded entry and a
-    truncated page are both partial successes -- the pass completed and
-    the corpus was written -- so they warn. A completed REST call is
-    routine, so it is not collected at all unless a run is being
-    debugged. Each partial success also carries a stable ``reason``, so a
-    query selects it by field rather than by matching its prose.
-    """
 
     def test_a_discarded_entry_warns_under_a_stable_reason(self):
         payload = {'listings': [{'id': 1}, 'not-an-object']}
@@ -2457,10 +2329,9 @@ class TestProviderEventTaxonomy(unittest.TestCase):
             self.assertLess(record.levelno, logging.ERROR)
 
     def test_a_whole_refused_call_is_still_an_error(self):
-        """A pass that returned nothing keeps its error level."""
         with _collecting_application_logs() as collector:
             with _provider(_answering({'listings': []}, status_code=500)):
-                self.assertEqual(_fetch(), [])
+                _refused(self, zillow_service.REASON_REQUEST_FAILED)
 
         self.assertTrue([
             record
@@ -2469,12 +2340,6 @@ class TestProviderEventTaxonomy(unittest.TestCase):
         ])
 
     def test_a_completed_rest_call_is_not_collected_at_information(self):
-        """The two PayPal success records sit below the collected level.
-
-        A record per completed call at information level makes the
-        provider's routine traffic the bulk of the log, which is what
-        pushes the refusals and the failures out of a retention window.
-        """
         source = inspect.getsource(paypal_service)
         for message in (
             'PayPal REST call completed',
@@ -2490,12 +2355,6 @@ class TestProviderEventTaxonomy(unittest.TestCase):
 
 
 class TestOutboundCorrelation(unittest.TestCase):
-    """An outbound provider call carries the trace it was made under.
-
-    Without it the provider's own record of the call cannot be joined to
-    this service's record of the request that caused it, which is what
-    makes a provider-side investigation possible at all.
-    """
 
     def test_the_provider_call_carries_the_bound_trace(self):
         token = bind_trace_context()
@@ -2512,7 +2371,6 @@ class TestOutboundCorrelation(unittest.TestCase):
         )
 
     def test_no_header_is_sent_when_no_trace_is_bound(self):
-        """An unbound call sends no correlation header at all."""
         with _provider(_answering({'listings': []})) as recorder:
             _fetch()
 
@@ -2533,14 +2391,6 @@ class TestOutboundCorrelation(unittest.TestCase):
 
 
 class TestOutboundClientRecordsAreGoverned(unittest.TestCase):
-    """A record the HTTP client writes discloses no search value.
-
-    The client logs its request target at information level, and that
-    target carries every postal code and filter value the caller
-    supplied. The record has to travel through the redacting handler, or
-    the search terms this service takes care never to log itself arrive in
-    the log by another route.
-    """
 
     def test_a_client_record_naming_the_target_loses_its_query(self):
         postal_code = '90210'

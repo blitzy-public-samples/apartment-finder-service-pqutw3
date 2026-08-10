@@ -1,57 +1,4 @@
-"""Add RBAC and subscription columns
-
-Adds ``role``, ``failed_login_attempts`` and ``locked_until`` to
-``users``. Adds ``plan_id``, ``amount``, ``currency`` and
-``paypal_order_id`` to ``subscriptions``, the last under a uniqueness
-constraint. Creates the ``webhook_events`` table, whose
-``transmission_id`` is unique. No column or constraint of any other
-table is added, altered or removed.
-
-Every column added to a table that precedes this revision carries a
-server default. An account already stored reads the role ``registered``
-and a zero failed-attempt count, and a subscription row already stored
-reads the currency ``USD``. This revision writes no other role and
-promotes no account.
-
-``upgrade`` first checks that none of the objects listed above is
-already present, and raises when one is: a database already carrying
-this revision's shape is stamped rather than migrated. Every object this
-revision then adds is therefore an object it created, and ``downgrade``
-reverses exactly that set -- the three ``users`` columns, the four
-``subscriptions`` columns with their uniqueness constraint, and the
-``webhook_events`` table. It removes no table or column that precedes
-this revision. The uniqueness over ``paypal_order_id`` is removed with
-the column it covers, on a backend that drops a constraint in place and
-on one that only recreates the table.
-
-A table this revision adds columns to is created in full when it is
-absent, so the revision applies to an empty database as well as to one
-holding the six tables that precede it. The name of every table it
-creates that way is written to :data:`CREATED_TABLES_RECORD`, and
-``downgrade`` drops exactly the tables recorded there before removing that
-record. An empty database therefore returns to being empty, and a
-database that already held those six tables keeps every one of them,
-because on that path no name is recorded and the record itself is never
-created. The record carries table names only.
-
-Offline, no database is present to inspect, so ``--sql`` emits the
-additive statements unconditionally, for a database already holding those
-six tables, and neither direction emits a statement for the record.
-
-``listings`` is one of the tables created only when absent, and it is
-created with no uniqueness over ``zillow_url``. The mapped
-:class:`backend.app.db.models.Listing` declares none either, so the two
-agree: a repeated provider address is stored rather than refused, a
-database already holding repeated addresses applies this revision
-unchanged, and ``backend/app/tasks/listing_updater.py`` reconciles by
-reading the earliest row carrying the value rather than by relying on a
-constraint.
-
-Revision ID: 0001
-Revises:
-Create Date: 2026-08-08 09:14:22.517394
-
-"""
+"""Add RBAC, subscription, and webhook replay-protection schema."""
 from alembic import context
 from alembic import op
 import sqlalchemy as sa
@@ -131,7 +78,6 @@ ALREADY_PRESENT_MESSAGE = (
 
 
 def _users_added_columns():
-    """Build the columns this revision adds to ``users``."""
     return [
         sa.Column(
             "role",
@@ -155,7 +101,6 @@ def _users_added_columns():
 
 
 def _subscriptions_added_columns():
-    """Build the columns this revision adds to ``subscriptions``."""
     return [
         sa.Column(
             "plan_id",
@@ -198,17 +143,14 @@ def _emitting_statements() -> bool:
 
 
 def _inspector():
-    """Reflect the bind this revision is running against."""
     return sa.inspect(op.get_bind())
 
 
 def _table_present(table):
-    """Report whether ``table`` exists on the bind."""
     return _inspector().has_table(table)
 
 
 def _column_names(table):
-    """Collect the column names ``table`` currently carries."""
     return set(
         column["name"] for column in _inspector().get_columns(table)
     )
@@ -239,12 +181,10 @@ def _uniqueness_over(table, columns):
 
 
 def _recreates_tables():
-    """Report whether the bind removes a uniqueness by recreation."""
     return op.get_bind().dialect.name == RECREATING_DIALECT
 
 
 def _create_users():
-    """Create ``users`` carrying this revision's columns."""
     op.create_table(
         USERS,
         sa.Column("id", sa.Integer(), nullable=False),
@@ -282,7 +222,6 @@ def _create_listings():
 
 
 def _create_filters():
-    """Create ``filters`` as the schema preceding this revision has it."""
     op.create_table(
         FILTERS,
         sa.Column("id", sa.Integer(), nullable=False),
@@ -296,7 +235,6 @@ def _create_filters():
 
 
 def _create_zip_codes():
-    """Create ``zip_codes`` as the preceding schema has it."""
     op.create_table(
         ZIP_CODES,
         sa.Column("id", sa.Integer(), nullable=False),
@@ -308,7 +246,6 @@ def _create_zip_codes():
 
 
 def _create_criteria():
-    """Create ``criteria`` as the preceding schema has it."""
     op.create_table(
         CRITERIA,
         sa.Column("id", sa.Integer(), nullable=False),
@@ -343,7 +280,6 @@ def _subscriptions_definition():
 
 
 def _create_subscriptions():
-    """Create ``subscriptions`` carrying this revision's columns."""
     op.create_table(SUBSCRIPTIONS, *_subscriptions_definition())
 
 
@@ -361,7 +297,6 @@ def _subscriptions_table():
 
 
 def _create_webhook_events():
-    """Create the delivery-record table this revision introduces."""
     op.create_table(
         WEBHOOK_EVENTS,
         sa.Column("id", sa.Integer(), nullable=False),
@@ -410,7 +345,6 @@ def _present_objects():
 
 
 def _refuse_present_shape():
-    """Raise when any object this revision adds is already in place."""
     present = _present_objects()
     if present:
         raise RuntimeError(
@@ -419,7 +353,6 @@ def _refuse_present_shape():
 
 
 def _create_created_tables_record():
-    """Create the bookkeeping table this revision records names in."""
     op.create_table(
         CREATED_TABLES_RECORD,
         sa.Column("table_name", sa.String(length=63), nullable=False),
@@ -458,10 +391,6 @@ def _recorded_created_tables():
 
 
 def _upgrade_users():
-    """Bring ``users`` to this revision's shape.
-
-    Returns ``True`` when the table was created by this call.
-    """
     if not _table_present(USERS):
         _create_users()
         return True
@@ -471,10 +400,6 @@ def _upgrade_users():
 
 
 def _upgrade_listings():
-    """Ensure ``listings`` exists; this revision alters no column of it.
-
-    Returns ``True`` when the table was created by this call.
-    """
     if not _table_present(LISTINGS):
         _create_listings()
         return True
@@ -482,10 +407,6 @@ def _upgrade_listings():
 
 
 def _upgrade_filters():
-    """Ensure ``filters`` exists; this revision alters no column of it.
-
-    Returns ``True`` when the table was created by this call.
-    """
     if not _table_present(FILTERS):
         _create_filters()
         return True
@@ -493,10 +414,6 @@ def _upgrade_filters():
 
 
 def _upgrade_zip_codes():
-    """Ensure ``zip_codes`` exists; no column of it is altered.
-
-    Returns ``True`` when the table was created by this call.
-    """
     if not _table_present(ZIP_CODES):
         _create_zip_codes()
         return True
@@ -504,10 +421,6 @@ def _upgrade_zip_codes():
 
 
 def _upgrade_criteria():
-    """Ensure ``criteria`` exists; no column of it is altered.
-
-    Returns ``True`` when the table was created by this call.
-    """
     if not _table_present(CRITERIA):
         _create_criteria()
         return True
@@ -515,10 +428,6 @@ def _upgrade_criteria():
 
 
 def _upgrade_subscriptions():
-    """Bring ``subscriptions`` to this revision's shape.
-
-    Returns ``True`` when the table was created by this call.
-    """
     if not _table_present(SUBSCRIPTIONS):
         _create_subscriptions()
         return True
@@ -535,7 +444,6 @@ def _upgrade_subscriptions():
 
 
 def _upgrade_webhook_events():
-    """Create the delivery-record table when it is absent."""
     if not _table_present(WEBHOOK_EVENTS):
         _create_webhook_events()
 
@@ -586,7 +494,6 @@ def upgrade() -> None:
 
 
 def _downgrade_webhook_events():
-    """Drop the delivery-record table this revision introduced."""
     if _table_present(WEBHOOK_EVENTS):
         op.drop_table(WEBHOOK_EVENTS)
 
@@ -639,7 +546,6 @@ def _downgrade_subscriptions():
 
 
 def _downgrade_users():
-    """Remove this revision's ``users`` additions."""
     if not _table_present(USERS):
         return
     existing = _column_names(USERS)
@@ -666,14 +572,12 @@ def _downgrade_offline():
 
 
 def _drop_created_tables(created):
-    """Drop the tables named in ``created``, children before parents."""
     for table in PRECEDING_TABLES_DROP_ORDER:
         if table in created and _table_present(table):
             op.drop_table(table)
 
 
 def _drop_created_tables_record():
-    """Drop the bookkeeping table, when it is present."""
     if _table_present(CREATED_TABLES_RECORD):
         op.drop_table(CREATED_TABLES_RECORD)
 

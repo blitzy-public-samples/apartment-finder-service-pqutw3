@@ -1,23 +1,3 @@
-"""Tests for the HTTP surface of the backend application.
-
-The cases here cover the routes the application publishes, the request
-contracts they accept, the response shapes they return and the entitlement
-state they record. A second group covers the interfaces the service keeps
-frozen: the login and registration response shapes, the nine method and
-path pairs mounted under the four router prefixes, the public reachability
-of the listings read endpoint, the ownership scoping of the filter
-endpoints, the verifiability of the ``$2a$`` and ``$2b$`` hash formats an
-account may carry, the seventy-two byte password ceiling and the
-importability of the application entrypoint.
-
-Fixtures come from ``backend/tests/conftest.py``: the isolated per-test
-database session, the test client bound to it, one stored row per role and
-the factories that mint access tokens and the header carrying them. One
-fixture is defined here -- :func:`unthrottled`, which suspends the shared
-rate limiter for the cases that drive more login attempts than the
-per-address rate admits.
-"""
-
 import asyncio
 import importlib
 import json
@@ -123,7 +103,6 @@ from backend.tests.support import REPO_ROOT, VALID_TEST_PASSWORD
 
 AUTH_MODULE = 'backend.app.api.endpoints.auth'
 
-#: Seconds one held or waiting attempt is allowed in the contention case.
 CONTENTION_BOUND_SECONDS = 30.0
 
 SUBSCRIPTIONS_MODULE = 'backend.app.api.endpoints.subscriptions'
@@ -132,16 +111,10 @@ ORDER_ID = 'ORDER-TEST-1'
 
 APPROVAL_URL = 'https://www.paypal.com/checkoutnow?token=' + ORDER_ID
 
-#: Correlation identifier the caller-supplied cases present. It carries
-#: only characters the identifier check accepts.
 SUPPLIED_REQUEST_ID = 'caller0trace0denial1'
 
-#: Seconds a fresh interpreter is given to import the application
-#: entrypoint before the case reports a failed startup.
 STARTUP_IMPORT_TIMEOUT_SECONDS = 180.0
 
-#: The five headers a PayPal notification must carry. The signature check
-#: is stood in for, so the values need only be present.
 PAYPAL_HEADERS = {
     'PAYPAL-AUTH-ALGO': 'SHA256withRSA',
     'PAYPAL-CERT-URL': 'https://api.sandbox.paypal.com/certs/CERT-1',
@@ -152,7 +125,6 @@ PAYPAL_HEADERS = {
 
 
 def order_response(order_id=ORDER_ID):
-    """Returns an opened order carrying its payer-approval target."""
     return {
         'id': order_id,
         'status': 'PAYER_ACTION_REQUIRED',
@@ -169,7 +141,6 @@ def order_response(order_id=ORDER_ID):
 
 
 def capture_response(order_id=ORDER_ID, status='COMPLETED', value='9.99'):
-    """Returns a capture response reporting ``status`` and ``value``."""
     return {
         'id': order_id,
         'status': status,
@@ -193,7 +164,6 @@ def capture_response(order_id=ORDER_ID, status='COMPLETED', value='9.99'):
 
 
 def approved_event(order_id=ORDER_ID):
-    """Returns the notification body reporting an approved order."""
     return {
         'event_type': 'CHECKOUT.ORDER.APPROVED',
         'resource': {'id': order_id},
@@ -201,7 +171,6 @@ def approved_event(order_id=ORDER_ID):
 
 
 def verified_approval(transmission_id=None):
-    """Returns the outcome of a passing check on an approval event."""
     return WebhookVerification(
         verified=True,
         transmission_id=(
@@ -211,13 +180,10 @@ def verified_approval(transmission_id=None):
     )
 
 
-#: Source of a distinct delivery identifier per notification, so a second
-#: delivery is a fresh event rather than a replay of the first.
 _deliveries = count(1)
 
 
 def verified_delivery(transmission_id=None, event_type=None):
-    """Returns a passing check carrying a distinct delivery identifier."""
     return WebhookVerification(
         verified=True,
         transmission_id=(
@@ -287,7 +253,6 @@ def test_user_login_accepts_a_json_body(client, registered_user):
 
 
 def test_login_response_shape_is_unchanged(client, registered_user):
-    """The frozen contract: fields may be added, none removed."""
     response = client.post('/auth/login', json={
         'email': registered_user.email,
         'password': VALID_TEST_PASSWORD
@@ -324,7 +289,6 @@ def test_login_rejects_a_wrong_password(client, registered_user):
 
 
 def test_a_relationship_attribute_is_not_an_accepted_lookup_column(db):
-    """A relationship is an InstrumentedAttribute but not a column."""
     for model, relationship_name in (
         (User, 'filters'),
         (User, 'subscriptions'),
@@ -355,7 +319,6 @@ def test_an_unmapped_class_is_refused_as_a_lookup_model(db):
 def test_a_non_unique_lookup_prefers_the_row_the_caller_owns(
     db, registered_user, second_registered_user
 ):
-    """A foreign row ordered first must not deny an owned row."""
     moment = datetime.now(timezone.utc)
     foreign = SubscriptionModel(
         user_id=second_registered_user.id,
@@ -397,7 +360,6 @@ def test_a_lookup_matching_only_a_foreign_row_is_not_found(
         authorization.load_owned(
             db, SubscriptionModel, registered_user, status=STATUS_ACTIVE
         )
-    # Indistinguishable from a lookup that matched no row at all.
     assert refused.value.status_code == 404
 
 
@@ -412,7 +374,6 @@ def test_a_lookup_matching_no_row_is_not_found(db, registered_user):
 def test_an_active_subscription_derives_the_premium_role(
     db, registered_user
 ):
-    """A paid entitlement raises the effective role above the stored one."""
     assert registered_user.role == 'registered'
     assert authorization.effective_role(db, registered_user) is Role.REGISTERED
 
@@ -430,7 +391,6 @@ def test_an_active_subscription_derives_the_premium_role(
 
     assert authorization.entitled_role(db, registered_user) is Role.PREMIUM
     assert authorization.effective_role(db, registered_user) is Role.PREMIUM
-    # The stored row is unchanged: the grant is derived, never written.
     db.expire_all()
     assert db.query(User).filter(
         User.id == registered_user.id
@@ -438,7 +398,6 @@ def test_an_active_subscription_derives_the_premium_role(
 
 
 def test_an_expired_subscription_derives_nothing(db, registered_user):
-    """The entitlement lapses on expiry with nothing having to demote it."""
     moment = datetime.now(timezone.utc)
     db.add(
         SubscriptionModel(
@@ -456,7 +415,6 @@ def test_an_expired_subscription_derives_nothing(db, registered_user):
 
 
 def test_a_pending_subscription_derives_nothing(db, registered_user):
-    """Only a captured payment grants an entitlement."""
     moment = datetime.now(timezone.utc)
     db.add(
         SubscriptionModel(
@@ -491,7 +449,6 @@ def test_another_users_subscription_derives_nothing(
 
 
 def test_an_unknown_plan_derives_nothing(db, registered_user):
-    """A row naming a plan the catalog does not publish grants nothing."""
     moment = datetime.now(timezone.utc)
     db.add(
         SubscriptionModel(
@@ -518,22 +475,10 @@ def test_a_stored_admin_role_is_never_lowered_by_derivation(
 def test_the_failed_attempt_write_takes_a_row_lock(
     registered_user, db, monkeypatch
 ):
-    """The lock is taken by the production helper, not by this case.
-
-    ``_lock_row`` is called as the endpoint calls it, and the query it
-    builds is captured where it asks for the lock. The captured statement
-    is compiled against the PostgreSQL dialect, which is the dialect that
-    renders the locking clause; SQLite accepts the request and renders
-    nothing, so compiling for it would assert nothing.
-
-    A helper that stopped asking for the lock would leave nothing to
-    capture and fail here.
-    """
     locking_queries = []
     request_lock = SqlAlchemyQuery.with_for_update
 
     def capture(query, *args, **kwargs):
-        """Records the query that asked for a row lock."""
         locked = request_lock(query, *args, **kwargs)
         locking_queries.append(locked)
         return locked
@@ -556,16 +501,10 @@ def test_the_failed_attempt_write_takes_a_row_lock(
 def test_the_counted_failure_reaches_that_helper(
     registered_user, db, monkeypatch
 ):
-    """The counting path resolves its row through ``_lock_row``.
-
-    The two cases together state the property: the count is written to a
-    row this helper returned, and this helper asks for the lock.
-    """
     calls = []
     resolve = auth_module._lock_row
 
     def record(session, user_id):
-        """Records one call and returns what the helper returns."""
         calls.append(user_id)
         return resolve(session, user_id)
 
@@ -579,7 +518,6 @@ def test_the_counted_failure_reaches_that_helper(
 
 
 def test_repeated_failures_lock_the_account(registered_user, db):
-    """The attempt reaching the configured limit locks the account."""
     moment = datetime.now(timezone.utc)
     for _ in range(settings.LOGIN_MAX_ATTEMPTS):
         auth_module._record_failed_attempt(db, registered_user, moment)
@@ -594,7 +532,6 @@ def test_repeated_failures_lock_the_account(registered_user, db):
 def test_no_counted_failure_is_lost_across_repeated_writes(
     registered_user, db
 ):
-    """Every counted failure is applied, none overwriting another."""
     moment = datetime.now(timezone.utc)
     for expected in range(1, settings.LOGIN_MAX_ATTEMPTS):
         auth_module._record_failed_attempt(db, registered_user, moment)
@@ -636,19 +573,6 @@ def test_a_successful_attempt_clears_the_count_and_the_lock(
 def test_two_concurrent_failures_are_both_counted_on_postgres(
     postgres_session_factory, postgres_observer, password_hash, monkeypatch
 ):
-    """Two independent transactions take the count from zero to two.
-
-    The first attempt is held inside ``_lock_row``, after the lock has
-    been taken and before the count is written. The second attempt is
-    then made from a session of its own, on a connection of its own, and
-    is observed waiting on a lock the server holds -- which is the
-    property SQLite cannot exhibit, since it serialises writers itself
-    and never has two transactions contending for one row.
-
-    Releasing the first lets both complete. The stored count is two: the
-    second read the value the first had written rather than the value it
-    read before the first began, so no increment was lost.
-    """
     moment = datetime.now(timezone.utc)
     seeding = postgres_session_factory()
     try:
@@ -670,7 +594,6 @@ def test_two_concurrent_failures_are_both_counted_on_postgres(
     resolve = auth_module._lock_row
 
     def hold_the_first(session, user_id):
-        """Holds the first caller inside the lock it just took."""
         row = resolve(session, user_id)
         if not held:
             held.append(session)
@@ -683,7 +606,6 @@ def test_two_concurrent_failures_are_both_counted_on_postgres(
     monkeypatch.setattr(auth_module, '_lock_row', hold_the_first)
 
     def count_one_failure():
-        """Counts one failed attempt from a session of its own."""
         session = postgres_session_factory()
         try:
             auth_module._record_failed_attempt(
@@ -728,7 +650,6 @@ def test_two_concurrent_failures_are_both_counted_on_postgres(
 def test_a_failed_persistence_is_recorded_rather_than_raised(
     registered_user, db
 ):
-    """A database fault must not change the answer the caller gives."""
     moment = datetime.now(timezone.utc)
     with patch(
         AUTH_MODULE + '._lock_row',
@@ -737,17 +658,11 @@ def test_a_failed_persistence_is_recorded_rather_than_raised(
         auth_module._record_failed_attempt(db, registered_user, moment)
         auth_module._record_successful_attempt(db, registered_user)
 
-    # The session is left clean, so the request can still be answered.
     assert not db.dirty
     assert not db.new
 
 
 def test_a_registration_race_answers_as_an_ordinary_duplicate(client):
-    """The email unique constraint is authoritative when it fires.
-
-    The commit is made to raise the constraint violation that a second
-    concurrent registration for one address would produce.
-    """
     violation = IntegrityError(
         'INSERT INTO users', {}, Exception('duplicate key value')
     )
@@ -814,7 +729,6 @@ def _filter_body(**overrides):
 def test_an_accepted_zip_code_is_persisted_as_a_child_row(
     client, registered_user, db, auth_header_factory
 ):
-    """Every postal code the contract admits reaches the database."""
     created = client.post(
         '/filters/',
         json=_filter_body(),
@@ -822,19 +736,16 @@ def test_an_accepted_zip_code_is_persisted_as_a_child_row(
     )
     assert created.status_code == 200
 
-    # Returned by the response model rather than silently dropped.
     assert sorted(z['code'] for z in created.json()['zip_codes']) == [
         '02139', '02140'
     ]
 
-    # Present as real zip_codes rows bound to the filter.
     db.expire_all()
     stored = db.query(FilterModel).one()
     assert sorted(z.code for z in stored.zip_codes) == ['02139', '02140']
     assert all(z.filter_id == stored.id for z in stored.zip_codes)
     assert db.query(ZipCode).count() == 2
 
-    # The criteria children are unaffected.
     assert [c.field for c in stored.criteria] == ['rent']
 
 
@@ -910,7 +821,6 @@ def test_a_listing_is_stored_by_an_administrator(
 def test_a_registered_user_cannot_store_a_listing(
     client, registered_user, db, auth_header_factory
 ):
-    """The one intentional breaking change: the write is admin-only."""
     response = client.post(
         '/listings/',
         json={'rent': 2400.0},
@@ -923,12 +833,6 @@ def test_a_registered_user_cannot_store_a_listing(
 def test_subscription_creation_and_retrieval(
     client, registered_user, auth_header_factory
 ):
-    """Creation opens an order for approval and captures nothing.
-
-    The row it records entitles nothing until a settlement is proven, so
-    the retrieval route reports nothing while it is pending and reports
-    the row once the verified approval has activated it.
-    """
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=order_response(),
@@ -968,7 +872,6 @@ def test_subscription_creation_and_retrieval(
 def test_subscription_creation_prices_from_the_catalog(
     client, db, registered_user, auth_header_factory
 ):
-    """Neither the amount nor the entitlement window is client supplied."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=order_response(),
@@ -992,7 +895,6 @@ def test_subscription_creation_prices_from_the_catalog(
 def test_subscription_creation_rejects_a_client_amount(
     client, registered_user, auth_header_factory
 ):
-    """The charge amount is absent from the contract, not validated."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=order_response(),
@@ -1008,7 +910,6 @@ def test_subscription_creation_rejects_a_client_amount(
 def test_verified_approval_captures_and_grants_the_plan_role(
     client, db, registered_user, auth_header_factory
 ):
-    """Entitlement follows a capture PayPal reported as complete."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=order_response(),
@@ -1049,7 +950,6 @@ def test_verified_approval_captures_and_grants_the_plan_role(
 def test_a_capture_that_is_not_complete_grants_nothing(
     client, db, registered_user, auth_header_factory
 ):
-    """A tampered captured amount leaves the subscription pending."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=order_response(),
@@ -1088,7 +988,6 @@ def test_a_capture_that_is_not_complete_grants_nothing(
 def test_a_repeated_delivery_is_acknowledged_without_reprocessing(
     client, registered_user, auth_header_factory
 ):
-    """A repeated delivery is answered 200 and is not reprocessed."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=order_response(),
@@ -1123,7 +1022,6 @@ def test_a_repeated_delivery_is_acknowledged_without_reprocessing(
 
 
 def test_an_unverified_notification_changes_no_state(client, db):
-    """A rejected notification writes nothing at all."""
     rejected = WebhookVerification(
         verified=False, reason='signature_not_verified'
     )
@@ -1144,7 +1042,6 @@ def test_an_unverified_notification_changes_no_state(client, db):
 def test_a_provider_outage_is_not_reported_as_a_client_error(
     client, registered_user, db, auth_header_factory
 ):
-    """A dependency failure is answered 502, not 400."""
     outage = PayPalAPIError(
         'unavailable', category=CATEGORY_PROVIDER_SERVER, status_code=503
     )
@@ -1157,14 +1054,12 @@ def test_a_provider_outage_is_not_reported_as_a_client_error(
             headers=auth_header_factory(registered_user),
         )
     assert response.status_code == 502
-    # The attempt stays recorded, entitling nothing.
     stored = db.query(SubscriptionModel).one()
     assert stored.status == STATUS_FAILED
     assert stored.end_date is None
 
 
 def _open_subscription(client, headers, plan_id=PREMIUM_MONTHLY):
-    """Opens one subscription with the order call stood in for."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=order_response(),
@@ -1179,13 +1074,6 @@ def _open_subscription(client, headers, plan_id=PREMIUM_MONTHLY):
 def test_the_ownership_row_is_durable_before_the_capture(
     client, registered_user, session_factory, auth_header_factory
 ):
-    """A settled charge can never be the first durable thing to happen.
-
-    Creation commits the pending row and captures nothing; the verified
-    approval stands in for the remote capture call and reads the database
-    from an independent session, so it only sees the row if that row was
-    genuinely committed before the charge.
-    """
     seen = {}
 
     async def observing_capture(db, order_id, current_user, **kwargs):
@@ -1215,14 +1103,12 @@ def test_the_ownership_row_is_durable_before_the_capture(
     )
 
     assert settled.status_code == 200
-    # Durable, owned, and granting nothing at the moment of the charge.
     assert seen['committed'] is True
     assert seen['status'] == STATUS_PENDING
     assert seen['end_date'] is None
     assert seen['user_id'] == registered_user.id
     assert seen['request_id']
 
-    # Activated only after the charge settled.
     entitling = client.get(
         '/subscriptions/', headers=auth_header_factory(registered_user)
     ).json()
@@ -1233,11 +1119,6 @@ def test_the_ownership_row_is_durable_before_the_capture(
 def test_a_failed_capture_leaves_a_failed_row_and_no_entitlement(
     client, registered_user, db, auth_header_factory
 ):
-    """A provider refusal at capture entitles nothing.
-
-    A provider failure with no category is a dependency failure, so it
-    is answered 502 rather than as a client error.
-    """
     assert _open_subscription(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -1255,22 +1136,18 @@ def test_a_failed_capture_leaves_a_failed_row_and_no_entitlement(
     row = db.query(SubscriptionModel).filter(
         SubscriptionModel.paypal_order_id == ORDER_ID
     ).one()
-    # Retained for reconciliation, entitling nothing.
     assert row.status == STATUS_PENDING
     assert row.end_date is None
     assert authorization.entitled_role(db, registered_user) is None
     assert client.get(
         '/subscriptions/', headers=auth_header_factory(registered_user)
     ).json() is None
-    # The delivery record went back with the transition, so PayPal's
-    # redelivery is processed rather than dismissed as a replay.
     assert db.query(WebhookEvent).count() == 0
 
 
 def test_a_duplicate_order_identifier_is_not_captured_again(
     client, registered_user, db, auth_header_factory
 ):
-    """The uniqueness constraint stops a second capture of one order."""
     moment = datetime.now(timezone.utc)
     db.add(
         SubscriptionModel(
@@ -1301,7 +1178,6 @@ def test_a_duplicate_order_identifier_is_not_captured_again(
 def test_a_settled_charge_that_cannot_activate_reports_reconciliation(
     client, registered_user, auth_header_factory
 ):
-    """The durable pending row is what reconciliation is left to finish."""
     assert _open_subscription(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -1319,7 +1195,6 @@ def test_a_settled_charge_that_cannot_activate_reports_reconciliation(
 def test_a_successful_subscription_derives_the_premium_entitlement(
     client, registered_user, db, auth_header_factory
 ):
-    """The paid role is derived from the settled row, end to end."""
     assert _open_subscription(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -1338,7 +1213,6 @@ def test_a_successful_subscription_derives_the_premium_entitlement(
 def test_no_client_field_can_influence_the_charge_or_the_window(
     client, registered_user, db, auth_header_factory
 ):
-    """Amount, currency, dates, status and order id are server-owned."""
     tampered = client.post(
         '/subscriptions/',
         json={
@@ -1352,7 +1226,6 @@ def test_no_client_field_can_influence_the_charge_or_the_window(
         },
         headers=auth_header_factory(registered_user),
     )
-    # Every one of those fields is outside the contract.
     assert tampered.status_code == 422
     assert db.query(SubscriptionModel).count() == 0
 
@@ -1377,7 +1250,6 @@ def test_no_client_field_can_influence_the_charge_or_the_window(
     assert row.currency == plan.currency
     assert row.paypal_order_id == ORDER_ID
     assert row.start_date.year >= 2020
-    # The response projects neither the amount nor the order identifier.
     assert 'amount' not in created.json()
     assert 'paypal_order_id' not in created.json()
 
@@ -1393,7 +1265,6 @@ def test_health_endpoint_reports_ready(client):
 
 
 def test_every_response_carries_a_correlation_id(client):
-    """A served response carries the identifier its records share."""
     response = client.get('/health')
     assert response.status_code == 200
     identifier = response.headers.get(REQUEST_ID_HEADER)
@@ -1402,7 +1273,6 @@ def test_every_response_carries_a_correlation_id(client):
 
 
 def test_a_supplied_correlation_id_is_honoured(client):
-    """A caller's own identifier is adopted, so traces join up."""
     response = client.get(
         '/health', headers={REQUEST_ID_HEADER: 'caller0trace1'}
     )
@@ -1417,7 +1287,6 @@ def test_a_supplied_correlation_id_is_honoured(client):
     'x' * 200,
 ])
 def test_an_unusable_correlation_id_is_replaced(client, supplied):
-    """An identifier that could corrupt a record is not adopted."""
     response = client.get(
         '/health', headers={REQUEST_ID_HEADER: supplied}
     )
@@ -1427,7 +1296,6 @@ def test_an_unusable_correlation_id_is_replaced(client, supplied):
 
 
 def test_a_rejected_request_still_carries_a_correlation_id(client):
-    """A failure is the case the identifier matters most for."""
     response = client.get('/subscriptions/')
     assert response.status_code == 401
     assert response.headers.get(REQUEST_ID_HEADER)
@@ -1436,12 +1304,6 @@ def test_a_rejected_request_still_carries_a_correlation_id(client):
 def test_a_supplied_correlation_id_reaches_the_refusal_record(
     client, registered_user, auth_header_factory
 ):
-    """The identifier a caller supplies is on the record of its refusal.
-
-    The assertion is made on the serialised line the process writes, not
-    on the response header alone, so the trace the caller holds and the
-    trace an operator reads are the same value.
-    """
     headers = auth_header_factory(registered_user)
     headers[REQUEST_ID_HEADER] = SUPPLIED_REQUEST_ID
 
@@ -1476,7 +1338,6 @@ def test_a_supplied_correlation_id_reaches_the_refusal_record(
     ('owner alice.smith@example.com', 'owner [REDACTED]'),
 ])
 def test_redaction_covers_internal_paths_and_pii(text, expected):
-    """A path or an address never reaches a record intact."""
     assert redact(text) == expected
 
 
@@ -1486,7 +1347,6 @@ def test_redaction_covers_internal_paths_and_pii(text, expected):
     'password=hunter2',
 ])
 def test_redaction_still_covers_credentials(value):
-    """The credential cover the path rules were added beside."""
     assert 'SUPERSECRET' not in redact(value)
     assert redact(value) != value
 
@@ -1497,12 +1357,10 @@ def test_redaction_still_covers_credentials(value):
     '/listings/',
 ])
 def test_redaction_leaves_route_paths_intact(path):
-    """An audited route path stays readable, or audit loses meaning."""
     assert redact(path) == path
 
 
 def collected(logger_name):
-    """Returns a logger and the list its records are appended to."""
     records = []
 
     class Collector(stdlib_logging.Handler):
@@ -1517,7 +1375,6 @@ def collected(logger_name):
 
 
 def test_a_logged_exception_carries_no_traceback():
-    """The failure is described by fields, not by a stack dump."""
     logger, records = collected('test.f11.exception')
     try:
         raise RuntimeError('failed reading /srv/app/backend/key.py')
@@ -1535,7 +1392,6 @@ def test_a_logged_exception_carries_no_traceback():
 
 @contextmanager
 def watching_audit_trail():
-    """Yields the records written to the governed namespace."""
     records = []
 
     class Collector(stdlib_logging.Handler):
@@ -1555,7 +1411,6 @@ def watching_audit_trail():
 
 
 def messages(records):
-    """Returns the plain message of every collected record."""
     return [record.getMessage() for record in records]
 
 
@@ -1577,7 +1432,6 @@ def formatted_lines(records):
 def test_a_denial_survives_a_failing_audit_sink(
     client, registered_user, capsys, auth_header_factory
 ):
-    """A denial reaches a sink even when the primary one fails."""
     reset_audit_failure_count()
     broken = Mock()
     broken.warning.side_effect = RuntimeError('sink down')
@@ -1601,7 +1455,6 @@ def test_a_denial_survives_a_failing_audit_sink(
 def test_a_refusal_is_audited_exactly_once(
     client, registered_user, auth_header_factory
 ):
-    """One refusal produces one canonical record, not two."""
     with watching_audit_trail() as records:
         response = client.post(
             '/listings/',
@@ -1615,7 +1468,6 @@ def test_a_refusal_is_audited_exactly_once(
 
 
 def test_a_foreign_log_handler_is_removed_and_reported():
-    """A handler that would bypass redaction does not survive."""
     governed = stdlib_logging.getLogger('backend')
     foreign = stdlib_logging.StreamHandler()
     governed.addHandler(foreign)
@@ -1639,7 +1491,6 @@ def test_a_foreign_log_handler_is_removed_and_reported():
 
 
 def test_a_child_logger_cannot_bypass_redaction():
-    """A handler on a descendant is stripped and made to propagate."""
     child = stdlib_logging.getLogger('backend.child.bypass')
     escape = stdlib_logging.StreamHandler()
     child.addHandler(escape)
@@ -1655,7 +1506,6 @@ def test_a_child_logger_cannot_bypass_redaction():
 
 
 def test_an_oversized_body_is_rejected(client):
-    """A body past the cap is refused before it can be handled."""
     oversized = 'x' * (1024 * 1024 + 512)
     response = client.post(
         '/filters/',
@@ -1726,14 +1576,12 @@ def drive_capped_request(declared, chunks, cap=32):
 
 
 def test_a_body_within_its_declaration_is_served():
-    """The cap does not interfere with an ordinary request."""
     statuses, reached = drive_capped_request(8, [b'x' * 8])
     assert statuses == [200]
     assert reached
 
 
 def test_a_body_that_understates_its_length_is_rejected():
-    """Received bytes are counted, so a false declaration fails."""
     statuses, reached = drive_capped_request(
         10, [b'x' * 26, b'y' * 26]
     )
@@ -1742,7 +1590,6 @@ def test_a_body_that_understates_its_length_is_rejected():
 
 
 def test_a_body_declaring_no_length_is_rejected():
-    """A chunked body is held to the same cap."""
     statuses, reached = drive_capped_request(
         None, [b'x' * 20, b'y' * 20]
     )
@@ -1751,14 +1598,12 @@ def test_a_body_declaring_no_length_is_rejected():
 
 
 def test_an_oversized_declaration_is_rejected_early():
-    """A declaration past the cap is refused before any read."""
     statuses, reached = drive_capped_request(4096, [b'x' * 8])
     assert statuses == [413]
     assert not reached
 
 
 def test_throttling_is_audited_and_answered_429(client):
-    """Exhausting the credential limit is refused and recorded."""
     limiter = app.state.limiter
     limiter.reset()
     try:
@@ -1785,12 +1630,6 @@ def test_throttling_is_audited_and_answered_429(client):
 
 
 class FakeResponse:
-    """Stands in for a provider response at the transport boundary.
-
-    ``content`` is what ``aiter_bytes`` yields and the declared length is
-    derived from it, so the service's response-size cap is applied to this
-    stand-in exactly as it is to a real streamed response.
-    """
 
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
@@ -1809,15 +1648,6 @@ class FakeResponse:
 
 
 class FakeClient:
-    """Records the calls a provider function issues.
-
-    Every call is asserted against the provider wire contract before a
-    response is served, so a call carrying the wrong method, host, path,
-    authentication, headers, body or timeout raises rather than receiving
-    a plausible answer. ``routes`` holds the contract route each recorded
-    call addressed. The service issues every call through ``stream``, so
-    that is the only call shape served.
-    """
 
     def __init__(self, responses):
         self._responses = list(responses)
@@ -1865,7 +1695,6 @@ def provider_transport(responses):
 
 
 def test_order_creation_sends_a_stable_idempotency_key():
-    """A repeat of an uncertain call resolves to the same order."""
     from backend.app.services.paypal_service import (
         capture_request_id,
         order_request_id,
@@ -1887,7 +1716,6 @@ def test_order_creation_sends_a_stable_idempotency_key():
 
 
 def test_order_creation_uses_the_current_experience_context():
-    """The redirect targets travel in the supported field."""
     with provider_transport([FakeResponse(200, order_response())]) as fake:
         asyncio.run(paypal_module.create_order(
             'premium_monthly',
@@ -1903,14 +1731,6 @@ def test_order_creation_uses_the_current_experience_context():
 
 
 def test_order_creation_sends_the_complete_documented_document():
-    """The outbound create-order body is asserted in full.
-
-    The document is compared member by member against the plan catalog
-    and the fixed payer experience values, and it is additionally handed
-    to the shared contract guard, which refuses any field outside the
-    documented sets. A field added to the outbound document therefore
-    fails this case rather than travelling unasserted.
-    """
     plan = get_plan(PREMIUM_MONTHLY)
     with provider_transport([FakeResponse(200, order_response())]) as fake:
         asyncio.run(paypal_module.create_order(
@@ -1950,7 +1770,6 @@ def test_order_creation_sends_the_complete_documented_document():
 
 
 def test_the_settle_call_sends_an_empty_body(db, registered_user):
-    """The outbound capture body is exactly the empty object."""
     owned_order(db, registered_user)
     with provider_transport(
         [FakeResponse(200, capture_response())]
@@ -1966,7 +1785,6 @@ def test_the_settle_call_sends_an_empty_body(db, registered_user):
 
 
 def test_a_rejected_token_is_refreshed_once():
-    """A stale grant is discarded and the call repeated once."""
     responses = [
         FakeResponse(401, {'name': 'INVALID_TOKEN'}),
         FakeResponse(200, order_response()),
@@ -1987,7 +1805,6 @@ def test_a_rejected_token_is_refreshed_once():
 
 
 def owned_order(db, user, order_id=ORDER_ID):
-    """Persists a pending subscription owned by ``user``."""
     plan = get_plan('premium_monthly')
     subscription = SubscriptionModel(
         user_id=user.id,
@@ -2005,7 +1822,6 @@ def owned_order(db, user, order_id=ORDER_ID):
 
 
 def test_capture_is_refused_for_another_principals_order(db, registered_user):
-    """An order is captured only by the principal that owns it."""
     owned_order(db, registered_user)
     intruder = User(
         email='intruder@example.com',
@@ -2026,7 +1842,6 @@ def test_capture_is_refused_for_another_principals_order(db, registered_user):
 
 
 def test_capture_is_refused_for_an_unknown_order(db, registered_user):
-    """An order resolving to no row is refused on the same terms."""
     with provider_transport([FakeResponse(200, capture_response())]) as fake:
         with pytest.raises(paypal_module.OrderOwnershipError):
             asyncio.run(paypal_module.capture_order(
@@ -2036,7 +1851,6 @@ def test_capture_is_refused_for_an_unknown_order(db, registered_user):
 
 
 def test_capture_proceeds_for_the_owning_principal(db, registered_user):
-    """The owner's own order is captured, so the guard is not blanket."""
     owned_order(db, registered_user)
     with provider_transport([FakeResponse(200, capture_response())]) as fake:
         captured = asyncio.run(paypal_module.capture_order(
@@ -2047,7 +1861,6 @@ def test_capture_proceeds_for_the_owning_principal(db, registered_user):
 
 
 def _published_routes():
-    """Returns every (method, path) pair the application publishes."""
     pairs = set()
     for route in app.routes:
         for method in getattr(route, 'methods', None) or []:
@@ -2071,11 +1884,6 @@ def test_route_paths_and_prefixes_are_unchanged():
 
 
 def test_the_webhook_is_the_only_additive_subscription_route():
-    """The subscription surface is the two frozen routes plus the webhook.
-
-    The set is asserted exactly, and a capture route taking a provider
-    identifier from a client is asserted absent from it.
-    """
     published = {
         pair
         for pair in _published_routes()
@@ -2090,32 +1898,19 @@ def test_the_webhook_is_the_only_additive_subscription_route():
 
 
 def test_no_route_accepts_a_paypal_identifier_from_a_client():
-    """No request contract declares a provider identifier field."""
     assert not hasattr(subscription_schema, 'SubscriptionCapture')
     assert set(SubscriptionCreate.__fields__) == {'plan_id'}
 
 
-# ---------------------------------------------------------------
-# The frozen interfaces: the credential contracts, the stored password
-# format, the route surface and the router prefixes.
-# ---------------------------------------------------------------
-
-# Four ASCII characters satisfying every complexity rule followed by
-# enough filler to carry the value one byte past the bcrypt ceiling.
 OVER_LIMIT_PASSWORD = 'Aa1!' + 'x' * 69
 
 
-# Stored hashes of VALID_TEST_PASSWORD in the two formats an account may
-# already carry, keyed by the format tag each one declares. Both are fixed
-# literals: nothing here recomputes them.
 LEGACY_HASHES = {
     '2a': '$2a$10$Fx4O/LGGE3rYIYARvyIzguVGMsohviwF6Jy2xHFo.LQO3vKPT8LqG',
     '2b': '$2b$10$QwmIv/qx/tUqhtOhYXa1ZOtRIA9lhyut9TfdHKBdOdD4mxT.DMjlO',
 }
 
 
-# Stored values that are not a readable hash: empty, unstructured, truncated
-# mid-hash, an unsupported format tag and an out-of-range cost.
 MALFORMED_HASHES = (
     '',
     'not-a-hash',
@@ -2125,12 +1920,9 @@ MALFORMED_HASHES = (
 )
 
 
-# The four router prefixes, which are a frozen interface.
 API_PREFIXES = ('/auth', '/listings', '/filters', '/subscriptions')
 
 
-# The eight pre-existing routes plus the one additive route, the webhook
-# listener, mounted under the existing /subscriptions prefix.
 EXPECTED_API_ROUTES = {
     ('POST', '/auth/register'),
     ('POST', '/auth/login'),
@@ -2164,7 +1956,6 @@ def unthrottled():
 def test_each_failed_login_is_counted_exactly_once(
     client, db, registered_user, unthrottled
 ):
-    """The counter is raised by the database, not read-modify-written."""
     for expected in (1, 2, 3):
         response = client.post('/auth/login', json={
             'email': registered_user.email,
@@ -2193,7 +1984,6 @@ def test_reaching_the_attempt_limit_locks_the_account(
     assert stored.failed_login_attempts == limit
     assert stored.locked_until is not None
 
-    # The correct password is refused identically while the lock holds.
     locked = client.post('/auth/login', json={
         'email': registered_user.email,
         'password': VALID_TEST_PASSWORD
@@ -2226,7 +2016,6 @@ def test_a_successful_login_clears_the_counter(
 def test_filter_creation_persists_the_submitted_zip_codes(
     client, db, registered_user, auth_header_factory
 ):
-    """Postal codes accepted by the contract reach the zip_codes table."""
     response = client.post(
         '/filters/',
         json={
@@ -2302,7 +2091,6 @@ def test_a_filter_is_not_visible_to_another_account(
 
 
 def _created_order(order_id=ORDER_ID):
-    """Returns a PayPal create-order object carrying an approval link."""
     return {
         'id': order_id,
         'status': 'PAYER_ACTION_REQUIRED',
@@ -2324,7 +2112,6 @@ def _settled(plan_id='premium_monthly'):
 
 
 def _post_plan(client, headers, plan_id='premium_monthly'):
-    """Posts one subscription-creation request."""
     return client.post(
         '/subscriptions/',
         json={'plan_id': plan_id},
@@ -2333,7 +2120,6 @@ def _post_plan(client, headers, plan_id='premium_monthly'):
 
 
 def _open_order(client, headers, plan_id='premium_monthly'):
-    """Opens a subscription order and returns the response."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         new=AsyncMock(return_value=_created_order()),
@@ -2344,7 +2130,6 @@ def _open_order(client, headers, plan_id='premium_monthly'):
 def test_subscription_creation_returns_the_approval_redirect(
     client, db, registered_user, auth_header_factory
 ):
-    """Creation opens the order and hands back the hosted redirect."""
     created = _open_order(client, auth_header_factory(registered_user))
     assert created.status_code == 200
     body = created.json()
@@ -2368,7 +2153,6 @@ def test_creation_grants_no_entitlement_before_settlement(
         client, auth_header_factory(registered_user)
     ).status_code == 200
 
-    # No active row is reported and no role was granted.
     fetched = client.get(
         '/subscriptions/', headers=auth_header_factory(registered_user)
     )
@@ -2417,8 +2201,6 @@ def test_an_unsettled_capture_changes_nothing(
         client, auth_header_factory(registered_user)
     ).status_code == 200
 
-    # A settlement that does not match the catalog is measured and
-    # refused; the row is left as it was so a later attempt can settle it.
     refused, _ = deliver_approval(
         client,
         capture=AsyncMock(return_value=capture_response(value='0.01')),
@@ -2440,7 +2222,6 @@ def test_an_unsettled_capture_changes_nothing(
 def test_capture_is_repeatable_without_a_second_settlement(
     client, registered_user, auth_header_factory
 ):
-    """A second approval of a settled order captures nothing again."""
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2451,8 +2232,6 @@ def test_capture_is_repeatable_without_a_second_settlement(
     assert first_response.status_code == 200
     assert first.await_count == 1
 
-    # A second distinct delivery for the same order finds it already
-    # active and asks the provider for nothing.
     repeated, second = deliver_approval(
         client, capture=AsyncMock(return_value=_settled())
     )
@@ -2467,12 +2246,6 @@ def test_capture_is_repeatable_without_a_second_settlement(
 def test_the_order_idempotency_key_is_derived_from_the_stored_row(
     client, db, registered_user, auth_header_factory
 ):
-    """The key is a function of the committed row, stored nowhere.
-
-    Re-derived from the same row it is the same value: a repeat of an
-    uncertain call presents the same ``PayPal-Request-Id``. No column
-    holds it.
-    """
     creator = AsyncMock(return_value=_created_order())
     with patch(SUBSCRIPTIONS_MODULE + '.create_order', new=creator):
         assert _post_plan(
@@ -2483,18 +2256,12 @@ def test_the_order_idempotency_key_is_derived_from_the_stored_row(
     sent = creator.await_args.kwargs['idempotency_key']
     assert sent == paypal_module.order_request_id(stored.id)
     assert sent == paypal_module.order_request_id(stored.id)
-    # No column on the row holds it.
     assert not hasattr(stored, 'paypal_request_id')
 
 
 def test_the_capture_identifier_is_carried_in_the_audit_record(
     client, db, registered_user, auth_header_factory
 ):
-    """A settled charge stays reconcilable through the activation record.
-
-    The provider's capture identifier is not a stored column, so the
-    activation record is where a reconciliation reads it from.
-    """
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2523,12 +2290,6 @@ def test_the_capture_identifier_is_carried_in_the_audit_record(
 def test_an_order_already_captured_is_read_back_and_activated(
     client, db, registered_user, auth_header_factory
 ):
-    """A settled order is measured, not charged again.
-
-    PayPal rejects a second capture of an order it has already settled.
-    The approval continuation reads that order back, measures what it
-    settled against the catalog, and grants the entitlement.
-    """
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2570,7 +2331,6 @@ def test_an_order_already_captured_is_read_back_and_activated(
     ).one().role == 'premium'
 
 
-#: Provider issue code carried by a refusal that is not a settlement.
 OTHER_PROVIDER_ISSUE = 'INSTRUMENT_DECLINED'
 
 
@@ -2602,7 +2362,6 @@ def provider_mock_transport(handler):
 
 
 def _refusing_capture_handler(issue, status_code=422):
-    """Returns a handler answering the capture call with ``issue``."""
 
     def handle(outbound):
         assert_paypal_request(outbound)
@@ -2625,15 +2384,6 @@ def _refusing_capture_handler(issue, status_code=422):
 def test_a_non_settlement_refusal_is_not_read_back_or_consumed(
     client, db, registered_user, auth_header_factory
 ):
-    """A 4xx that is not an already-settled order consumes nothing.
-
-    The refusal is served by a real transport carrying a provider issue
-    code that is not the already-captured one, so the service reads that
-    code out of the error body and the endpoint's discriminator sees it.
-    Nothing is read back, the delivery record is discarded, the
-    subscription is untouched and the response is not a success -- so
-    PayPal delivers the notification again.
-    """
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2669,12 +2419,6 @@ def test_a_non_settlement_refusal_is_not_read_back_or_consumed(
 def test_the_already_captured_issue_is_the_only_recovered_refusal(
     client, db, registered_user, auth_header_factory
 ):
-    """The recovered refusal is the one the provider names as settled.
-
-    Paired with the case above, which serves the same status under a
-    different issue code, this proves the discriminator is the issue code
-    rather than the status or the failure category.
-    """
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2716,7 +2460,6 @@ def test_the_already_captured_issue_is_the_only_recovered_refusal(
 def test_a_provider_refusal_at_capture_is_not_read_back(
     client, db, registered_user, auth_header_factory
 ):
-    """Only an already-settled order is read back, never a refusal."""
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2747,12 +2490,6 @@ def test_a_provider_refusal_at_capture_is_not_read_back(
 def test_an_approval_naming_a_foreign_order_activates_nothing(
     client, db, registered_user, second_registered_user, auth_header_factory
 ):
-    """A notification cannot move an order to a different account.
-
-    The account entitled is resolved from the stored order identifier, so
-    a second account gains nothing from the delivery and the row it does
-    not own stays exactly as it was.
-    """
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2774,7 +2511,6 @@ def test_an_approval_naming_a_foreign_order_activates_nothing(
 def test_an_approval_naming_an_unknown_order_activates_nothing(
     client, db, registered_user, auth_header_factory
 ):
-    """A notification for an order this service never opened is ignored."""
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2798,11 +2534,6 @@ def test_an_approval_naming_an_unknown_order_activates_nothing(
 def test_a_notification_naming_an_unopened_order_is_ignored(
     client, db, registered_user, second_registered_user, auth_header_factory
 ):
-    """A notification is bound to the row that opened the order.
-
-    An order this service never opened resolves to no row, so nothing is
-    captured and no account is entitled.
-    """
     assert _open_order(
         client, auth_header_factory(registered_user)
     ).status_code == 200
@@ -2826,11 +2557,6 @@ def test_a_notification_naming_an_unopened_order_is_ignored(
 def test_the_payer_return_target_is_not_the_first_cors_origin(
     client, registered_user, monkeypatch, auth_header_factory
 ):
-    """Each hosted-redirect target is the setting that configures it.
-
-    The origin list is reordered around the call, and both targets stay
-    the configured addresses.
-    """
     monkeypatch.setattr(
         settings,
         'ALLOWED_ORIGINS',
@@ -2853,13 +2579,6 @@ def test_the_payer_return_target_is_not_the_first_cors_origin(
 def test_both_payer_return_targets_use_the_declared_frontend_path(
     client, registered_user, auth_header_factory
 ):
-    """A returning payer lands on a route the frontend actually declares.
-
-    The frontend router declares one subscription route, ``/subscription``.
-    Both targets address exactly that path and differ only by a query
-    string, so neither outcome sends the payer to a path that does not
-    exist.
-    """
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         new=AsyncMock(return_value=_created_order()),
@@ -2882,7 +2601,6 @@ def test_both_payer_return_targets_use_the_declared_frontend_path(
 def test_expired_entitlement_is_withdrawn_on_retrieval(
     client, db, registered_user, auth_header_factory
 ):
-    """An expired window lowers a plan-granted role back to the baseline."""
     started = datetime.now(timezone.utc) - timedelta(days=60)
     db.add(SubscriptionModel(
         user_id=registered_user.id,
@@ -2923,7 +2641,6 @@ def test_an_administrator_is_never_demoted_on_retrieval(
 
 
 def _api_routes():
-    """Collects the (method, path) pairs mounted under the API prefixes."""
     pairs = set()
     for route in app.routes:
         path = getattr(route, 'path', '')
@@ -2944,18 +2661,11 @@ def test_every_router_prefix_is_still_mounted():
 
 
 def test_the_api_route_surface_is_exactly_the_expected_nine():
-    """The surface is the eight originals plus the webhook, and no more."""
     assert _api_routes() == EXPECTED_API_ROUTES
 
 
 @pytest.mark.parametrize('prefix', sorted(LEGACY_HASHES))
 def test_pre_existing_bcrypt_hashes_still_verify(prefix):
-    """Both fixed stored-hash literals verify the shared password.
-
-    The stored value is the ``$2a$`` or ``$2b$`` literal
-    :data:`LEGACY_HASHES` holds for the format tag under test, and a
-    different password does not verify against it.
-    """
     stored = LEGACY_HASHES[prefix]
     assert stored.startswith('$' + prefix + '$')
     assert verify_password(VALID_TEST_PASSWORD, stored) is True
@@ -2989,7 +2699,6 @@ def test_a_malformed_stored_hash_is_refused_without_raising(stored):
 
 
 def test_a_password_past_the_byte_ceiling_is_refused_cleanly(client):
-    """The ceiling yields a validation error, never a server fault."""
     assert len(OVER_LIMIT_PASSWORD.encode()) == 73
 
     registered = client.post('/auth/register', json={
@@ -3008,15 +2717,6 @@ def test_a_password_past_the_byte_ceiling_is_refused_cleanly(client):
 
 
 def test_the_shared_test_values_are_held_by_one_module_object():
-    """The values the suite shares are loaded under one module name.
-
-    pytest imports ``backend/tests/conftest.py`` as the top-level module
-    ``conftest``. A test module importing that same file again under a
-    package name loads it a second time, and the two module objects then
-    hold separate copies of every class and constant in it. The shared
-    values are published by ``backend/tests/support.py`` instead, which
-    every module imports as ``backend.tests.support``.
-    """
     loaded = sorted(
         name for name in sys.modules
         if name in ('support', 'backend.tests.support')
@@ -3033,14 +2733,6 @@ def test_the_application_entrypoint_imports():
 
 
 def test_the_application_entrypoint_imports_in_a_fresh_interpreter():
-    """A new interpreter imports the entrypoint and exits reporting success.
-
-    The import runs out of process, on the interpreter running this suite,
-    with the repository root on its import path. It is given
-    :data:`STARTUP_IMPORT_TIMEOUT_SECONDS` to finish; an import that has
-    not returned by then is reported as a failed startup rather than left
-    to hold the suite open.
-    """
     environment = dict(os.environ)
     environment['PYTHONPATH'] = str(REPO_ROOT)
     try:
@@ -3066,12 +2758,6 @@ def test_the_application_entrypoint_imports_in_a_fresh_interpreter():
     )
 
 
-# ---------------------------------------------------------------
-# The subscription lifecycle driven end to end: an order opened for payer
-# approval, a signature-verified notification, and the settlement that
-# grants entitlement.
-# ---------------------------------------------------------------
-
 PAYPAL_ORDER = {
     'id': ORDER_ID,
     'status': 'CREATED',
@@ -3092,7 +2778,6 @@ APPROVAL_NOTIFICATION = {
 
 
 def open_subscription(client, headers):
-    """Creates a pending subscription with the order call stood in for."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=PAYPAL_ORDER,
@@ -3109,7 +2794,6 @@ def open_subscription(client, headers):
 
 
 def approve_subscription(client, transmission_id=TRANSMISSION_ID):
-    """Delivers a signature-verified approval for the opened order."""
     verification = WebhookVerification(
         verified=True,
         transmission_id=transmission_id,
@@ -3131,7 +2815,6 @@ def approve_subscription(client, transmission_id=TRANSMISSION_ID):
 def test_subscription_creation_returns_the_hosted_approval_target(
     client, registered_user, auth_header_factory
 ):
-    """Creation opens the order and defers capture to the approval."""
     created = open_subscription(client, auth_header_factory(registered_user))
 
     assert created.status_code == 200
@@ -3191,7 +2874,6 @@ def test_a_replayed_approval_is_acknowledged_and_captures_once(
 def test_an_unsettled_approval_leaves_no_change(
     client, registered_user, auth_header_factory
 ):
-    """A failed capture rolls back the delivery record with the row."""
     open_subscription(client, auth_header_factory(registered_user))
     verification = WebhookVerification(
         verified=True,
@@ -3214,7 +2896,6 @@ def test_an_unsettled_approval_leaves_no_change(
         '/subscriptions/', headers=auth_header_factory(registered_user)
     ).json() is None
 
-    # The same delivery settles once the capture succeeds
     assert approve_subscription(client)[0].status_code == 200
     assert client.get(
         '/subscriptions/', headers=auth_header_factory(registered_user)
@@ -3246,11 +2927,6 @@ def test_an_unverified_notification_changes_nothing(
     assert fetched.json() is None
 
 
-# ---------------------------------------------------------------
-# Capture bound to the account that opened the order: what a settlement
-# grants, what a repeat settles, and what another account receives.
-# ---------------------------------------------------------------
-
 OPENED_ORDER = {
     'id': ORDER_ID,
     'status': 'CREATED',
@@ -3261,13 +2937,10 @@ OPENED_ORDER = {
 }
 
 
-# The provider response a settled capture returns, which the endpoint
-# measures against the catalog's own amount and currency.
 SETTLED_CAPTURE = capture_response()
 
 
 def open_order(client, headers):
-    """Open a subscription order with the PayPal call stood in for."""
     with patch(
         SUBSCRIPTIONS_MODULE + '.create_order',
         return_value=OPENED_ORDER,
@@ -3280,7 +2953,6 @@ def open_order(client, headers):
 
 
 def settle_order(client, order_id=ORDER_ID):
-    """Settle an approved order through the signature-verified webhook."""
     return deliver_approval(
         client,
         order_id=order_id,
@@ -3291,7 +2963,6 @@ def settle_order(client, order_id=ORDER_ID):
 def test_subscription_creation_captures_nothing(
     client, db, registered_user, auth_header_factory
 ):
-    """The order is durable and unsettled until the payer approves."""
     with patch(SUBSCRIPTIONS_MODULE + '.capture_order') as capture:
         created = open_order(client, auth_header_factory(registered_user))
     assert created.status_code == 200
@@ -3376,7 +3047,6 @@ def test_repeating_the_capture_settles_nothing_twice(
 def test_a_settlement_entitles_only_the_account_that_opened_it(
     client, db, registered_user, auth_header_factory
 ):
-    """The webhook entitles the row's own owner and nobody else."""
     open_order(client, auth_header_factory(registered_user))
     intruder = User(
         email='intruder@example.com',
@@ -3399,7 +3069,6 @@ def test_a_settlement_entitles_only_the_account_that_opened_it(
     )
     assert settled.status_code == 200
     capture.assert_awaited_once()
-    # The capture was bound to the row's owner, not to the caller.
     assert bound['owner_id'] == registered_user.id
 
     db.expire_all()

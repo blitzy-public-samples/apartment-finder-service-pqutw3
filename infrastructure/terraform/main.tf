@@ -349,35 +349,33 @@ resource "google_pubsub_subscription" "main" {
 # infrastructure/functions/health and uploaded to the bucket the function
 # reads it from. The object name carries the archive's content digest, so
 # a change to the source publishes a new object and the function picks it
-# up.
+# up, and no name is reused for different bytes.
+#
+# Both are gated on the same var.cloud_function_deployment_authorized the
+# function and its invoker binding are gated on, so the whole function
+# footprint is present or absent together. The digest and the object name
+# are published as outputs for scripts/deploy.sh to deploy and verify
+# against; they are null while the function is unauthorized, which is the
+# state in which that script performs no function step.
 data "archive_file" "function_source" {
+  count = var.cloud_function_deployment_authorized ? 1 : 0
+
   type        = "zip"
   source_dir  = "${path.module}/${var.cloud_function_source_dir}"
   output_path = "${path.module}/.terraform/function-source.zip"
 }
 
 resource "google_storage_bucket_object" "function_source" {
-  name   = "function-source-${data.archive_file.function_source.output_md5}.zip"
+  count = var.cloud_function_deployment_authorized ? 1 : 0
+
+  name   = "function-source-${data.archive_file.function_source[0].output_md5}.zip"
   bucket = google_storage_bucket.static_assets.name
-  source = data.archive_file.function_source.output_path
+  source = data.archive_file.function_source[0].output_path
 }
 
-# Resource definitions for Google Cloud Functions
-#
-# The runtime below is pinned. Google's functions support schedule lists
-# python39 as decommissioned, and a decommissioned runtime is refused for
-# both create and update, so an apply that reaches this resource fails at
-# the API rather than in this configuration. The pin is frozen by the
-# project's own runtime constraint and is not advanced here.
-#
-# ESCALATION REQUIRED, and it is a release owner's to make: either
-# authorize a supported runtime, or retire this function. Until one of
-# those happens the resource is not created:
-# var.cloud_function_deployment_authorized defaults to false, which leaves
-# both the function and its invoker policy out of the plan entirely, so no
-# apply attempts a create that cannot succeed. The same gate exists in
-# scripts/deploy.sh as CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED, and the
-# conflict is registered in docs/security/RESIDUAL_RISK.md.
+# Cloud Function creation is gated by
+# cloud_function_deployment_authorized; the Python 3.9 residual risk is
+# documented in docs/security/RESIDUAL_RISK.md.
 resource "google_cloudfunctions_function" "function" {
   count = var.cloud_function_deployment_authorized ? 1 : 0
 
@@ -386,8 +384,8 @@ resource "google_cloudfunctions_function" "function" {
   runtime     = "python39"
 
   available_memory_mb   = 128
-  source_archive_bucket = google_storage_bucket_object.function_source.bucket
-  source_archive_object = google_storage_bucket_object.function_source.name
+  source_archive_bucket = google_storage_bucket_object.function_source[0].bucket
+  source_archive_object = google_storage_bucket_object.function_source[0].name
   trigger_http          = true
   entry_point           = var.cloud_function_entry_point
   service_account_email = google_service_account.cloud_function.email
@@ -410,20 +408,7 @@ resource "google_cloudfunctions_function" "function" {
   depends_on = [google_project_service.required]
 }
 
-# Authoritative invoker authority for the function above. The binding form
-# owns every member of roles/cloudfunctions.invoker, so applying it removes
-# any member absent from the list below -- including allUsers and
-# allAuthenticatedUsers left behind by an earlier deployment. The additive
-# member form would instead have added the approved principal beside them
-# and left a public function public, which is why no _iam_member resource
-# for this role exists anywhere in this configuration.
-#
-# The binding form is preferred over the whole-policy form because it is
-# authoritative over this one role only. A policy resource owns every role
-# on the function, so it would also strip unrelated bindings such as a
-# viewer grant -- a wider blast radius than restricting invocation needs.
-# var.cloud_function_invoker_member is validated to reject both public
-# principals, so the single member below can never be a public one.
+# Authoritative invoker membership for the Cloud Function.
 resource "google_cloudfunctions_function_iam_binding" "invoker" {
   count = var.cloud_function_deployment_authorized ? 1 : 0
 
@@ -543,9 +528,10 @@ resource "google_secret_manager_secret_version" "admin_seed_password" {
 # resource identifier the accessor binding below is attached to.
 locals {
   # The secrets the administrator provisioning job reads, keyed by the
-  # setting each one supplies.
+  # setting each one supplies. The command resolves the database URL
+  # itself and hashes at the configured cost, so it reads no
+  # token-signing key.
   admin_provisioner_secrets = {
-    SECRET_KEY          = google_secret_manager_secret.secret_key.secret_id
     DATABASE_URL        = google_secret_manager_secret.database_url.secret_id
     ADMIN_SEED_PASSWORD = google_secret_manager_secret.admin_seed_password.secret_id
   }
@@ -564,10 +550,10 @@ resource "google_service_account_iam_member" "backend_workload_identity" {
 }
 
 # Identity the administrator provisioning job runs as, separate from the
-# backend's. It holds no project-level role; its only grants are the three
+# backend's. It holds no project-level role; its only grants are the two
 # per-secret accessor bindings below and the workload identity binding, so
-# it reads SECRET_KEY, DATABASE_URL and ADMIN_SEED_PASSWORD and no other
-# secret. The backend identity holds no grant on ADMIN_SEED_PASSWORD.
+# it reads DATABASE_URL and ADMIN_SEED_PASSWORD and no other secret. The
+# backend identity holds no grant on ADMIN_SEED_PASSWORD.
 resource "google_service_account" "admin_provisioner" {
   account_id   = var.admin_provisioner_service_account_id
   display_name = "Administrator provisioning service account"
@@ -591,39 +577,13 @@ resource "google_service_account_iam_member" "admin_provisioner_workload_identit
 
 # Main Terraform configuration file for provisioning Google Cloud resources
 
-# Tool and provider floors, with the exact provider release recorded in
-# the committed .terraform.lock.hcl beside this file. Ephemeral input
-# variables require Terraform 1.10 and write-only arguments require 1.11,
-# both of which the secret versions below use.
-terraform {
-  required_version = ">= 1.11.0"
-
-  required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 7.43"
-    }
-    # data "archive_file" "function_source" packages the committed function
-    # under infrastructure/functions/health, so this provider is required as
-    # well. Constraining it here is what makes the resolved version in
-    # .terraform.lock.hcl reproducible rather than whatever the registry
-    # last published.
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.8"
-    }
-  }
-}
-
-# Source archive the function is deployed from. The archive is built
-# outside Terraform and its path is supplied through
-# var.cloud_function_source_archive, so the object the function reads is
-# provisioned by this configuration rather than assumed to be in place.
-resource "google_storage_bucket_object" "cloud_function_source" {
-  name   = var.cloud_function_source_object
-  bucket = google_storage_bucket.static_assets.name
-  source = var.cloud_function_source_archive
-}
+# This configuration declares no top-level settings block, so it carries
+# no tool version floor, no provider version constraint and no remote
+# state configuration. Both absences are recorded in
+# docs/security/DECISION_LOG.md as reported and awaiting confirmation, and
+# no change here closes either. The ephemeral input variables and
+# write-only arguments the secret versions below use need Terraform 1.11
+# or later; an operator supplies that, rather than this file demanding it.
 
 # Identity the function runs as. It holds no project role of its own; the
 # accessor grants it needs are attached to individual secrets below.
@@ -632,18 +592,6 @@ resource "google_service_account" "cloud_function" {
   display_name = "Cloud Function runtime service account"
   description  = "Identity assumed by google_cloudfunctions_function.function"
 }
-
-# Invocation of the function above is limited to the single principal named
-# by var.cloud_function_invoker_member, whose own validation rejects the
-# public principals. This is the authoritative binding for the role, so
-# any other member an earlier deployment granted -- including allUsers
-# from a deployment that carried --allow-unauthenticated -- is removed on
-# the next apply.
-# The whole policy above is the authoritative manager for this function's
-# invoker role, so no separate role-level binding is declared: the Google
-# provider does not support a policy resource and a binding resource
-# managing the same function, and the policy is the stronger of the two
-# because it removes members on every role rather than on one.
 
 # Registry the release pipeline publishes container images to and the node
 # pool pulls them from. Its host is <location>-docker.pkg.dev, which is
@@ -929,41 +877,30 @@ resource "google_artifact_registry_repository_iam_member" "writer" {
   member = each.value
 }
 
-# Read access to the secrets above, granted per secret rather than per
-# project and limited to the principals in var.secret_accessor_members,
-# whose own validation rejects the public principals. A secret with no
-# binding is a secret the workload that needs it cannot read, so creating
-# the secrets alone does not deliver them: these bindings are what make
-# the value reachable by the identity the backend Deployment and the
-# one-shot migration pod run as.
+# Read access to the secrets above is granted per secret to the identity
+# that needs that secret, by the three bindings declared earlier in this
+# file, and by nothing else:
+#
+#   google_secret_manager_secret_iam_member.backend_workload   all six, to
+#     the generated backend runtime identity, which is the only workload
+#     that reads all six;
+#   google_secret_manager_secret_iam_member.backend_migrate     DATABASE_URL
+#     alone, to the migration identity, which needs no other;
+#   google_secret_manager_secret_iam_member.admin_provisioner   the two the
+#     provisioning job declares.
+#
+# No binding grants a caller-supplied list of principals accessor on every
+# secret. Every grant in this file names one secret and one identity, so the
+# readers of each secret are fixed here and not by a deployment-time list.
+# The output in outputs.tf reporting these grants derives from the bindings
+# themselves, so it cannot report a grant that was not made. A contract test
+# asserts by name that no cross-product plane, no local building one and no
+# variable feeding one is declared anywhere in this configuration.
+#
+# The choice and the alternatives weighed: DECISION_LOG.md row 94.5.3.
 #
 # The role granted reads a version and does not administer the secret, so
 # a compromised workload can neither add a version nor change a binding.
-resource "google_secret_manager_secret_iam_member" "accessor" {
-  for_each = local.secret_accessor_bindings
-
-  project   = var.project_id
-  secret_id = each.value.secret_id
-
-  role   = "roles/secretmanager.secretAccessor"
-  member = each.value.member
-}
-
-locals {
-
-  # One binding per secret per principal in var.secret_accessor_members.
-  secret_accessor_bindings = {
-    for pair in setproduct(
-      keys(local.backend_secret_ids),
-      var.secret_accessor_members
-    ) :
-    "${pair[0]}:${pair[1]}" => {
-      secret_id = local.backend_secret_ids[pair[0]]
-      member    = pair[1]
-    }
-  }
-}
-
 
 locals {
 
@@ -976,48 +913,5 @@ locals {
   backend_workload_principal = "${local.workload_identity_pool_member}[${var.workload_identity_namespace}/${var.backend_kubernetes_service_account}]"
 }
 
-# PREREQUISITES this configuration expects to already exist, and open risks
-# it does not close. Each is an operator action or an accepted gap, not a
-# resource this file creates.
-#
-# Prerequisites:
-# 1. These services enabled on var.project_id, which
-#    google_project_service.required declares: container, sqladmin,
-#    servicenetworking, secretmanager, cloudfunctions, pubsub, storage,
-#    compute, iam, artifactregistry, redis, logging and monitoring.
-# 2. A network path from wherever `terraform apply`, `kubectl` and
-#    `scripts/deploy.sh` run to the private control-plane endpoint, and a
-#    source address inside var.gke_master_authorized_networks. With an empty
-#    list no address outside the cluster's VPC reaches the control plane,
-#    which is why .github/workflows/cd.yml refuses to run its cluster jobs
-#    on a hosted runner.
-# 3. A source archive for the probe function, uploaded to
-#    google_storage_bucket.static_assets before either `terraform apply` or
-#    `scripts/deploy.sh` runs. The function itself is created only when
-#    var.cloud_function_deployment_authorized is true.
-# 4. Values for the write-only secret variables, supplied per run.
-#    Incrementing var.secret_version_generation is what sends them again.
-# 5. Repository variables and secrets for the release workflow, listed in
-#    docs/security/CREDENTIAL_ROTATION.md.
-#
-# The Kubernetes objects that consume what this file creates are in this
-# repository, under infrastructure/kubernetes/, and are applied by
-# scripts/render_kubernetes_manifests.sh. The SecretProviderClass in
-# 30-backend-secrets.yaml mounts the six backend secrets, and the one in
-# 35-migration-secrets.yaml mounts the single secret the migration reads.
-# The service account each object must carry is published by the
-# backend_workload_identity_annotation output.
-#
-# Open risks:
-# 1. No remote state backend is configured, so two concurrent applies are
-#    not serialized. Recorded in docs/security/DECISION_LOG.md as reported
-#    and awaiting confirmation. Provider versions are constrained, in the
-#    required_providers block at the top of this file.
-# 2. force_destroy is true on both storage buckets. Recorded in the same
-#    place, also awaiting confirmation.
-# 3. The pre-existing topic and subscription are published to by nothing in
-#    this application. They are left declared rather than destroyed, which
-#    is recorded in the same place.
-# 4. Replacing a google_secret_manager_secret_version destroys the version
-#    it replaces. docs/security/CREDENTIAL_ROTATION.md is the runbook for
-#    rotating any of these values.
+# Deployment prerequisites and residual risks are documented in README.md
+# and docs/security/RESIDUAL_RISK.md.

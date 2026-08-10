@@ -35,6 +35,7 @@ while an added credential field would pass one that only counted keys.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -42,21 +43,31 @@ import bcrypt
 import pytest
 from fastapi.testclient import TestClient
 from limits import RateLimitItemPerMinute
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.api.endpoints import auth as auth_module
 from backend.app.core import security
 from backend.app.core.config import settings
 from backend.app.db import database as database_module
-from backend.app.db.models import Base, User
+from backend.app.db.models import (
+    LOGIN_ATTEMPT_SLOT_COUNT,
+    Base,
+    LoginAttemptSlot,
+    User,
+)
 from backend.app.main import app
 from backend.tests.support import enforce_sqlite_foreign_keys
 
 PASSWORD = "Str0ng-Passphrase-9"
 
 WRONG_PASSWORD = "not-the-password-at-all"
+
+#: A signing key other than the configured one, used to show the
+#: throttling bucket is keyed rather than a bare digest.
+OTHER_SIGNING_KEY = "a-different-signing-key-of-length"
 
 # A cost factor below the configured one, standing in for a hash stored
 # before the current setting was chosen.
@@ -890,6 +901,258 @@ class TestRefusalBranchesDoTheSameWork:
             security.MIN_CREDENTIAL_CHECK_SECONDS
         )
         assert security.REFUSAL_WORK_ALLOWANCE > 0
+
+    #: Selects one refusal issues: the account lookup, then the read of
+    #: the row it takes its write lock on.
+    EXPECTED_SELECTS = 2
+
+    #: Writes one refusal issues: the single update it commits.
+    EXPECTED_UPDATES = 1
+
+    @staticmethod
+    def counted_statements(session_factory):
+        """Counts the statements issued against the case's database.
+
+        The listener records the verb of every statement the engine
+        executes. ``FOR UPDATE`` is not counted separately: SQLite accepts
+        the clause and emits nothing for it, so the shape is counted in a
+        form both engines report identically, and
+        ``test_the_throttle_reads_take_a_write_lock`` asserts the clause
+        itself against the dialect that implements it.
+        """
+        engine = session_factory.kw["bind"]
+        counts = {"selects": 0, "updates": 0, "inserts": 0, "deletes": 0}
+        verbs = {
+            "SELECT": "selects",
+            "UPDATE": "updates",
+            "INSERT": "inserts",
+            "DELETE": "deletes",
+        }
+
+        def record(conn, cursor, statement, parameters, context, many):
+            """Records the verb of one executed statement."""
+            head = statement.lstrip().split(None, 1)
+            if head and head[0].upper() in verbs:
+                counts[verbs[head[0].upper()]] += 1
+
+        event.listen(engine, "before_cursor_execute", record)
+        counts["_stop"] = lambda: event.remove(
+            engine, "before_cursor_execute", record
+        )
+        return counts
+
+    @pytest.mark.parametrize(
+        "branch",
+        ["unknown", "wrong_password", "locked", "unsupported_cost"],
+    )
+    def test_each_refusal_branch_issues_the_same_database_work(
+        self, branch, db, client, session_factory
+    ):
+        """Every branch reads one row under lock, updates it and commits.
+
+        This is the F6 control. The branch that found no account and the
+        branch whose account is already locked previously issued no write
+        at all, while the wrong-password branch took a write lock on the
+        account row and updated it. A wait on a row lock is unbounded and
+        the refusal budget can only add time, so the branch that wrote was
+        distinguishable by elapsed time whenever its row was contended.
+        Each branch now issues the same statements; only the table
+        differs, because the failed-attempt count belongs to an account
+        while the other branches have none to count against.
+        """
+        credentials = self.branches(db)
+        address, password = credentials[branch]
+        counts = self.counted_statements(session_factory)
+        try:
+            response = login(client, address, password)
+        finally:
+            counts.pop("_stop")()
+
+        assert response.status_code == 401, response.text
+        assert counts["selects"] == self.EXPECTED_SELECTS, (branch, counts)
+        assert counts["updates"] == self.EXPECTED_UPDATES, (branch, counts)
+        assert counts["inserts"] == 0, (branch, counts)
+        assert counts["deletes"] == 0, (branch, counts)
+
+    def test_the_throttle_reads_take_a_write_lock(self):
+        """Both throttle reads request the same row-level lock.
+
+        Asserted against the PostgreSQL dialect, which is the deployed one
+        and the one that implements the clause.
+        """
+        dialect = postgresql.dialect()
+        account = (
+            Session().query(User).filter(User.id == 1).with_for_update()
+        )
+        slot = (
+            Session()
+            .query(LoginAttemptSlot)
+            .filter(LoginAttemptSlot.bucket == 1)
+            .with_for_update()
+        )
+
+        for statement in (account, slot):
+            compiled = str(statement.statement.compile(dialect=dialect))
+            assert "FOR UPDATE" in compiled.upper(), compiled
+
+    def test_no_refusal_branch_inserts_or_removes_a_throttle_row(
+        self, db, client
+    ):
+        """The throttle table is a fixed set of rows, never grown.
+
+        A branch that inserted its own row would be distinguishable from
+        one that updated an existing row, and an address would be able to
+        grow the table.
+        """
+        credentials = self.branches(db)
+        before = db.query(LoginAttemptSlot).count()
+        assert before == LOGIN_ATTEMPT_SLOT_COUNT
+
+        for address, password in credentials.values():
+            assert login(client, address, password).status_code == 401
+
+        db.expire_all()
+        assert db.query(LoginAttemptSlot).count() == before
+
+    def test_a_locked_account_advances_the_bucket_not_the_account(
+        self, db, client
+    ):
+        """The locked branch writes, and writes nowhere countable.
+
+        The account's failed-attempt count and lock expiry are both left
+        exactly as the lockout set them, so the write that equalizes the
+        branch cannot extend a lock or advance a count.
+        """
+        credentials = self.branches(db)
+        address, password = credentials["locked"]
+        locked = db.query(User).filter(User.email == address).one()
+        attempts_before = locked.failed_login_attempts
+        locked_until_before = locked.locked_until
+        bucket = security.login_attempt_slot(address)
+        slot_before = (
+            db.query(LoginAttemptSlot)
+            .filter(LoginAttemptSlot.bucket == bucket)
+            .one()
+            .attempts
+        )
+
+        assert login(client, address, password).status_code == 401
+
+        db.expire_all()
+        after = db.query(User).filter(User.email == address).one()
+        assert after.failed_login_attempts == attempts_before
+        assert after.locked_until == locked_until_before
+        slot_after = (
+            db.query(LoginAttemptSlot)
+            .filter(LoginAttemptSlot.bucket == bucket)
+            .one()
+        )
+        assert slot_after.attempts == slot_before + 1
+        assert slot_after.observed_at is not None
+
+    def test_the_bucket_is_keyed_normalized_and_in_range(self):
+        """The bucket is a keyed digest of the normalized address.
+
+        Keying it means which addresses share a bucket is not computable
+        without the signing key, so a caller cannot choose two addresses
+        that contend with one another.
+        """
+        address = "Mixed.Case@Example.COM"
+        bucket = security.login_attempt_slot(address)
+
+        assert bucket == security.login_attempt_slot(
+            "  mixed.case@example.com  "
+        )
+        assert 0 <= bucket < LOGIN_ATTEMPT_SLOT_COUNT
+
+        with mock.patch.object(
+            security.settings, "SECRET_KEY", OTHER_SIGNING_KEY
+        ):
+            rekeyed = security.login_attempt_slot(address)
+        moved = [
+            security.login_attempt_slot("user%d@example.com" % index)
+            for index in range(64)
+        ]
+        with mock.patch.object(
+            security.settings, "SECRET_KEY", OTHER_SIGNING_KEY
+        ):
+            moved_again = [
+                security.login_attempt_slot("user%d@example.com" % index)
+                for index in range(64)
+            ]
+        assert (bucket, moved) != (rekeyed, moved_again)
+
+    def test_the_throttle_row_stores_no_address_or_credential(self):
+        """The table carries a bucket, a count and an instant, and no more."""
+        columns = set(LoginAttemptSlot.__table__.columns.keys())
+
+        assert columns == {"bucket", "attempts", "observed_at"}
+
+    @pytest.mark.postgres
+    @pytest.mark.parametrize("branch", ["unknown", "wrong_password"])
+    def test_two_simultaneous_refusals_serialise_on_postgres(
+        self, branch, postgres_client, postgres_db, monkeypatch
+    ):
+        """Two refusals for one address are answered identically.
+
+        Both branches now take a write lock, so two requests for the same
+        address serialise against each other whether that address holds an
+        account or not. Each request is still answered with the same
+        refusal, and each write lands exactly once: the counter the branch
+        advances moves by two, so neither request's update was lost to the
+        other.
+        """
+        monkeypatch.setattr(auth_module.limiter, "enabled", False)
+        address = "contended@example.com"
+        password = WRONG_PASSWORD
+        if branch == "wrong_password":
+            account = User(
+                email=address,
+                hashed_password=security.get_password_hash(PASSWORD),
+                created_at=datetime.now(timezone.utc),
+                role="registered",
+            )
+            postgres_db.add(account)
+            postgres_db.commit()
+
+        bucket = security.login_attempt_slot(address)
+
+        def refuse():
+            """Posts one login against the shared address."""
+            return postgres_client.post(
+                "/auth/login",
+                json={"email": address, "password": password},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = [
+                task.result()
+                for task in [pool.submit(refuse), pool.submit(refuse)]
+            ]
+
+        assert first.status_code == 401, first.text
+        assert second.status_code == 401, second.text
+        assert first.content == second.content
+        assert first.json() == {
+            "detail": auth_module.INVALID_CREDENTIALS_DETAIL
+        }
+
+        postgres_db.rollback()
+        postgres_db.expire_all()
+        if branch == "wrong_password":
+            stored = (
+                postgres_db.query(User)
+                .filter(User.email == address)
+                .one()
+            )
+            assert stored.failed_login_attempts == 2
+        else:
+            slot = (
+                postgres_db.query(LoginAttemptSlot)
+                .filter(LoginAttemptSlot.bucket == bucket)
+                .one()
+            )
+            assert slot.attempts == 2
 
 
 @pytest.mark.timing

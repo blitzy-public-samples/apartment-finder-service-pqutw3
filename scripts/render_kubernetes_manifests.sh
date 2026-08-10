@@ -13,10 +13,20 @@ set -euo pipefail
 #   scripts/render_kubernetes_manifests.sh all
 #   scripts/render_kubernetes_manifests.sh admin-credential
 #   scripts/render_kubernetes_manifests.sh 40-backend.yaml
+#   scripts/render_kubernetes_manifests.sh job-name migration
+#   scripts/render_kubernetes_manifests.sh job-name admin-credential
 #
 # A group renders its files in the order listed below, so the namespace is
 # created before anything placed in it. An argument ending in `.yaml` is
 # taken as a file name relative to the manifest directory instead.
+#
+# `job-name <group>` prints the name the one-shot Job of that group is
+# rendered under and nothing else. The two Job manifests carry that name as
+# a token, and it is derived here rather than by the caller, so the name a
+# delivery path applies, waits on, reads logs from and describes is the name
+# the manifest was rendered with. It is derived from IMAGE_TAG folded to the
+# alphabet a Kubernetes object name accepts and shortened to the length one
+# accepts, and a tag that leaves no usable character stops the render.
 #
 # The three release groups are applied in this order by both deployment
 # paths: prerequisites, then migration run to completion, then workloads.
@@ -100,6 +110,110 @@ readonly TOKEN_DEFAULTS=(
     "INGESTION_SCHEDULE=0 * * * *"
 )
 
+# Longest name a Kubernetes object may carry: the RFC 1123 label limit the
+# API server applies to metadata.name.
+readonly JOB_NAME_LIMIT=63
+
+# Name each one-shot Job's name begins with, keyed by the group it belongs
+# to and by the token that carries the whole name.
+readonly JOB_NAME_GROUPS=(
+    "migration:MIGRATION_JOB_NAME:backend-migrate"
+    "admin-credential:ADMIN_CREDENTIAL_JOB_NAME:backend-admin-credential"
+)
+
+# Report the field at position "$2" of the JOB_NAME_GROUPS entry whose
+# field "$3" equals "$1", or nothing when no entry matches.
+job_name_field() {
+    local wanted="$1"
+    local wanted_field="$2"
+    local reported_field="$3"
+    local entry
+    for entry in "${JOB_NAME_GROUPS[@]}"; do
+        IFS=':' read -r group token prefix <<EOF
+${entry}
+EOF
+        local fields=("${group}" "${token}" "${prefix}")
+        if [ "${fields[${wanted_field}]}" = "${wanted}" ]; then
+            printf '%s' "${fields[${reported_field}]}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Report the name the one-shot Job of a group is applied under.
+#
+# The name is the group's prefix followed by IMAGE_TAG folded to lower case
+# with every character outside the accepted alphabet replaced by a hyphen,
+# shortened so the whole name is within JOB_NAME_LIMIT, and stripped of a
+# hyphen the shortening left at either end. A tag leaving no usable
+# character, or a result that is not a valid object name, stops the run.
+job_name() {
+    local group="$1"
+    local prefix
+    local tag
+    local suffix
+    local room
+    local name
+
+    prefix="$(job_name_field "${group}" 0 2)"
+    if [ -z "${prefix}" ]; then
+        echo "Unknown one-shot Job group ${group}. Use migration or" \
+            "admin-credential." >&2
+        return 1
+    fi
+
+    tag="${IMAGE_TAG-}"
+    if [ -z "${tag}" ]; then
+        echo "Required manifest token IMAGE_TAG is not set." >&2
+        return 1
+    fi
+
+    suffix="$(printf '%s' "${tag}" | tr '[:upper:]' '[:lower:]' \
+        | tr -c 'a-z0-9-' '-')"
+    room=$(( JOB_NAME_LIMIT - ${#prefix} - 1 ))
+    suffix="${suffix:0:room}"
+    while [ -n "${suffix}" ] && [ "${suffix#-}" != "${suffix}" ]; do
+        suffix="${suffix#-}"
+    done
+    while [ -n "${suffix}" ] && [ "${suffix%-}" != "${suffix}" ]; do
+        suffix="${suffix%-}"
+    done
+    if [ -z "${suffix}" ]; then
+        echo "IMAGE_TAG carries no character a Kubernetes object name may" \
+            "use." >&2
+        return 1
+    fi
+
+    name="${prefix}-${suffix}"
+    if [ "${#name}" -gt "${JOB_NAME_LIMIT}" ]; then
+        echo "Job name ${name} is longer than ${JOB_NAME_LIMIT}" \
+            "characters." >&2
+        return 1
+    fi
+    if ! printf '%s' "${name}" \
+        | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'; then
+        echo "Job name ${name} is not a valid Kubernetes object name." >&2
+        return 1
+    fi
+
+    printf '%s' "${name}"
+}
+
+# Report the value a token is derived from rather than read for, or nothing
+# when the token is not one of those. The two one-shot Job names are always
+# derived, so a rendered manifest and every command a delivery path issues
+# against it name one object.
+derived_token() {
+    local group
+    group="$(job_name_field "$1" 1 0)"
+    if [ -n "${group}" ]; then
+        job_name "${group}"
+        return $?
+    fi
+    return 0
+}
+
 # Report the default recorded for a token, or nothing when it has none.
 token_default() {
     local name="$1"
@@ -116,7 +230,13 @@ token_default() {
 # Resolve a token to the value it is rendered with.
 token_value() {
     local name="$1"
-    local value="${!name-}"
+    local value
+    value="$(derived_token "${name}")" || return 1
+    if [ -n "${value}" ]; then
+        printf '%s' "${value}"
+        return 0
+    fi
+    value="${!name-}"
     if [ -z "${value}" ]; then
         value="$(token_default "${name}")"
     fi
@@ -215,8 +335,18 @@ main() {
 
     if [ "$#" -eq 0 ]; then
         echo "Usage: $0 <prerequisites|migration|workloads|all" \
-            "|admin-credential|FILE.yaml>..." >&2
+            "|admin-credential|FILE.yaml>... | job-name <group>" >&2
         return 2
+    fi
+
+    if [ "$1" = "job-name" ]; then
+        if [ "$#" -ne 2 ]; then
+            echo "Usage: $0 job-name <migration|admin-credential>" >&2
+            return 2
+        fi
+        job_name "$2"
+        printf '\n'
+        return 0
     fi
 
     for selector in "$@"; do

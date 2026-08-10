@@ -1,81 +1,5 @@
-"""Validated application settings loaded from the environment and ``.env``.
-
-Values are read from the process environment and from the ``.env`` file,
-and every security-relevant value is checked before the module finishes
-loading. A rejected value raises and stops startup: no value is
-defaulted, generated or downgraded in response to a failed check.
-
-The checks applied here are:
-
-* the token signing key must carry no surrounding whitespace, must be
-  at least :data:`MIN_SIGNING_KEY_BYTES` UTF-8 bytes long once measured
-  on its canonical form -- and at least the floor
-  :data:`MIN_SIGNING_KEY_BYTES_BY_ALGORITHM` sets for the strongest
-  configured algorithm -- must carry at least
-  :data:`MIN_SIGNING_KEY_DISTINCT_CHARS` distinct characters with no run
-  longer than :data:`MAX_SIGNING_KEY_REPEAT_RUN` repeated characters or
-  :data:`MAX_SIGNING_KEY_SEQUENCE_RUN` consecutive code points, and
-  must not be a known placeholder value
-* the JWT algorithm list must be non-empty and must name only entries
-  present in :data:`ALLOWED_JWT_ALGORITHMS`, with ``none`` refused in
-  any letter case
-* the database URL must name a supported PostgreSQL driver and carry a
-  host and a database name; ``sqlite`` is accepted only when
-  ``ENVIRONMENT`` names :data:`LOCAL_ENVIRONMENT`
-* the CORS origin list must be non-empty and must carry complete
-  ``<scheme>://<host>[:<port>]`` origins with no wildcard
-* the trusted-host list must be non-empty and must carry bare hostnames
-  or IP addresses with no wildcard
-* the listing-provider URL must be an ``https`` URL addressing a named
-  public host under :data:`ZILLOW_API_DOMAINS`, carrying no user
-  information, query string or fragment
-* the PayPal certificate-host allowlist must be non-empty and must
-  carry bare PayPal hostnames only
-* the PayPal API base must be the entry in :data:`PAYPAL_API_BASES`
-  that corresponds to ``PAYPAL_MODE``
-* the PayPal hosted-redirect base must be one complete
-  ``<scheme>://<host>[:<port>]`` base carrying no wildcard, path, query
-  string, fragment or user information, and outside
-  :data:`LOCAL_ENVIRONMENT` must use :data:`TLS_SCHEME` and address
-  neither this host nor a private network
-* the production environment must not be paired with sandbox payment
-  configuration
-* each setting named by :data:`PROVIDER_SECRET_SETTINGS` must be at
-  least :data:`MIN_PROVIDER_SECRET_LENGTH` characters long, which is the
-  shortest value the redaction registry in
-  :mod:`backend.app.core.logging` accepts
-* the sender address must be a routable ``<local-part>@<domain>``
-  address
-* each rate limit must carry a positive, bounded count and period
-  multiple
-* the rate-limit storage URI must name a scheme in
-  :data:`RATE_LIMIT_STORAGE_SCHEMES`, and a scheme outside
-  :data:`IN_PROCESS_RATE_LIMIT_SCHEMES` must carry the address of the
-  store it names
-* outside :data:`LOCAL_ENVIRONMENT` the rate-limit storage URI must name
-  a scheme in :data:`DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES`, which holds
-  the shared schemes and excludes every in-process scheme
-* placeholder values and reserved example domains are refused outside
-  :data:`LOCAL_ENVIRONMENT`
-* when ``SECRET_BACKEND`` names :data:`MANAGED_BACKEND_NAME`, every
-  setting listed in :data:`MANAGED_SECRET_SETTINGS` must arrive from
-  the process environment rather than from an environment file
-* the log level must name an entry in :data:`LOG_LEVEL_NAMES`, and
-  :data:`LOCAL_ONLY_LOG_LEVEL` is accepted only while ``ENVIRONMENT``
-  names :data:`LOCAL_ENVIRONMENT`
-
-Constructing :class:`Settings` raises ``ValidationError`` for a rejected
-value, and the module-level :data:`settings` instance applies that
-validation during import.
-
-This module imports nothing from the application. A rejected value is
-reported by raising.
-
-Usage::
-
-    from backend.app.core.config import settings
-
-    engine = create_engine(settings.DATABASE_URL)
+"""Validated settings loaded from the process environment and configured
+environment file.
 """
 
 import ipaddress
@@ -88,11 +12,16 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseSettings, Field, root_validator, validator
 
+from backend.app.core import db_contract
+
 __all__ = [
     "ALLOWED_JWT_ALGORITHMS",
     "BOUNDED_MEMORY_SCHEME",
+    "DB_MIGRATION_TIMEOUT_CEILING_SECONDS",
     "DB_TIMEOUT_CEILING_SECONDS",
+    "DB_TIMEOUT_FLOOR_SECONDS",
     "DEFAULT_DB_CONNECT_TIMEOUT_SECONDS",
+    "DEFAULT_DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS",
     "DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS",
     "DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS",
     "DEFAULT_ENV_FILE",
@@ -141,10 +70,10 @@ __all__ = [
 #: JWT algorithms accepted for signing and verification.
 ALLOWED_JWT_ALGORITHMS = frozenset({"HS256", "HS384", "HS512"})
 
-#: Deployment environment names accepted by ``Settings.ENVIRONMENT``.
-ENVIRONMENT_NAMES = frozenset(
-    {"local", "development", "staging", "production"}
-)
+#: Deployment environment names accepted by ``Settings.ENVIRONMENT``. The
+#: set is declared by :mod:`backend.app.core.db_contract`, which the
+#: one-shot commands hold their own resolved environment to.
+ENVIRONMENT_NAMES = db_contract.ENVIRONMENT_NAMES
 
 #: Environment name that activates the payment-configuration guard.
 PRODUCTION_ENVIRONMENT = "production"
@@ -218,17 +147,15 @@ MANAGED_SECRET_SETTINGS = (
 )
 
 #: Settings the delivery pipeline publishes as a namespace-scoped
-#: Kubernetes secret rather than as a value in the deployed ConfigMap,
-#: because the value carries a credential.
+#: Kubernetes secret rather than as a value in the deployed ConfigMap.
 #:
 #: ``RATE_LIMIT_STORAGE_URI`` names the shared store the credential-endpoint
-#: counters are kept in. The store requires an AUTH string, so the assembled
-#: address is a credential even though the setting is not one of
-#: :data:`MANAGED_SECRET_SETTINGS`: those six are read from Secret Manager by
-#: the CSI driver at pod start, while this one is read by the deployment and
-#: written into the ``backend-rate-limit-store`` secret every workload
-#: references. It is excluded from the ConfigMap key-set assertion the
-#: infrastructure job of ``.github/workflows/ci.yml`` makes.
+#: counters are kept in, and the assembled address carries the store's AUTH
+#: string. The six names in :data:`MANAGED_SECRET_SETTINGS` are read from
+#: Secret Manager by the CSI driver at pod start; this one is read by the
+#: deployment and written into the ``backend-rate-limit-store`` secret every
+#: workload references. It is excluded from the ConfigMap key-set assertion
+#: the infrastructure job of ``.github/workflows/ci.yml`` makes.
 PIPELINE_SECRET_SETTINGS = ("RATE_LIMIT_STORAGE_URI",)
 
 #: Log levels accepted by ``Settings.LOG_LEVEL``. The names are the
@@ -325,22 +252,53 @@ MAX_PAGINATION_OFFSET_CEILING = 1000000
 #: environment names none.
 DEFAULT_MAX_PAGINATION_OFFSET = 10000
 
-#: Largest value any database timeout may be set to, in seconds. A value
-#: above it is refused by settings validation.
-DB_TIMEOUT_CEILING_SECONDS = 300
+#: Largest value any request-path database timeout may be set to, in
+#: seconds. A value above it is refused by settings validation.
+DB_TIMEOUT_CEILING_SECONDS = db_contract.DB_TIMEOUT_CEILING_SECONDS
+
+#: Smallest value any database timeout may be set to, in seconds.
+DB_TIMEOUT_FLOOR_SECONDS = db_contract.DB_TIMEOUT_FLOOR_SECONDS
+
+#: Largest value the migration statement timeout may be set to, in
+#: seconds. It is above :data:`DB_TIMEOUT_CEILING_SECONDS` because the
+#: statements a revision issues are schema changes rather than
+#: request-path reads.
+DB_MIGRATION_TIMEOUT_CEILING_SECONDS = (
+    db_contract.DB_MIGRATION_TIMEOUT_CEILING_SECONDS
+)
 
 #: Seconds a connection attempt to the database may take when the
 #: environment names none. It is applied as the libpq ``connect_timeout``
 #: parameter, which waits indefinitely when it is omitted or zero.
-DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 3
+DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = (
+    db_contract.DEFAULT_DB_CONNECT_TIMEOUT_SECONDS
+)
 
 #: Seconds one statement may run on the server when the environment names
 #: none. It is applied as the PostgreSQL ``statement_timeout`` runtime
 #: parameter, so a statement past it is cancelled by the server rather
 #: than left running after the client has stopped waiting. The default is
 #: below the readiness probe's own client timeout, so the probe's
-#: statement is bounded on the server before the probe abandons it.
-DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS = 3
+#: statement is bounded on the server before the probe abandons it. It is
+#: also below ``HTTP_TIMEOUT_SECONDS``, so a statement contending with a
+#: request that is waiting on a provider call is cancelled before that
+#: call returns;
+#: :func:`backend.app.api.endpoints.subscriptions._record_delivery` reads
+#: the delivery identifier back and attempts its write again when that
+#: happens. The migrations run under
+#: :data:`DEFAULT_DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS` instead.
+DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS = (
+    db_contract.DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS
+)
+
+#: Seconds one migration statement may run on the server when the
+#: environment names none. A revision's statements are schema changes over
+#: whatever the tables already hold, so they are bounded separately from
+#: the request path and by a value below the wall-clock deadline the
+#: deployment paths place on the migration job.
+DEFAULT_DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS = (
+    db_contract.DEFAULT_DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS
+)
 
 #: Seconds an established database connection may hold unacknowledged
 #: data before the socket is aborted, when the environment names none. It
@@ -350,7 +308,9 @@ DEFAULT_DB_STATEMENT_TIMEOUT_SECONDS = 3
 #: server, but the cancellation cannot reach a client whose packets are
 #: no longer acknowledged. Platforms without the underlying socket option
 #: ignore the parameter.
-DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS = 4
+DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS = (
+    db_contract.DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS
+)
 
 #: Largest value ``Settings.INGESTION_MAX_ZIP_CODES`` may be set to. A
 #: value above it is refused by settings validation.
@@ -429,15 +389,18 @@ _HOST_FORBIDDEN_CHARS = ("/", ":", "?", "#", "@", "*", " ", "\t")
 # Schemes accepted in a CORS origin.
 _ORIGIN_SCHEMES = frozenset({"http", "https"})
 
-# URL schemes accepted in ``Settings.DATABASE_URL``.
-_DATABASE_SCHEMES = frozenset({"postgresql", "postgresql+psycopg2"})
+# URL schemes accepted in ``Settings.DATABASE_URL``. The three names
+# below and the check that reads them are
+# :mod:`backend.app.core.db_contract`'s, which the migration environment
+# and the administrative command hold the same value to.
+_DATABASE_SCHEMES = db_contract.DATABASE_SCHEMES
 
 # URL schemes accepted in ``Settings.DATABASE_URL`` under
 # :data:`LOCAL_ENVIRONMENT` only.
-_LOCAL_DATABASE_SCHEMES = frozenset({"sqlite", "sqlite+pysqlite"})
+_LOCAL_DATABASE_SCHEMES = db_contract.LOCAL_DATABASE_SCHEMES
 
 # Scheme whose SQLAlchemy support was withdrawn.
-_WITHDRAWN_DATABASE_SCHEME = "postgres"
+_WITHDRAWN_DATABASE_SCHEME = db_contract.WITHDRAWN_DATABASE_SCHEME
 
 # Longest accepted hostname, in characters.
 _MAX_HOSTNAME_LENGTH = 253
@@ -861,6 +824,11 @@ class Settings(BaseSettings):
         ge=1,
         le=DB_TIMEOUT_CEILING_SECONDS,
     )
+    DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS: int = Field(
+        DEFAULT_DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS,
+        ge=1,
+        le=DB_MIGRATION_TIMEOUT_CEILING_SECONDS,
+    )
     DB_TCP_USER_TIMEOUT_SECONDS: int = Field(
         DEFAULT_DB_TCP_USER_TIMEOUT_SECONDS,
         ge=1,
@@ -957,6 +925,9 @@ class Settings(BaseSettings):
     # requires MANAGED_BACKEND_NAME.
     SECRET_BACKEND: str = Field(ENVIRONMENT_BACKEND_NAME)
     LOG_LEVEL: str = LOG_LEVEL_NAMES[3]
+    # Telemetry endpoint. Optional and read by no code path in this
+    # service; a deployment that supplies it changes nothing here.
+    SENTRY_DSN: Optional[str] = None
 
     @validator(*_LIST_VALUED_FIELDS, pre=True)
     def _split_delimited_list(cls, value: Any) -> Any:
@@ -1058,32 +1029,14 @@ class Settings(BaseSettings):
         The URL must name a scheme in :data:`_DATABASE_SCHEMES` and must
         carry both a host and a database name. A scheme in
         :data:`_LOCAL_DATABASE_SCHEMES` is accepted only while
-        ``ENVIRONMENT`` names :data:`LOCAL_ENVIRONMENT`.
+        ``ENVIRONMENT`` names :data:`LOCAL_ENVIRONMENT`. The check is
+        :func:`backend.app.core.db_contract.validate_database_url`, so the
+        migration environment and the administrative command hold the
+        value they resolve to the same rule.
         """
-        candidate = value.strip()
-        parts = _split_url(candidate)
-        scheme = parts.scheme.lower()
-        accepted = sorted(_DATABASE_SCHEMES)
-        if scheme in _LOCAL_DATABASE_SCHEMES:
-            if values.get("ENVIRONMENT") != LOCAL_ENVIRONMENT:
-                raise ValueError(
-                    f"must use one of {accepted} unless ENVIRONMENT is "
-                    f"{LOCAL_ENVIRONMENT}"
-                )
-            return candidate
-        if scheme == _WITHDRAWN_DATABASE_SCHEME:
-            raise ValueError(
-                f"must use one of {accepted} rather than "
-                f"{_WITHDRAWN_DATABASE_SCHEME}"
-            )
-        if scheme not in _DATABASE_SCHEMES:
-            raise ValueError(f"must use one of {accepted}")
-        if not parts.hostname:
-            raise ValueError("must carry a host")
-        database = parts.path.lstrip("/")
-        if not database or "/" in database:
-            raise ValueError("must carry a database name")
-        return candidate
+        return db_contract.validate_database_url(
+            value, values.get("ENVIRONMENT")
+        )
 
     @validator("JWT_ALGORITHMS")
     def _check_jwt_algorithms(cls, value: List[str]) -> List[str]:

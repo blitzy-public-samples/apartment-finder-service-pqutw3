@@ -370,30 +370,40 @@ PAYPAL_WEBHOOK_ID                   SENDGRID_API_KEY
 `local` semantics by omission. `CLOUD_SQL_INSTANCE_CONNECTION_NAME` is consumed only by the
 `gcp` profile's proxy, and is validated to be well formed under that profile.
 
-**Deployment workflow — four repository secrets and five repository variables.**
+**Deployment workflow — six repository secrets and twenty-three repository variables.**
 `.github/workflows/cd.yml` reads these and asserts every one is present and well formed
-before it mutates anything. Only the four in the first table are credentials or
-project identifiers; the rest are configuration, so they are repository variables:
+before it mutates anything. Only the six in the first table are credentials or project
+identifiers; everything else is configuration, so it is a repository variable. The
+[Deployment](#deployment) section below is the complete inventory with each name's kind;
+the two tables here are the ones a first-time deployment gets wrong most often.
 
 | Secret | Purpose |
 | --- | --- |
 | `GCP_PROJECT_ID` | The target project. |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT` | Federated identity, which replaced the long-lived service-account key. |
 | `GKE_CLUSTER_NAME` | The cluster the rollout targets. |
+| `BACKEND_GCP_SERVICE_ACCOUNT_EMAIL` | The Google service account the backend workload identity binds to. |
+| `ADMIN_PROVISIONER_GCP_SERVICE_ACCOUNT_EMAIL` | The identity the optional administrator-credential Job runs as. |
 
 | Variable | Purpose |
 | --- | --- |
-| `GKE_CLUSTER_REGION` | The cluster's region, addressed **regionally**. This replaces a zonal setting: a regional cluster cannot be reached with a zone flag, and the former `GKE_CLUSTER_ZONE` secret is retired. |
+| `GKE_CLUSTER_REGION` | The cluster's region, addressed **regionally**, and a variable rather than a secret. This replaces a zonal setting: a regional cluster cannot be reached with a zone flag, and the former `GKE_CLUSTER_ZONE` secret is retired. |
 | `K8S_NAMESPACE` | The namespace whose workloads are updated. |
 | `ARTIFACT_REGISTRY_LOCATION`, `ARTIFACT_REGISTRY_REPOSITORY` | The regional registry images are pushed to and pulled from, replacing `gcr.io`. |
-| `GKE_DEPLOY_RUNNER_LABEL` | The self-hosted runner inside the VPC that the deploy job runs on. |
+| `GKE_DEPLOY_RUNNER_LABEL` | The self-hosted runner inside the VPC that the cluster jobs run on. It has **no default**, and preflight refuses a hosted-image label. |
+| `REACT_APP_API_BASE_URL`, `PAYPAL_CLIENT_ID` | The two public frontend build arguments. Preflight refuses a blank value for either. |
 
-**Terraform — inputs with no safe default.** Beyond `project_id` and the six secret values,
-the resources added by this work require `database_private_network`,
-`gke_master_authorized_networks`, `cloud_function_invoker_member`, `github_repository`
-(which scopes federated identity to one repository, and is what stops any repository
-minting a token for this project), `cloud_function_entry_point` and
-`cloud_function_source_archive`.
+**Terraform — inputs with no safe default.** Fourteen variables declare no default, so a
+plan refuses until each is supplied. Beyond `project_id` and the six managed secret values,
+they are `admin_seed_password` and `rate_limit_storage_uri` — credentials in their own right
+— together with `database_private_network`, `gke_master_authorized_networks`,
+`artifact_registry_writer_members`, `cloud_function_invoker_member` and `github_repository`
+(which scopes federated identity to one repository, and is what stops any repository minting
+a token for this project). `cloud_function_entry_point` and `cloud_function_source_dir` both
+carry defaults and are deliberately not in this set. The `cloud_function_source_archive`
+*variable* that an earlier revision of this section listed no longer exists: Terraform
+packages the source itself and names the object after the archive's content digest, so there
+is no path for a caller to supply.
 
 **Backend settings added for boundary resilience.** Each has a working default, and one of
 them needs deliberate attention per deployment:
@@ -435,21 +445,27 @@ anything.
 | Cluster access | A regional cluster addressed with `--region`, reached over the authorized DNS endpoint while the private endpoint stays private. Requires `container.clusters.connect` |
 | Cloud Function | `apartment-finder-probe`, entry point `hello_world`, runtime `python39`, source `function-source.zip` in the project's static-assets bucket, invoker restricted &mdash; no anonymous invocation |
 
-The pipeline needs two repository **secrets** (`GCP_PROJECT_ID`, `GKE_CLUSTER_NAME`) plus
-the two Workload Identity Federation secrets (`GCP_WORKLOAD_IDENTITY_PROVIDER`,
-`GCP_SERVICE_ACCOUNT`), and three repository **variables**, which are not credentials:
-`GKE_CLUSTER_REGION`, `K8S_NAMESPACE` and `ARTIFACT_REGISTRY_REPOSITORY`. **The former
+The pipeline needs six repository **secrets** — `GCP_PROJECT_ID`, `GKE_CLUSTER_NAME`, the
+two Workload Identity Federation secrets `GCP_WORKLOAD_IDENTITY_PROVIDER` and
+`GCP_SERVICE_ACCOUNT`, and the two service-account addresses
+`BACKEND_GCP_SERVICE_ACCOUNT_EMAIL` and `ADMIN_PROVISIONER_GCP_SERVICE_ACCOUNT_EMAIL` — and
+twenty-three repository **variables**, none of which is a credential. The
+[Deployment](#deployment) section lists every one with its kind. **The former
 `GKE_CLUSTER_ZONE` secret is retired**, because the cluster is regional. `deploy.sh`
 takes no arguments and reads `GCP_PROJECT_ID`, `GKE_CLUSTER`, `GKE_REGION`,
 `K8S_NAMESPACE` and `VERSION` from the environment; run `scripts/deploy.sh --help` for
 the full contract. It additionally needs `jq` and `timeout` on `PATH`.
 
-Terraform requires eleven variables with no default, including
-`artifact_registry_writer_members`, `secret_accessor_members`,
-`cloud_function_invoker_member` and `database_private_network`. The six application
+Terraform requires fourteen variables with no default, including
+`artifact_registry_writer_members`, `cloud_function_invoker_member`,
+`database_private_network` and `gke_master_authorized_networks`. The six application
 secrets are provisioned as Secret Manager secrets whose `secret_id` is the setting name
-that consumes it, with a per-secret `roles/secretmanager.secretAccessor` binding for the
-workload principal.
+that consumes it, and each carries a `roles/secretmanager.secretAccessor` binding for
+the one identity that reads it: the backend runtime identity holds all six, the
+migration identity holds `DATABASE_URL` alone, and the provisioning identity holds the
+two its job declares. There is no variable that grants a supplied list of principals
+access to every secret; the `secret_accessor_bindings` output lists the pairs actually
+granted, derived from the bindings themselves.
 
 **Two things block a first release, deliberately and visibly rather than silently:**
 
@@ -490,32 +506,33 @@ CI job that runs each command, or says plainly that nothing but you runs it.
 
 | Command | Expected result | Enforced by |
 | --- | --- | --- |
-| `python -c "import backend.app.main"` | Exit code 0 — the application imports. | **CI — `integration` job**, step "Verify the application starts" |
+| `python -c "import backend.app.main"` | Exit code 0 — the application imports. | **CI — `runtime-integration` job**, step "Verify the application starts", and the `backend` job's step "Check the application starts" |
 | `python -m pytest backend/tests -q` | Tests collected, all passing. | **CI — `backend` job**, which runs the same suite with coverage instead of `-q` |
 | `python -m pytest backend/tests/security -q` | All passing, including the **45-assertion role matrix** — nine role-governed routes by five principals, anonymous included. | **CI — `backend` job**, this exact command |
 | `pip-audit -r backend/requirements.txt` | **Only** the seven advisories in the *Runtime register* of [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md). | **CI — `backend` job**, as `--strict` with those seven identifiers suppressed by name, so an eighth fails the build |
-| `pip-audit -r backend/requirements-dev.txt` | **Only** the seven advisories in the *Development register* of the same file. Fourteen identifiers are suppressed in total, all of them registered. | **CI — `backend` job**, the same way, with that manifest's seven identifiers |
+| `pip-audit -r backend/requirements-dev.txt` | **Only** the one advisory in the *Development register* of the same file. Eight identifiers are suppressed in total, all of them registered. `backend/requirements-audit.txt` declares the audit instrument and is not audited. | **CI — `backend` job**, the same way, with that manifest's one identifier |
 | `bandit -r backend/app -ll` | Exit code 0 — no Medium or High findings. | **CI — `backend` job**, this exact command |
 | `flake8 backend` | Clean. | **CI — `backend` job**, which runs `flake8 .` from inside `backend/`. Same files, and the per-file ignores in `setup.cfg` are written to match under both spellings |
 | `cd infrastructure/terraform && terraform init -backend=false && terraform validate` | Passes. | **CI — `infrastructure` job**, which additionally runs `terraform fmt -check -recursive` before validating |
-| `cd backend && alembic upgrade head` | Every revision applies; `alembic current` reports `0003 (head)`. |
-| Reversibility, **against a disposable database only**: `alembic upgrade head`, `alembic downgrade -1`, `alembic downgrade -1`, `alembic upgrade head`, `alembic current` | Each revision reverses independently and re-applies, and the sequence **ends at `0003 (head)`**. | **CI — `integration` job**, against a PostgreSQL 13 service, which also reapplies afterwards and asserts exactly one administrator |
+| `cd backend && alembic upgrade head` | Every revision applies; `alembic current` reports `0005 (head)`. | **CI &mdash; `backend`, `runtime-integration` and `integration` jobs**, each against a PostgreSQL 13 service; the first two also reverse the chain and reapply it, and all three then assert the administrator count |
+| Reversibility, **against a disposable database only**: `alembic upgrade head`, then one `alembic downgrade -1` per revision in the chain (5 today: `0005` &rarr; `0004` &rarr; `0003` &rarr; `0002` &rarr; `0001` &rarr; base), then `alembic upgrade head`, `alembic current` | Each revision reverses independently, the chain reaches the base, every revision re-applies, and the sequence **ends at `0005 (head)`**. | **CI &mdash; `backend` and `runtime-integration` jobs**, each against a PostgreSQL 13 service. Both read the number of reversals from the revision chain, assert the base was reached, reapply afterwards and assert exactly one administrator |
 | `bash -n scripts/deploy.sh scripts/render_kubernetes_manifests.sh` | Exit code 0. | **Manual / local only.** No CI job parses the deployment scripts |
 | `kubectl create --dry-run=client -f <rendered manifest>` | Accepted for every built-in kind. | **Partly CI.** The `infrastructure` job checks the manifests against the settings contract — key sets, the secret backend, no literal secret, no inline environment entry — but does **not** run a client-side schema validation, which needs `kubectl` |
 | Opening `blitzy-deck/executive-summary.html` in a browser | Renders; every section carries a non-text visual. | **Manual / local only** |
 | The credential rotation runbook | Each step completed in order. | **Manual / operational only**, and irreversible. See [`docs/security/CREDENTIAL_ROTATION.md`](docs/security/CREDENTIAL_ROTATION.md) |
 
 **Continuous integration runs six jobs** — `backend`, `runtime-integration`,
-`postgres-integration`, `integration`, `frontend` and `infrastructure`. Four of them
-declare no dependency at all, so a failure in one cannot prevent their gates from running
-and reporting. That independence is deliberate where it matters most: the frontend checks
-previously sat ahead of the security gates *inside* the backend job, so a frontend failure
-stopped the dependency audit, the static analysis and the security suite from running at
-all. They are now a job of their own with no dependants. The two integration jobs that do
-declare `needs: backend` do so on purpose — there is nothing to learn from migrating a
-database and serving the application when the unit suite has already failed. The
-workflow's overall conclusion is success only when all six pass, and that conclusion is
-what the deployment workflow gates on.
+`postgres-integration`, `integration`, `frontend` and `infrastructure`. **None of them
+declares a dependency on another**, so every job starts as soon as the workflow does and
+a failure in one cannot prevent another's gates from running and reporting. That
+independence is deliberate where it matters most: the frontend checks previously sat ahead
+of the security gates *inside* the backend job, so a frontend failure stopped the
+dependency audit, the static analysis and the security suite from running at all. They are
+now a job of their own with no dependants, and the three jobs that need a database bring
+up their own service rather than waiting on the unit suite — the cost is that a broken
+commit reports every failure at once instead of the first one. The workflow's overall
+conclusion is success only when all six pass, and that conclusion is what the deployment
+workflow gates on.
 
 **What each job runs.** One row per job, so a gate can be traced to the thing that fails
 when it fails:
@@ -535,12 +552,14 @@ strict form. `.github/workflows/ci.yml` is the authority.
 
 Three notes on how these are invoked, because the scope and the flags change the result:
 
-- **The two `alembic downgrade -1` calls are destructive and must not be run against a
-  database you intend to keep.** Together they remove the revision that adds the `role`
-  column and the revision that seeds the single administrator, so an environment left in
-  that state has no authorization data at all &mdash; and every command in the sequence
+- **The `alembic downgrade -1` calls are destructive and must not be run against a
+  database you intend to keep.** One is issued per revision in the chain, 5 today, and
+  together they remove the login-attempt slots, the open-intent uniqueness, the workload
+  indexes, the revision that seeds the single administrator and the revision that adds
+  the `role` column, so an environment left in that state has no authorization data at
+  all &mdash; and every command in the sequence
   exits 0 while doing it. Run the reversibility check against a throwaway database, and
-  end it at `alembic upgrade head` with `alembic current` confirming `0003 (head)`.
+  end it at `alembic upgrade head` with `alembic current` confirming `0005 (head)`.
   Reversibility is a property worth proving, but proving it is not a maintenance
   operation.
 - **The plain `pip-audit -r <manifest>` form is diagnostic, not a pass/fail gate.** It
@@ -568,9 +587,7 @@ Python files under `backend/`, and nothing more:
 # Guard 1. The omitted package must stay omitted, or six advisories return.
 ! pip show python-multipart
 
-# Guard 2, layer 1. A textual pre-filter over the application package — the only
-# code a request reaches. Scoped to backend/app/ and not backend/, so a test that
-# merely names one of these literals cannot fail the build.
+# Guard 2, layer 1: scan backend/app for prohibited reachability patterns.
 ! grep -rEn "request\.form|request\.url|StaticFiles|HTTPEndpoint|Route\(|set_key|unset_key|\bclick\b" \
     --include=*.py backend/app/
 
@@ -606,16 +623,26 @@ run in `.github/workflows/ci.yml`, and neither is a substitute for the other.
 frontend checks as a job marked `continue-on-error: true` and described in both documents
 as `Frontend checks (known blocker, gates nothing)`, because the read-only frontend source
 could not pass a linter. That job now passes and gates like every other: the linter is
-invoked directly with the one unparseable file excluded and recorded as a reported
-finding, and the suite runs with `--passWithNoTests` because the workspace carries no test
-file. There is therefore no job whose red build a reader should discount.
+invoked directly over the whole of `frontend/src`, its report is judged by
+[`.github/scripts/check_frontend_lint_budget.js`](.github/scripts/check_frontend_lint_budget.js)
+against the count the workflow declares in `ESLINT_WARNING_BUDGET`, and the one unparseable
+file's finding is exempted from that budget rather than hidden from the lint, so it stays
+visible in
+the uploaded report and is recorded as a reported finding, and the suite runs with
+`--passWithNoTests` because the workspace carries no test file. It is a **limited** gate:
+it runs no `tsc --noEmit` and no production build, so a green result does not prove the
+client compiles. There is therefore no job whose red build a reader should discount, and
+no green one a reader should over-read.
 
 ### Dependency changes
 
 A Python dependency manifest now exists for the first time:
-[`backend/requirements.txt`](backend/requirements.txt) for the runtime and
-[`backend/requirements-dev.txt`](backend/requirements-dev.txt) for verification tooling.
-Nothing in the development manifest enters the runtime image.
+[`backend/requirements.txt`](backend/requirements.txt) for the runtime,
+[`backend/requirements-dev.txt`](backend/requirements-dev.txt) for verification tooling
+and [`backend/requirements-audit.txt`](backend/requirements-audit.txt) for the
+dependency-audit instrument. Nothing in either development manifest enters the runtime
+image, and the audit instrument is held apart from the manifests it reads so that its
+own dependency tree is not measured as this project's.
 
 Four packages were replaced rather than upgraded, and one was omitted:
 
@@ -658,8 +685,12 @@ The seven remaining runtime advisories are **accepted residual risk**: every ava
 fix requires Python 3.10 or later, which the runtime pin forecloses — and for the five
 in `starlette` a newer interpreter alone would not be enough, because the FastAPI pin
 that Pydantic v1 fixes will not accept the releases those fixes occupy. The development
-manifest carries **seven more** on the same basis, in test, lint and audit tooling that
-no deployed process installs — **fourteen accepted in total**. Each carries a named
+manifest carries **one more** on the same basis, in the test framework, which no
+deployed process installs — **eight accepted in total**. A third manifest,
+[`backend/requirements-audit.txt`](backend/requirements-audit.txt), declares the
+dependency-audit instrument and is deliberately not audited, because auditing the
+manifest that declares the scanner reports the scanner's own supply chain as this
+project's. Each accepted advisory carries a named
 compensating control, and both registers with the supporting evidence, the ledger
 reconciling all nineteen runtime advisories, and the stated limits of that evidence are
 at
@@ -734,51 +765,149 @@ deployment configured before this work will not have.
 `.github/workflows/cd.yml` runs only after `.github/workflows/ci.yml` passes in full — it
 calls that workflow rather than repeating part of it — and then reads the following.
 
+Every name below is read as the workflow reads it. The **Kind** column is load-bearing: a
+value supplied as a secret where the workflow reads a variable arrives as the empty string,
+and GitHub reports nothing.
+
 | Name | Kind | Note |
 | --- | --- | --- |
 | `GCP_PROJECT_ID` | secret | Unchanged. |
 | `GKE_CLUSTER_NAME` | secret | Unchanged. |
-| `GKE_CLUSTER_REGION` | secret | **Renamed.** It replaces `GKE_CLUSTER_ZONE`, and the cluster is regional, so credentials are fetched with `--region` rather than `--zone`. A configuration left on the old name will fail the workflow's input check by design rather than deploying against the wrong location. |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | secret | **New.** Authentication is federated; the long-lived service-account key it replaces must be deleted, not merely unused. |
 | `GCP_SERVICE_ACCOUNT` | secret | **New.** The service account the federated identity impersonates. |
-| `GKE_DEPLOY_RUNNER` | variable | **New**, defaulting to `self-hosted`. The control plane has a private endpoint with enforcement on, so the job needs a runner with a network path to it. A GitHub-hosted runner cannot reach it. |
-| `REACT_APP_API_BASE_URL` | variable | **New.** A frontend build argument, inlined into the bundle and therefore public — never a secret. |
-| `PAYPAL_CLIENT_ID` | variable | **New.** The same: a public client identifier, passed as a build argument. The PayPal *secret* is never a build argument. |
+| `BACKEND_GCP_SERVICE_ACCOUNT_EMAIL` | secret | **New.** The Google service account the backend workload identity binds to. |
+| `ADMIN_PROVISIONER_GCP_SERVICE_ACCOUNT_EMAIL` | secret | **New.** The identity the administrator-credential Job runs as. Read only while `PROVISION_ADMIN_CREDENTIAL` is `true`. |
+| `GKE_CLUSTER_REGION` | variable | **Renamed, and a variable rather than a secret** — a cluster location is not a credential. It replaces `GKE_CLUSTER_ZONE`, and the cluster is regional, so credentials are fetched with `--region` rather than `--zone`. A configuration left on the old name fails the workflow's input check by design rather than deploying against the wrong location. |
+| `GKE_DEPLOY_RUNNER_LABEL` | variable | **New, and it has no default.** The control plane has no public endpoint, so the cluster jobs need a self-hosted runner with a network path to it, and this variable names that runner's label. Preflight refuses the run when it is unset **or** when it names one of the twelve GitHub-hosted images, none of which can reach a private control plane. Add the runner's CIDR to `var.gke_master_authorized_networks` as well. |
+| `K8S_NAMESPACE` | variable | The namespace whose workloads are updated. Defaults to `apartment-finder`. |
+| `ARTIFACT_REGISTRY_LOCATION`, `ARTIFACT_REGISTRY_REPOSITORY` | variables | The regional registry images are pushed to and pulled from, replacing `gcr.io`. |
+| `REACT_APP_API_BASE_URL` | variable | **New.** A frontend build argument, inlined into the bundle and therefore public — never a secret. Preflight refuses the run when it is blank, because `react-scripts build` inlines an empty value silently and the bundle would address no origin. |
+| `PAYPAL_CLIENT_ID` | variable | **New.** The same: a public client identifier, passed as a build argument and also rendered into the settings map. Preflight refuses a blank value here too. The PayPal *secret* is never a build argument. |
+
+The manifest-render step reads a further set of variables — `BACKEND_ENVIRONMENT`,
+`BACKEND_ALLOWED_ORIGINS`, `BACKEND_ALLOWED_HOSTS`, `PAYPAL_MODE`, `PAYPAL_API_BASE`,
+`PAYPAL_RETURN_URL`, `PAYPAL_CANCEL_URL`, `ZILLOW_API_URL` and `FROM_EMAIL` — and
+`scripts/render_kubernetes_manifests.sh` names any that is absent. Four more shape the
+rollout rather than the application: `K8S_SERVICE_ACCOUNT`, `FRONTEND_SERVICE_TYPE`,
+`BACKEND_REPLICAS` and `FRONTEND_REPLICAS`. Two gate the optional administrator-credential
+step: `PROVISION_ADMIN_CREDENTIAL` and `ADMIN_CREDENTIAL_RESET`, both of which default off.
+`CLOUD_FUNCTION_NAME` names the probe function the workflow addresses.
 
 ### `scripts/deploy.sh`
 
-The script now fails fast rather than proceeding on error, requires `docker`, `gcloud`,
-`kubectl` and **`jq`** on `PATH`, and requires these variables:
+The script **takes no arguments**: every input is an environment variable, and
+`scripts/deploy.sh --help` prints the whole contract. It fails fast rather than proceeding
+on error, and requires `gcloud`, `kubectl`, `docker`, **`jq`** and `timeout` on `PATH`
+together with an active Google Cloud credential and bash 4 or newer.
 
-| Variable | Source |
+| Variable | Required? | Source |
+| --- | --- | --- |
+| `GCP_PROJECT_ID` | required | The project the cluster and registry live in. |
+| `GKE_CLUSTER`, `GKE_REGION` | required | The target cluster and its **region** — the cluster is regional, so this is `us-central1` and not a zone. |
+| `K8S_NAMESPACE` | required | The namespace holding the `backend` and `frontend` Deployments. |
+| `VERSION` | required | The image tag for this release. A tag that has already been published is **refused**, so a rollout cannot resolve to earlier content. |
+| `ARTIFACT_REGISTRY_REPOSITORY` | optional | Defaults to `apartment-finder`. |
+| `CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED` | optional | Defaults to `false`, which reports the Cloud Function step as blocked and performs it not at all. |
+
+**The former Cloud Function inputs are retired.** `CLOUD_FUNCTION_NAME`,
+`CLOUD_FUNCTION_ENTRY_POINT`, `CLOUD_FUNCTION_SOURCE_ARCHIVE` and `CLOUD_FUNCTION_REGION`
+are no longer read from the environment. The script carries the function's name, entry
+point, runtime and source object as fixed constants that match
+`infrastructure/terraform/main.tf`, which owns the function, so the two tools cannot
+address the same function under different names. A deployment configured against the
+previous contract should drop those four variables. The function is deployed
+`--no-allow-unauthenticated`, and the script then reads its **effective** IAM policy back
+and exits non-zero if any public principal remains — an authoritative policy in Terraform
+removes an inherited public binding, and this read-back proves it.
+
+Migrations run **before** traffic moves. The order is: apply the rendered `prerequisites`
+group, assert both Deployments and their containers exist, refuse a reused tag, publish the
+images by digest, run the Alembic upgrade as a bounded one-shot Job rendered from
+`infrastructure/kubernetes/60-migration-job.yaml`, then apply the rendered `workloads`
+group, wait for the rollout, compare each running pod's `imageID` against the digest that
+was published, and probe readiness through a port-forward. A failed migration stops the
+release before any workload serves the new image.
+
+### The cluster objects, and the one prerequisite an operator must supply
+
+The Kubernetes objects are **declared in this repository**, at
+[`infrastructure/kubernetes/`](infrastructure/kubernetes/): the namespace, the service
+accounts, the settings map, the two secret deliveries, the `backend` and `frontend`
+Deployments and Services, both autoscalers, the schema-migration Job, the listing-ingestion
+CronJob and the administrator-credential Job.
+[`scripts/render_kubernetes_manifests.sh`](scripts/render_kubernetes_manifests.sh) is the
+single substitution pass over them and the authority for which manifest belongs to which
+render group, and **both** release paths invoke it and apply its output — so the manifests
+that are validated in CI are the manifests that are applied.
+[`infrastructure/k8s/README.md`](infrastructure/k8s/README.md) records the consolidation
+that produced that single inventory and holds no manifest of its own.
+
+Secret **delivery** into the pod is declared here too: `30-backend-secrets.yaml` and
+`35-migration-secrets.yaml` mount the six Secret Manager values through the CSI driver as
+files, which the container exports before the process starts, so no credential is written
+into a Kubernetes Secret. Terraform grants the workload identity per-secret access and the
+`backend_workload_identity_annotation` output gives the exact annotation.
+
+| Prerequisite | What an operator must do |
 | --- | --- |
 | `GCP_PROJECT_ID`, `VERSION` | The deploying environment. |
-| `CLOUD_FUNCTION_NAME` | The `cloud_function_name` Terraform output. |
-| `CLOUD_FUNCTION_SOURCE_ARCHIVE` | The `cloud_function_source_archive` output. Must be a `gs://<bucket>/<object>` address; the script confirms the object exists before deploying. |
-| `CLOUD_FUNCTION_ENTRY_POINT` | The `cloud_function_entry_point` output. |
-| `CLOUD_FUNCTION_REGION` | The region the function is deployed to. |
+| `CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED` | The deploying environment. `"true"` runs the Cloud Function step; the default of `false` reports it as blocked and performs it not at all. |
+| `CLOUD_FUNCTION_SOURCE_OBJECT` | The `cloud_function_source_object` output. Required only when the step is authorized. |
+| `CLOUD_FUNCTION_SOURCE_MD5` | The `cloud_function_source_md5` output. Required only when the step is authorized; the bucket's digest must match it or the step refuses to deploy. |
 
-Taking the function's identity from Terraform's outputs is what stops the two tools
-addressing the same function under different names. The function is deployed
+The function's name, entry point and runtime are constants in the script that match
+`infrastructure/terraform/main.tf`, which owns the function and its invoker binding, so the
+two tools cannot address the same function under different names. The source object is
+deliberately *not* a constant: Terraform names it after the archive's content digest, so the
+name changes whenever the bytes do and could not be restated in the script without the two
+drifting apart. Comparing the digest as well as the name is what stops an object replaced in
+the bucket being deployed as though it were the reviewed one. The function is deployed
 `--no-allow-unauthenticated`, and the script then reads its **effective** IAM policy back and
 exits non-zero if any public principal remains — an authoritative policy in Terraform removes
 an inherited public binding, and this read-back proves it.
 
 Migrations run **before** traffic moves: the Alembic upgrade executes in a one-shot pod built
-from the new image, and only if it succeeds does `kubectl set image` roll the Deployment
-forward.
+from the new image, and only if it succeeds are the rendered workload manifests applied.
+Applying them *is* the rollout — each carries this release's verified image digest, so neither
+path calls `kubectl set image`.
+
+### Prerequisites the Terraform configuration expects
+
+`infrastructure/terraform/main.tf` creates what it declares and nothing else. Each item
+below is an operator action, not a resource that file creates, and each has to be in place
+before `terraform apply` completes or before what it creates is usable.
+
+| # | Prerequisite | Detail |
+| --- | --- | --- |
+| 1 | These services enabled on `project_id` | `google_project_service.required` declares them: `container`, `sqladmin`, `servicenetworking`, `secretmanager`, `cloudfunctions`, `pubsub`, `storage`, `compute`, `iam`, `artifactregistry`, `redis`, `logging` and `monitoring`. |
+| 2 | A network path to the private control plane | Wherever `terraform apply`, `kubectl` and `scripts/deploy.sh` run needs a source address inside `gke_master_authorized_networks`. With an empty list no address outside the cluster's VPC reaches the control plane, which is why `.github/workflows/cd.yml` refuses to run its cluster jobs on a hosted runner. |
+| 3 | A source archive for the probe function | Uploaded to `google_storage_bucket.static_assets` before either `terraform apply` or `scripts/deploy.sh` runs. The function itself is created only when `cloud_function_deployment_authorized` is true. |
+| 4 | Values for the write-only secret variables | Supplied per run. Incrementing `secret_version_generation` is what sends them again. |
+| 5 | Repository variables and secrets for the release workflow | Listed in [`docs/security/CREDENTIAL_ROTATION.md`](docs/security/CREDENTIAL_ROTATION.md). |
+
+The Kubernetes objects that consume what that configuration creates are in this repository,
+under `infrastructure/kubernetes/`, and are applied by
+`scripts/render_kubernetes_manifests.sh`. The `SecretProviderClass` in
+`30-backend-secrets.yaml` mounts the six backend secrets, and the one in
+`35-migration-secrets.yaml` mounts the single secret the migration reads. The service
+account each object must carry is published by the `backend_workload_identity_annotation`
+output.
+
+The open risks that configuration does not close are recorded in
+[`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md).
 
 ### Prerequisites this repository cannot satisfy
 
 | Prerequisite | Why it is not here |
 | --- | --- |
-| Kubernetes manifests | `deployment/app-deployment`, `deployment/backend` and `deployment/frontend` are addressed by the script and the workflow but defined outside this repository. |
-| Secret **delivery** into the pod | Terraform grants the workload identity access to all six secrets and enables the managed Secret Manager add-on, and the `backend_workload_identity_annotation` output gives the exact annotation. Mounting them is a manifest change, so it happens outside this repository. |
+| The first apply against a new cluster | The manifests themselves **are** here, under `infrastructure/kubernetes/`, and both release paths apply them. But each path first asserts that `deployment/backend` and `deployment/frontend` already exist and stops naming what is missing, so a release cannot create the first cluster. Run `scripts/render_kubernetes_manifests.sh workloads` once, out of band, before the first release — and note that this creates the ingestion CronJob, which [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) O-8 says must not be enabled until O-9 is closed. |
+| Secret **values** in Secret Manager | Terraform creates the six secrets, grants the workload identity access and enables the managed Secret Manager add-on, and the `backend_workload_identity_annotation` output gives the exact annotation. Mounting them is done here — `30-backend-secrets.yaml` declares the provider class and `40-backend.yaml` mounts it read-only as files. What is not here is the secret *contents*: an operator adds each version, following [`docs/security/CREDENTIAL_ROTATION.md`](docs/security/CREDENTIAL_ROTATION.md). |
 | Private services access, and a shared VPC | The Terraform variables enforce that the cluster and the database sit on the same network; the network itself is an input. |
+| The ingestion cadence | `INGESTION_SCHEDULE` defaults to hourly in the renderer. Set it to the cadence the deployment wants before applying the `workloads` group. |
 
 Each is tracked as an operator-owned item at
-[`docs/security/DECISION_LOG.md`](docs/security/DECISION_LOG.md) §35.1 rather than being
-assumed.
+[`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) O-7 and O-8, with the
+reasoning at [`docs/security/DECISION_LOG.md`](docs/security/DECISION_LOG.md) §35.1.
 
 
 ## Usage Guide
@@ -830,18 +959,24 @@ apartment-finder-service/
 │   │   └── main.py                 app assembly, middleware, health endpoints
 │   ├── migrations/
 │   │   └── versions/               0001 additive schema, 0002 single-admin seed,
-│   │                               0003 workload indexes
+│   │                               0003 workload indexes,
+│   │                               0004 open-intent uniqueness,
+│   │                               0005 login throttling slots
 │   ├── tests/
 │   │   └── security/               the security suite
 │   ├── alembic.ini
 │   ├── requirements.txt
-│   └── requirements-dev.txt
+│   ├── requirements-dev.txt
+│   └── requirements-audit.txt
 ├── frontend/
 │   └── src/                        React and TypeScript client
 ├── infrastructure/
 │   ├── docker/                     backend and frontend images, compose stack
-│   ├── k8s/                        GKE workloads: deployments, services, config,
-│   │                               secret delivery, migration job, ingestion cronjob
+│   ├── functions/                  the Cloud Function source
+│   ├── k8s/                        consolidation notice only; holds no manifest
+│   ├── kubernetes/                 GKE workloads: namespace, service accounts, config,
+│   │                               secret delivery, deployments and services, autoscalers,
+│   │                               migration job, ingestion cronjob, admin credential job
 │   └── terraform/                  Google Cloud infrastructure
 ├── scripts/                        deployment, manifest rendering, local setup
 ├── docs/
@@ -879,8 +1014,9 @@ to the SendGrid client before the send. All three outbound boundaries are theref
 by the same configured timeout, but through two different mechanisms — so a change to
 either one has to be checked against both.
 
-**Verification tooling.** pytest with pytest-asyncio and pytest-cov · pip-audit · Bandit ·
-flake8.
+**Verification tooling.** pytest with pytest-asyncio and pytest-cov · Bandit · flake8, in
+`backend/requirements-dev.txt`; pip-audit in `backend/requirements-audit.txt`. The
+bootstrap installer is pinned at workflow scope in `.github/workflows/ci.yml`.
 
 **Frontend.** React with TypeScript — present in `frontend/`, but not currently operational
 against this API, as stated at the top of this file.
@@ -903,7 +1039,7 @@ The reasoning for each is in
 | [`.env.example`](.env.example) | The complete configuration contract. |
 | [`docs/security/DECISION_LOG.md`](docs/security/DECISION_LOG.md) | Every non-trivial decision, the alternatives that existed, and the risk each carries. This is the single source of truth for *why*. |
 | [`docs/security/TRACEABILITY_MATRIX.md`](docs/security/TRACEABILITY_MATRIX.md) | The bidirectional mapping from finding, to the file that fixes it, to the test that verifies it. |
-| [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) | Two registers covering all fourteen accepted advisories &mdash; seven runtime, seven development-only &mdash; with their unreachable fix versions, each named compensating control, and the total-suppression accounting. |
+| [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) | Two registers covering all eight accepted advisories &mdash; seven runtime, one development-only &mdash; with their unreachable fix versions, each named compensating control, and the total-suppression accounting. |
 | [`docs/security/CREDENTIAL_ROTATION.md`](docs/security/CREDENTIAL_ROTATION.md) | The ordered runbook for credentials exposed through version control. |
 | [`docs/review/CRITICAL_DECISIONS.md`](docs/review/CRITICAL_DECISIONS.md) | The five highest-risk decisions, each with its reviewer persona and that reviewer's checks. |
 | `blitzy-deck/executive-summary.html` | Executive summary presentation, for a non-technical audience. Open it directly in a browser. |
@@ -926,12 +1062,13 @@ private vulnerability reporting, and the deployment inputs listed under
 5. Submit a pull request.
 
 Before opening a pull request, run every command in [Verification](#verification).
-**Continuous integration runs a subset of them, not all of them** — the "Runs in CI?"
-column there says which, and the application-import gate, `terraform validate` and the
-Alembic downgrade round trip are yours to run locally because nothing else will. CI does
-additionally enforce the two compensating-control guards and both dependency audits in
-their strict form, so a change that reintroduces the omitted package, or that brings one of
-the eight guarded constructs into `backend/`, fails the build.
+**Continuous integration runs a subset of them, not all of them** — the "Enforced by"
+column there says which, and the shell-syntax parse of the deployment scripts, the
+client-side manifest schema check and the presentation render are yours to run locally
+because nothing else will. CI does additionally enforce the two compensating-control guards
+and both dependency audits in their strict form, so a change that reintroduces the omitted
+package, or that brings one of the eight guarded constructs into `backend/`, fails the
+build.
 
 Two conventions apply to contributions that touch security-relevant code:
 

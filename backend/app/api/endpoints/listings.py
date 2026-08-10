@@ -16,24 +16,16 @@ router = APIRouter()
 
 logger = get_logger(__name__)
 
-#: Page size applied when a request names none.
 DEFAULT_PAGE_SIZE = min(100, settings.MAX_PAGE_SIZE)
 
-#: Detail returned when a listing cannot be persisted, whatever the
-#: database refused it for.
 LISTING_NOT_STORED_DETAIL = "Listing could not be stored"
 
-#: Detail returned for a page carrying a stored row the response contract
-#: cannot represent.
 LISTING_NOT_PROJECTABLE_DETAIL = "Listing page could not be served"
 
-#: Reason recorded for a stored row the response contract cannot carry.
 REASON_UNPROJECTABLE_ROW = "listing_not_projectable"
 
-#: Message recorded when the database refuses a listing write.
 LISTING_NOT_STORED_MESSAGE = "Failed to store a listing"
 
-#: Reason recorded with that message.
 REASON_NOT_STORED = "listing_not_stored"
 
 
@@ -45,26 +37,8 @@ def get_listings(
         DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE
     ),
 ) -> List[Listing]:
-    """Returns one page of the listing corpus, reachable without a token.
-
-    Ordered by the primary key, so a row keeps its position across pages
-    while the corpus is being written to. The page carries every row the
-    named window selects, in that order, so a page shorter than ``limit``
-    means the window reached the end of the corpus and nothing else.
-
-    ``limit`` is bounded by ``settings.MAX_PAGE_SIZE`` and ``skip`` by
-    ``settings.MAX_PAGINATION_OFFSET``, so the rows one anonymous request
-    can make the database walk are bounded by configuration rather than
-    by the range of the column type. An offset above the cap is refused
-    by request validation.
-
-    Each row is projected on its own. A row carrying a value the response
-    contract cannot represent -- which
-    :class:`backend.app.schema.listing.ListingCreate` refuses at every
-    write path, so only a row written outside this contract can carry one
-    -- fails the page it appears on. The row is recorded against its
-    identifier and the failing contract fields, and the response is an
-    error rather than a page with that row removed.
+    """Return a bounded, ID-ordered public listings page; fail if any
+    stored row violates the response schema.
     """
     listings = (
         db.query(ListingModel)
@@ -145,8 +119,6 @@ def create_listing(
         zillow_url=listing.zillow_url,
     )
     db.add(db_listing)
-    # Any refusal from the database rolls the session back, is recorded
-    # against the caller, and is answered with one fixed detail.
     try:
         db.commit()
     except SQLAlchemyError as error:

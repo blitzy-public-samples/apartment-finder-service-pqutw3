@@ -1,28 +1,3 @@
-"""Price and entitlement tampering.
-
-Two properties are covered.
-
-* The price and the entitlement window are the server's own. Every
-  ``test_h2_*`` case submits a tampered subscription request and asserts
-  that the tampered field is refused, that no row carries it, that the
-  stored price is the plan catalog's price, and that the stored
-  entitlement window is the catalog period measured from the server
-  clock.
-* Capture is bound to the account that opened the order. Every
-  ``test_h3_*`` case drives
-  :func:`backend.app.services.paypal_service.capture_order`, whose
-  server-side lookup resolves the stored ``paypal_order_id`` to its row
-  and compares that row's owner with the authenticated principal.
-
-Units under test: :mod:`backend.app.api.endpoints.subscriptions`,
-:mod:`backend.app.core.plans` and :mod:`backend.app.schema.subscription`.
-
-Every outbound PayPal call is served by a stand-in installed at the
-transport boundary of :mod:`backend.app.services.paypal_service`, so no
-case reaches the network. The stand-in records each call, which is what
-the "no payment call was made" assertions read.
-"""
-
 import json
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -55,52 +30,32 @@ from backend.app.services.paypal_service import (
     read_capture,
 )
 
-#: Route that opens a subscription. The trailing slash is part of it.
 CREATE_PATH = '/subscriptions/'
 
-#: Route that receives one PayPal notification.
 WEBHOOK_PATH = '/subscriptions/webhook'
 
-#: Both catalog identifiers. Every price and period case runs once
-#: per published plan.
 CATALOG_PLAN_IDS = (PREMIUM_MONTHLY, PREMIUM_ANNUAL)
 
-#: Provider order identifier the stand-in reports for a created order.
 ORDER_ID = 'ORDER-TAMPERING-1'
 
-#: Provider capture identifier the stand-in reports for a settlement.
 CAPTURE_ID = 'CAPTURE-TAMPERING-1'
 
-#: Order identifier stored on the row a second principal reaches for.
 OWNED_ORDER_ID = 'ORDER-TAMPERING-OWNED'
 
-#: Payer-approval target the stand-in reports. Its host sits under a
-#: registrable domain of ``settings.PAYPAL_CERT_HOST_ALLOWLIST``, which
-#: is the condition :func:`paypal_service.approval_url` applies.
 APPROVAL_URL = 'https://www.sandbox.paypal.com/checkoutnow?token=1'
 
-#: Delivery identifier carried by the notification each case delivers.
 TRANSMISSION_ID = 'c7d8e9f0-1111-2222-3333-444455556666'
 
-#: Bearer value the credential accessor is stood in with. It is never
-#: asserted on and cannot match a provider credential pattern.
 STAND_IN_GRANT = 'not-a-real-grant'
 
-#: Notification reporting that the payer approved an order.
 APPROVED_EVENT = subscriptions_module.EVENT_ORDER_APPROVED
 
-#: Status the provider reports for a settled capture.
 SETTLED_STATUS = paypal_service.CAPTURE_COMPLETED_STATUS
 
-#: Seconds a stored timestamp may differ from the clock reading the
-#: assertion takes.
 CLOCK_TOLERANCE_SECONDS = 120.0
 
-#: Amounts a client may submit in place of the catalog price.
 TAMPERED_AMOUNTS = ('0.01', '0', '-100.00', '1000000.00')
 
-#: Identifiers the catalog does not publish. The last two are a
-#: differently-cased and a hyphenated variant of a real identifier.
 UNKNOWN_PLAN_IDS = (
     'free_forever',
     '',
@@ -110,12 +65,6 @@ UNKNOWN_PLAN_IDS = (
 
 
 class StandInResponse(object):
-    """One provider response served at the transport boundary.
-
-    ``content`` is what ``aiter_bytes`` yields and the declared length is
-    derived from it, so the service's response-size cap is applied to this
-    stand-in exactly as it is to a real streamed response.
-    """
 
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
@@ -124,32 +73,16 @@ class StandInResponse(object):
         self.headers = {"Content-Length": str(len(self.content))}
 
     async def aiter_bytes(self):
-        """Yields the body this response streams, in one chunk."""
         yield self.content
 
     def json(self):
-        """Returns the decoded body this response carries."""
         return self._payload
 
     def raise_for_status(self):
-        """Reports no transport failure."""
         return None
 
 
 class RecordingTransport(object):
-    """Serves queued responses and records every call it is handed.
-
-    Every call is asserted against the provider wire contract before a
-    response is served, so a call carrying the wrong method, host, path,
-    authentication, headers, body or timeout raises rather than receiving
-    a plausible answer. ``calls`` holds one ``(url, kwargs)`` pair per
-    call, in order, and ``routes`` the contract route each addressed. The
-    last queued response is served repeatedly once the queue is down to
-    it.
-
-    The service issues every call through ``stream`` with an explicit
-    method, so that is the only call shape served here.
-    """
 
     def __init__(self, responses):
         self._responses = list(responses)
@@ -157,7 +90,6 @@ class RecordingTransport(object):
         self.routes = []
 
     def _serve(self, method, url, kwargs):
-        """Asserts one call and returns the response due for it."""
         self.routes.append(assert_paypal_call(method, url, **kwargs))
         self.calls.append((url, kwargs))
         if len(self._responses) > 1:
@@ -165,7 +97,6 @@ class RecordingTransport(object):
         return self._responses[0]
 
     def stream(self, method, url, **kwargs):
-        """Records one call of ``method`` and streams its response."""
         response = self._serve(method, url, kwargs)
 
         @asynccontextmanager
@@ -200,7 +131,6 @@ def provider_transport(responses):
 
 
 def order_reply(order_id=ORDER_ID):
-    """Returns a created-order body shaped like the provider's."""
     return StandInResponse(
         200,
         {
@@ -249,7 +179,6 @@ def capture_reply(plan, order_id=ORDER_ID):
 
 
 def approval_notification(order_id=ORDER_ID):
-    """Returns a payer-approval notification naming ``order_id``."""
     return {
         'id': 'WH-TAMPERING-1',
         'event_type': APPROVED_EVENT,
@@ -273,7 +202,6 @@ def rejection_status():
 
 
 def open_subscription(test_client, headers, body):
-    """Posts one subscription request and returns the response."""
     return test_client.post(CREATE_PATH, json=body, headers=headers)
 
 
@@ -305,7 +233,6 @@ def deliver_approval(test_client, order_id=ORDER_ID):
 
 
 def stored_rows(session):
-    """Returns every stored subscription row, oldest first."""
     session.expire_all()
     return (
         session.query(SubscriptionModel)
@@ -315,7 +242,6 @@ def stored_rows(session):
 
 
 def only_row(session):
-    """Returns the single stored subscription row."""
     rows = stored_rows(session)
     assert len(rows) == 1, rows
     return rows[0]
@@ -344,7 +270,6 @@ def naive_utc_now():
 
 
 def assert_close_to_now(moment):
-    """Asserts ``moment`` is within the tolerated clock window."""
     assert moment is not None
     difference = abs((naive_utc_now() - moment).total_seconds())
     assert difference <= CLOCK_TOLERANCE_SECONDS, difference
@@ -376,7 +301,6 @@ def seed_owned_order(session, owner, plan_id=PREMIUM_MONTHLY,
 
 
 def account_snapshot(session, *principals):
-    """Returns the stored role of each principal, keyed by identifier."""
     session.expire_all()
     return dict(
         (
@@ -576,9 +500,6 @@ def test_h2_an_unknown_plan_is_refused_before_any_row_or_payment_call(
     assert stored_rows(db) == []
 
 
-#: Order identifiers the provider must not be believed about. Each one
-#: either cannot address a provider path or cannot be told apart from a
-#: different identifier once stored, so none of them may reach the column.
 UNUSABLE_ORDER_IDENTIFIERS = (
     pytest.param(None, id="identifier_absent"),
     pytest.param(17, id="identifier_is_a_number"),
@@ -617,13 +538,6 @@ def order_reply_identified_by(identifier):
 def test_h3_an_unusable_provider_order_identifier_is_never_stored(
     client, db, registered_user, auth_header_factory, identifier
 ):
-    """A created order the provider cannot be addressed by is refused.
-
-    The value is served in the created-order response, so it is refused
-    on the way in from the provider rather than on the way in from a
-    client. The subscription is left failed carrying no order identifier,
-    so nothing is later interpolated into a provider path.
-    """
     plan = get_plan(PREMIUM_MONTHLY)
     reply = order_reply_identified_by(identifier)
 
@@ -645,7 +559,6 @@ def test_h3_an_unusable_provider_order_identifier_is_never_stored(
 def test_h3_a_padded_provider_order_identifier_is_stored_stripped(
     client, db, registered_user, auth_header_factory
 ):
-    """A padded identifier is stored as the value the path will carry."""
     plan = get_plan(PREMIUM_MONTHLY)
     reply = order_reply_identified_by('  ' + ORDER_ID + '\t')
 
@@ -664,7 +577,6 @@ def test_h3_a_padded_provider_order_identifier_is_stored_stripped(
 
 
 def test_h3_the_accepted_identifier_shape_is_a_bounded_path_segment():
-    """The reader accepts only a bounded URL-safe path segment."""
     read = subscriptions_module._provider_order_id
     ceiling = subscriptions_module.MAX_PROVIDER_ORDER_ID_LENGTH
 

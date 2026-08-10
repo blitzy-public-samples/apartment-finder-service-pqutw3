@@ -39,6 +39,25 @@ class ListingMappingError(ValueError):
         self.fields = tuple(fields)
 
 
+class ListingProviderError(RuntimeError):
+    """Raised when one provider read produced no usable response.
+
+    ``reason`` is the stable identifier of what failed, drawn from the
+    ``REASON_*`` constants in this module, so a caller and a log query
+    both select the cause by field rather than by matching prose. The
+    message names the cause and never a provider value, a search value or
+    the request target.
+
+    This is distinct from a provider that answered correctly and reported
+    no listings: that is an empty result, not a failure, and
+    :func:`fetch_listings` returns an empty list for it.
+    """
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 #: Listing columns a provider record may set, and the provider keys read
 #: for each. Keys are tried in order and the first one carrying a value
 #: wins. Any key the provider sends that appears in no entry is ignored.
@@ -55,7 +74,7 @@ PROVIDER_FIELD_SOURCES: Mapping[str, Tuple[str, ...]] = MappingProxyType(
     }
 )
 
-# Failures translated into an empty result. httpx.InvalidURL,
+# Failures raised as a ListingProviderError. httpx.InvalidURL,
 # httpx.CookieConflict and httpx.StreamError sit outside the
 # httpx.HTTPError hierarchy, and ValueError covers the JSON decode error
 # and the decoding error raised while reading the body.
@@ -76,26 +95,38 @@ MAX_PROVIDER_LISTINGS = 1000
 #: Response header a provider declares its body length in.
 CONTENT_LENGTH_HEADER = "Content-Length"
 
-#: Rejection reason: the body is past :data:`MAX_PROVIDER_RESPONSE_BYTES`.
 REASON_RESPONSE_TOO_LARGE = "response_body_too_large"
+
+#: Rejection reason: the configured endpoint is outside the provider
+#: allowlist, so no request may be issued to it.
+REASON_ENDPOINT_NOT_ALLOWED = "provider_endpoint_not_allowed"
+
+#: Rejection reason: the request could not be completed, or the provider
+#: answered with a status it refuses with.
+REASON_REQUEST_FAILED = "provider_request_failed"
+
+#: Rejection reason: the body was not decodable as UTF-8 JSON.
+REASON_BODY_NOT_DECODABLE = "response_body_not_decodable"
+
+#: Rejection reason: the decoded body was not a JSON object, so the
+#: declared collection key could not be read from it.
+REASON_BODY_NOT_OBJECT = "response_body_not_object"
+
+#: Rejection reason: the declared collection key did not carry a list.
+REASON_COLLECTION_NOT_LIST = "response_collection_not_list"
 
 #: Truncation reason: the body carried more listing objects than
 #: :data:`MAX_PROVIDER_LISTINGS`.
 REASON_TOO_MANY_LISTINGS = "listing_count_past_cap"
 
-#: Rejection reason: the caller handed more postal codes than
-#: ``settings.INGESTION_ZIP_CODE_CHUNK`` admits in one request.
 REASON_CHUNK_TOO_LARGE = "zip_code_chunk_past_cap"
 
-#: Message recorded when a request is refused for its chunk size.
 REQUEST_CHUNK_REFUSED_MESSAGE = (
     "Refused to call the listing provider with more postal codes than "
     "one request accepts"
 )
-#: Discard reason: an entry in the listings field was not an object.
 REASON_LISTING_NOT_OBJECT = "listing_not_object"
 
-#: Method the provider endpoint is read with.
 _GET_METHOD = "GET"
 
 #: Request header the provider credential travels in, so it appears in no
@@ -106,6 +137,31 @@ API_KEY_HEADER = "X-API-Key"
 #: A provider-side record and the local record for the same call then
 #: carry the same identifier.
 REQUEST_ID_HEADER = "X-Request-ID"
+
+#: Query parameter one request names its postal codes in, comma joined.
+ZIP_CODES_PARAMETER = "zip_codes"
+
+#: Key the response object carries its listing collection under.
+LISTINGS_COLLECTION_KEY = "listings"
+
+#: Every element of the wire contract this adapter reads and writes,
+#: gathered so that the whole of it is enumerable from one object.
+#:
+#: This is the contract as *declared here*. It has not been verified
+#: against a listing provider, and the register at
+#: ``docs/security/RESIDUAL_RISK.md`` carries that as an open item.
+#: Re-pointing this adapter at a provider whose contract is known means
+#: changing these five entries and :data:`PROVIDER_FIELD_SOURCES`, and
+#: nothing else in this module.
+DECLARED_PROVIDER_CONTRACT: Mapping[str, Any] = MappingProxyType(
+    {
+        "method": _GET_METHOD,
+        "credential_header": API_KEY_HEADER,
+        "zip_codes_parameter": ZIP_CODES_PARAMETER,
+        "listings_collection_key": LISTINGS_COLLECTION_KEY,
+        "record_fields": PROVIDER_FIELD_SOURCES,
+    }
+)
 
 
 def _client() -> "httpx.Client":
@@ -165,6 +221,21 @@ def _bounded_body(response: Any) -> Optional[bytes]:
     return b"".join(chunks)
 
 
+def _refuse(
+    message: str, reason: str, **fields: Any
+) -> ListingProviderError:
+    """Records a provider read that produced nothing, and returns the
+    error to raise for it.
+
+    The record carries ``reason`` and ``fields``, so a query selects the
+    cause by field rather than by matching prose. Neither the record nor
+    the returned error carries a provider value, a search value or the
+    request target.
+    """
+    logger.error(message, extra=dict(fields, reason=reason))
+    return ListingProviderError(message, reason)
+
+
 def _provider_failure_fields(
     error: BaseException,
 ) -> Dict[str, Optional[str]]:
@@ -182,49 +253,38 @@ def _provider_failure_fields(
 
 
 def fetch_listings(zip_codes: List[str], filters: Dict) -> List[Dict]:
-    """
-    Fetches apartment listings from Zillow API
+    """Fetch one bounded postal-code chunk of provider listings.
 
-    ``zip_codes`` is one bounded chunk of postal codes, not a whole
-    corpus: a list carrying more than ``settings.INGESTION_ZIP_CODE_CHUNK``
-    entries is refused without a request being issued, and the refusal is
-    recorded with the count and the cap. The caller in
-    :mod:`backend.app.tasks.listing_updater` chunks to that same setting.
+    ``zip_codes`` is one chunk, not a whole corpus: a list longer than
+    ``settings.INGESTION_ZIP_CODE_CHUNK`` is refused before any request.
+    Returns at most :data:`MAX_PROVIDER_LISTINGS` provider objects; an
+    empty list is a result rather than a failure.
 
-    Returns the provider's listing objects, or an empty list when the
-    chunk is past that cap, when the request fails, when the response
-    body is past :data:`MAX_PROVIDER_RESPONSE_BYTES`, when it is not
-    decodable JSON, or when the decoded body does not carry a list of
-    listing objects. At most :data:`MAX_PROVIDER_LISTINGS` objects are
-    returned.
-
-    Every failure is logged once, as the failing exception's class and
-    defining module with no message text and no request target, and none
-    propagates to the caller. The call issues one request and performs no
-    retry.
+    Raises :class:`ListingProviderError`, carrying the ``reason`` its log
+    record carries, when the read produced no response this adapter can
+    use: an endpoint outside the allowlist, a chunk past the cap, a failed
+    or refused request, an oversized body, or a body that does not satisfy
+    :data:`DECLARED_PROVIDER_CONTRACT`.
     """
     if not is_allowed_listing_provider_url(ZILLOW_API_URL):
-        logger.error(
+        raise _refuse(
             "Refusing to call the listing provider because the "
-            "configured endpoint is outside the provider allowlist"
+            "configured endpoint is outside the provider allowlist",
+            REASON_ENDPOINT_NOT_ALLOWED,
         )
-        return []
 
     chunk_ceiling = int(settings.INGESTION_ZIP_CODE_CHUNK)
     if len(zip_codes) > chunk_ceiling:
-        logger.error(
+        raise _refuse(
             REQUEST_CHUNK_REFUSED_MESSAGE,
-            extra={
-                "reason": REASON_CHUNK_TOO_LARGE,
-                "setting": "INGESTION_ZIP_CODE_CHUNK",
-                "zip_codes": len(zip_codes),
-                "max_zip_codes": chunk_ceiling,
-            },
+            REASON_CHUNK_TOO_LARGE,
+            setting="INGESTION_ZIP_CODE_CHUNK",
+            zip_codes=len(zip_codes),
+            max_zip_codes=chunk_ceiling,
         )
-        return []
 
     params = {
-        "zip_codes": ",".join(zip_codes),
+        ZIP_CODES_PARAMETER: ",".join(zip_codes),
         **filters
     }
     headers = {API_KEY_HEADER: ZILLOW_API_KEY}
@@ -245,35 +305,44 @@ def fetch_listings(zip_codes: List[str], filters: Dict) -> List[Dict]:
                 response.raise_for_status()
                 body = _bounded_body(response)
         if body is None:
-            return []
+            # _bounded_body has already recorded the size it refused.
+            raise ListingProviderError(
+                "Refused a Zillow API response body past the accepted "
+                "size",
+                REASON_RESPONSE_TOO_LARGE,
+            )
         payload = json.loads(body.decode("utf-8"))
     except ValueError as error:
-        logger.error(
+        raise _refuse(
             "Zillow API returned an undecodable body",
-            extra=_provider_failure_fields(error),
-        )
-        return []
+            REASON_BODY_NOT_DECODABLE,
+            **_provider_failure_fields(error)
+        ) from None
     except _PROVIDER_ERRORS as error:
-        logger.error(
+        raise _refuse(
             "Failed to fetch listings from Zillow API",
-            extra=_provider_failure_fields(error),
-        )
-        return []
+            REASON_REQUEST_FAILED,
+            **_provider_failure_fields(error)
+        ) from None
 
     if not isinstance(payload, dict):
-        logger.error(
+        raise _refuse(
             "Zillow API response body was not an object",
-            extra={"body_type": type(payload).__name__},
+            REASON_BODY_NOT_OBJECT,
+            body_type=type(payload).__name__,
         )
-        return []
 
-    listings = payload.get("listings", [])
+    # An absent key is a shape the declared contract does not describe,
+    # so it is reported here rather than defaulted to an empty list: a
+    # provider reporting no listings sends the key carrying no entries.
+    listings = payload.get(LISTINGS_COLLECTION_KEY)
     if not isinstance(listings, list):
-        logger.error(
+        raise _refuse(
             "Zillow API listings field was not a list",
-            extra={"listings_type": type(listings).__name__},
+            REASON_COLLECTION_NOT_LIST,
+            listings_key=LISTINGS_COLLECTION_KEY,
+            listings_type=type(listings).__name__,
         )
-        return []
 
     accepted = [entry for entry in listings if isinstance(entry, dict)]
     if len(accepted) != len(listings):

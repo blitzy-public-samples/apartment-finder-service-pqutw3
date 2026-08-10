@@ -13,16 +13,29 @@ is ever written, a credential already in place is never replaced without an
 explicit request, the credential is held to the policy every account is held
 to, exactly one account holds the role afterwards, no role is ever granted,
 and no record carries the credential.
+
+Two further properties are asserted about the run rather than about the
+row. The module imports nothing that reads ``Settings``, and the command
+is driven in a subprocess carrying only the environment the credential Job
+mounts, so a run that came to depend on a credential the Job does not
+grant fails here. And the record that reports a credential is in place is
+emitted after the commit, with every outcome record carrying whether the
+state it describes is durable.
 """
 
+import ast
 import io
 import json
 import logging
+import os
 import re
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from backend.app.core import admin_provisioning
 from backend.app.core.admin_provisioning import (
@@ -57,14 +70,94 @@ FIRST_CREDENTIAL = "Adm1n_Seed_Pass!2026"
 #: refusal to replace.
 SECOND_CREDENTIAL = "Rot4ted_Seed_Pass!2026"
 
+#: Repository root, which a subprocess run of the command is started from.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+
 #: Path of the module under test, read by the structural guard below.
 MODULE_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "backend"
-    / "app"
-    / "core"
-    / "admin_provisioning.py"
+    REPOSITORY_ROOT / "backend" / "app" / "core" / "admin_provisioning.py"
 )
+
+#: Modules whose import would make the command read ``Settings``, and so
+#: depend on the token-signing key and the five provider credentials the
+#: credential Job does not mount.
+SETTINGS_BOUND_MODULES = (
+    "backend.app.core.config",
+    "backend.app.core.security",
+    "backend.app.core.authorization",
+    "backend.app.db.database",
+)
+
+#: Settings the credential Job does not mount. A run that reads one of
+#: them cannot start under that Job.
+UNMOUNTED_SETTINGS = (
+    "SECRET_KEY",
+    "ZILLOW_API_KEY",
+    "PAYPAL_CLIENT_ID",
+    "PAYPAL_CLIENT_SECRET",
+    "PAYPAL_WEBHOOK_ID",
+    "SENDGRID_API_KEY",
+    "RATE_LIMIT_STORAGE_URI",
+)
+
+
+def _imported_modules(path):
+    """Return every module name the file at ``path`` imports.
+
+    A ``from package import name`` statement contributes the package and
+    the dotted path of each name it binds, so a module imported that way
+    is named here exactly as a module imported outright is.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+            for alias in node.names:
+                imported.add("{0}.{1}".format(node.module, alias.name))
+    return imported
+
+
+def _job_environment(database_url, **extra):
+    """Return the environment the credential Job grants, and no more.
+
+    The Job mounts the database URL and the seed password, and reads the
+    non-credential configuration map, which names the deployment
+    environment and the managed secret backend. Nothing else is supplied,
+    so a run that reads one of :data:`UNMOUNTED_SETTINGS` fails.
+    """
+    environment = {
+        "PATH": os.environ["PATH"],
+        "PYTHONPATH": str(REPOSITORY_ROOT),
+        "PYTHONIOENCODING": "utf-8",
+        "ENV_FILE": "",
+        "ENVIRONMENT": "production",
+        "SECRET_BACKEND": "gcp-secret-manager",
+        "ADMIN_SEED_PASSWORD": FIRST_CREDENTIAL,
+    }
+    for name in ("SystemRoot", "COMSPEC", "TEMP"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    if database_url is not None:
+        environment["DATABASE_URL"] = database_url
+    environment.update(extra)
+    for absent in UNMOUNTED_SETTINGS:
+        assert absent not in environment, absent
+    return environment
+
+
+def _run(arguments, environment):
+    """Return the completed run of the interpreter under ``environment``."""
+    return subprocess.run(
+        [sys.executable] + list(arguments),
+        cwd=str(REPOSITORY_ROOT),
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
 
 
 @pytest.fixture
@@ -453,23 +546,29 @@ class TestSingleAdministratorPostcondition:
         assert "post-condition" in str(refusal.value)
 
 
+@pytest.fixture
+def entry_point_session(db, monkeypatch):
+    """Bind the module's session factory to the test session.
+
+    The factory is a callable, so a run of the command opens the session
+    the case already holds rather than a connection of its own. The list
+    returned records the closes the command performed.
+    """
+    closed = []
+
+    class Factory:
+        def __call__(self):
+            return db
+
+    monkeypatch.setattr(admin_provisioning, "SessionLocal", Factory())
+    monkeypatch.setattr(
+        db, "close", lambda: closed.append(True), raising=False
+    )
+    return closed
+
+
 class TestEntryPoint:
     """The behaviour of the command an operator runs."""
-
-    @pytest.fixture
-    def entry_point_session(self, db, monkeypatch):
-        """Bind the module's session factory to the test session."""
-        closed = []
-
-        class Factory:
-            def __call__(self):
-                return db
-
-        monkeypatch.setattr(admin_provisioning, "SessionLocal", Factory())
-        monkeypatch.setattr(
-            db, "close", lambda: closed.append(True), raising=False
-        )
-        return closed
 
     def test_a_successful_run_exits_zero_and_commits(
         self, db, seeded_admin, entry_point_session, supplied_credential,
@@ -695,3 +794,156 @@ class TestObservability:
 
         for record in emitted():
             assert weak not in json.dumps(record)
+
+    def test_the_prepared_record_states_it_is_not_yet_durable(
+        self, db, seeded_admin, emitted
+    ):
+        """The write is announced as prepared, not as stored.
+
+        Nothing outside the caller's transaction can see it at that
+        point, and a rollback afterwards would leave the stored value
+        unchanged.
+        """
+        provision_admin_credential(db, FIRST_CREDENTIAL)
+
+        record = emitted()[0]
+        assert record["context"]["durable"] is False
+        assert "not durable" in record["message"]
+
+    def test_the_committed_record_follows_the_commit(
+        self, db, seeded_admin, entry_point_session, supplied_credential,
+        emitted,
+    ):
+        """The command records the state the database holds."""
+        supplied_credential(FIRST_CREDENTIAL)
+
+        assert main() == 0
+
+        records = emitted()
+        durable = [r for r in records if r["context"].get("durable")]
+        assert len(durable) == 1
+        assert durable[0]["context"]["outcome"] == OUTCOME_PROVISIONED
+        assert "count is 1" in durable[0]["message"]
+        assert records.index(durable[0]) == len(records) - 1
+
+    def test_a_failed_commit_records_no_durable_outcome(
+        self, db, seeded_admin, entry_point_session, supplied_credential,
+        emitted, monkeypatch,
+    ):
+        """A commit that raises is recorded as not committed."""
+        supplied_credential(FIRST_CREDENTIAL)
+
+        def fail():
+            raise RuntimeError("the commit did not land")
+
+        monkeypatch.setattr(db, "commit", fail, raising=False)
+        monkeypatch.setattr(
+            db, "rollback", lambda: None, raising=False
+        )
+
+        with pytest.raises(RuntimeError, match="did not land"):
+            main()
+
+        records = emitted()
+        assert [r["context"].get("durable") for r in records] == [
+            False, False
+        ]
+        assert records[-1]["level"] == "ERROR"
+        assert "rolled back" in records[-1]["message"]
+
+
+class TestTheCommandRunsOnWhatTheJobGrantsIt:
+    """It reads the database URL and the seed password, and nothing else.
+
+    The credential Job mounts those two values and reads the
+    non-credential configuration map. It does not mount the token-signing
+    key or any provider credential, so a run that resolved ``Settings``
+    could not start under it.
+    """
+
+    def test_the_module_imports_nothing_that_reads_the_settings(self):
+        imported = _imported_modules(MODULE_PATH)
+
+        for module in SETTINGS_BOUND_MODULES:
+            assert module not in imported, module
+
+    def test_the_module_names_no_setting_the_job_withholds(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+
+        for setting in UNMOUNTED_SETTINGS:
+            assert setting not in source, setting
+
+    def test_the_role_it_requires_is_the_role_the_grant_stores(
+        self, admin_seed_revision
+    ):
+        """One value, stated in three places, asserted equal here."""
+        assert ADMIN_ROLE == Role.ADMIN.value
+        assert ADMIN_ROLE == admin_seed_revision.ADMIN_ROLE
+        assert ADMIN_EMAIL == admin_seed_revision.ADMIN_EMAIL
+
+    def test_an_absent_database_is_refused_by_the_command_itself(self):
+        """The run reaches its own refusal rather than a settings error.
+
+        No database is needed to prove it: the process is started without
+        one, and the message it writes is the command's own. A run that
+        still resolved ``Settings`` would fail before reaching it, naming
+        the credentials the Job does not mount.
+        """
+        completed = _run(
+            ["-m", "backend.app.core.admin_provisioning"],
+            _job_environment(None),
+        )
+
+        assert completed.returncode == 1, completed.stderr
+        assert "DATABASE_URL is not set" in completed.stderr
+        for absent in UNMOUNTED_SETTINGS:
+            assert absent not in completed.stderr, absent
+
+    @pytest.mark.postgres
+    def test_the_command_provisions_under_that_environment_on_postgres(
+        self, postgres_url
+    ):
+        """End to end, on a real database, with the Job's environment.
+
+        The migrations are applied first, in a process given the same
+        environment, so the row the command addresses is the one the grant
+        revision leaves. The credential is then read back and verified.
+        """
+        environment = _job_environment(postgres_url)
+
+        migrated = _run(
+            ["-m", "alembic", "-c", "backend/alembic.ini", "upgrade", "head"],
+            environment,
+        )
+        assert migrated.returncode == 0, migrated.stderr
+
+        provisioned = _run(
+            ["-m", "backend.app.core.admin_provisioning"], environment
+        )
+        assert provisioned.returncode == 0, provisioned.stderr
+        assert OUTCOME_PROVISIONED in provisioned.stdout
+
+        engine = create_engine(postgres_url)
+        try:
+            with engine.connect() as connection:
+                stored = connection.execute(
+                    text(
+                        "SELECT hashed_password, role, "
+                        "failed_login_attempts FROM users WHERE email = :e"
+                    ),
+                    {"e": ADMIN_EMAIL},
+                ).first()
+        finally:
+            engine.dispose()
+
+        assert stored is not None
+        assert stored[1] == ADMIN_ROLE
+        assert stored[2] == 0
+        assert stored[0] != LOCKED_CREDENTIAL
+        assert verify_password(FIRST_CREDENTIAL, stored[0])
+
+        repeated = _run(
+            ["-m", "backend.app.core.admin_provisioning"], environment
+        )
+        assert repeated.returncode == 0, repeated.stderr
+        assert OUTCOME_UNCHANGED in repeated.stdout

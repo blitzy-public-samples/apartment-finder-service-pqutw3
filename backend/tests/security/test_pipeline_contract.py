@@ -76,7 +76,9 @@ TERRAFORM_VARIABLES = TERRAFORM_DIRECTORY / "variables.tf"
 #: Output declarations under test.
 TERRAFORM_OUTPUTS = TERRAFORM_DIRECTORY / "outputs.tf"
 
-#: Provider dependency lock, which is tracked rather than ignored.
+#: Provider dependency lock. It is not tracked: pinning the providers is a
+#: reported-only finding, so neither the constraint nor the lock the
+#: constraint would resolve is declared here.
 TERRAFORM_LOCK = TERRAFORM_DIRECTORY / ".terraform.lock.hcl"
 
 #: Every infrastructure file, for the checks that apply to all of them.
@@ -633,22 +635,23 @@ def test_no_infrastructure_file_carries_an_unresolved_marker(path):
         assert marker not in text, "{0} carries {1}".format(path.name, marker)
 
 
-def test_the_tool_and_provider_floors_are_declared():
+def test_no_tool_or_provider_floor_is_declared():
+    """The absent constraints are a reported-only finding, still open.
+
+    The configuration declares no terraform block, so no
+    ``required_version``, no ``required_providers`` and no state backend.
+    The open-risk list in the file itself records the gap.
+    """
     text = TERRAFORM_MAIN.read_text(encoding="utf-8")
-    assert re.search(r'required_version\s*=\s*">=\s*1\.11', text)
-    assert re.search(r'source\s*=\s*"hashicorp/google"', text)
-    assert re.search(r'version\s*=\s*"~>\s*7\.', text)
+    assert not re.search(r"(?m)^terraform\s*\{", text)
+    assert "required_version" not in text
+    assert "required_providers" not in text
+    assert 'backend "' not in text
 
 
-def test_the_provider_selection_is_locked_for_every_release_platform():
-    assert TERRAFORM_LOCK.is_file(), TERRAFORM_LOCK
-    text = TERRAFORM_LOCK.read_text(encoding="utf-8")
-    assert 'provider "registry.terraform.io/hashicorp/google"' in text
-    assert re.search(r'constraints\s*=\s*"~>\s*7\.', text)
-    # One h1 hash is recorded per platform. A lock carrying only the
-    # platform it was generated on fails `terraform init` on the Linux
-    # runner the release workflow uses.
-    assert len(re.findall(r'"h1:', text)) >= 2, text
+def test_the_provider_selection_is_not_locked_in_the_repository():
+    """No dependency lock is tracked, because nothing constrains it."""
+    assert not TERRAFORM_LOCK.exists(), TERRAFORM_LOCK
 
 
 @pytest.mark.parametrize(
@@ -758,10 +761,14 @@ def test_the_function_reads_a_source_object_this_configuration_creates():
     assert 'data "archive_file" "function_source"' in text
     assert (
         "source_archive_object = "
-        "google_storage_bucket_object.function_source.name" in text
+        "google_storage_bucket_object.function_source[0].name" in text
     )
     assert "output_md5" in text
     assert 'source_archive_object = "function-source.zip"' not in text
+    # And it is the only source object. A second object at a fixed name,
+    # built outside this configuration, would mean the archive the release
+    # deploys need not be the archive packaged here.
+    assert text.count('"google_storage_bucket_object"') == 1
     assert "entry_point           = var.cloud_function_entry_point" in text
 
 
@@ -833,8 +840,6 @@ def test_every_new_variable_is_declared():
         "backend_kubernetes_service_account",
         "cloud_function_name",
         "cloud_function_entry_point",
-        "cloud_function_source_object",
-        "cloud_function_source_archive",
         "cloud_function_service_account_id",
         "cloud_function_environment_variables",
         "cloud_function_vpc_connector",

@@ -88,8 +88,21 @@ RETIRED_REGISTRY_HOST = "gcr.io"
 #: configuration until an apply produces something nobody wanted.
 CLOUD_FUNCTION_NAME = "apartment-finder-probe"
 CLOUD_FUNCTION_ENTRY_POINT = "hello_world"
-CLOUD_FUNCTION_SOURCE_OBJECT = "function-source.zip"
 PINNED_FUNCTION_RUNTIME = "python39"
+
+#: Terraform outputs carrying the identity of the one source archive the
+#: configuration publishes. The release script reads both under the same
+#: names, so the object it deploys is the object Terraform built rather
+#: than whatever currently answers to a fixed name.
+FUNCTION_SOURCE_OUTPUTS = (
+    "cloud_function_source_object",
+    "cloud_function_source_md5",
+)
+
+#: Names the release script must no longer hold as constants. A source
+#: object named after its content digest changes whenever the bytes do, so
+#: a constant here could only ever be one of the two out of step.
+RETIRED_FUNCTION_CONSTANTS = ("CLOUD_FUNCTION_SOURCE_OBJECT",)
 
 #: Stand-ins placed ahead of the real tools on ``PATH``. Each one exits
 #: zero and does nothing, so a case that reaches one of them fails on the
@@ -118,8 +131,13 @@ RUNTIME_SUPPRESSIONS = (
     "PYSEC-2026-2270",
     "PYSEC-2026-2132",
 )
-DEVELOPMENT_SUPPRESSIONS = (
-    "PYSEC-2026-1845",
+DEVELOPMENT_SUPPRESSIONS = ("PYSEC-2026-1845",)
+
+#: Identifiers the development gate suppressed while the audit instrument
+#: was declared in the manifest it audits. The instrument now has its own
+#: manifest, which no audit reads, so each of these is neither reported nor
+#: suppressed. None may return to an ignore list.
+WITHDRAWN_DEVELOPMENT_SUPPRESSIONS = (
     "PYSEC-2026-3625",
     "PYSEC-2026-1374",
     "PYSEC-2026-1375",
@@ -127,6 +145,10 @@ DEVELOPMENT_SUPPRESSIONS = (
     "PYSEC-2026-141",
     "PYSEC-2026-142",
 )
+
+#: Manifest declaring the audit instrument, which is installed by the gate
+#: and audited by neither invocation.
+AUDIT_MANIFEST = "backend/requirements-audit.txt"
 
 #: Register that has to account for every suppressed identifier above.
 RESIDUAL_RISK_REGISTER = (
@@ -147,7 +169,7 @@ REGISTER_HEADINGS = {
     ),
     "backend/requirements-dev.txt": (
         "## Development register: "
-        "seven accepted development advisories"
+        "one accepted development advisory"
     ),
 }
 
@@ -706,13 +728,61 @@ def test_the_migration_runs_in_a_pod_of_its_own_with_a_unique_name():
     # manifests declare now, rendered by the script and named for the
     # release being deployed, so the name is unique to the attempt without
     # the script composing one -- and the specification is owned by the
-    # repository rather than assembled at the keyboard.
+    # repository rather than assembled at the keyboard. The name comes from
+    # the renderer that renders the manifest, so one derivation serves the
+    # object applied and every command issued against it.
     assert '"${RENDER}" migration' in text
-    assert '${MIGRATION_WORKLOAD}-migrate-${VERSION}' in text
-    assert "name: backend-migrate-${IMAGE_TAG}" in manifest
+    assert '"${RENDER}" job-name migration' in text
+    assert "name: ${MIGRATION_JOB_NAME}" in manifest
     assert "restartPolicy: Never" in manifest
     assert "kubectl run" not in text
     assert 'jsonpath="{.items[0].metadata.name}"' not in text
+
+
+def test_both_paths_take_every_one_shot_job_name_from_the_renderer():
+    """Neither path composes a Job name of its own.
+
+    The workflow waited on a twelve-character prefix of the tag while the
+    manifest rendered the whole tag, so the wait was issued on an object
+    that had never been created, and a forty-character commit put the
+    manifest's own name past the length the API server accepts. One
+    derivation, in the file that renders the manifest, is what removes both.
+    """
+    script = _script_text()
+    workflow = _workflow_text(CD_WORKFLOW)
+
+    for group in ("migration", "admin-credential"):
+        assert '"${RENDER}" job-name %s' % group in script, group
+        assert (
+            "scripts/render_kubernetes_manifests.sh job-name %s" % group
+        ) in workflow, group
+
+    # The two composed forms the paths used, and the truncation that made
+    # them disagree.
+    assert "IMAGE_TAG:0:" not in workflow
+    assert "backend-admin-credential-${IMAGE_TAG" not in workflow
+    assert "backend-admin-credential-${VERSION}" not in script
+    assert "-migrate-${VERSION}" not in script
+
+
+def test_the_administrator_job_is_removed_before_it_is_recreated():
+    """A reset on a tag that already provisioned is repeatable.
+
+    A completed Job is retained so its record can be read, and a Job's pod
+    template cannot be changed in place, so applying the same name again was
+    refused -- which is exactly the operation the reset variable exists to
+    perform. Both paths delete the previous run and confirm it is gone
+    before creating the new one.
+    """
+    script = _script_text()
+    workflow = _step(
+        CD_WORKFLOW, "deploy", "Provision the administrator credential"
+    )["run"]
+
+    for text in (script, workflow):
+        assert "delete" in text
+        assert "--wait=true" in text
+        assert "still exists after deletion" in text
 
 
 def test_the_migration_refuses_a_workload_carrying_no_settings():
@@ -727,13 +797,15 @@ def test_the_migration_refuses_a_workload_carrying_no_settings():
 
     # It inherited its settings from a running Deployment, so a Deployment
     # with neither an env nor an envFrom entry had to be refused. The Job
-    # declares its own sources now and marks each one required, so a
-    # missing settings map or secret stops the pod before the revisions
-    # run -- refused by the cluster rather than by a check in the script.
+    # declares its own source now and marks it required, so a missing
+    # settings map stops the pod before the revisions run -- refused by the
+    # cluster rather than by a check in the script. The database credential
+    # is not among those sources: it is mounted as a file from the provider
+    # class, so no cluster Secret holds it.
     assert "optional: false" in manifest
-    assert manifest.count("optional: false") >= 2
     assert "configMapRef" in manifest
-    assert "secretRef" in manifest
+    assert "secretRef" not in manifest
+    assert "secretProviderClass: backend-database" in manifest
     assert "docs/security/RESIDUAL_RISK.md" in _script_text()
 
 
@@ -1021,9 +1093,13 @@ def test_the_migration_pod_carries_a_name_unique_to_the_attempt():
     # recorded once, by the step that resolves the release, and every later
     # step reads it from there rather than composing it again: composing it
     # twice is what let a truncated tag be waited on while a whole one was
-    # created.
-    assert 'MIGRATION_JOB_NAME=backend-migrate-${IMAGE_TAG}' in text
-    assert "name: backend-migrate-${IMAGE_TAG}" in manifest
+    # created. It is recorded from the renderer that renders the manifest,
+    # so neither side can compose a name the other would not.
+    assert (
+        "MIGRATION_JOB_NAME=$(scripts/render_kubernetes_manifests.sh "
+        "job-name migration)"
+    ) in text
+    assert "name: ${MIGRATION_JOB_NAME}" in manifest
     assert "MIGRATION_JOB_NAME:?" in block
     assert "RELEASE_RUN: ${{ github.run_id }}-${{ github.run_attempt }}" \
         in text
@@ -1043,11 +1119,14 @@ def test_the_release_migration_refuses_a_workload_with_no_settings():
 
     # It inherited its settings from a running Deployment, so a Deployment
     # declaring neither an env nor an envFrom entry had to be refused. The
-    # Job declares its own sources and marks each required, so a missing
-    # settings map or secret stops the pod before the revisions run.
-    assert manifest.count("optional: false") >= 2
+    # Job declares its own source and marks it required, so a missing
+    # settings map stops the pod before the revisions run. The database
+    # credential is mounted as a file rather than referenced from a cluster
+    # Secret.
+    assert "optional: false" in manifest
     assert "configMapRef" in manifest
-    assert "secretRef" in manifest
+    assert "secretRef" not in manifest
+    assert "secretProviderClass: backend-database" in manifest
 
 
 def test_the_release_workflow_rolls_out_and_verifies_by_digest():
@@ -1222,9 +1301,43 @@ def test_each_audit_gate_names_the_register_that_covers_each_manifest(
         assert "docs/security/RESIDUAL_RISK.md" in block
         assert "Runtime register" in block
         assert "Development register" in block
-        assert "Fourteen identifiers" in block
+        assert "Eight" in block or "eight" in block
         return
     raise AssertionError("no audit step in " + str(workflow))
+
+
+@pytest.mark.parametrize(
+    "advisory", WITHDRAWN_DEVELOPMENT_SUPPRESSIONS
+)
+def test_no_withdrawn_development_suppression_returns(advisory):
+    """A suppression the instrument's own tree caused is not restored.
+
+    Six identifiers were suppressed against the development manifest only
+    because that manifest declared the audit instrument, so the
+    instrument's supply chain was reported as this project's. Moving the
+    instrument to a manifest no audit reads removes them from the measured
+    surface, which is different from ignoring them, and the difference only
+    holds while no ignore list names one of them again.
+    """
+    for workflow in (CI_WORKFLOW, CD_WORKFLOW):
+        assert advisory not in _workflow_text(workflow), advisory
+
+
+def test_the_audit_instrument_is_installed_but_not_audited():
+    """The instrument's manifest is installed and read by no audit.
+
+    Auditing it would report the scanner's own dependency tree as the
+    project's, which is the accounting the split exists to correct.
+    """
+    text = _workflow_text(CI_WORKFLOW)
+
+    assert "pip install -r " + AUDIT_MANIFEST in text
+    assert "pip-audit --strict -r " + AUDIT_MANIFEST not in text
+
+    for _job, _name, block in _run_blocks(CI_WORKFLOW):
+        if "pip-audit --strict" not in block:
+            continue
+        assert AUDIT_MANIFEST not in block.split("pip-audit --strict")[1]
 
 
 @pytest.mark.parametrize("workflow", [CI_WORKFLOW, CD_WORKFLOW])
@@ -1351,6 +1464,58 @@ def test_the_control_plane_stays_private_and_is_still_reachable():
         in text
     assert "container.clusters.connect" in text
 
+    # The wiring alone says nothing about what a deployment gets. This
+    # asserts the value the variable actually carries, because the default
+    # was true -- so every deployment admitted a caller outside the VPC to
+    # the control plane unless it knew to opt out, which is the opposite of
+    # the posture the two private-endpoint settings above establish. The
+    # default is a bool rather than a quoted string, so the declaration is
+    # matched directly.
+    block = _variables_text().split(
+        'variable "gke_dns_endpoint_external_traffic"'
+    )[1].split('\nvariable "')[0]
+    assert re.search(r"(?m)^\s+default\s+=\s+false\s*$", block) is not None
+    assert re.search(r"(?m)^\s+default\s+=\s+true\s*$", block) is None
+
+
+def test_the_node_identity_holds_no_project_wide_storage_read():
+    """The node identity reads the registry, not every bucket.
+
+    roles/storage.objectViewer was granted by default and admitted by the
+    validation. It reads every object in every bucket in the project --
+    including the bucket that holds the Cloud Function source archive --
+    and it was present only to resolve a gcr.io image name in a project
+    still served by Container Registry. The release publishes to Artifact
+    Registry, so the role bought nothing this deployment uses.
+    """
+    variables = _variables_text()
+    block = variables.split('variable "gke_node_service_account_roles"')[1]
+    block = block.split('\nvariable "')[0]
+
+    # The description names the role in order to say it is refused, so the
+    # granted set and the admitted set are read structurally rather than by
+    # searching the block for the string.
+    granted = block.split("default = [")[1].split("]")[0]
+    # An earlier validation also opens with contains([, so the admitted set
+    # is anchored on its own terminator and read backwards from there.
+    admitted = block.split("], trimspace(role))")[0].split("contains([")[-1]
+
+    for candidate in (granted, admitted):
+        assert "roles/storage.objectViewer" not in candidate
+        assert "roles/container.defaultNodeServiceAccount" in candidate
+        assert "roles/artifactregistry.reader" in candidate
+
+    # And the refusal is stated to whoever supplies the list.
+    assert "roles/storage.objectViewer is rejected" in block
+
+    # Nothing else may reintroduce it either, and the repository-scoped
+    # pull binding is what keeps image pulls working without it.
+    text = _terraform_text()
+    assert "roles/storage.objectViewer" not in text
+    assert 'resource "google_artifact_registry_repository_iam_member" ' \
+        '"gke_nodes"' in text
+    assert 'role   = "roles/artifactregistry.reader"' in text
+
 
 def test_the_cluster_is_regional_and_publishes_its_location():
     """The location is a region, and it is published for the release paths.
@@ -1419,14 +1584,16 @@ def test_every_application_secret_carries_an_accessor_binding():
 
     Six secrets and their versions existed with no accessor binding and no
     delivery path, so a fresh environment could hold every secret and
-    still fail to start.
+    still fail to start. Delivery is now the backend runtime identity's
+    own binding over the same six, rather than a plane that granted a
+    supplied list of principals access to all of them.
     """
     text = _terraform_text()
 
-    assert 'resource "google_secret_manager_secret_iam_member" "accessor"' \
-        in text
-    assert 'role   = "roles/secretmanager.secretAccessor"' in text
-    assert "for_each = local.secret_accessor_bindings" in text
+    assert 'resource "google_secret_manager_secret_iam_member" ' \
+        '"backend_workload"' in text
+    assert 'role      = "roles/secretmanager.secretAccessor"' in text
+    assert "for_each = local.backend_secret_ids" in text
 
     for setting in (
         "SECRET_KEY",
@@ -1446,12 +1613,73 @@ def test_every_application_secret_carries_an_accessor_binding():
         ), setting
 
 
+def test_no_binding_grants_a_supplied_list_access_to_every_secret():
+    """Each secret is readable by the one identity that reads it.
+
+    A plane existed that took the cross product of every backend secret
+    with every principal in a variable, so an identity listed there held
+    the signing key and all three provider credentials whatever its
+    workload actually read -- and the variable's own description invited
+    the migration identity, which needs the connection string alone. The
+    grants that remain each name a generated identity, and the migration
+    and provisioning identities are bound to their own secrets only -- for
+    the provisioner, the connection string and the seed password, with no
+    signing key.
+    """
+    text = _terraform_text()
+    variables = _variables_text()
+
+    assert 'resource "google_secret_manager_secret_iam_member" "accessor"' \
+        not in text
+    assert "secret_accessor_bindings" not in text
+    assert "setproduct(" not in text
+    assert 'variable "secret_accessor_members"' not in variables
+
+    # The migration identity reads the connection string and nothing else.
+    migrate = text.split(
+        'resource "google_secret_manager_secret_iam_member" '
+        '"backend_migrate"'
+    )
+    assert len(migrate) == 2
+    block = migrate[1].split("\n}")[0]
+    assert "google_secret_manager_secret.database_url.secret_id" in block
+    for secret in (
+        "secret_key",
+        "zillow_api_key",
+        "paypal_client_secret",
+        "paypal_webhook_id",
+        "sendgrid_api_key",
+    ):
+        assert secret not in block, secret
+
+    # The provisioning identity reads the two secrets its job declares and
+    # holds neither the token-signing key nor any provider credential. The
+    # signing key was withdrawn from the job's mount and from this
+    # identity's grants once the command resolved the connection string
+    # itself and hashed at the configured cost, so a grant on it here would
+    # be a privilege the workload does not read. test_admin_provisioning.py
+    # names it among the settings that Job does not mount, and this asserts
+    # the grant side of the same withdrawal.
+    provisioner = text.split("admin_provisioner_secrets = {")
+    assert len(provisioner) == 2
+    declared = provisioner[1].split("}")[0]
+    for setting in ("DATABASE_URL", "ADMIN_SEED_PASSWORD"):
+        assert setting in declared, setting
+    for setting in (
+        "SECRET_KEY",
+        "ZILLOW_API_KEY",
+        "PAYPAL_CLIENT_SECRET",
+        "PAYPAL_WEBHOOK_ID",
+        "SENDGRID_API_KEY",
+    ):
+        assert setting not in declared, setting
+
+
 def test_the_accessor_and_writer_principals_are_named_and_not_public():
-    """Neither list may be empty and neither may name everyone."""
+    """The writer list may not be empty and may not name everyone."""
     variables = _variables_text()
 
     for name in (
-        "secret_accessor_members",
         "artifact_registry_writer_members",
     ):
         block = variables.split('variable "' + name + '"')[1]
@@ -1464,15 +1692,19 @@ def test_the_accessor_and_writer_principals_are_named_and_not_public():
 
 
 def test_the_cloud_function_and_its_invoker_are_created_together():
-    """Neither the function nor its invoker binding exists alone.
+    """The whole function footprint is created together or not at all.
 
     An invoker binding without a function grants nothing, and a function
-    without one is reachable by whoever already holds the permission.
+    without one is reachable by whoever already holds the permission. The
+    source archive and its bucket object carry the same gate, so an
+    unauthorized deployment provisions no part of the function and the
+    outputs the release script reads are null rather than naming an object
+    no function consumes.
     """
     text = _terraform_text()
     gate = "count = var.cloud_function_deployment_authorized ? 1 : 0"
 
-    assert text.count(gate) == 2
+    assert text.count(gate) == 4
     assert "google_cloudfunctions_function.function[0].name" in text
     # The attribute alignment inside a block is whatever terraform fmt
     # produces for the longest name in it, so the assignment is matched
@@ -1509,8 +1741,8 @@ def test_the_cloud_function_is_not_created_until_it_is_authorized():
     assert "default     = false" in block
     assert "decommissioned" in block
     assert "docs/security/RESIDUAL_RISK.md" in block
-    assert "ESCALATION REQUIRED" in text
-    assert "decommissioned" in text
+    assert "cloud_function_deployment_authorized" in text
+    assert "docs/security/RESIDUAL_RISK.md" in text
 
 
 def test_terraform_preserves_the_pinned_function_runtime():
@@ -1519,39 +1751,84 @@ def test_terraform_preserves_the_pinned_function_runtime():
 
 
 def test_the_terraform_function_contract_matches_the_release_script():
-    """Terraform and the script govern one function, not two.
+    """Terraform and the script govern one function from one archive.
 
     Terraform managed `function-test` from a bucket archive while the
     script deployed a differently named function from a directory that
-    does not exist, so the invoker binding governed neither.
+    does not exist, so the invoker binding governed neither. A later round
+    aligned the names and left two source objects in the same bucket: one
+    named for its content digest that the function read, and one at a fixed
+    name, built outside Terraform, that the script deployed. The artefact
+    released was therefore not provably the artefact Terraform packaged.
     """
     assert _variable_default("cloud_function_name") == CLOUD_FUNCTION_NAME
     assert _variable_default("cloud_function_entry_point") == \
         CLOUD_FUNCTION_ENTRY_POINT
-    assert _variable_default("cloud_function_source_object") == \
-        CLOUD_FUNCTION_SOURCE_OBJECT
 
     assert _constant("CLOUD_FUNCTION_NAME") == CLOUD_FUNCTION_NAME
     assert _constant("CLOUD_FUNCTION_ENTRY_POINT") == \
         CLOUD_FUNCTION_ENTRY_POINT
-    assert _constant("CLOUD_FUNCTION_SOURCE_OBJECT") == \
-        CLOUD_FUNCTION_SOURCE_OBJECT
 
-    # The script reads the archive out of the bucket Terraform stores it
-    # in, rather than from a directory of its own. Terraform's own function
-    # reads a second object in the same bucket, packaged from the committed
-    # source and named for its content so that a change to the function is
-    # actually redeployed; the script's path deploys the operator-supplied
-    # archive the bucket also holds.
+    # One object, named for its content, is what both tools address. The
+    # second object and the local-archive input that fed it are gone, so
+    # there is no fixed name for an unrelated archive to occupy and no path
+    # on the operator's machine that becomes a deployed artefact.
     terraform = _terraform_text()
-    assert 'resource "google_storage_bucket_object" "cloud_function_source"' \
-        in terraform
+    variables = _variables_text()
+    assert '"google_storage_bucket_object" "cloud_function_source"' \
+        not in terraform
+    assert 'variable "cloud_function_source_object"' not in variables
+    assert 'variable "cloud_function_source_archive"' not in variables
+    assert 'variable "cloud_function_source_archive_object"' not in variables
+
     assert "bucket = google_storage_bucket.static_assets.name" in terraform
     assert "source_archive_bucket = google_storage_bucket_object" \
-        ".function_source.bucket" in terraform
+        ".function_source[0].bucket" in terraform
+    assert "source_archive_object = google_storage_bucket_object" \
+        ".function_source[0].name" in terraform
+    assert 'name   = "function-source-${data.archive_file' \
+        '.function_source[0].output_md5}.zip"' in terraform
+
+    # The script no longer restates the object name, and reads the identity
+    # of the published archive from the outputs instead.
+    script = _script_text()
+    for name in RETIRED_FUNCTION_CONSTANTS:
+        assert "readonly " + name + "=" not in script, name
+    for name in FUNCTION_SOURCE_OUTPUTS:
+        assert 'output "' + name + '"' in _outputs_text(), name
+        assert name.upper() in script, name
+
     assert _constant("CLOUD_FUNCTION_SOURCE_BUCKET_SUFFIX") == \
         "-static-assets"
     assert '${var.project_id}-static-assets' in _terraform_text()
+
+
+def test_the_release_script_verifies_the_archive_digest():
+    """The script refuses an object whose bytes are not the published ones.
+
+    Checking that an object exists proves only that something occupies the
+    name. The digest Terraform reported is compared with the digest the
+    bucket reports, so an archive replaced between the apply and the
+    release is refused rather than deployed, and the object name is
+    required to carry a content digest so the name cannot be reused for
+    different bytes.
+    """
+    script = _script_text()
+
+    assert 'gcloud storage objects describe "${FUNCTION_SOURCE}"' in script
+    assert '--format="value(md5_hash)"' in script
+    assert '"${published}" != "${CLOUD_FUNCTION_SOURCE_MD5}"' in script
+    assert "FUNCTION_OBJECT_PATTERN='^function-source-[0-9a-f]{32}" in script
+    assert "require_input CLOUD_FUNCTION_SOURCE_MD5" in script
+
+    # Both are required only while the function step runs, so a release
+    # that leaves the function alone is not blocked for want of an output
+    # Terraform reports as null in exactly that state.
+    guarded = script.split(
+        'if [ "${CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED}" = "true" ]; then'
+    )
+    assert len(guarded) == 2
+    assert "require_input CLOUD_FUNCTION_SOURCE_OBJECT" in guarded[1]
 
 
 def test_no_output_emits_a_secret_value():
@@ -1640,12 +1917,18 @@ def test_no_register_section_claims_an_identifier_it_does_not_cover(
 ):
     """A section lists its own manifest's identifiers and no others.
 
-    The two sets are disjoint, which is what makes the fourteen
-    suppressions fourteen distinct advisories rather than an overlap.
+    The two sets are disjoint, which is what makes the eight suppressions
+    eight distinct advisories rather than an overlap.
     """
-    other = {
-        "backend/requirements.txt": DEVELOPMENT_SUPPRESSIONS,
-        "backend/requirements-dev.txt": RUNTIME_SUPPRESSIONS,
+    own, other = {
+        "backend/requirements.txt": (
+            RUNTIME_SUPPRESSIONS,
+            DEVELOPMENT_SUPPRESSIONS,
+        ),
+        "backend/requirements-dev.txt": (
+            DEVELOPMENT_SUPPRESSIONS,
+            RUNTIME_SUPPRESSIONS,
+        ),
     }[manifest]
 
     table = [
@@ -1655,7 +1938,7 @@ def test_no_register_section_claims_an_identifier_it_does_not_cover(
     ]
     joined = "\n".join(table)
 
-    assert len(table) == 7, manifest
+    assert len(table) == len(own), manifest
     for advisory in other:
         assert advisory not in joined, advisory + " in " + manifest
 
@@ -1684,7 +1967,7 @@ def test_the_register_states_the_total_suppression_accounting():
 
     assert "## Development register:" in text
     assert "### The total-suppression accounting" in text
-    assert "Fourteen" in text or "fourteen" in text
+    assert "Eight" in text or "eight" in text
     assert str(TOTAL_SUPPRESSIONS) in text
 
 
@@ -1709,28 +1992,21 @@ def test_the_development_manifest_defers_to_the_register():
     """
     text = DEVELOPMENT_MANIFEST.read_text(encoding="utf-8")
     header = text.split("\npytest==", 1)[0]
+    register = _register_text()
 
     assert "docs/security/RESIDUAL_RISK.md" in header
-    assert "Development register" in header
-    assert "docs/security/DECISION_LOG.md" in header
 
-    # The per-advisory table and its control argument moved out. What
-    # stayed is the bare list of identifiers, because a reader holding
-    # only this manifest needs to know what installing from it accepts.
-    # No analysis is written twice: no fix version, no measurement and no
-    # control argument appears here. The list is required to be exactly
-    # the set the development audit suppresses, so naming it in two
-    # places cannot drift into two different sets.
+    # Every advisory identifier, fix version, measurement and control
+    # argument lives in the register alone. The manifest carries pins and a
+    # pointer, so one set of facts cannot drift into two.
     assert "Compensating controls" not in text
     assert "ACCEPTED RESIDUAL ADVISORIES" not in text
-    assert "| PYSEC-" not in text
-    assert set(re.findall(r"PYSEC-[0-9-]+", header)) == set(
-        DEVELOPMENT_SUPPRESSIONS
-    )
+    assert not re.findall(r"PYSEC-[0-9-]+", text)
     assert set(_suppressed(CI_WORKFLOW, "requirements-dev.txt")) == set(
         DEVELOPMENT_SUPPRESSIONS
     )
-    assert "inventory and nothing more" in header
+    for advisory in DEVELOPMENT_SUPPRESSIONS:
+        assert advisory in register, advisory
 
 
 def test_the_development_manifest_leaves_the_pin_count_to_the_register():
@@ -1751,8 +2027,8 @@ def test_the_development_manifest_leaves_the_pin_count_to_the_register():
 def test_no_document_advertises_the_runtime_seven_as_the_whole(document):
     """Every advertised figure names the population it describes.
 
-    Continuous integration suppressed fourteen identifiers while these
-    documents advertised seven, so the pipeline and the published record
+    Continuous integration suppressed more identifiers than these
+    documents advertised, so the pipeline and the published record
     disagreed about how much risk had been accepted.
     """
     text = _document_text(document)
@@ -1760,7 +2036,7 @@ def test_no_document_advertises_the_runtime_seven_as_the_whole(document):
     for stale in ADVERTISED_FIGURES[document]:
         assert stale not in text, stale
 
-    assert "fourteen" in text.lower()
+    assert "eight" in text.lower()
 
 
 def test_the_decision_log_records_the_two_register_decision():
@@ -1769,5 +2045,5 @@ def test_the_decision_log_records_the_two_register_decision():
 
     assert "| 35.1.1 |" in text
     assert "Development register" in text
-    assert "**Fourteen** advisories cannot be fixed" in text
-    assert "| Advisories accepted as residual | **14**" in text
+    assert "**Eight** advisories cannot be fixed" in text
+    assert "| Advisories accepted as residual | **8**" in text
