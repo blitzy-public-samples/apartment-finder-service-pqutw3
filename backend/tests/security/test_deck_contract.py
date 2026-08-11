@@ -398,20 +398,83 @@ def test_the_diagram_theme_is_unchanged(variable):
     assert variable in _text(), variable
 
 
+#: Window of source, in characters, a handler's body is looked for in
+#: after its registration. Long enough to hold either handler as
+#: written and short enough that a match cannot come from the next one.
+HANDLER_WINDOW = 240
+
+
+def _after(text, marker):
+    """Returns the source following ``marker``, bounded to one handler."""
+    assert marker in text, marker
+    start = text.index(marker) + len(marker)
+    return text[start:start + HANDLER_WINDOW]
+
+
 def test_the_render_cycle_is_wired_to_both_events():
     """Asserts diagrams and icons are drawn on ready and on every change.
 
     A diagram on a slide the framework has not laid out yet has no
     layout box, so a single draw at load time leaves later diagrams
-    blank. Both libraries are therefore invoked twice, once per event.
+    blank. Each library is therefore invoked from the ready handler and
+    again from the slide-changed handler. The invocations are located
+    inside those handlers, so moving one out of a handler fails here
+    even when the number of call sites is unchanged.
     """
     text = _text()
 
     assert "startOnLoad: false" in text
-    assert text.count("mermaid.run(") == 2
-    assert text.count("lucide.createIcons()") == 2
     assert "Reveal.on('ready'" in text
     assert "Reveal.on('slidechanged'" in text
+
+    assert "lucide.createIcons()" in _after(text, "Reveal.on('ready'")
+
+    changes = text.split("Reveal.on('slidechanged'")[1:]
+    assert len(changes) == 2, len(changes)
+    bodies = [change[:HANDLER_WINDOW] for change in changes]
+    assert any("lucide.createIcons()" in body for body in bodies), bodies
+    assert any("mermaid.run(" in body for body in bodies), bodies
+
+    # Two call sites: the pass that draws every diagram once the library
+    # arrives, and the pass a slide change runs.
+    assert text.count("mermaid.run(") == 2
+
+
+def test_the_presentation_starts_outside_the_diagram_module():
+    """Asserts a diagram-library fetch failure cannot stop the deck.
+
+    A failed static import discards the whole module it appears in.
+    While the framework start-up, the icon fallback and the diagram
+    recovery notice all lived in the module that imported the diagram
+    library, losing that one file left every slide hidden, no fallback
+    drawn and nothing on the console: the presentation never started.
+    Start-up therefore lives in a script that imports nothing, and the
+    library is fetched by a guarded dynamic import.
+    """
+    text = _text()
+
+    scripts = re.findall(
+        r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script>", text, re.S
+    )
+    starters = [
+        body for attrs, body in scripts if "Reveal.initialize(" in body
+    ]
+    assert len(starters) == 1, len(starters)
+    starter = starters[0]
+
+    assert "import " not in starter
+    assert "import(" not in starter
+
+    importers = [body for attrs, body in scripts if "import(" in body]
+    assert len(importers) == 1, len(importers)
+    importer = importers[0]
+
+    assert "import('mermaid')" in importer
+    assert ".catch(" in importer
+    assert "Reveal.initialize(" not in importer
+
+    # No static import of the library survives anywhere.
+    assert not re.search(r"^\s*import\s+\w+\s+from", text, re.M)
 
 
 @pytest.mark.parametrize("token", THEME_TOKENS)

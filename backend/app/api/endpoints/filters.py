@@ -103,20 +103,18 @@ def get_user_filters(
         DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE
     ),
 ):
-    """Return one page of the caller's own filters.
+    """Returns one page of the caller's own saved filters.
 
-    ``skip`` and ``limit`` are applied in SQL, and both are bounded:
-    ``limit`` by ``settings.MAX_PAGE_SIZE`` and ``skip`` by
-    ``settings.MAX_PAGINATION_OFFSET``, so an offset above the configured
-    cap is refused by request validation. The page is ordered by
-    ``id``, so the boundary between one page and the next is the same on
-    every read and a filter is neither repeated across pages nor omitted
-    from all of them. The postal codes and the predicates
-    of the returned filters are loaded by two further statements for the
-    whole page rather than by two per filter, so the number of
-    statements does not follow the page size. The number of children per
-    filter is bounded by the creation contract in
-    :mod:`backend.app.schema.filter`.
+    Both ``skip`` and ``limit`` are applied by the query itself, and each
+    is capped. The accepted range for both is published with the
+    parameters above, and a value outside that range is refused before
+    the query runs. The page is ordered by identifier, so the boundary
+    between one page and the next is the same on every read, and a filter
+    is neither repeated across pages nor missing from all of them. A
+    filter's postal codes and predicates are read for the whole page at
+    once rather than once per filter, so the number of queries does not
+    grow with the page size. How many of each one filter may carry is
+    capped by the request body the creation route accepts.
     """
     filters = (
         db.query(FilterModel)

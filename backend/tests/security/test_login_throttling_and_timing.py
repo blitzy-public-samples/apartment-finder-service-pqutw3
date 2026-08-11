@@ -18,8 +18,10 @@ one budget, the time a branch takes is a floor that the machine can only
 add to, so the branches are sampled round-robin and each is read at its
 shortest: the reading that carries the least noise and therefore the
 clearest view of the work the branch does. Deselecting the mark loses no
-coverage of the control, because the counted case asserts the same
-property without a clock.
+coverage of the control, because two counted mechanisms assert the same
+properties without a clock: one counts the work each branch does, and the
+other replaces the clock the padding helper reads and counts the interval
+it holds the response for.
 
 The rate limiter's storage is covered by operating it -- a health probe
 answered, a counter incremented, read back and released -- rather than by
@@ -1155,6 +1157,126 @@ class TestRefusalBranchesDoTheSameWork:
             assert slot.attempts == 2
 
 
+class _RecordingClock:
+    """A stand-in for the ``time`` module the padding helper reads.
+
+    ``monotonic`` returns the readings it was built with, in order, and
+    repeats the last one once they are exhausted. ``sleep`` records the
+    interval it was asked for and returns at once, so a case reads back
+    what the helper decided to wait for without any of that time passing.
+    """
+
+    def __init__(self, *readings):
+        self._readings = list(readings)
+        self.slept = []
+
+    def monotonic(self):
+        if len(self._readings) > 1:
+            return self._readings.pop(0)
+        return self._readings[0]
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+
+
+class TestThePaddingHelperWaitsOutItsBudget:
+    """The wait itself, asserted by counting rather than by measuring.
+
+    Two properties together make the equalisation hold: every refusal
+    branch has to reach the padding helper, and the helper has to hold the
+    response until the budget has elapsed. The classes above count the
+    first -- one equalisation per refusal branch, one credential-budget
+    call per check -- and the cases here count the second, so that neither
+    property rests on a case that reads a wall clock and neither is lost
+    to ``-m "not timing"``.
+
+    The clock the security module reads is replaced by a stand-in, so a
+    case states the elapsed time as data and reads back the interval the
+    helper asked to sleep for. Nothing here measures anything: the
+    readings are fixed, so a helper that stopped waiting fails these on an
+    idle machine and on a loaded one alike, and the intervals asserted are
+    exact rather than tolerated.
+    """
+
+    @staticmethod
+    def _clock(monkeypatch, *readings):
+        """Replaces the clock the security module reads for the case."""
+        clock = _RecordingClock(*readings)
+        monkeypatch.setattr(security, "time", clock)
+        return clock
+
+    def test_it_sleeps_out_the_time_still_left_on_the_budget(
+        self, monkeypatch
+    ):
+        """It waits, and it waits for the remainder of the budget.
+
+        One second of a two-and-a-half second budget has elapsed, so the
+        helper has one and a half left to wait out. A helper that returned
+        without waiting records no interval, and one that waited out the
+        whole budget again records the wrong one.
+        """
+        clock = self._clock(monkeypatch, 100.0)
+
+        security._pad_until(99.0, 2.5)
+
+        assert clock.slept == [1.5]
+
+    def test_it_sleeps_for_nothing_once_the_budget_has_elapsed(
+        self, monkeypatch
+    ):
+        """A call arriving late returns rather than waiting again."""
+        clock = self._clock(monkeypatch, 100.0)
+
+        security._pad_until(90.0, 2.5)
+
+        assert clock.slept == []
+
+    def test_it_sleeps_for_nothing_at_the_exact_budget(self, monkeypatch):
+        """The boundary belongs to the branch that does not wait."""
+        clock = self._clock(monkeypatch, 100.0)
+
+        security._pad_until(97.5, 2.5)
+
+        assert clock.slept == []
+
+    def test_a_refused_login_sleeps_out_the_refusal_budget(
+        self, monkeypatch
+    ):
+        """A refusal entered at the reading waits out its whole budget."""
+        clock = self._clock(monkeypatch, 100.0)
+
+        security.equalize_login_refusal(100.0)
+
+        assert clock.slept == [security.MIN_LOGIN_REFUSAL_SECONDS]
+
+    @pytest.mark.parametrize(
+        "shape", ["absent", "legacy", "configured", "unusable"]
+    )
+    def test_a_credential_check_sleeps_out_the_credential_budget(
+        self, shape, monkeypatch
+    ):
+        """Whatever it is given, the check ends in the wait.
+
+        This is the counted form of the elapsed-time case below: the
+        legacy cost factor is far below the configured one, and what keeps
+        the two indistinguishable is that both reach the wait and both are
+        held there for the rest of the credential budget.
+        """
+        stored = {
+            "absent": None,
+            "legacy": legacy_hash(PASSWORD),
+            "configured": security.get_password_hash(PASSWORD),
+            "unusable": "not-a-hash",
+        }[shape]
+        clock = self._clock(monkeypatch, 0.0)
+
+        security.verify_credential(WRONG_PASSWORD, stored)
+
+        assert clock.slept == [
+            security.MIN_CREDENTIAL_CHECK_SECONDS
+        ], shape
+
+
 @pytest.mark.timing
 class TestRefusalBranchesTakeTheSameTime:
     """Every login refusal is held to one budget, measured end to end.
@@ -1163,8 +1285,9 @@ class TestRefusalBranchesTakeTheSameTime:
     is classified as such: it reads a wall clock, so an adverse pattern of
     host contention can move a reading even though the branches perform
     identical work. Deselect it with ``-m "not timing"`` where that
-    matters; the counted case above proves the same property
-    deterministically and is never deselected.
+    matters; the counted classes above prove the same properties
+    deterministically -- the work each branch does, and the wait every
+    branch ends in -- and neither is ever deselected.
     """
 
     @staticmethod

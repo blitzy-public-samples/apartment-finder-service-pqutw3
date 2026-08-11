@@ -154,7 +154,7 @@ security contact once someone is accountable for reading it.
 
 ### Owner action required
 
-The channel above is a repository surface and needs no address, but three further things
+The channel above is a repository surface and needs no address, but four further things
 must be settled by the repository owner — with legal input where the last one is
 concerned — before a reporter can rely on more than the channel itself. They are listed
 rather than assumed, because a disclosure policy that promises what nobody has agreed to
@@ -197,9 +197,11 @@ Whenever a channel does exist, a report is easiest to act on when it carries:
 
 **No response times are committed, because no channel is monitored yet.** A commitment to
 acknowledge a report within a number of days is only meaningful if something receives the
-report and someone is accountable for reading it. Neither condition holds until an operator
-completes one of the two prerequisites above, so publishing a schedule here would be a
-promise this repository cannot keep.
+report and someone is accountable for reading it. **Item 1 above is what establishes both**
+— enabling private vulnerability reporting is what receives a report, and confirming that a
+test report was read is what makes someone accountable for it — and until it is completed
+neither condition holds, so publishing a schedule here would be a promise this repository
+cannot keep. Item 2 is what would set the targets themselves.
 
 The targets below are therefore a **proposal, not a commitment**. They take effect only when
 an operator turns them on — that is, once a channel is operational and this paragraph is
@@ -262,14 +264,22 @@ compiles — but it is not a tolerated failure, and a red one blocks the change 
 The paragraph headed *On the tolerated job*, further down this policy, states this once more
 with the history behind it.
 
-### Safe harbour
+### Safe harbour — proposed, not yet in force
 
-Good-faith research that stays within the limits below will not be pursued by this
-project:
+**No safe-harbour undertaking is in force.** Item 4 of *Owner action required* above is
+where that is settled: safe harbour is a legal commitment not to pursue good-faith
+research, and it cannot be published on the project's behalf without its authorization.
+What follows is therefore the scope such an undertaking would be proposed against, in the
+same form as the response targets above — a proposal an operator turns on by replacing this
+paragraph with a statement that it is in force.
+
+The limits below are also **statements of scope that hold today**, independently of any
+undertaking: they say where a finding belongs and what this codebase does deliberately, so
+a reporter can tell a defect from a documented decision.
 
 - **Third-party services.** PayPal, Zillow, SendGrid and Google Cloud are separate products with their own disclosure processes. A defect in one of them is theirs to fix; report it to them directly.
 - **`frontend/` source.** It is in this repository, but the change set that produced this policy treated it as read-only reference material, so a finding there is **recorded rather than patched** under the current scope. That is a statement of the authorized change scope, not a judgement that frontend findings are unimportant — and it is a boundary the owner can lift.
-- **Findings requiring an already-compromised host, or local filesystem access to the machine running the service.** Whether these are accepted is item 2's decision; they are noted here because the codebase assumes the host is trusted.
+- **Findings requiring an already-compromised host, or local filesystem access to the machine running the service.** Whether these are accepted is part of item 4's decision, since it is the scope any safe-harbour undertaking would be made against; they are noted here because the codebase assumes the host is trusted.
 - **Volumetric denial of service.** Traffic floods and volume-driven resource exhaustion are a deployment and edge-infrastructure concern rather than a property of this code. The application-level resource controls it does carry — a bounded page size, a request-body cap and rate limits on the credential endpoints — are in scope as code.
 - **Two email addresses sharing a login-throttle row.** A refused login updates one row of a fixed-size table, selected by a keyed digest of the submitted address, so two different addresses can select the same row and briefly serialise behind one another's write. That is intended rather than a defect: it is what lets every refusal branch perform the same database work, which is what removes the timing difference between an account that exists and one that does not. The row holds no address, no credential and no account identifier, only a count and a timestamp, and the set of rows never grows. The reasoning and the accepted trade-off are recorded at row 94.7.1 of [`docs/security/DECISION_LOG.md`](docs/security/DECISION_LOG.md).
 
@@ -366,46 +376,60 @@ bandit -r backend/app -ll
 ! grep -rEn "request\.form|request\.url|StaticFiles|HTTPEndpoint|Route\(|set_key|unset_key|\bclick\b" \
     --include=*.py backend/app/
 
-# Guard 2, layer 2 — the same question resolved semantically
+# Guard 2, layer 2 — the same question resolved semantically. Not a workflow
+# step of its own: this module runs inside the security suite below, and is
+# named here because it is the layer that answers the question semantically.
 python -m pytest backend/tests/security/test_residual_risk_guards.py -q
 
-# Full backend suite, with coverage
-python -m pytest backend/tests --cov=backend/app --cov-report=xml:backend/coverage.xml
+# Security suite, which the workflow runs first so coverage starts here
+python -m pytest backend/tests/security -q \
+  --cov=backend/app \
+  --cov-report= \
+  --cov-fail-under=0
 
-# Security suite
-python -m pytest backend/tests/security -q
+# Everything else, appending to that coverage
+python -m pytest backend/tests \
+  --ignore=backend/tests/security \
+  --cov=backend/app \
+  --cov-append \
+  --cov-report=xml:backend/coverage.xml
 ```
 
 | Gate | Expected outcome |
 | --- | --- |
-| Lint | Clean. Run from `backend/` because that is what the workflow does; the configuration comes from the single `setup.cfg` at the repository root, which `flake8` finds by searching upwards. |
+| Lint | Clean. Run from `backend/` because that is what the workflow does; the configuration comes from the single `setup.cfg` at the repository root, which `flake8` finds by searching upwards. On Windows add `--jobs=1`: the default parallel mode exhausts the interpreter's 64-handle wait limit and aborts before reporting anything. The workflow runs on Linux, where the default is correct. |
 | Dependency audit — runtime | Exits zero. The seven suppressed identifiers are the residual advisories; anything else is a new finding, and `--strict` makes an unaudited package a failure rather than a warning. |
-| Dependency audit — development | Exits zero. Its seven identifiers are a **different** set, documented in the development manifest itself rather than in the residual-risk register. |
+| Dependency audit — development | Exits zero. Its **one** identifier is a **different** set, documented in the *Development register* of [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md). Eight identifiers are suppressed across the two manifests: seven against the runtime manifest and one against this one. |
 | Static analysis | No findings at Medium severity or above. |
 | Guard 1 — omitted package | `pip show` fails, because the package is deliberately absent from the manifest. |
-| Guard 2 — advisory reachability | No match, so no accepted residual advisory has become reachable. |
-| Full suite | Passes. This is the gate the deployment workflow waits on. |
+| Guard 2, layer 1 — textual reachability | No match, so no accepted residual advisory has become textually reachable in `backend/app/`. |
+| Guard 2, layer 2 — semantic reachability | Passes. It walks the application's import graph and syntax trees, so a construct reintroduced under another name is still found. |
 | Security suite | Passes, including the forty-five-cell role matrix — nine routes against five principals, anonymous included. |
+| Everything else, with coverage | Passes. Together with the security suite this is the gate the deployment workflow waits on, and the two partitions are what accumulate one coverage report. |
 
-Three details in the block above are load-bearing rather than incidental, and dropping any
-of them produces a different answer:
-Continuous integration runs more than the five commands above. It additionally applies both
-Alembic revisions against a PostgreSQL 13 service, reverses and re-applies them, asserts that
-exactly one account holds the administrative role, imports the application entrypoint, runs
-the whole test suite, and probes a live process on `/health`, `/health/ready`,
-`GET /listings/` and a full registration and sign-in round trip. The five commands above are
-listed on their own because they are the ones a reporter can run without a database.
+Continuous integration runs more than the nine gates above. It additionally checks the
+secret and ignore policy, applies every Alembic revision against a PostgreSQL 13 service,
+reverses the chain one revision at a time and re-applies it, asserts that exactly one
+account holds the administrative role, imports the application entrypoint, runs the cases
+marked `postgres` against that service, and probes a live process on `/health`,
+`/health/ready`, `GET /listings/` and a full registration and sign-in round trip. The nine
+gates above are listed on their own, one per row of the table, because they are the ones a
+reporter can run without a PostgreSQL service.
 
-The `-r backend/requirements.txt` argument to `pip-audit` is mandatory. A bare invocation
-audits the whole environment and folds the audit tool's own dependency tree into the
-report, which inflates the count and obscures which findings belong to this application.
+Four details in the block are load-bearing rather than incidental, and dropping any of
+them produces a different answer:
 
-- **`-r <manifest>` is mandatory.** A bare invocation audits the whole environment and
-  folds the audit tool's own dependency tree into the report, which inflates the count and
-  obscures which findings belong to this application.
-- **`--strict` is mandatory.** Without it `pip-audit` treats a package it cannot resolve
-  as a warning and still exits zero, so a manifest entry that no longer audits would pass
-  silently.
+- **`-r <manifest>` is mandatory.** A bare invocation audits the whole active environment
+  and folds the audit tool's own dependency tree into the report, which inflates the count
+  and obscures which findings belong to this application.
+- **`--strict` and the `--ignore-vuln` flags are not decoration.** Without `--strict`,
+  `pip-audit` treats a package it cannot resolve as a warning and still exits zero, so a
+  manifest entry that no longer audits would pass silently. Without the `--ignore-vuln`
+  flags the audit exits **non-zero**, because the accepted advisories are still reported: a
+  plain `pip-audit -r backend/requirements.txt` is a **diagnostic** command rather than the
+  gate. If the plain form fails, compare its output against
+  [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) before treating the
+  failure as a regression.
 - **The two audited manifests carry different suppression lists**, eight identifiers in
   total. Each set has its own section in
   [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) &mdash; the *Runtime
@@ -414,31 +438,28 @@ report, which inflates the count and obscures which findings belong to this appl
   Applying one list to the other manifest fails. A third manifest,
   `backend/requirements-audit.txt`, declares the audit instrument and is installed but
   audited by neither step.
-
-- **`--strict` and the `--ignore-vuln` flags are not decoration.** Without them the audit
-  exits **non-zero**, because the seven accepted advisories are still reported. A plain
-  `pip-audit -r backend/requirements.txt` is therefore a **diagnostic** command — useful
-  for seeing the current findings, and **not** equivalent to the gate. If you run the
-  plain form and it fails, compare its output against
-  [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) before treating the
-  failure as a regression.
-- **The `-r <manifest>` argument is mandatory in either form.** A bare invocation audits
-  the whole active environment and folds the audit tool's own dependency tree into the
-  report, which inflates the count and obscures which findings belong to this application.
-- **The last two gates are narrower than they look.** They are the executable part of the
+- **The two guards are narrower than they look.** They are the executable part of the
   compensating controls for the accepted advisories, and between them they assert exactly
   two facts: one named package is absent, and eight named patterns do not appear in Python
-  files under `backend/`. They do not check the runtime platform, the six further patterns
-  in the register's reachability measurement, or anything outside `backend/`. Their leading
-  `!` inverts the exit status, because for both the desired result — the package is absent,
-  the pattern does not match — is what makes the underlying command exit non-zero.
+  files under **`backend/app/`**. That scope is the guard's own, and it is the code whose
+  reachability the acceptances are argued from. Measured on this tree, those patterns match
+  nothing under `backend/app/` and their only matches anywhere under `backend/` are the
+  literals inside `backend/tests/security/test_residual_risk_guards.py`, which is the
+  module that names them in order to assert their absence. The guards do not check the
+  runtime platform, the six further patterns in the register's reachability measurement, or
+  any code outside `backend/app/`. Their leading `!` inverts the exit status, because for
+  both the desired result &mdash; the package is absent, the pattern does not match &mdash;
+  is what makes the underlying command exit non-zero.
 
-The pipeline additionally runs the full backend suite with coverage, `flake8` from the
-`backend/` directory and the frontend lint and test jobs.
 [`README.md`](README.md) lists the full local and release verification set, which is
-**wider** than this pipeline subset — it includes the application-import gate,
-`terraform validate` and the Alembic round trip, none of which run in continuous
-integration.
+**wider** than the nine commands above: it adds `terraform fmt -check` and
+`terraform validate`, the Alembic round trip against a disposable database, the
+application-import gate and the manifest checks. Each of those does run in continuous
+integration, in the `infrastructure`, `backend`, `runtime-integration` or `integration`
+job, and the readme's *Enforced by* column names which. Four entries in that set run
+nowhere but locally: `bash -n` over the two release scripts, the client-side
+`kubectl create --dry-run` schema check, opening the executive presentation in a browser,
+and the credential-rotation runbook.
 
 **The reachability guard has two layers, and the first one is bypassable.** Layer 1 is the
 grep above: a textual pre-filter, scoped to `backend/app/` because that is the code whose

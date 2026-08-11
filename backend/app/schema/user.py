@@ -92,6 +92,17 @@ class User(BaseModel):
         orm_mode = True
 
 
+#: Body published as the example for both credential endpoints. The
+#: address matches the accepted shape and the password satisfies the
+#: registration policy in full -- twelve characters or more, one of each
+#: character class, and inside the byte ceiling -- so a viewer that
+#: pre-fills it sends a body this contract accepts unedited.
+_CREDENTIAL_EXAMPLE = {
+    "email": "renter@example.com",
+    "password": "Example-Passw0rd",
+}
+
+
 class UserCreate(BaseModel):
     """Request body accepted by the registration endpoint."""
 
@@ -100,6 +111,7 @@ class UserCreate(BaseModel):
 
     class Config:
         extra = "forbid"
+        schema_extra = {"example": _CREDENTIAL_EXAMPLE}
 
     @validator("email")
     def validate_email(cls, value: str) -> str:
@@ -121,6 +133,7 @@ class UserLogin(BaseModel):
 
     class Config:
         extra = "forbid"
+        schema_extra = {"example": _CREDENTIAL_EXAMPLE}
 
     @validator("email")
     def validate_email(cls, value: str) -> str:

@@ -45,19 +45,22 @@ PIN_SITES = (
     ("infrastructure/docker/Dockerfile.backend", 1, "python:3.9-slim"),
     (".github/workflows/ci.yml", 108, "3.9"),
     ("infrastructure/terraform/main.tf", 384, "python39"),
-    ("scripts/deploy.sh", 768, "python39"),
+    ("scripts/deploy.sh", 889, "python39"),
 )
 
 #: Line references the review document must no longer carry for the pin
 #: sites, each having described an earlier tree.
 #:
-#: Two generations are withdrawn. The first five described the tree this
-#: work started from. The rest described it after the pins had been
+#: Three generations are withdrawn. The first five described the tree this
+#: work started from. The next described it after the pins had been
 #: rewritten but before the delivery paths, the gate workflow and the
 #: ingestion module grew around them, which moved four of the five sites
-#: again. A number that has been corrected twice is the clearest evidence
-#: that hand-maintained line references drift, which is why every live
-#: citation is read back from the file it names.
+#: again. The last, ``scripts/deploy.sh:768``, described the release script
+#: before its port-forward teardown, its manifest-token pre-flight and its
+#: generated usage text were added above the runtime flag. A number that has
+#: been corrected three times is the clearest evidence that hand-maintained
+#: line references drift, which is why every live citation is read back from
+#: the file it names.
 WITHDRAWN_CITATIONS = (
     "backend/app/tasks/listing_updater.py:10",
     "backend/app/tasks/listing_updater.py:319",
@@ -70,6 +73,7 @@ WITHDRAWN_CITATIONS = (
     "scripts/deploy.sh:24",
     "scripts/deploy.sh:664",
     "scripts/deploy.sh:669",
+    "scripts/deploy.sh:768",
     "scripts/deploy.sh:775",
 )
 
@@ -470,15 +474,32 @@ DISCLOSURE_POLICY = "SECURITY.md"
 #: every suppression identifier, and ran the audit from the repository
 #: root. Each difference changes the result, so a reporter following the
 #: policy did not reproduce the gate they believed they were reproducing.
+#: The single-line full-suite invocation this tuple used to carry was itself
+#: a paraphrase: the workflow runs the suite in two partitions, the security
+#: cases first and the rest with ``--cov-append``, and no step invokes the
+#: one-call form. It passed only through the element-wise fallback below.
+#: The two partition heads replace it, and the flags each one carries are
+#: asserted by ``DOCUMENTED_GATE_FLAGS``.
 DOCUMENTED_GATE_COMMANDS = (
     "flake8 .",
     "pip-audit --strict -r backend/requirements.txt",
     "pip-audit --strict -r backend/requirements-dev.txt",
     "bandit -r backend/app -ll",
     "! pip show python-multipart",
-    "python -m pytest backend/tests --cov=backend/app "
-    "--cov-report=xml:backend/coverage.xml",
     "python -m pytest backend/tests/security -q",
+    "python -m pytest backend/tests",
+)
+
+#: Coverage flags the workflow's two pytest steps carry. The policy states
+#: it reproduces each gate exactly as the workflow invokes it, so every flag
+#: has to appear there too -- omitting one changes what the command measures.
+DOCUMENTED_GATE_FLAGS = (
+    "--cov=backend/app",
+    "--cov-report=",
+    "--cov-fail-under=0",
+    "--ignore=backend/tests/security",
+    "--cov-append",
+    "--cov-report=xml:backend/coverage.xml",
 )
 
 
@@ -503,6 +524,24 @@ def test_the_policy_documents_the_gate_the_workflow_runs(command):
     #: invoked there, which is what a reporter following the policy needs.
     for element in command.split():
         assert element in workflow, (INTEGRATION_WORKFLOW, command, element)
+
+
+@pytest.mark.parametrize("flag", DOCUMENTED_GATE_FLAGS)
+def test_the_policy_reproduces_the_coverage_flags(flag):
+    """Each coverage flag the workflow passes is reproduced in the policy.
+
+    The policy promises the gates as the workflow invokes them, and the
+    coverage flags are the part a paraphrase drops first: without them the
+    documented command measures nothing and the two partitions no longer
+    accumulate one report.
+    """
+    workflow = (REPOSITORY_ROOT / INTEGRATION_WORKFLOW).read_text(
+        encoding="utf-8"
+    )
+    policy = (REPOSITORY_ROOT / DISCLOSURE_POLICY).read_text(encoding="utf-8")
+
+    assert flag in workflow, (INTEGRATION_WORKFLOW, flag)
+    assert flag in policy, (DISCLOSURE_POLICY, flag)
 
 
 def test_the_policy_suppresses_exactly_what_the_workflow_suppresses():

@@ -263,7 +263,7 @@ bandit -r backend/app -ll
 ```
 
 The fifth command is the one that establishes
-[Constraint 2](#constraint-2-the-framework-resolver-which-applies-to-the-five-in-starlette).
+[Constraint 2](#constraint-2--the-framework-resolver-which-applies-to-the-five-in-starlette).
 Reading it against the installed `fastapi` prints the bound the delivered pin
 places on `starlette`; reading the same field from a downloaded `fastapi` 0.128.8
 wheel prints the bound the highest CPython-3.9-installable release places on it,
@@ -443,7 +443,7 @@ document, and row 91.2.1 of the decision log records the measurement behind it.
 | 1 | `infrastructure/docker/Dockerfile.backend:1` | `FROM python:3.9-slim` |
 | 2 | `.github/workflows/ci.yml:108` | `python-version: '3.9'` |
 | 3 | `infrastructure/terraform/main.tf:384` | `runtime = "python39"` |
-| 4 | `scripts/deploy.sh:768` | `--runtime python39` |
+| 4 | `scripts/deploy.sh:889` | `--runtime python39` |
 | 5 | `backend/app/tasks/listing_updater.py:329` | `@asyncio.coroutine` |
 
 So the delivered pin is **four version declarations plus one code-level constraint**:
@@ -468,13 +468,29 @@ execution rather than by reading, because the delivered ingestion workload now i
 that coroutine directly from a scheduled job: the exact command that job runs was
 executed under CPython 3.9.25 and exited 0.
 
-Two notes keep this table checkable. The line numbers above are the pre-remediation
-locations, which is where each pin was verified and how the other documents in this
-change set cite them; this remediation leaves **every surviving pin unchanged at 3.9**,
-and the surrounding hardening has since shifted the survivors further down their files.
-Separately, the development manifest states the pin is load-bearing in five places and
-leaves the inventory here rather than repeating it, so there is one count and this
-section is where it is maintained. Four of the five are version declarations &mdash;
+Two notes keep this table checkable. **The line numbers above are the delivered
+locations**, each re-read from this tree rather than carried over from the plan, and each
+one resolves: `FROM python:3.9-slim` on line 1, `python-version: '3.9'` on line 108,
+`runtime = "python39"` on line 384, `--runtime python39` on line 889 and
+`@asyncio.coroutine` on line 329. Entry 4 moved during the round that added the release
+script's port-forward teardown and its pre-flight token check, from line 768 to line 889 of
+`scripts/deploy.sh`; row 102.2.5 of the decision log records that renumbering and lists the
+withdrawn location. That location is named in prose rather than as a path-and-line citation,
+because `backend/tests/security/test_deployment_contract.py` reads every citation of that
+shape in this file and opens the line it names, so quoting a withdrawn number in that form
+would send the gate &mdash; and a reviewer with it &mdash; to a line that no longer carries the
+pin. The locations the plan states &mdash; Dockerfile line 2, workflow line 19,
+Terraform line 99, release-script line 24 and task line 10 &mdash; are the
+**pre-remediation** ones and no longer resolve, because the surrounding hardening moved
+each declaration further down its file; what has not changed is the version itself, since
+this remediation leaves **every surviving pin unchanged at 3.9**. Separately,
+[`README.md`](../../README.md) is the other document that publishes the count, as "the
+Python 3.9 pin is a hard constraint and is load-bearing in five places" followed by the
+five files without line numbers; every sibling document cites this table for the locations,
+so there is one inventory and this section is where it is maintained. The development
+manifest names the interpreter in its header and states no count at all, which is
+deliberate: a manifest that restated the inventory would be a second place to keep it in
+step. Four of the five are version declarations &mdash;
 `infrastructure/docker/Dockerfile.backend`, `.github/workflows/ci.yml`,
 `infrastructure/terraform/main.tf` and `scripts/deploy.sh` &mdash; and the fifth is the
 `@asyncio.coroutine` construct in `backend/app/tasks/listing_updater.py`, which pins the
@@ -517,7 +533,7 @@ of risk and is counted separately.
 | **What** | The provider's managed serverless functions product retired its Python 3.9 runtime |
 | **When** | 5 April 2026. This register was last measured on 9 August 2026, so the date is **past**, not upcoming |
 | **Effect after the date** | Under that provider's runtime-support policy, a retired runtime can no longer be used to create or update a function, and existing deployments on it become liable to be disabled |
-| **Where it applies here** | `infrastructure/terraform/main.tf:384` declares a function with `runtime = "python39"` and `scripts/deploy.sh:768` passes `--runtime python39` — pin sites 3 and 4 of the table above. Both are **withheld rather than removed**: the resource and its invoker binding each carry `count = var.cloud_function_deployment_authorized ? 1 : 0`, which defaults to `false`, and the script refuses the deploy step unless `CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED=true`. So the declaration exists, is reviewable, and no apply or release attempts a create that the provider would refuse |
+| **Where it applies here** | `infrastructure/terraform/main.tf:384` declares a function with `runtime = "python39"` and `scripts/deploy.sh:889` passes `--runtime python39` — pin sites 3 and 4 of the table above. Both are **withheld rather than removed**: the resource and its invoker binding each carry `count = var.cloud_function_deployment_authorized ? 1 : 0`, which defaults to `false`, and the script refuses the deploy step unless `CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED=true`. So the declaration exists, is reviewable, and no apply or release attempts a create that the provider would refuse |
 | **Why it could not be fixed by upgrading the runtime** | The pin is a hard constraint, and pin site 5 makes it more than a preference: `@asyncio.coroutine` was removed in CPython 3.11, so the ingestion code would break on the newer runtimes the product still offers |
 
 ### The evidence behind withholding the resource rather than applying or deleting it
@@ -797,6 +813,27 @@ the pre-filter are the form-handling constructs — `UploadFile`, `File(`,
 the package level and the semantic assertion covers at the symbol level, and
 `TrustedHost`, which is a control rather than a risk.
 
+### A change these guards have already refused
+
+The `StaticFiles` pattern is not hypothetical. A browser review of the running
+service observed that the two documentation viewers load their scripts,
+stylesheets and fonts from external content-delivery networks, and would
+therefore render unstyled in a deployment whose egress is filtered. The obvious
+remedy — vendoring the viewer bundles and serving them from this application —
+is **refused**, because it requires mounting a static-file handler, and the
+absence of one is this register's named compensating control for
+PYSEC-2026-2281. Taking it would reactivate an accepted advisory, fail Guard 2's
+pre-filter on pattern 3, and fail the semantic assertion's `StaticFiles` case.
+
+The observation is not dismissed: it is real, and it is bounded rather than
+closed. The documentation pages are a developer surface, `DOCUMENTATION_ENABLED`
+governs whether they are published at all, and no API response depends on them,
+so a filtered-egress deployment loses page styling and nothing else.
+`docs/security/DECISION_LOG.md` row 98.3.7 holds the reasoning and the rejected
+alternatives. This paragraph exists so that a future round meeting the same
+observation finds the refusal recorded beside the control it would break, rather
+than discovering the conflict by failing a build.
+
 ## Development register: one accepted development advisory
 
 `backend/requirements-dev.txt` declares the test, lint and static-analysis
@@ -911,7 +948,7 @@ The Runtime and Development registers are disjoint. No identifier appears in bot
 audit invocations, and nothing in this register counts an identifier twice.
 
 PYSEC-2026-2275, PYSEC-2026-142 and PYSEC-2026-141 still appear once each in this
-file, under [Eliminated by package removal](#eliminated-by-package-removal-4),
+file, under [Eliminated by package removal](#eliminated-by-package-removal--4),
 because `requests` and `urllib3` left the **runtime** manifest and that genuinely
 closed them there: the runtime audit suppresses neither, and would fail if either
 reappeared. They are no longer accepted anywhere, because the manifest that
@@ -983,7 +1020,7 @@ effective for the runtime figures.
 Five in `starlette`, one in `python-dotenv` and one in `click`, all of them in the
 runtime manifest and all of them the subject of the
 [Runtime register](#runtime-register-seven-accepted-runtime-advisories). The
-development manifest's seven are not part of this disposition, because they were
+development manifest's one is not part of this disposition, because it was
 never part of the 19 this section accounts for.
 
 Six of those seven were in the pre-work audit: the five in `starlette` and the one
@@ -1640,7 +1677,7 @@ obligation rather than declaring the matter settled:
    re-derivation would find: `python-dotenv` 1.2.2 and `click` 8.3.3 become
    installable, closing **two** entries, while the five `starlette` entries stay
    open until the FastAPI and Pydantic constraint in
-   [Constraint 2](#constraint-2-the-framework-resolver-which-applies-to-the-five-in-starlette)
+   [Constraint 2](#constraint-2--the-framework-resolver-which-applies-to-the-five-in-starlette)
    is also resolved.
 4. **A reachability precondition changes outside the guarded set.** The four
    assumptions in [What the evidence establishes, and what it does

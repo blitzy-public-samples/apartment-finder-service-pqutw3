@@ -388,7 +388,7 @@ The provider retired the Python 3.9 runtime of its managed serverless functions 
 on **5 April 2026**. Under that provider's runtime-support policy, a retired runtime can
 no longer be used to create or update a function after that date, and existing
 deployments on it become liable to be disabled. `infrastructure/terraform/main.tf:384`
-declares such a function and `scripts/deploy.sh:768` deploys one — pin sites 3 and 4 of
+declares such a function and `scripts/deploy.sh:889` deploys one — pin sites 3 and 4 of
 the table below.
 
 **Both are withheld rather than removed.** `google_cloudfunctions_function.function` and
@@ -498,7 +498,7 @@ of its configuration. All five sites, as delivered:
 | 1 | `infrastructure/docker/Dockerfile.backend:1` | `FROM python:3.9-slim` |
 | 2 | `.github/workflows/ci.yml:108` | `python-version: '3.9'` |
 | 3 | `infrastructure/terraform/main.tf:384` | `runtime = "python39"` |
-| 4 | `scripts/deploy.sh:768` | `--runtime python39` |
+| 4 | `scripts/deploy.sh:889` | `--runtime python39` |
 | 5 | `backend/app/tasks/listing_updater.py:329` | `@asyncio.coroutine` |
 
 [`../security/RESIDUAL_RISK.md`](../security/RESIDUAL_RISK.md) carries the same five-site
@@ -595,7 +595,7 @@ advisories.
 8. Confirm both guards fail the build rather than merely report, by inspecting how each
    step's exit status is handled.
 9. Confirm all five pin sites still carry the pinned runtime, including
-   `scripts/deploy.sh:768`, where the runtime flag is retained while
+   `scripts/deploy.sh:889`, where the runtime flag is retained while
    `--allow-unauthenticated` is removed in favour of `--no-allow-unauthenticated`. The
    two assertions named above cover both the construct and the line number quoted for
    it, so this check is a matter of reading their outcome rather than of counting by

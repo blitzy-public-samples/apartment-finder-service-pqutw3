@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy import inspect as sa_inspect
@@ -1064,3 +1065,168 @@ async def test_a_failed_pass_records_under_its_run_identifier(
         assert run_id
         assert run_id.startswith(listing_updater.RUN_ID_PREFIX)
         assert getattr(record, TRACE_ID_FIELD, None)
+
+
+class TestTheRealProviderSeamIsDriven:
+    """One ingestion pass with nothing stubbed but the network itself.
+
+    Every other pass in this module replaces ``fetch_listings``, the
+    boundary the task calls, so the adapter behind it never runs from
+    here: not the request it assembles, not the header the credential
+    travels in, not the bounded body it reads and not the field mapping it
+    applies. These cases replace only the transport the HTTP library sends
+    on, so the request is assembled, sent, streamed, decoded and mapped by
+    the delivered code, and what is asserted is what a provider and a
+    stored row would actually carry.
+    """
+
+    #: Addresses under the domain a stored listing may name.
+    ALLOWED_URL = 'https://www.zillow.com/homedetails/real-seam-1'
+    SECOND_ALLOWED_URL = 'https://www.zillow.com/homedetails/real-seam-2'
+
+    #: An address outside that domain, which the mapping must discard.
+    REFUSED_URL = 'https://listings.example.com/homedetails/3'
+
+    @staticmethod
+    def _configured_timeout():
+        """Returns the timeout the delivered client factory carries.
+
+        The stand-in client below is built with this rather than with the
+        setting, so a factory that stopped configuring a timeout changes
+        what the recorded request carries and is reported here as well as
+        by the factory's own case in ``test_services.py``. The static
+        analyser does not read this control, so the number of independent
+        cases covering it is the whole of its gate.
+        """
+        with zillow_service._client() as configured:
+            return configured.timeout
+
+    @classmethod
+    @contextlib.contextmanager
+    def _provider(cls, payload):
+        """Answers provider calls from ``payload``, recording each request.
+
+        Only the transport the HTTP library sends on is replaced. The
+        client carries the delivered factory's own timeout, so the request
+        reaching the recorder is the request the adapter built.
+        """
+        requests = []
+
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(200, json=payload)
+
+        transport = httpx.MockTransport(handle)
+        timeout = cls._configured_timeout()
+
+        def build_client():
+            return httpx.Client(transport=transport, timeout=timeout)
+
+        with patch.object(zillow_service, '_client', new=build_client):
+            yield requests
+
+    def _payload(self, rent):
+        """Returns a provider body carrying two usable records and one not."""
+        return {
+            'listings': [
+                _provider_listing(
+                    listing_url=self.ALLOWED_URL, price=rent
+                ),
+                _provider_listing(
+                    listing_url=self.SECOND_ALLOWED_URL, price=rent + 100
+                ),
+                _provider_listing(listing_url=self.REFUSED_URL),
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_request_carries_the_credential_in_its_header(
+        self, db, session_factory, saved_zip_code
+    ):
+        """One request, keyed by header, timed out, and free of the key."""
+        with self._provider(self._payload(2500)) as requests:
+            with patch(TASK_MODULE + '.SessionLocal', session_factory):
+                await update_listings()
+
+        assert len(requests) == 1
+        sent = requests[0]
+        query = sent.url.query.decode('utf-8')
+
+        assert sent.method == 'GET'
+        assert saved_zip_code in query
+        assert sent.headers[zillow_service.API_KEY_HEADER] == (
+            zillow_service.ZILLOW_API_KEY
+        )
+        assert zillow_service.ZILLOW_API_KEY not in str(sent.url)
+        assert zillow_service.ZILLOW_API_KEY not in query
+        timeout = sent.extensions['timeout']
+        assert timeout['read'] == (
+            zillow_service.settings.HTTP_TIMEOUT_SECONDS
+        )
+        assert timeout['connect'] == (
+            zillow_service.settings.HTTP_TIMEOUT_SECONDS
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_adapter_maps_the_records_the_contract_declares(
+        self, db, session_factory, saved_zip_code
+    ):
+        """The stored rows are what the real field mapping produced."""
+        with self._provider(self._payload(2500)):
+            with patch(TASK_MODULE + '.SessionLocal', session_factory):
+                await update_listings()
+
+        db.expire_all()
+        stored = db.query(Listing).order_by(Listing.id).all()
+        addresses = [listing.zillow_url for listing in stored]
+
+        assert addresses == [self.ALLOWED_URL, self.SECOND_ALLOWED_URL]
+        assert self.REFUSED_URL not in addresses
+        assert [listing.rent for listing in stored] == [2500.0, 2600.0]
+        assert stored[0].street_address == '123 Main St'
+        assert stored[0].square_footage == 850.0
+        assert stored[0].bedrooms == 2
+
+    @pytest.mark.asyncio
+    async def test_a_second_pass_refreshes_rather_than_duplicating(
+        self, db, session_factory, saved_zip_code
+    ):
+        """Re-ingesting the same addresses reconciles onto the same rows."""
+        for rent in (2500, 2600):
+            with self._provider(self._payload(rent)):
+                with patch(TASK_MODULE + '.SessionLocal', session_factory):
+                    await update_listings()
+
+        db.expire_all()
+        stored = db.query(Listing).order_by(Listing.id).all()
+
+        assert len(stored) == 2
+        assert [listing.rent for listing in stored] == [2600.0, 2700.0]
+
+    @pytest.mark.asyncio
+    async def test_a_refusing_provider_raises_through_the_real_adapter(
+        self, db, session_factory, saved_zip_code
+    ):
+        """A refused read reaches the task as the adapter's own failure."""
+        requests = []
+
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(500, json={'error': 'unavailable'})
+
+        transport = httpx.MockTransport(handle)
+        timeout = self._configured_timeout()
+
+        def build_client():
+            return httpx.Client(transport=transport, timeout=timeout)
+
+        with patch.object(zillow_service, '_client', new=build_client):
+            with patch(TASK_MODULE + '.SessionLocal', session_factory):
+                with pytest.raises(ListingProviderError) as raised:
+                    await update_listings()
+
+        assert raised.value.reason == zillow_service.REASON_REQUEST_FAILED
+        assert len(requests) == 1
+
+        db.expire_all()
+        assert db.query(Listing).count() == 0

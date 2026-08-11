@@ -92,18 +92,16 @@ def create_listing(
 ) -> Listing:
     """Stores one listing for an administrator and returns it.
 
-    The row is built from named columns, so no field outside
-    :class:`backend.app.schema.listing.ListingCreate` reaches it.
+    Only the fields the request body below declares are written. A field
+    outside it cannot reach the stored listing.
 
-    The provider address column carries no uniqueness, in the mapped
-    table and in revision ``0001`` alike, so a listing repeating an
-    address already stored is **stored** rather than refused, and two
-    rows may carry one address.
+    A street address is not required to be unique, so a listing naming an
+    address that is already stored is accepted rather than refused, and
+    more than one listing may carry the same address.
 
-    Every refusal the database raises -- an integrity violation included
-    -- rolls the write back and is answered with one fixed detail, so no
-    response distinguishes which constraint the database refused or
-    otherwise discloses its internals.
+    Any refusal from storage, including a constraint violation, rolls the
+    write back and is answered with one fixed message, so no response
+    reveals which constraint was refused.
     """
     recorded_at = datetime.now(timezone.utc)
     db_listing = ListingModel(

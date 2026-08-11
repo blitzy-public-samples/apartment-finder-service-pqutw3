@@ -64,6 +64,8 @@ TEST_SETTINGS: Dict[str, str] = {
     "DB_TCP_USER_TIMEOUT_SECONDS": "4",
     "DB_POOL_TIMEOUT_SECONDS": "10.0",
     "DB_POOL_RECYCLE_SECONDS": "1800",
+    "DB_POOL_SIZE": "10",
+    "DB_MAX_OVERFLOW": "5",
     "SECRET_KEY": "tZ4mQ7vK2pR9wB6nD3jS8xF5hL0cY1gA",
     "JWT_ALGORITHMS": "HS256",
     "JWT_ISSUER": "apartment-finder-service",

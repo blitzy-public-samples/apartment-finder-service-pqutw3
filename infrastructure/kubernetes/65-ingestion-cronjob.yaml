@@ -11,8 +11,12 @@
 # provider key from Secret Manager through the CSI driver, mounted as files
 # and exported by the shell before the task starts -- the same path
 # 40-backend.yaml and 60-migration-job.yaml use, so no credential is written
-# into a Kubernetes Secret. The key travels in a request header, never in a
-# URL, and the logger redacts it from every record.
+# into a Kubernetes Secret. The class mounted below is backend-secrets,
+# declared by 30-backend-secrets.yaml: the task imports the application's
+# settings model, which refuses to construct unless every managed
+# credential is present, so this pod reads all six and runs under the same
+# service account the backend Deployment does. The key travels in a request
+# header, never in a URL, and the logger redacts it from every record.
 apiVersion: batch/v1
 kind: CronJob
 metadata:

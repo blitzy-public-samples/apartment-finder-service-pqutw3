@@ -92,7 +92,7 @@ variable "network_name" {
 }
 
 variable "subnetwork_name" {
-  description = "Name of the subnetwork google_compute_subnetwork.primary creates, applied as subnetwork on google_container_cluster.primary"
+  description = "Name of the subnetwork google_compute_subnetwork.primary creates. google_container_cluster.primary attaches to that resource by reference rather than by name, so the cluster and the created subnetwork cannot name two different subnetworks"
   type        = string
   default     = "apartment-finder-subnet"
 
@@ -196,7 +196,7 @@ variable "nat_name" {
 }
 
 variable "private_service_access_range_name" {
-  description = "Name of the reserved range google_compute_global_address.private_service_access creates and google_service_networking_connection.private_service_access publishes, from which the Cloud SQL instance draws its private address"
+  description = "Name of the reserved range google_compute_global_address.private_services_access creates and google_service_networking_connection.private_services_access publishes, from which the Cloud SQL instance draws its private address"
   type        = string
   default     = "apartment-finder-psa-range"
 
@@ -207,7 +207,7 @@ variable "private_service_access_range_name" {
 }
 
 variable "private_service_access_prefix_length" {
-  description = "Prefix length of the reserved private services access range, applied as prefix_length on google_compute_global_address.private_service_access"
+  description = "Prefix length of the reserved private services access range, applied as prefix_length on google_compute_global_address.private_services_access"
   type        = number
   default     = 16
 
@@ -323,7 +323,7 @@ variable "gke_subnetwork" {
 }
 
 variable "database_private_services_access_range_name" {
-  description = "Name of the google_compute_global_address reserved for private services access on var.database_private_network, consumed as the reserved peering range of google_service_networking_connection.private_services_access"
+  description = "Name of a range reserved for private services access, retained as a second spelling of var.private_service_access_range_name. That variable is the one google_compute_global_address.private_services_access is named from and the one google_service_networking_connection.private_services_access publishes; this input is read by no resource"
   type        = string
   default     = "cloudsql-private-services-access"
 
@@ -334,7 +334,7 @@ variable "database_private_services_access_range_name" {
 }
 
 variable "database_private_services_access_prefix_length" {
-  description = "Prefix length of the address block reserved for private services access, applied as prefix_length on google_compute_global_address.private_services_access"
+  description = "Prefix length of the address block reserved for private services access, retained as a second spelling of var.private_service_access_prefix_length. That variable is the one google_compute_global_address.private_services_access takes its prefix_length from; this input is read by no resource"
   type        = number
   default     = 16
 
@@ -465,7 +465,7 @@ variable "backend_workload_service_account_id" {
 }
 
 variable "backend_kubernetes_namespace" {
-  description = "Kubernetes namespace of the backend workload, forming the Workload Identity principal granted roles/iam.workloadIdentityUser on google_service_account.backend_workload"
+  description = "Kubernetes namespace of the backend workload, retained as a second spelling of var.workload_identity_namespace. That variable is the namespace every Workload Identity principal in this configuration is formed from, including the one granted roles/iam.workloadIdentityUser on google_service_account.backend_workload; this input is read by no resource"
   type        = string
   default     = "default"
 
@@ -701,8 +701,9 @@ variable "secret_version_generation" {
 }
 
 variable "database_private_network" {
-  description = "Self-link of the existing VPC network the Cloud SQL instance attaches to, applied as settings.ip_configuration.private_network on google_sql_database_instance.main. Expected form: projects/<project>/global/networks/<name>"
+  description = "Self-link of a VPC network, retained for deployments that attach the database to a network this configuration does not create. The instance in main.tf takes settings.ip_configuration.private_network from google_compute_network.primary, which is the same VPC the cluster's subnetwork is created on, so the route from the pods to the private address is structural rather than asserted across two variables. Expected form: projects/<project>/global/networks/<name>"
   type        = string
+  default     = "projects/apartment-finder/global/networks/primary-network"
 
   validation {
     condition     = can(regex("^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/global/networks/[a-z]([-a-z0-9]{0,61}[a-z0-9])?$", var.database_private_network))
@@ -853,7 +854,7 @@ variable "cloud_function_secret_ids" {
 }
 
 variable "rate_limit_store_memory_gb" {
-  description = "Capacity of the managed rate-limit store in gibibytes, applied as memory_size_gb on google_redis_instance.rate_limit"
+  description = "Capacity of the managed rate-limit store in gibibytes, retained as a second spelling of var.rate_limit_store_memory_size_gb. That variable is the one google_redis_instance.rate_limit takes its memory_size_gb from; this input is read by no resource"
   type        = number
   default     = 1
 
@@ -864,9 +865,9 @@ variable "rate_limit_store_memory_gb" {
 }
 
 variable "rate_limit_store_version" {
-  description = "Engine version of the managed rate-limit store, applied as redis_version on google_redis_instance.rate_limit"
+  description = "Engine version of the managed rate-limit store. google_redis_instance.rate_limit fixes redis_version as a literal, so this input changes no resource and is read by none; the default below states the version the instance is created with, and an operator who needs another one changes that literal"
   type        = string
-  default     = "REDIS_7_0"
+  default     = "REDIS_6_X"
 
   validation {
     condition     = contains(["REDIS_6_X", "REDIS_7_0", "REDIS_7_2"], var.rate_limit_store_version)
@@ -995,7 +996,7 @@ variable "cloud_function_vpc_connector_egress_settings" {
 }
 
 variable "backend_workload_namespace" {
-  description = "Kubernetes namespace of the service account that impersonates google_service_account.backend_runtime, applied inside the member of google_service_account_iam_member.backend_workload_identity. It names the namespace the backend Deployment, the frontend Deployment and the one-shot migration pod run in"
+  description = "Kubernetes namespace of the service account that impersonates google_service_account.backend_workload, retained as a second spelling of var.workload_identity_namespace. That variable is the namespace half of local.backend_workload_principal, which google_service_account_iam_member.backend_workload_identity binds; this input is read by no resource"
   type        = string
   default     = "default"
 
@@ -1006,7 +1007,7 @@ variable "backend_workload_namespace" {
 }
 
 variable "backend_workload_service_account" {
-  description = "Name of the Kubernetes service account that impersonates google_service_account.backend_runtime, applied inside the member of google_service_account_iam_member.backend_workload_identity. The Kubernetes object of this name must carry an iam.gke.io/gcp-service-account annotation naming the email outputs.tf publishes as backend_runtime_service_account_email"
+  description = "Name of the Kubernetes service account that impersonates google_service_account.backend_workload, retained as a second spelling of var.backend_kubernetes_service_account. That variable is the account half of local.backend_workload_principal, which google_service_account_iam_member.backend_workload_identity binds; this input is read by no resource. The Kubernetes object that carries the account name must carry an iam.gke.io/gcp-service-account annotation naming the email outputs.tf publishes as backend_runtime_service_account_email"
   type        = string
   default     = "apartment-finder-backend"
 

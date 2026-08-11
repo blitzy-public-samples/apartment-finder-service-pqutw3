@@ -32,7 +32,21 @@ What is asserted:
   publisher and no subscriber is removed rather than left provisioned
 * no file defers work to a person, and no output emits a secret value
 * every variable the configuration declares is used, or is recorded here
-  as one this project deliberately leaves in place
+  as one this project deliberately leaves in place. A reference inside a
+  comment is not a read: a comment describes the configuration rather
+  than being part of it, and counting one as a read let three inputs that
+  nothing applies pass as applied
+* no variable demands a value it cannot spend. An input with no default
+  stops a plan until it is supplied, so one that no resource reads makes
+  a plan fail for a value that reaches nothing -- and neither ``validate``
+  nor ``fmt`` resolves variable values, so nothing in the pipeline would
+  report it before a deployment did
+* every provider address a description names is one the configuration
+  declares, and where a description claims a value is *applied as* a
+  property *on* a block, that block reads that input. A description is
+  what a reviewer checks a claim against, so one naming a resource that
+  does not exist, or attributing a property the configuration fills from
+  somewhere else, is refused here
 * every file ends with exactly one newline
 
 The application is the authority for the signal and the field it is carried
@@ -124,11 +138,14 @@ RECORDED_UNUSED_VARIABLES = frozenset(
         #: already reads under another name. Each names a property whose
         #: value is supplied by the variable beside it -- the network and
         #: subnetwork by var.network_name and var.subnetwork_name, the
-        #: private-services range by its own pair, and the store size and
-        #: version by var.rate_limit_store_memory_size_gb and the instance
-        #: default. Removing a declared input is a change to the
-        #: configuration's interface, which no finding calls for, so each
-        #: is recorded rather than deleted.
+        #: private-services range by its own pair, the store size by
+        #: var.rate_limit_store_memory_size_gb, the engine version by the
+        #: literal on the instance, and the workload-identity namespace and
+        #: account by var.workload_identity_namespace and
+        #: var.backend_kubernetes_service_account. Removing a declared
+        #: input is a change to the configuration's interface, which no
+        #: finding calls for, so each is recorded rather than deleted, and
+        #: each says so in its own description.
         #:
         #: The function's archive inputs were the exception and are gone:
         #: cloud_function_source_archive_object was read by nothing, and
@@ -137,6 +154,18 @@ RECORDED_UNUSED_VARIABLES = frozenset(
         #: from a path on the machine running Terraform. Deleting them is
         #: the interface change the source-artefact finding asks for, so
         #: they are absent here rather than recorded.
+        #:
+        #: The three workload-identity names entered this record late, and
+        #: how is worth keeping: each was referenced only inside a main.tf
+        #: comment that attributed the principal to the wrong pair of
+        #: inputs, and the comparison below counted a reference in a
+        #: comment as a read -- so a variable nothing applied looked
+        #: applied. Correcting those comments is what surfaced them, and
+        #: :func:`_read_variables` now reads code alone so a comment can no
+        #: longer stand in for a read.
+        "backend_kubernetes_namespace",
+        "backend_workload_namespace",
+        "backend_workload_service_account",
         "database_private_network",
         "database_private_services_access_prefix_length",
         "database_private_services_access_range_name",
@@ -169,6 +198,28 @@ OUTPUT_OPENING = re.compile(r'(?m)^output\s+"([^"]+)"\s*\{')
 
 #: One reference to an input variable.
 VARIABLE_REFERENCE = re.compile(r"\bvar\.([A-Za-z_][A-Za-z0-9_]*)")
+
+#: One resource or data block opening. Descriptions name both kinds, and a
+#: reader following an address does not care which it is, so the two are
+#: collected together.
+BLOCK_OPENING = re.compile(
+    r'(?m)^(?:resource|data)\s+"([^"]+)"\s+"([^"]+)"\s*\{'
+)
+
+#: The ``description`` a variable block declares.
+DESCRIPTION = re.compile(r'(?m)^\s*description\s*=\s*"(.*)"\s*$')
+
+#: One provider address named in prose, as ``type.name``.
+NAMED_ADDRESS = re.compile(r"\b(google_[a-z0-9_]+)\.([a-z0-9_]+)\b")
+
+#: One clause claiming an input reaches a named block. The attribute
+#: between the claim and the address may be a dotted path -- a nested
+#: block's field is written that way -- so only a comma or a semicolon
+#: ends the span, which is what keeps the match inside one clause.
+APPLICATION_CLAUSE = re.compile(
+    r"(?:applied|consumed)\s+(?:as|by)\b[^,;]{0,120}?"
+    r"\b(?:on|of|by)\s+(google_[a-z0-9_]+)\.([a-z0-9_]+)\b"
+)
 
 #: One ``secret_id`` a secret resource declares.
 SECRET_ID = re.compile(r'(?m)^\s*secret_id\s*=\s*"([^"]+)"\s*$')
@@ -241,6 +292,51 @@ def _default(body):
     found = re.search(r'(?m)^\s*default\s*=\s*"?([^"\n]*)"?\s*$', body)
     assert found is not None, body
     return found.group(1).strip()
+
+
+def _declares_default(body):
+    """Return whether a variable body declares a default at all."""
+    return re.search(r"(?m)^\s{2}default\s*=", body) is not None
+
+
+def _description(name, body):
+    """Return the description one variable declares."""
+    found = DESCRIPTION.search(body)
+    assert found is not None, "%s declares no description" % name
+    return found.group(1)
+
+
+def _code(text):
+    """Return one configuration with every comment removed.
+
+    A comment is prose about the configuration, not part of it, so a
+    ``var.`` reference inside one is not a read. Distinguishing the two
+    matters: a comment naming an input the configuration never applies
+    would otherwise satisfy every read comparison below, which is how
+    three unread inputs went unrecorded.
+    """
+    kept = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        kept.append(line.split(" #")[0])
+    return "\n".join(kept)
+
+
+def _read_variables():
+    """Return every input the configuration's code reads."""
+    return set(
+        VARIABLE_REFERENCE.findall(_code(_text(MAIN)) + _code(_text(OUTPUTS)))
+    )
+
+
+def _blocks():
+    """Return ``{(type, name): body}`` for every resource and data block."""
+    text = _text(MAIN)
+    found = {}
+    for match in BLOCK_OPENING.finditer(text):
+        found[match.group(1, 2)] = _block(text, match.end() - 1)
+    return found
 
 
 def _migration_setting():
@@ -674,8 +770,7 @@ def test_no_output_emits_a_secret_value():
 
 def test_every_declared_variable_is_read_or_recorded_as_unread():
     """A variable added and left unread is reported rather than ignored."""
-    read = set(VARIABLE_REFERENCE.findall(_text(MAIN) + _text(OUTPUTS)))
-    unread = set(_variables()) - read
+    unread = set(_variables()) - _read_variables()
     assert unread == RECORDED_UNUSED_VARIABLES, sorted(
         unread ^ RECORDED_UNUSED_VARIABLES
     )
@@ -683,9 +778,74 @@ def test_every_declared_variable_is_read_or_recorded_as_unread():
 
 def test_every_variable_read_is_declared():
     """No resource reads an input the configuration does not declare."""
-    read = set(VARIABLE_REFERENCE.findall(_text(MAIN) + _text(OUTPUTS)))
-    undeclared = sorted(read - set(_variables()))
+    undeclared = sorted(_read_variables() - set(_variables()))
     assert undeclared == [], undeclared
+
+
+def test_every_variable_without_a_default_is_read_by_the_configuration():
+    """An input a plan demands and nothing applies is refused here.
+
+    A variable with no default stops ``terraform plan`` until a value is
+    supplied. If no resource reads it, that value reaches nothing, so the
+    only effect of the declaration is to make a plan fail for an input
+    that cannot change the outcome -- and neither ``validate`` nor ``fmt``
+    detects it, because neither resolves variable values. That is why this
+    is asserted here rather than left to a plan: the ``infrastructure``
+    job runs ``fmt``, ``init`` and ``validate``, so a plan-time refusal of
+    this shape would first appear at a deployment.
+
+    The rule is one direction only. An input that is unread but carries a
+    default demands nothing of an operator and is recorded above.
+    """
+    demanded_and_unread = sorted(
+        name
+        for name, body in _variables().items()
+        if not _declares_default(body) and name not in _read_variables()
+    )
+    assert demanded_and_unread == [], demanded_and_unread
+
+
+def test_every_block_a_description_names_is_declared():
+    """A description sending a reader to a resource that does not exist.
+
+    Each description names the resources its value reaches, and a reader
+    checking a claim resolves the address. An address that resolves to
+    nothing -- a singular where the declaration is plural, a name a later
+    round changed -- reads as a claim about a resource rather than as a
+    typographical slip, so it is refused.
+    """
+    blocks = _blocks()
+    unresolved = []
+    for name, body in sorted(_variables().items()):
+        for match in NAMED_ADDRESS.finditer(_description(name, body)):
+            if match.group(1, 2) not in blocks:
+                unresolved.append((name, match.group(0)))
+    assert unresolved == [], unresolved
+
+
+def test_every_description_that_claims_application_names_a_reader():
+    """The block a description says applies an input really reads it.
+
+    This is the accuracy rule for the strongest form a description takes:
+    that the value is *applied as* some property *on* a named block. A
+    reviewer reading it concludes that changing the input changes that
+    property, so the claim is checked against the block -- five
+    descriptions asserted an application that the configuration performed
+    from a different input, and one asserted a property the resource fixes
+    as a literal.
+
+    Calibrated against the configuration: the clause matches 24 claims
+    across the file, including nested properties written as dotted paths,
+    and every one resolves to a block that reads the input.
+    """
+    blocks = _blocks()
+    misattributed = []
+    for name, body in sorted(_variables().items()):
+        for clause in APPLICATION_CLAUSE.finditer(_description(name, body)):
+            body_of = blocks.get(clause.group(1, 2))
+            if body_of is None or "var." + name not in body_of:
+                misattributed.append((name, clause.group(0)))
+    assert misattributed == [], misattributed
 
 
 @pytest.mark.parametrize(

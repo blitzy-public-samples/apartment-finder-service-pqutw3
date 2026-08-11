@@ -685,7 +685,7 @@ resource "google_service_account_iam_member" "deployer_federation" {
 }
 
 # Identity the backend workload runs as inside the cluster. The
-# Kubernetes service account named by var.backend_kubernetes_namespace
+# Kubernetes service account named by var.workload_identity_namespace
 # and var.backend_kubernetes_service_account acts as this account through
 # the cluster's workload identity pool.
 resource "google_service_account" "backend_workload" {
@@ -905,7 +905,7 @@ resource "google_artifact_registry_repository_iam_member" "writer" {
 locals {
 
   # Principal the Kubernetes service account named by
-  # var.backend_workload_namespace and var.backend_workload_service_account
+  # var.workload_identity_namespace and var.backend_kubernetes_service_account
   # presents when it impersonates the backend runtime identity.
   # The Kubernetes principal google_service_account_iam_member.backend_workload_identity
   # permits. It is composed once here so the namespace and the account name

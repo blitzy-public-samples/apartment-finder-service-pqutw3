@@ -750,8 +750,19 @@ configure_env_vars() {
         "SECRET_KEY and a generated ADMIN_SEED_PASSWORD."
     echo "The administrator seed password is in ${env_file} and is" \
         "written nowhere else."
-    echo "Environment variables configured. Please update the values in" \
-        ".env file."
+    # The application starts against this file as it stands, which is what
+    # README.md promises of this route. What remains are the five provider
+    # credentials no bootstrap can invent; each is a CHANGE_ME placeholder
+    # and is accepted only while ENVIRONMENT is local.
+    echo "Environment variables configured. Nothing in ${env_file} needs" \
+        "editing by hand: the next step writes its DATABASE_URL," \
+        "COMPOSE_DATABASE_URL and POSTGRES_PASSWORD entries, and the" \
+        "application starts against the completed file."
+    echo "Still placeholders, because no bootstrap can supply them:" \
+        "ZILLOW_API_KEY, PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET," \
+        "PAYPAL_WEBHOOK_ID and SENDGRID_API_KEY. Set each one before the" \
+        "integration that reads it is used, and before any non-local" \
+        "environment, which refuses a placeholder at startup."
 }
 
 init_database() {

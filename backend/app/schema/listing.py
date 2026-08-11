@@ -100,9 +100,10 @@ class Listing(BaseModel):
     ``updated_at`` and ``rent`` are non-null columns and stay required;
     every other column is nullable and projects as ``None``.
 
-    Each field in :data:`MEASUREMENT_FIELDS` must be a finite number, and
-    each field in :data:`NUMERIC_FIELDS` refuses a boolean. A stored row
-    carrying a value this contract cannot represent fails to project.
+    ``rent``, ``broker_fee`` and ``square_footage`` must each be a finite
+    number, and none of those three nor ``bedrooms`` or ``bathrooms``
+    accepts a boolean. A stored row carrying a value this contract cannot
+    represent fails to project.
     """
 
     id: int
@@ -138,18 +139,17 @@ class ListingCreate(BaseModel):
     client may supply. Unknown fields are rejected. ``id``, ``created_at`` and
     ``updated_at`` are server-assigned and absent from this contract.
 
-    Each text field is bounded in length and refuses
-    :data:`FORBIDDEN_TEXT_CHARACTERS`, and ``zillow_url`` must be an
-    absolute URL whose scheme is one of :data:`LISTING_URL_SCHEMES`,
-    whose host falls under :data:`LISTING_URL_DOMAINS`, and which carries
-    no user information. A refusal names the field and never repeats the
-    value.
+    Each text field is bounded in length, published with the field below,
+    and refuses a NUL character. ``zillow_url`` must be an absolute
+    ``https`` address on ``zillow.com`` or a subdomain of it, and must
+    carry no user information. A refusal names the field and never
+    repeats the value.
 
-    Each field in :data:`MEASUREMENT_FIELDS` must be a finite number the
-    column's type can represent: an infinity, a NaN or a magnitude beyond
-    that type is refused. Each field in :data:`COUNT_FIELDS` is bounded at
-    :data:`MAX_COUNT`, and each field in :data:`NUMERIC_FIELDS` refuses a
-    boolean.
+    ``rent``, ``broker_fee`` and ``square_footage`` must each be a finite
+    number the stored column can represent: an infinity, a NaN or a
+    magnitude beyond that range is refused. ``bedrooms`` and
+    ``bathrooms`` are bounded at the maximum published with each of them,
+    and none of these five fields accepts a boolean.
     """
 
     rent: float = Field(..., ge=0)

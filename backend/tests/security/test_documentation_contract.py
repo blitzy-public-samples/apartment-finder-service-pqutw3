@@ -23,7 +23,7 @@ What is asserted:
 * the documents earlier decision rows record as absent exist, and the rows and
   the matrix paragraph that recorded their absence are superseded rather than
   quietly rewritten
-* the presentation keeps its structure -- sixteen slides, both diagrams, every
+* the presentation keeps its structure -- eighteen slides, both diagrams, every
   icon -- while its remote assets carry an integrity hash and its document
   carries an origin policy that names every host it fetches from
 * the presentation's architecture claims match what the infrastructure
@@ -184,6 +184,12 @@ SUPERSEDED_BEHAVIOUR_ROWS = (
     "82.16",
     "83.16",
     "86.5.8",
+    #: Two rows about one Terraform input, each untrue of the delivered
+    #: tree and in opposite directions: one reported the input as removed
+    #: when it was declared and required, the other described a
+    #: cross-variable validation a later round replaced with a created VPC.
+    "37.1",
+    "42.2.6",
 )
 
 #: The section that withdraws those claims and names each row it withdraws
@@ -296,7 +302,7 @@ RETIRED_ONBOARDING_CLAIM = "every setting has a safe local default"
 #: Slides, diagrams and icon placeholders the presentation must keep.
 DECK_SLIDES = 18
 DECK_DIAGRAMS = 2
-DECK_ICONS = 43
+DECK_ICONS = 44
 
 #: Remote assets the presentation fetches that must carry an integrity hash,
 #: by the substring identifying each.
@@ -750,7 +756,7 @@ def test_the_presentation_makes_no_claim_of_a_working_default():
 
 
 def test_the_presentation_keeps_its_structure():
-    """Sixteen slides, both diagrams and every icon survive the change."""
+    """Eighteen slides, both diagrams and every icon survive the change."""
     body = _text(DECK)
 
     assert body.count("<section") == DECK_SLIDES
@@ -786,8 +792,12 @@ def test_the_diagram_module_carries_its_hash_in_the_import_map():
     assert '"integrity"' in mapping
 
     #: The specifier is bare, so resolution goes through the map above and
-    #: the hash applies. A full URL in the import would bypass it.
-    assert "import mermaid from 'mermaid';" in body
+    #: the hash applies. A full URL in the import would bypass it. The
+    #: import is dynamic, which resolves through the same map and keeps a
+    #: fetch failure from discarding the module that starts the deck.
+    assert "import('mermaid')" in body
+    assert not re.search(r"import[\s(]+['\"]https://", body)
+    assert not re.search(r"from\s+['\"]https://", body)
 
 
 def test_the_presentation_restricts_the_origins_it_may_reach():

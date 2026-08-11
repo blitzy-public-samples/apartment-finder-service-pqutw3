@@ -51,12 +51,18 @@ NON_POOLED_URLS = (
 )
 
 #: Pool keywords a PostgreSQL URL must carry.
-POOL_KEYWORDS = ("pool_timeout", "pool_recycle", "pool_pre_ping")
+POOL_KEYWORDS = (
+    "pool_timeout",
+    "pool_recycle",
+    "pool_pre_ping",
+    "pool_size",
+    "max_overflow",
+)
 
 #: Of those, the ones the pool a SQLite URL resolves to refuses outright.
 #: The rest it accepts and acts on neither, so the exclusion covers both
 #: a refusal and a no-op.
-REFUSED_BY_THE_SQLITE_POOL = ("pool_timeout",)
+REFUSED_BY_THE_SQLITE_POOL = ("pool_timeout", "max_overflow")
 
 #: Seconds a bounded checkout is given in the behavioural case. Small so
 #: the case is quick, and measured against rather than assumed.
@@ -156,6 +162,8 @@ class TestThePoolIsBounded:
             settings.DB_POOL_RECYCLE_SECONDS
         )
         assert arguments["pool_pre_ping"] is True
+        assert arguments["pool_size"] == settings.DB_POOL_SIZE
+        assert arguments["max_overflow"] == settings.DB_MAX_OVERFLOW
 
     @pytest.mark.parametrize("url", NON_POOLED_URLS)
     def test_every_other_backend_carries_no_pool_bound(self, url):
@@ -191,6 +199,71 @@ class TestThePoolIsBounded:
         built = create_engine("sqlite://", **{keyword: 60})
 
         assert not isinstance(built.pool, QueuePool)
+
+
+class TestHowManyConnectionsOneProcessMayHold:
+    """The pool's two size bounds are stated, not left to a default.
+
+    Left unstated they came from the pool's own defaults, which have no
+    relation to how many requests the application admits at once. A
+    surplus request then waited the whole checkout timeout for a
+    connection before it could be refused, which is the failure these
+    bounds and :func:`admitted_concurrency` remove.
+    """
+
+    @pytest.mark.parametrize("url", POSTGRESQL_URLS)
+    def test_the_ceiling_is_the_two_bounds_added(self, url):
+        assert database.pool_capacity(url) == (
+            settings.DB_POOL_SIZE + settings.DB_MAX_OVERFLOW
+        )
+
+    @pytest.mark.parametrize("url", POSTGRESQL_URLS)
+    def test_the_admitted_count_is_the_persistent_bound(self, url):
+        assert database.admitted_concurrency(url) == settings.DB_POOL_SIZE
+
+    @pytest.mark.parametrize("url", POSTGRESQL_URLS)
+    def test_the_admitted_count_leaves_the_overflow_unclaimed(self, url):
+        """The routes the admission gate does not hold draw on the rest.
+
+        The readiness probe reads the database and its path is one the
+        gate passes straight through, so it needs a connection no
+        admitted request is entitled to. The overflow is that remainder,
+        and the admitted count is below the ceiling by exactly it.
+        """
+        admitted = database.admitted_concurrency(url)
+        ceiling = database.pool_capacity(url)
+
+        assert admitted < ceiling
+        assert ceiling - admitted == settings.DB_MAX_OVERFLOW
+
+    @pytest.mark.parametrize("url", NON_POOLED_URLS)
+    def test_a_backend_with_no_ceiling_reports_neither_figure(self, url):
+        assert database.pool_capacity(url) is None
+        assert database.admitted_concurrency(url) is None
+
+    @pytest.mark.parametrize("url", POSTGRESQL_URLS)
+    def test_both_figures_are_read_from_the_settings(
+        self, url, monkeypatch
+    ):
+        """Neither is a literal in the module."""
+        monkeypatch.setattr(settings, "DB_POOL_SIZE", 7)
+        monkeypatch.setattr(settings, "DB_MAX_OVERFLOW", 4)
+
+        assert database.admitted_concurrency(url) == 7
+        assert database.pool_capacity(url) == 11
+
+    @pytest.mark.parametrize("url", POSTGRESQL_URLS)
+    def test_an_engine_accepts_both_bounds(self, url):
+        """The bounds reach a queueing pool that acts on them."""
+        built = create_engine(url, **_pool_args(url))
+
+        assert isinstance(built.pool, QueuePool)
+        assert built.pool.size() == settings.DB_POOL_SIZE
+        assert built.pool._max_overflow == settings.DB_MAX_OVERFLOW
+
+    def test_the_bounds_are_positive_and_the_ceiling_is_reachable(self):
+        assert settings.DB_POOL_SIZE >= 1
+        assert settings.DB_MAX_OVERFLOW >= 0
 
 
 class TestTheEngineTheModuleBuilds:

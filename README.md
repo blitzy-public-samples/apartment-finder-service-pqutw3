@@ -119,24 +119,42 @@ setting arrives from the process environment. `ENV_FILE` is not itself a setting
 not appear as a line inside the file.
 
 Bootstrap. The supported route is the setup script, which is the only one that
-produces a `.env` the application will start against without further editing:
+produces a `.env` the application will start against without further editing. It takes
+no arguments, requires `python3.9`, `npm` and `psql` on `PATH`, and reads every input
+from the environment:
+
+| Input | Required? | Detail |
+| --- | --- | --- |
+| `SETUP_DB_ADMIN_USER` | **required whenever no `.env` yet names a configured `DATABASE_URL`**, which is the case on a clean checkout | The PostgreSQL account the role and database are created with. It must hold `CREATEROLE` and `CREATEDB` or be a superuser, and it must connect **without an interactive prompt** &mdash; supply its password through `PGPASSWORD`, a `.pgpass` entry, or peer or trust authentication. Left unset, the script stops with `SETUP_DB_ADMIN_USER is not set.` before it creates anything. |
+| `SETUP_DB_ADMIN_DB`, `SETUP_DB_ADMIN_HOST`, `SETUP_DB_ADMIN_PORT` | optional | Where that account connects. Default `postgres`, `localhost`, `5432`. |
+| `PYTHON` | optional | Interpreter the virtual environment is built with. Defaults to the first Python 3.9 on `PATH`. |
 
 ```bash
-./scripts/setup_dev_environment.sh
+PGPASSWORD='<the admin account password>' \
+  SETUP_DB_ADMIN_USER=postgres \
+  ./scripts/setup_dev_environment.sh
 ```
 
-It writes `.env` from the template with mode 0600, generates a `SECRET_KEY` that
-clears every validation rule and an `ADMIN_SEED_PASSWORD`, prompts for the database
+`./scripts/setup_dev_environment.sh --help` prints the same contract and exits 0. On an
+existing tree that already carries a configured `DATABASE_URL`, no administrator input
+is needed and the script keeps the `.env` it finds.
+
+It writes `.env` from the template with mode 0600 **wherever the filesystem enforces
+POSIX permission bits**; on Windows the mode is not applied and the file inherits the
+directory's access control, so a checkout there must be kept off shared storage. It
+generates a `SECRET_KEY` that clears every validation rule and an
+`ADMIN_SEED_PASSWORD`, prompts twice and without echo for the database
 password and percent-encodes it into `DATABASE_URL`, creates the role and database,
-applies both migrations, and seeds the single administrator. **No generated value is
+applies every revision in the chain &mdash; five today, `0001` through `0005` &mdash;
+and seeds the single administrator. **No generated value is
 printed** — the script reports the administrator by a non-reversible twelve-character
 reference, the same one migration `0002` records.
 
 `.env` is untracked and holds real secrets once it is filled in, so it must never
 be replaced by the template. Prefer `scripts/setup_dev_environment.sh`, which keeps an
 existing `.env`, checks that it already carries a configured `DATABASE_URL`, and creates
-the file only when it is absent &mdash; with mode `600`, a generated signing key and a
-generated administrator password. To create it by hand, guard the copy explicitly:
+the file only when it is absent &mdash; with mode `600` where POSIX bits apply, as
+qualified above, a generated signing key and a generated administrator password. To create it by hand, guard the copy explicitly:
 
 ```bash
 if [ -e .env ]; then
@@ -289,8 +307,17 @@ repository variable of the same name for the CD workflow.
 Run the server:
 
 ```bash
-python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-proxy-headers
 ```
+
+`--no-proxy-headers` is part of the command rather than an optional extra. Without it the
+ASGI server replaces the address the connection was made from with whatever an inbound
+`X-Forwarded-For` header claims, for any connection arriving from an address it trusts —
+loopback by default. A caller varying that header would then be counted as a new client on
+every request, which defeats the login and registration rate limits entirely. With the flag,
+`TRUSTED_PROXY_HOPS` is the only setting that decides which address a limit is counted
+against. The same flag belongs on every invocation, including the container image and the
+Kubernetes deployment, both of which carry it.
 
 Liveness is at `GET /health`; readiness, which answers 503 while the database is
 unreachable, is at `GET /health/ready`.
@@ -370,7 +397,7 @@ PAYPAL_WEBHOOK_ID                   SENDGRID_API_KEY
 `local` semantics by omission. `CLOUD_SQL_INSTANCE_CONNECTION_NAME` is consumed only by the
 `gcp` profile's proxy, and is validated to be well formed under that profile.
 
-**Deployment workflow — six repository secrets and twenty-three repository variables.**
+**Deployment workflow — six repository secrets and twenty-four repository variables.**
 `.github/workflows/cd.yml` reads these and asserts every one is present and well formed
 before it mutates anything. Only the six in the first table are credentials or project
 identifiers; everything else is configuration, so it is a repository variable. The
@@ -393,17 +420,20 @@ the two tables here are the ones a first-time deployment gets wrong most often.
 | `GKE_DEPLOY_RUNNER_LABEL` | The self-hosted runner inside the VPC that the cluster jobs run on. It has **no default**, and preflight refuses a hosted-image label. |
 | `REACT_APP_API_BASE_URL`, `PAYPAL_CLIENT_ID` | The two public frontend build arguments. Preflight refuses a blank value for either. |
 
-**Terraform — inputs with no safe default.** Fourteen variables declare no default, so a
-plan refuses until each is supplied. Beyond `project_id` and the six managed secret values,
-they are `admin_seed_password` and `rate_limit_storage_uri` — credentials in their own right
-— together with `database_private_network`, `gke_master_authorized_networks`,
-`artifact_registry_writer_members`, `cloud_function_invoker_member` and `github_repository`
-(which scopes federated identity to one repository, and is what stops any repository minting
-a token for this project). `cloud_function_entry_point` and `cloud_function_source_dir` both
-carry defaults and are deliberately not in this set. The `cloud_function_source_archive`
-*variable* that an earlier revision of this section listed no longer exists: Terraform
-packages the source itself and names the object after the archive's content digest, so there
-is no path for a caller to supply.
+**Terraform — inputs with no safe default.** Thirteen variables declare no default, so a
+plan refuses until each is supplied, and every one of the thirteen is read by a resource.
+Beyond `project_id` and the six managed secret values, they are `admin_seed_password` and
+`rate_limit_storage_uri` — credentials in their own right — together with
+`gke_master_authorized_networks`, `artifact_registry_writer_members`,
+`cloud_function_invoker_member` and `github_repository` (which scopes federated identity to
+one repository, and is what stops any repository minting a token for this project).
+`cloud_function_entry_point`, `cloud_function_source_dir` and `database_private_network` all
+carry defaults and are deliberately not in this set — the last of those is read by no
+resource, because the database attaches to the VPC this configuration creates, so demanding
+a value for it would refuse a plan over an input that reaches nothing. The
+`cloud_function_source_archive` *variable* that an earlier revision of this section listed
+no longer exists: Terraform packages the source itself and names the object after the
+archive's content digest, so there is no path for a caller to supply.
 
 **Backend settings added for boundary resilience.** Each has a working default, and one of
 them needs deliberate attention per deployment:
@@ -413,7 +443,9 @@ them needs deliberate attention per deployment:
 | `DB_CONNECT_TIMEOUT_SECONDS` | Caps how long a new database connection may take to establish. |
 | `DB_POOL_TIMEOUT_SECONDS` | Caps how long a request waits for a pooled connection. |
 | `DB_POOL_RECYCLE_SECONDS` | Retires connections before an idle peer can drop them. |
-| `TRUSTED_PROXY_HOPS` | **Set this to the real number of proxies in front of the service.** It defaults to `0`, meaning no forwarded client address is trusted. Behind a GKE ingress or load balancer the default makes rate limits and lockouts apply per proxy rather than per client, which is the safe direction to be wrong in but is not what you want. |
+| `DB_POOL_SIZE` | Connections one process keeps open, and how many requests it lets into its router at once — so at most this many hold a session and each finds a connection waiting rather than queueing for one. A request arriving above that count waits up to `DB_POOL_TIMEOUT_SECONDS` for a place and is then refused `503` with `Retry-After`; `/health` and `/health/ready` are admitted without waiting. |
+| `DB_MAX_OVERFLOW` | Further connections one process may open under load, above `DB_POOL_SIZE`. The sum of the two is the ceiling per process, so **raise them together with the connection limit of the database they point at**: a deployment of *N* replicas may hold *N* times that sum. The gap between `DB_POOL_SIZE` and the sum is what the two ungated probe paths draw on. |
+| `TRUSTED_PROXY_HOPS` | **Set this to the real number of proxies in front of the service.** It defaults to `0`, meaning no forwarded client address is trusted. Behind a GKE ingress or load balancer the default makes rate limits and lockouts apply per proxy rather than per client, which is the safe direction to be wrong in but is not what you want. This setting is only in force when the server is started with `--no-proxy-headers`, which every invocation this repository ships now carries; without the flag the ASGI server resolves the client address first and this setting never sees the real peer. Should you ever need the ASGI server to resolve it instead, pass `--forwarded-allow-ips` with the exact proxy addresses rather than a wildcard, and raise `TRUSTED_PROXY_HOPS` to the same hop count so the two agree. |
 
 **Two behaviour changes worth knowing before you deploy.** Email delivery now treats only
 HTTP 202 from SendGrid as success, where any 2xx previously passed. And a non-local
@@ -443,25 +475,29 @@ anything.
 | Release identity | An immutable tag per release. **A tag that already exists is refused**, and the rollout is applied by digest, then the running pod's `imageID` is compared against it |
 | Migrations | A bounded one-shot pod built from the release image, run **before** the rollout and required to succeed first |
 | Cluster access | A regional cluster addressed with `--region`, reached over the authorized DNS endpoint while the private endpoint stays private. Requires `container.clusters.connect` |
-| Cloud Function | `apartment-finder-probe`, entry point `hello_world`, runtime `python39`, source `function-source.zip` in the project's static-assets bucket, invoker restricted &mdash; no anonymous invocation |
+| Cloud Function | `apartment-finder-probe`, entry point `hello_world`, runtime `python39`, invoker restricted &mdash; no anonymous invocation. Its source object in the project's static-assets bucket is **named after the archive's content digest**, `function-source-<md5>.zip`, so it is supplied per release rather than fixed: `scripts/deploy.sh` accepts only a name matching `^function-source-[0-9a-f]{32}\.zip$` and compares the bucket object's digest against it |
 
 The pipeline needs six repository **secrets** — `GCP_PROJECT_ID`, `GKE_CLUSTER_NAME`, the
 two Workload Identity Federation secrets `GCP_WORKLOAD_IDENTITY_PROVIDER` and
 `GCP_SERVICE_ACCOUNT`, and the two service-account addresses
 `BACKEND_GCP_SERVICE_ACCOUNT_EMAIL` and `ADMIN_PROVISIONER_GCP_SERVICE_ACCOUNT_EMAIL` — and
-twenty-three repository **variables**, none of which is a credential. The
+twenty-four repository **variables**, none of which is a credential. The
 [Deployment](#deployment) section lists every one with its kind. **The former
 `GKE_CLUSTER_ZONE` secret is retired**, because the cluster is regional. `deploy.sh`
 takes no arguments and reads `GCP_PROJECT_ID`, `GKE_CLUSTER`, `GKE_REGION`,
 `K8S_NAMESPACE` and `VERSION` from the environment; run `scripts/deploy.sh --help` for
 the full contract. It additionally needs `jq` and `timeout` on `PATH`.
 
-Terraform requires fourteen variables with no default, including
-`artifact_registry_writer_members`, `cloud_function_invoker_member`,
-`database_private_network` and `gke_master_authorized_networks`. The six application
-secrets are provisioned as Secret Manager secrets whose `secret_id` is the setting name
-that consumes it, and each carries a `roles/secretmanager.secretAccessor` binding for
-the one identity that reads it: the backend runtime identity holds all six, the
+Terraform requires thirteen variables with no default, including
+`artifact_registry_writer_members`, `cloud_function_invoker_member` and
+`gke_master_authorized_networks`. **Eight** Secret Manager
+secrets are provisioned, each with a `secret_id` equal to the setting name that consumes
+it: the six the backend runtime reads &mdash; `SECRET_KEY`, `DATABASE_URL`,
+`ZILLOW_API_KEY`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID` and `SENDGRID_API_KEY`
+&mdash; plus `ADMIN_SEED_PASSWORD`, read only by the administrator-credential Job, and
+`RATE_LIMIT_STORAGE_URI`, which carries the shared rate-limit store address. Each
+carries a `roles/secretmanager.secretAccessor` binding for
+the one identity that reads it: the backend runtime identity holds the six it mounts, the
 migration identity holds `DATABASE_URL` alone, and the provisioning identity holds the
 two its job declares. There is no variable that grants a supplied list of principals
 access to every secret; the `secret_accessor_bindings` output lists the pairs actually
@@ -507,8 +543,8 @@ CI job that runs each command, or says plainly that nothing but you runs it.
 | Command | Expected result | Enforced by |
 | --- | --- | --- |
 | `python -c "import backend.app.main"` | Exit code 0 — the application imports. | **CI — `runtime-integration` job**, step "Verify the application starts", and the `backend` job's step "Check the application starts" |
-| `python -m pytest backend/tests -q` | Tests collected, all passing. | **CI — `backend` job**, which runs the same suite with coverage instead of `-q` |
-| `python -m pytest backend/tests/security -q` | All passing, including the **45-assertion role matrix** — nine role-governed routes by five principals, anonymous included. | **CI — `backend` job**, this exact command |
+| `python -m pytest backend/tests -q` | Tests collected, all passing. **Run it against a clean working tree**: the delivered-path reconciliation reads `git status --porcelain` as well as the diff against the baseline revision, so an unexpected untracked path fails `test_operator_documentation.py::test_every_delivered_path_is_reachable_from_the_file_side`. Scratch paths beginning `blitzy_adhoc` or `blitzy/`, and files ending `.log`, `.err` or `.pid`, are allowed for; anything else is not. | **CI — `backend` job**, which runs the same tests in two partitions rather than in this one call: `backend/tests/security` first with `--cov=backend/app --cov-report= --cov-fail-under=0`, then `backend/tests --ignore=backend/tests/security` with `--cov=backend/app --cov-append --cov-report=xml:backend/coverage.xml`. Same files, different invocation |
+| `python -m pytest backend/tests/security -q` | All passing, including the **45-assertion role matrix** — nine role-governed routes by five principals, anonymous included. | **CI — `backend` job**, step "Run backend security tests", which runs this path with the three coverage flags above instead of `-q` |
 | `pip-audit -r backend/requirements.txt` | **Only** the seven advisories in the *Runtime register* of [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md). | **CI — `backend` job**, as `--strict` with those seven identifiers suppressed by name, so an eighth fails the build |
 | `pip-audit -r backend/requirements-dev.txt` | **Only** the one advisory in the *Development register* of the same file. Eight identifiers are suppressed in total, all of them registered. `backend/requirements-audit.txt` declares the audit instrument and is not audited. | **CI — `backend` job**, the same way, with that manifest's one identifier |
 | `bandit -r backend/app -ll` | Exit code 0 — no Medium or High findings. Dropping `-ll` widens the scan to LOW and exits 1 on five findings, none of them a defect: three are `B105` against string literals that are not credentials — a refusal-decision code, an environment-variable name and an operation label — and two are `B110` against the deliberate `try`/`except`/`pass` in the logging listener's shutdown path. `-ll` is the documented threshold, so that exit 1 is the tool's own default verbosity rather than a regression. | **CI — `backend` job**, this exact command |
@@ -539,18 +575,23 @@ when it fails:
 
 | Job | What it runs |
 | --- | --- |
-| `backend` | `flake8 .` from inside `backend/`, both `pip-audit --strict` invocations, `bandit`, the two compensating-control guards, the secret and ignore policy, the import gate, the migration round trip, the administrator-count assertion, the unit suite with coverage and the security suite |
+| `backend` | Sixteen steps: the checkout, the interpreter setup, the dependency install, **the secret and ignore policy**, `flake8 .` from inside `backend/`, both `pip-audit --strict` invocations, `bandit`, the two compensating-control guards, the import gate, the migration round trip, the administrator-count assertion, the security suite with coverage, the unit suite with coverage appended, and **the production-dialect integration tests** (`pytest backend/tests -m postgres`) |
 | `runtime-integration` | Applies the revisions, reverses and reapplies them, asserts the administrator count, verifies the import, then serves the application and exercises it over HTTP |
 | `postgres-integration` | Reports the database version and runs the PostgreSQL migration and persistence suite against a real service |
 | `integration` | Applies the migrations, confirms exactly one administrator, starts the API and probes liveness, readiness, the public listing read, and registration, login and the role refusal |
 | `frontend` | Installs the declared dependencies, runs ESLint over `src`, and runs the frontend unit tests |
 | `infrastructure` | `terraform fmt -check -recursive`, `terraform validate`, and the deployment-manifest settings contract |
 
-**What CI runs that is not in the table above:** the frontend lint job, the frontend unit
-tests, the two compensating-control guards below, and both dependency audits in their
-strict form. `.github/workflows/ci.yml` is the authority.
+**What CI runs that the command table above does not list:** the frontend lint job, the
+frontend unit tests, the two compensating-control guards below, both dependency audits in
+their strict form, the `backend` job's step **"Check the secret and ignore policy"**
+(`.github/scripts/check_secret_policy.sh`, which fails on a committed connection string,
+a placeholder signing key, private-key material, a tracked credential path or a required
+path that has been ignored), and its step **"Run the production-dialect integration
+tests"** (`pytest backend/tests -m postgres`, which runs the PostgreSQL-only cases against
+the job's own service). `.github/workflows/ci.yml` is the authority.
 
-Three notes on how these are invoked, because the scope and the flags change the result:
+Four notes on how these are invoked, because the scope and the flags change the result:
 
 - **The `alembic downgrade -1` calls are destructive and must not be run against a
   database you intend to keep.** One is issued per revision in the chain, 5 today, and
@@ -570,7 +611,6 @@ Three notes on how these are invoked, because the scope and the flags change the
   [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) before treating a
   failure as a regression.
 - **The `-r <manifest>` argument is mandatory in either form.** A bare invocation audits
-
   the whole active environment and conflates the audit tool's own dependency tree with the
   application's, inflating the count and obscuring which findings the application owns.
   The runtime and development manifests are audited separately for the same reason.
@@ -791,7 +831,22 @@ The manifest-render step reads a further set of variables — `BACKEND_ENVIRONME
 rollout rather than the application: `K8S_SERVICE_ACCOUNT`, `FRONTEND_SERVICE_TYPE`,
 `BACKEND_REPLICAS` and `FRONTEND_REPLICAS`. Two gate the optional administrator-credential
 step: `PROVISION_ADMIN_CREDENTIAL` and `ADMIN_CREDENTIAL_RESET`, both of which default off.
-`CLOUD_FUNCTION_NAME` names the probe function the workflow addresses.
+`CLOUD_FUNCTION_NAME` names the probe function the workflow addresses, and
+`CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED` decides whether that function is deployed at all
+&mdash; the default of `false` reports the step as blocked and performs it not at all.
+That is **twenty-four** variables in total, and this inventory is complete: seven are
+named in the table above and seventeen in the paragraph here, which is exactly the set
+`.github/workflows/cd.yml` reads as `vars.*`.
+
+**One assertion exists in the workflow and has no counterpart in the script.** After the
+rollout, `.github/workflows/cd.yml` reads the namespace's service account back and
+confirms its workload-identity annotation names the runtime service account;
+`scripts/deploy.sh` does not. The difference is deliberate rather than an omission: the
+workflow is the path that also renders and applies the service-account manifest carrying
+that annotation, so it is the path that can regress it, while an operator running the
+script against an established cluster is not changing it. A release driven by the script
+should confirm the annotation out of band &mdash; the
+`backend_workload_identity_annotation` Terraform output publishes the exact value.
 
 ### `scripts/deploy.sh`
 
@@ -806,27 +861,51 @@ together with an active Google Cloud credential and bash 4 or newer.
 | `GKE_CLUSTER`, `GKE_REGION` | required | The target cluster and its **region** — the cluster is regional, so this is `us-central1` and not a zone. |
 | `K8S_NAMESPACE` | required | The namespace holding the `backend` and `frontend` Deployments. |
 | `VERSION` | required | The image tag for this release. A tag that has already been published is **refused**, so a rollout cannot resolve to earlier content. |
+| `BACKEND_ALLOWED_ORIGINS`, `BACKEND_ALLOWED_HOSTS`, `BACKEND_GCP_SERVICE_ACCOUNT_EMAIL`, `PAYPAL_CLIENT_ID`, `PAYPAL_RETURN_URL`, `PAYPAL_CANCEL_URL`, `ZILLOW_API_URL`, `FROM_EMAIL` | **required** | Manifest tokens the renderer carries no default for. All eight are checked in one pre-flight pass **before** any cluster credential is acquired, and every missing name is reported together. |
+| `ADMIN_PROVISIONER_GCP_SERVICE_ACCOUNT_EMAIL` | required **only while `PROVISION_ADMIN_CREDENTIAL` is `true`** | The identity the administrator-credential Job runs as. The only manifest that carries it is that Job, which no other release renders. |
 | `ARTIFACT_REGISTRY_REPOSITORY` | optional | Defaults to `apartment-finder`. |
+| `PROVISION_ADMIN_CREDENTIAL`, `ADMIN_CREDENTIAL_RESET` | optional | Both default off. The first adds the administrator-credential Job to the release; the second re-provisions a credential already provisioned for this tag. |
 | `CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED` | optional | Defaults to `false`, which reports the Cloud Function step as blocked and performs it not at all. |
+| `CLOUD_FUNCTION_SOURCE_OBJECT`, `CLOUD_FUNCTION_SOURCE_MD5` | required **only while that step is authorized** | The Terraform outputs of the same names. The object name must match the content-digest pattern and the bucket object's digest must equal the supplied one. |
+
+A further eight manifest tokens are accepted and defaulted by the renderer when absent
+&mdash; `BACKEND_ENVIRONMENT`, `PAYPAL_MODE`, `PAYPAL_API_BASE`,
+`BACKEND_SERVICE_ACCOUNT`, `FRONTEND_SERVICE_ACCOUNT`, `MIGRATION_SERVICE_ACCOUNT`,
+`MIGRATION_SERVICE_ACCOUNT_ID` and `ADMIN_PROVISIONER_SERVICE_ACCOUNT`. Each is
+re-exported when it is set, so a value assigned in the calling shell without `export`
+still reaches the renderer. `scripts/deploy.sh --help` prints all three groups from the same
+arrays the pre-flight check reads, so the printed contract and the enforced contract
+cannot drift.
 
 **The former Cloud Function inputs are retired.** `CLOUD_FUNCTION_NAME`,
 `CLOUD_FUNCTION_ENTRY_POINT`, `CLOUD_FUNCTION_SOURCE_ARCHIVE` and `CLOUD_FUNCTION_REGION`
 are no longer read from the environment. The script carries the function's name, entry
-point, runtime and source object as fixed constants that match
+point and runtime as fixed constants that match
 `infrastructure/terraform/main.tf`, which owns the function, so the two tools cannot
-address the same function under different names. A deployment configured against the
+address the same function under different names. **The source object is deliberately not
+a constant**: Terraform names it after the archive's content digest, so it is supplied
+per release through `CLOUD_FUNCTION_SOURCE_OBJECT` and validated against
+`^function-source-[0-9a-f]{32}\.zip$`, with `CLOUD_FUNCTION_SOURCE_MD5` compared against
+the bucket object's own digest. A deployment configured against the
 previous contract should drop those four variables. The function is deployed
 `--no-allow-unauthenticated`, and the script then reads its **effective** IAM policy back
 and exits non-zero if any public principal remains — an authoritative policy in Terraform
 removes an inherited public binding, and this read-back proves it.
 
-Migrations run **before** traffic moves. The order is: apply the rendered `prerequisites`
-group, assert both Deployments and their containers exist, refuse a reused tag, publish the
-images by digest, run the Alembic upgrade as a bounded one-shot Job rendered from
-`infrastructure/kubernetes/60-migration-job.yaml`, then apply the rendered `workloads`
-group, wait for the rollout, compare each running pod's `imageID` against the digest that
-was published, and probe readiness through a port-forward. A failed migration stops the
-release before any workload serves the new image.
+Migrations run **before** traffic moves. The order is: parse the (absent) arguments,
+check the required tools, read the inputs, build the image references, **assert every
+manifest token is present by dry-rendering each group** &mdash; the one step that runs
+before a cluster credential is acquired, so a missing token costs nothing &mdash;
+acquire cluster credentials, apply the rendered `prerequisites` group, **publish the
+shared rate-limit store address**, assert both Deployments and their containers exist,
+refuse a reused tag, publish the images by digest, run the Alembic upgrade as a bounded
+one-shot Job rendered from `infrastructure/kubernetes/60-migration-job.yaml`,
+provision the administrator credential when that is asked for, apply the rendered
+`workloads` group, wait for the rollout, compare each running pod's `imageID` against
+the digest that was published, probe readiness through a port-forward, and deploy the
+Cloud Function when that step is authorized. A failed migration stops the release before
+any workload serves the new image, and the readiness probe's port forward is closed by
+the script's single exit handler, which also removes the temporary kubeconfig.
 
 ### The cluster objects, and the one prerequisite an operator must supply
 
@@ -901,8 +980,8 @@ The open risks that configuration does not close are recorded in
 | Prerequisite | Why it is not here |
 | --- | --- |
 | The first apply against a new cluster | The manifests themselves **are** here, under `infrastructure/kubernetes/`, and both release paths apply them. But each path first asserts that `deployment/backend` and `deployment/frontend` already exist and stops naming what is missing, so a release cannot create the first cluster. Run `scripts/render_kubernetes_manifests.sh workloads` once, out of band, before the first release — and note that this creates the ingestion CronJob, which [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) O-8 says must not be enabled until O-9 is closed. |
-| Secret **values** in Secret Manager | Terraform creates the six secrets, grants the workload identity access and enables the managed Secret Manager add-on, and the `backend_workload_identity_annotation` output gives the exact annotation. Mounting them is done here — `30-backend-secrets.yaml` declares the provider class and `40-backend.yaml` mounts it read-only as files. What is not here is the secret *contents*: an operator adds each version, following [`docs/security/CREDENTIAL_ROTATION.md`](docs/security/CREDENTIAL_ROTATION.md). |
-| Private services access, and a shared VPC | The Terraform variables enforce that the cluster and the database sit on the same network; the network itself is an input. |
+| Secret **values** in Secret Manager | Terraform creates all eight secrets — the six the backend mounts plus `ADMIN_SEED_PASSWORD` and `RATE_LIMIT_STORAGE_URI` — grants each reader access and enables the managed Secret Manager add-on, and the `backend_workload_identity_annotation` output gives the exact annotation. Mounting them is done here — `30-backend-secrets.yaml` declares the provider class and `40-backend.yaml` mounts it read-only as files. What is not here is the secret *contents*: an operator adds each version, following [`docs/security/CREDENTIAL_ROTATION.md`](docs/security/CREDENTIAL_ROTATION.md). |
+| The `servicenetworking` API enabled before the first apply | `main.tf` creates the VPC, the subnetwork, the reserved range and the peering that give the database its private address, and both the cluster and the database attach to the network it creates — so the topology is not a prerequisite. Enabling the API that publishes the peering is: `google_project_service.required` declares it, and an apply that reaches the peering before the service is active fails on it. |
 | The ingestion cadence | `INGESTION_SCHEDULE` defaults to hourly in the renderer. Set it to the cadence the deployment wants before applying the `workloads` group. |
 
 Each is tracked as an operator-owned item at

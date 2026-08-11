@@ -91,8 +91,27 @@ if [ -n "${tracked}" ]; then
 fi
 
 echo "Checking that no tracked file carries a real credential"
-carried="$(git grep -nIE "${DSN}" -- . ':(exclude)backend/tests/*' \
-    | grep -Ev "${PLACEHOLDER}" || true)"
+
+# git grep reports each match as path:line:content, so the placeholder test
+# is applied to the connection string alone rather than to the whole line.
+# Applied to the line, a path carrying a placeholder token would exempt
+# every match in it -- and .env.example, the one file an operator copies and
+# edits, is such a path.
+carried=""
+while IFS= read -r match; do
+    [ -n "${match}" ] || continue
+
+    value="$(printf '%s\n' "${match}" | grep -oE "${DSN}" | head -n 1)"
+
+    if printf '%s\n' "${value}" | grep -Eq "${PLACEHOLDER}"; then
+        continue
+    fi
+
+    carried="${carried}${match}"$'\n'
+done <<EOF
+$(git grep -nIE "${DSN}" -- . ':(exclude)backend/tests/*' || true)
+EOF
+
 carried="${carried}$(git grep -nIE "${PLAINTEXT_KEY}" -- . \
     ':(exclude)backend/tests/*' ':(exclude)docs/*' ':(exclude)*.md' \
     || true)"
@@ -113,7 +132,11 @@ done
 
 echo "Checking that every documented path is still committable"
 for candidate in "${REQUIRED_PATHS[@]}"; do
-    if git check-ignore -q "${candidate}"; then
+    # --no-index is what makes this check answerable. Without it,
+    # check-ignore skips any path present in the index, so a rule widened
+    # over one of these -- each of which is tracked -- would report as not
+    # ignored and the check could never fail.
+    if git check-ignore -q --no-index "${candidate}"; then
         echo "${candidate} is ignored but must be tracked." >&2
         failed=1
     fi

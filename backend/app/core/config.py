@@ -836,6 +836,8 @@ class Settings(BaseSettings):
     )
     DB_POOL_TIMEOUT_SECONDS: float = Field(10.0, gt=0, le=300)
     DB_POOL_RECYCLE_SECONDS: int = Field(1800, ge=60, le=86400)
+    DB_POOL_SIZE: int = Field(10, ge=1, le=100)
+    DB_MAX_OVERFLOW: int = Field(5, ge=0, le=100)
 
     # JWT / token signing
     SECRET_KEY: str

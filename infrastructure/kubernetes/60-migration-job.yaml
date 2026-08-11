@@ -1,8 +1,10 @@
 # One-shot schema migration.
 #
 # The job runs `alembic upgrade head` from the same image the backend
-# serves from, reading the same configuration the backend reads: the
-# backend-config ConfigMap and the Secret Manager CSI mount declared by
+# serves from, reading the backend-config ConfigMap the backend reads and
+# one credential of its own: the Secret Manager CSI mount below is the
+# backend-database class declared by 35-migration-secrets.yaml, which
+# carries DATABASE_URL alone rather than the six of
 # 30-backend-secrets.yaml. It copies nothing from a running Deployment, so
 # it applies to a first deployment as well as to a later one.
 #

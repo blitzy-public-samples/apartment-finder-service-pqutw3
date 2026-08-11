@@ -76,6 +76,10 @@ MATRIX_REVERSE_ROWS = 156
 BYPRODUCT_PREFIXES = ("blitzy_adhoc", "blitzy/")
 BYPRODUCT_SUFFIXES = (".log", ".err", ".pid")
 
+#: Status ``git status --porcelain`` reports for a path it does not
+#: track. Such a path is not part of the delivered change.
+UNTRACKED_STATUS = "??"
+
 #: Committed template the bootstrap copies from.
 ENVIRONMENT_TEMPLATE = REPO_ROOT / ".env.example"
 
@@ -92,6 +96,20 @@ PIN_SITES = (
 
 #: Construct that pins the interpreter in code.
 CODE_LEVEL_PIN = "@asyncio.coroutine"
+
+#: Text identifying the documented command that starts the application.
+ASGI_APP_MARKER = "uvicorn backend.app.main:app"
+
+#: Flag that leaves the peer address of the connection in the ASGI scope.
+NO_PROXY_HEADERS_FLAG = "--no-proxy-headers"
+
+#: Flag that names the addresses whose forwarded header is honoured, which
+#: an operator needing the server to resolve the address reaches for
+#: instead.
+FORWARDED_ALLOW_FLAG = "--forwarded-allow-ips"
+
+#: Setting that decides the address a rate limit is counted against.
+HOP_SETTING = "TRUSTED_PROXY_HOPS"
 
 
 def _delivered_revision_head() -> str:
@@ -504,13 +522,21 @@ def test_the_runbook_scopes_its_compromise_claim_to_exposed_values():
 
     The opening said every credential was already compromised while the
     webhook identifier is explicitly new and was never committed.
+
+    The count is four, not three: the listing-provider key was exposed
+    through URL query strings and standard output rather than through the
+    repository, so it is exposed without ever having been committed.
+    Section 3 and ``SECURITY.md`` both name four, and this asserts the
+    opening agrees with them.
     """
     text = _text(ROTATION_RUNBOOK)
     flat = _flattened(ROTATION_RUNBOOK)
 
     assert "### 1.2 Every previously exposed credential" in text
     assert "### 1.2 Every credential here is already compromised" not in text
-    assert "For the three previously exposed credentials" in flat
+    assert "**Four credentials were exposed**" in flat
+    assert "For all four, do not reason about whether the value leaked" in flat
+    assert "For the three previously exposed credentials" not in flat
 
 
 def test_the_runbook_marks_the_webhook_identifier_as_provisioning():
@@ -543,10 +569,17 @@ def test_the_runbook_qualifies_the_four_step_sequence():
 
 
 def test_the_runbook_verification_does_not_demand_an_order_that_cannot_exist():
-    """First provisioning has no revocation to precede a rewrite."""
+    """First provisioning has no revocation to precede a rewrite.
+
+    Four credentials were exposed, so the order is confirmed for four.
+    Only three of them were committed, so the narrower claim that
+    revocation preceded a history rewrite is scoped to those three, and
+    the fourth is verified against the log purge instead.
+    """
     flat = _flattened(ROTATION_RUNBOOK)
 
-    assert "For each of the three **previously exposed** credentials" in flat
+    assert "For each of the four **previously exposed** credentials" in flat
+    assert "for the three that were committed" in flat
     assert "there is no order to confirm on first provisioning" in flat
 
 
@@ -665,12 +698,31 @@ def test_no_operator_document_carries_an_unresolved_marker(path):
 # --- The Rule 1 artifacts describe the delivered change ------------------
 
 
-def _delivered_paths():
-    """Returns every path created or modified since the baseline.
+def _status_path(line):
+    """Returns the path one porcelain status line names.
 
-    The baseline is the revision the matrix and the log both cite as the
-    state before this remediation. Validation byproducts are excluded:
-    they are not delivered and are removed before commit.
+    A rename is reported as ``old -> new``, and the path that has been
+    delivered is the new one.
+    """
+    path = line[3:]
+    _, arrow, renamed = path.partition(" -> ")
+    return renamed if arrow else path
+
+
+def _delivered_paths():
+    """Returns every path this change delivers.
+
+    A path is delivered when it is committed against the baseline -- the
+    revision the matrix and the log both cite as the state before this
+    remediation -- or when it is staged in the index, which is what a
+    commit is assembled from.
+
+    A path git does not track is not delivered. It is scratch until it is
+    added, and adding it is what brings it into this set, so a validation
+    byproduct sitting in a working tree neither has to be named in the
+    matrix nor makes this case unrunnable locally. The byproduct filter
+    below still applies, and covers a tracked path whose content is a
+    validation artefact.
     """
     if not (REPO_ROOT / ".git").exists():
         pytest.skip("not a git checkout")
@@ -695,8 +747,9 @@ def _delivered_paths():
             paths.add(line.split("\t")[-1])
     for line in git("status", "--porcelain").split("\n"):
         line = line.rstrip("\r")
-        if line.strip():
-            paths.add(line[3:])
+        if not line.strip() or line[:2] == UNTRACKED_STATUS:
+            continue
+        paths.add(_status_path(line))
 
     return {
         path
@@ -732,7 +785,13 @@ def test_every_delivered_path_is_reachable_from_the_file_side():
     reverse = set(_matrix_reverse_index())
     missing = sorted(p for p in _delivered_paths() if p not in reverse)
 
-    assert missing == [], "not indexed: " + ", ".join(missing)
+    assert missing == [], (
+        "these paths are committed or staged and the reverse index of "
+        "%s carries no row for them: %s. Add a row for each path the "
+        "change delivers; a path that is only a validation byproduct "
+        "should be left untracked or removed instead."
+        % (TRACEABILITY_MATRIX.name, ", ".join(missing))
+    )
 
 
 def test_the_reverse_index_carries_no_duplicate_row():
@@ -1599,6 +1658,69 @@ def test_the_deck_is_a_single_self_contained_file():
 
     assert "<html" in text and "</html>" in text
     assert local == [], local
+
+
+def test_the_documented_start_command_leaves_the_client_address_alone():
+    """The command an operator pastes carries the forwarded-header flag.
+
+    Without it the ASGI server replaces the address the connection was
+    made from with whatever an inbound ``X-Forwarded-For`` header claims,
+    for any connection arriving from an address it trusts, so a caller
+    varying that header is counted as a new client on every request and no
+    per-caller rate limit engages. The container image and the deployment
+    carry the same flag, which
+    ``test_delivery_pipeline.py`` asserts.
+    """
+    block = _block_containing(README, ASGI_APP_MARKER)
+
+    assert NO_PROXY_HEADERS_FLAG in block.split()
+
+
+@pytest.mark.parametrize(
+    "path", [README, ENVIRONMENT_TEMPLATE], ids=lambda path: path.name
+)
+def test_each_document_pairs_the_flag_with_the_hop_setting(path):
+    """Both places the hop setting is read name what puts it in force.
+
+    An operator setting a hop count on a server started without the flag
+    is changing a value the server has already decided for them.
+    """
+    flat = _flattened(path)
+
+    assert NO_PROXY_HEADERS_FLAG in flat, path.name
+    assert HOP_SETTING in flat, path.name
+    assert FORWARDED_ALLOW_FLAG in flat, path.name
+
+
+def test_the_readme_row_for_the_hop_setting_names_the_flag():
+    """The pairing is stated in the setting's own row, not elsewhere."""
+    rows = [
+        line
+        for line in _text(README).split("\n")
+        if line.startswith("|") and HOP_SETTING in line
+    ]
+
+    assert len(rows) == 1, len(rows)
+    assert NO_PROXY_HEADERS_FLAG in rows[0]
+    assert FORWARDED_ALLOW_FLAG in rows[0]
+
+
+def test_the_template_block_for_the_hop_setting_names_the_flag():
+    """The same holds where an operator writes the value."""
+    lines = _text(ENVIRONMENT_TEMPLATE).split("\n")
+    index = next(
+        position
+        for position, line in enumerate(lines)
+        if line.startswith(HOP_SETTING + "=")
+    )
+    block = []
+    while index > 0 and lines[index - 1].startswith("#"):
+        index -= 1
+        block.append(lines[index])
+    commentary = " ".join(" ".join(reversed(block)).split())
+
+    assert NO_PROXY_HEADERS_FLAG in commentary
+    assert FORWARDED_ALLOW_FLAG in commentary
 
 
 def test_this_module_reads_every_document_it_claims_to():

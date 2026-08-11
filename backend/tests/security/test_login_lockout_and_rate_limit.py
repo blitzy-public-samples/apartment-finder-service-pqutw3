@@ -13,9 +13,11 @@ from backend.app.core.config import settings
 from backend.app.core.logging import BASE_LOGGER_NAME, configure_logging
 from backend.app.db.database import get_db
 from backend.app.db.models import User
+from backend.app.core.rate_limit import RETRY_AFTER_HEADER
 from backend.app.main import (
     INVALID_REQUEST_DETAIL,
     REQUEST_ID_HEADER,
+    RETRY_AFTER_FIELD,
     TOO_MANY_REQUESTS_DETAIL,
     TRACEPARENT_HEADER,
     app,
@@ -153,8 +155,17 @@ def _invalid_credentials_body():
     return {"detail": auth_module.INVALID_CREDENTIALS_DETAIL}
 
 
-def _throttled_body():
-    return {"detail": TOO_MANY_REQUESTS_DETAIL}
+def _throttled_body(response):
+    """Returns the exact body a throttled ``response`` must carry.
+
+    The wait is read back out of the response's own ``Retry-After``
+    header, so an equality check against this dict also establishes that
+    the header and the body name the same number of seconds.
+    """
+    return {
+        "detail": TOO_MANY_REQUESTS_DETAIL,
+        RETRY_AFTER_FIELD: int(response.headers[RETRY_AFTER_HEADER]),
+    }
 
 
 @contextmanager
@@ -422,7 +433,7 @@ def test_login_beyond_the_configured_rate_is_throttled(
     )
 
     assert throttled.status_code == 429
-    assert throttled.json() == {"detail": TOO_MANY_REQUESTS_DETAIL}
+    assert throttled.json() == _throttled_body(throttled)
 
 
 def test_registration_beyond_the_configured_rate_is_throttled(client):
@@ -444,7 +455,7 @@ def test_registration_beyond_the_configured_rate_is_throttled(client):
     )
 
     assert throttled.status_code == 429
-    assert throttled.json() == {"detail": TOO_MANY_REQUESTS_DETAIL}
+    assert throttled.json() == _throttled_body(throttled)
 
 
 def test_a_throttled_login_never_reaches_the_account(
@@ -465,7 +476,7 @@ def test_a_throttled_login_never_reaches_the_account(
         )
 
     assert throttled.status_code == 429
-    assert throttled.json() == _throttled_body()
+    assert throttled.json() == _throttled_body(throttled)
     assert "access_token" not in throttled.json()
     assert _touching_accounts(statements) == []
     assert statements == []
@@ -513,7 +524,7 @@ def test_the_throttle_and_the_lock_are_told_apart(
         )
 
     assert throttled.status_code == 429
-    assert throttled.json() == _throttled_body()
+    assert throttled.json() == _throttled_body(throttled)
     assert _touching_accounts(throttled_statements) == []
     assert record["checks"][spent:] == []
     assert throttled.status_code != locked.status_code

@@ -187,11 +187,11 @@ jobs:
         set -euo pipefail
 
         cd backend
-        # The head reverses on its own, the rest of the chain unwinds to
-        # base, and the whole chain re-applies. Targeting base rather than
-        # counting steps keeps this correct as revisions are added; that
-        # every single revision reverses independently is asserted by
-        # backend/tests/security/test_migration_gate.py.
+        # Every revision must apply, reverse one step at a time to the base
+        # and reapply, which is what makes the schema change reversible from
+        # the code. Reaching the base is read back from the database below
+        # rather than assumed; that each revision reverses independently is
+        # asserted by backend/tests/security/test_migration_gate.py.
         alembic upgrade head
         alembic current
 
@@ -406,7 +406,8 @@ jobs:
       run: |
         set -euo pipefail
 
-        python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 &
+        python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 \
+          --no-proxy-headers &
         server=$!
         trap 'kill "$server" 2>/dev/null || true' EXIT
 
@@ -612,7 +613,7 @@ jobs:
       run: |
         set -euo pipefail
         nohup python -m uvicorn backend.app.main:app \
-          --host 127.0.0.1 --port 8000 > uvicorn.log 2>&1 &
+          --host 127.0.0.1 --port 8000 --no-proxy-headers > uvicorn.log 2>&1 &
         echo "$!" > uvicorn.pid
         for attempt in $(seq 1 30); do
           if curl --fail --silent "$BASE_URL/health" > /dev/null; then

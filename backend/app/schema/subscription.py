@@ -22,7 +22,8 @@ class Subscription(BaseModel):
     contract.
 
     The hosted-checkout address is not declared here. It is carried by
-    :class:`SubscriptionCreated`, the response that opens a subscription.
+    the response that opens a subscription, which adds that one field to
+    the fields declared here.
     """
 
     id: int
@@ -60,8 +61,9 @@ class SubscriptionCreate(BaseModel):
 class SubscriptionCreated(Subscription):
     """Response contract for a newly opened subscription.
 
-    Carries every field of :class:`Subscription` and adds the hosted
-    PayPal redirect the payer visits to approve the order. The row is
+    Carries every field of the stored subscription projection and adds
+    the hosted PayPal redirect the payer visits to approve the order.
+    ``approval_url`` is the only field this response adds. The row is
     created with the pending status and carries no entitlement until the
     approved order has been captured and reconciled.
 

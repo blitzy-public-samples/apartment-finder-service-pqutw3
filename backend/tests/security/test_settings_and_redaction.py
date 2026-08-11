@@ -2220,3 +2220,101 @@ class TestTraceContextCorrelation:
 
         assert app_logging.TRACE_ID_FIELD not in context
         assert app_logging.SPAN_ID_FIELD not in context
+
+
+class TestMappingValuesCarryingNoQuotes:
+    """A credential mapped to an unquoted value is still replaced.
+
+    A serialised mapping does not have to quote its value: a number, a
+    boolean and a null are all written bare, and so is a token in prose
+    that was assembled by hand rather than by a JSON writer. The rule that
+    covers the quoted form and the rule that covers the bare one are
+    separate branches, and each case below drives one of them and reads
+    the substituted text back rather than only asserting the credential is
+    gone -- so a case cannot pass because some other rule happened to
+    catch the same value.
+    """
+
+    def test_an_unquoted_value_is_replaced(self):
+        rendered = redact('{"api_key": %s}' % SENTINEL)
+
+        assert rendered == '{"api_key": %s}' % REDACTION_PLACEHOLDER
+        assert SENTINEL not in rendered
+
+    def test_an_unquoted_value_with_no_separating_space_is_replaced(self):
+        rendered = redact('{"client_secret":%s}' % SENTINEL)
+
+        assert rendered == '{"client_secret":%s}' % REDACTION_PLACEHOLDER
+
+    def test_an_unquoted_value_that_names_no_credential_is_replaced(self):
+        """A key that spells a stem is enough; the value need not look it."""
+        rendered = redact('{"password": null}')
+
+        assert rendered == '{"password": %s}' % REDACTION_PLACEHOLDER
+
+    def test_an_already_replaced_unquoted_value_is_left_alone(self):
+        """A second pass over redacted text changes nothing."""
+        once = '{"api_key": %s}' % REDACTION_PLACEHOLDER
+
+        assert redact(once) == once
+
+    def test_a_skipped_unquoted_value_is_emitted_unchanged(
+        self, monkeypatch
+    ):
+        """The skip set governs the unquoted branch as well.
+
+        The shipped placeholder is bracketed and an unquoted value stops
+        at a bracket, so the substituted text can never re-enter this
+        branch while that is the placeholder. The guard against it is
+        driven here through the module's own skip set, which is the value
+        the branch consults, so the branch is exercised rather than
+        assumed and stays correct if either the placeholder or the value
+        alphabet changes.
+        """
+        monkeypatch.setattr(
+            app_logging,
+            "_SKIP_VALUES",
+            frozenset(set(app_logging._SKIP_VALUES) | {"keepme"}),
+        )
+        skipped = '{"api_key": keepme}'
+
+        assert redact(skipped) == skipped
+        assert redact('{"api_key": %s}' % SENTINEL) == (
+            '{"api_key": %s}' % REDACTION_PLACEHOLDER
+        )
+
+    def test_an_unquoted_value_under_an_ordinary_key_is_left_alone(self):
+        """Only a key spelling a credential stem selects the value."""
+        ordinary = '{"listing_id": 4210}'
+
+        assert redact(ordinary) == ordinary
+
+
+class TestTheBaseLoggerIsReachable:
+    """Every route through the accessor lands inside the governed tree.
+
+    A caller passes ``__name__``, and three callers pass nothing usable:
+    no name at all, the base name itself, and a name that normalises away
+    to nothing. Each has to resolve to the base logger rather than to the
+    root logger, because the root logger carries no redacting handler and
+    a record emitted there would leave the governed tree entirely.
+    """
+
+    def test_omitting_the_name_returns_the_base_logger(self):
+        assert get_logger().name == BASE_LOGGER_NAME
+
+    def test_the_empty_name_returns_the_base_logger(self):
+        assert get_logger("").name == BASE_LOGGER_NAME
+
+    def test_the_base_name_itself_returns_the_base_logger(self):
+        assert get_logger(BASE_LOGGER_NAME).name == BASE_LOGGER_NAME
+
+    def test_a_name_that_normalises_away_returns_the_base_logger(self):
+        assert get_logger(" . ").name == BASE_LOGGER_NAME
+
+    def test_the_base_logger_carries_the_redacting_handler(self):
+        """The accessor's fallback is a governed logger, not the root."""
+        base = get_logger()
+
+        assert HANDLER_NAME in [handler.name for handler in base.handlers]
+        assert base.name != logging.getLogger().name

@@ -27,6 +27,16 @@ What is asserted:
   committed inventory, and the containers it exempts from naming the
   published rate-limit store are exactly the ones the manifests declare
   without it
+* every secret-delivery class names the workloads that mount it and every
+  workload names the class it mounts. The secret boundary is the property a
+  reviewer audits from these comments, and a comment naming the wrong
+  workload or the wrong class describes a boundary the manifests do not
+  implement -- which is the failure this pair of cases was written for
+* every invocation of the application -- the container image's command, the
+  deployment's command and both continuous-integration invocations --
+  starts the ASGI server with forwarded-header handling disabled, so the
+  address a rate limit is counted against is the address the connection was
+  made from and ``TRUSTED_PROXY_HOPS`` is the only setting that changes it
 
 The application is the authority for what a rate-limit store must be:
 :mod:`backend.app.core.config` refuses every in-process scheme under any
@@ -346,6 +356,38 @@ EXPECTED_DOCKERFILES = {
     "frontend": "infrastructure/docker/Dockerfile.frontend",
 }
 
+#: Program every invocation of this application runs.
+ASGI_SERVER = "uvicorn"
+
+#: Text identifying an invocation of this application's own ASGI app,
+#: rather than of the server in prose or of another application.
+ASGI_APP_MARKER = "uvicorn backend.app.main:app"
+
+#: Flag that leaves the peer address of the connection in the ASGI scope.
+#: Without it the server overwrites it from ``X-Forwarded-For`` for any
+#: connection arriving from an address it trusts, which is loopback by
+#: default, so a caller varying that header is counted as a new client on
+#: every request and no per-caller rate limit engages.
+NO_PROXY_HEADERS_FLAG = "--no-proxy-headers"
+
+#: Flag forms that put the forwarded header back in force: the first
+#: enables the handling outright, the second re-enables it for the
+#: addresses it names.
+PROXY_TRUST_FLAGS = ("--proxy-headers", "--forwarded-allow-ips")
+
+#: Files that start the application, and the fewest invocations each
+#: carries. The documented local command is asserted by
+#: ``test_operator_documentation.py``, which owns the README.
+ASGI_INVOCATION_SOURCES = {
+    "infrastructure/docker/Dockerfile.backend": 1,
+    "infrastructure/kubernetes/40-backend.yaml": 1,
+    ".github/workflows/ci.yml": 2,
+}
+
+#: Characters that make a Dockerfile exec-form command a JSON array, which
+#: are replaced with spaces so the command reads as a command line.
+JSON_ARRAY_CHARACTERS = re.compile(r"[\"\[\],]")
+
 #: Flag every ``kubectl`` call that reaches the API server carries, so a
 #: call that does not answer ends its step rather than holding the job.
 KUBECTL_DEADLINE_FLAG = "--request-timeout"
@@ -582,6 +624,59 @@ def _raw_text(name):
     return (MANIFEST_DIR / name).read_text(encoding="utf-8")
 
 
+def _comments(name):
+    """Returns one manifest's comment lines as a single flowed string.
+
+    A comment is hard-wrapped, so a citation can straddle a line break;
+    joining the lines lets a name be matched whole.
+    """
+    return " ".join(
+        line.lstrip().lstrip("#").strip()
+        for line in _raw_text(name).splitlines()
+        if line.lstrip().startswith("#")
+    )
+
+
+def _sentences(flowed):
+    """Returns one flowed comment split into sentences.
+
+    The split is a period followed by whitespace, which leaves a filename's
+    own dot alone -- ``30-backend-secrets.yaml`` is one token here, and a
+    citation that landed in two halves could not be found.
+    """
+    return [part for part in re.split(r"\.\s+", flowed) if part]
+
+
+def _declared_provider_classes():
+    """Returns ``{class name: manifest}`` for every delivery class."""
+    declared = {}
+    for path in sorted(MANIFEST_DIR.glob("*.yaml")):
+        for document in _manifest(path.name):
+            if document["kind"] == "SecretProviderClass":
+                declared[document["metadata"]["name"]] = path.name
+    return declared
+
+
+def _mounted_provider_classes():
+    """Returns ``{manifest: {class name}}`` for every workload that mounts."""
+    mounted = {}
+    for name in sorted(WORKLOAD_CONTAINERS):
+        for document in _manifest(name):
+            if "kind" not in document:
+                continue
+            try:
+                pod = _pod_spec(document)
+            except KeyError:
+                continue
+            for volume in pod.get("volumes") or []:
+                if "csi" not in volume:
+                    continue
+                mounted.setdefault(name, set()).add(
+                    volume["csi"]["volumeAttributes"]["secretProviderClass"]
+                )
+    return mounted
+
+
 def _manifest_gate():
     """Returns the settings-contract gate, loaded from its path.
 
@@ -628,6 +723,32 @@ def _workflow_commands(path, program):
         for command in _logical_commands(script, program):
             commands.append((step, command))
     return commands
+
+
+def _asgi_invocations(relative_path):
+    """Returns every start command ``relative_path`` carries.
+
+    A Dockerfile carries its command as a JSON array, so the array's
+    punctuation is replaced with spaces before the line is read as a
+    command line. Continuations are joined by :func:`_logical_commands`.
+    """
+    text = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    if "Dockerfile" in relative_path:
+        text = JSON_ARRAY_CHARACTERS.sub(" ", text)
+    return [
+        command
+        for command in _logical_commands(text, ASGI_SERVER)
+        if ASGI_APP_MARKER in command
+    ]
+
+
+def _every_asgi_invocation():
+    """Returns every start command, paired with the file carrying it."""
+    return [
+        (path, command)
+        for path in sorted(ASGI_INVOCATION_SOURCES)
+        for command in _asgi_invocations(path)
+    ]
 
 
 def _is_bounded_kubectl(command):
@@ -1473,6 +1594,79 @@ def test_the_migration_runs_under_its_own_narrow_identity():
     assert pod["serviceAccountName"] != serving["serviceAccountName"]
 
 
+def test_each_delivery_class_names_the_workloads_that_mount_it():
+    """Asserts the secret boundary a comment describes is the applied one.
+
+    A reviewer establishes which identity may read which credential from the
+    class that carries them, so that comment is the boundary as documented
+    and the volumes are the boundary as applied. When the two disagree, the
+    documented one is what gets believed: the six-secret class named the
+    migration Job and the administrator-credential Job among its readers and
+    said no narrower class was declared, while both pods mount classes of
+    their own -- so the comment described an identity holding six
+    credentials where the manifests grant it one, and the workload that does
+    mount all six went unnamed.
+
+    Two directions are asserted. Every workload that mounts the class is
+    named by the manifest declaring it, and any other workload named there
+    in a sentence about mounting is named beside the class it does mount --
+    which admits both the cross-reference a reader needs and a sequencing
+    note, while refusing a bare attribution. The comparison is by manifest
+    filename rather than by prose label, because a filename is what a reader
+    follows and what this case can resolve; a class declared and mounted in
+    one file cites no other for itself.
+    """
+    declared = _declared_provider_classes()
+    mounted = _mounted_provider_classes()
+    assert declared, "no delivery class is declared"
+
+    for klass, source in sorted(declared.items()):
+        mounting = sorted(
+            name for name, classes in mounted.items() if klass in classes
+        )
+        assert mounting, (klass, source)
+        cited = _comments(source)
+        for name in mounting:
+            assert name == source or name in cited, (klass, source, name)
+        for name in sorted(set(mounted) - set(mounting)):
+            for sentence in _sentences(cited):
+                if name not in sentence or "mount" not in sentence:
+                    continue
+                assert any(
+                    other in sentence for other in mounted[name]
+                ), (klass, source, name, sentence)
+
+
+def test_each_workload_cites_the_file_declaring_the_class_it_mounts():
+    """Asserts a workload's own comment names the delivery it applies.
+
+    The migration Job attributed its mount to the six-secret manifest while
+    its volume named the one-secret class, so a reader following the
+    citation arrived at the wider class and read the pod as holding every
+    credential. Every manifest declaring a class is a candidate citation:
+    the one a workload cites for its own mount has to be the one it mounts,
+    and another may be named only in contrast to it.
+    """
+    declared = _declared_provider_classes()
+    sources = set(declared.values())
+    mounted = _mounted_provider_classes()
+    assert mounted, "no workload mounts a delivery class"
+
+    for name, classes in sorted(mounted.items()):
+        cited = _comments(name)
+        expected = {declared[klass] for klass in classes}
+        for source in sorted(sources):
+            if source == name:
+                continue
+            if source in expected:
+                assert source in cited, (name, source)
+                continue
+            for occurrence in re.finditer(re.escape(source), cited):
+                preceding = cited[max(0, occurrence.start() - 80):
+                                  occurrence.start()]
+                assert "rather than" in preceding, (name, source, preceding)
+
+
 @pytest.mark.parametrize("token", sorted(DERIVED_JOB_NAMES))
 def test_each_one_shot_job_is_named_by_the_renderer(token):
     """Asserts one derivation names the object and every command on it.
@@ -2113,3 +2307,42 @@ def test_every_frozen_runtime_pin_is_still_in_place(path):
     text = (REPO_ROOT / path).read_text(encoding="utf-8")
 
     assert FROZEN_RUNTIME_PINS[path] in text
+
+
+@pytest.mark.parametrize(
+    "path,minimum", sorted(ASGI_INVOCATION_SOURCES.items())
+)
+def test_each_start_command_source_carries_what_is_recorded_for_it(
+    path, minimum
+):
+    """Asserts the invocations are found before they are asserted on.
+
+    A reader of the command form that stopped matching would leave every
+    case below asserting over an empty set and reporting success.
+    """
+    assert len(_asgi_invocations(path)) >= minimum, path
+
+
+@pytest.mark.parametrize("path,command", _every_asgi_invocation())
+def test_every_start_command_leaves_the_client_address_alone(
+    path, command
+):
+    """Asserts the server does not resolve the client address itself.
+
+    The address a request is counted against is read from the ASGI scope
+    by ``backend.app.core.rate_limit.client_address``, which at the
+    shipped ``TRUSTED_PROXY_HOPS`` of zero uses the address the
+    connection was made from. The server overwrites that value from
+    ``X-Forwarded-For`` unless this flag is present, and a caller varying
+    the header is then a new client on every request.
+    """
+    assert NO_PROXY_HEADERS_FLAG in command.split(), (path, command)
+
+
+@pytest.mark.parametrize("path,command", _every_asgi_invocation())
+def test_no_start_command_restores_forwarded_header_trust(path, command):
+    """Asserts neither enabling form appears beside the flag."""
+    tokens = command.split()
+
+    for flag in PROXY_TRUST_FLAGS:
+        assert flag not in tokens, (path, command, flag)

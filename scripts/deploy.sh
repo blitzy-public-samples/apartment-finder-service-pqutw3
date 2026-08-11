@@ -86,25 +86,48 @@ readonly RATE_LIMIT_SETTING="RATE_LIMIT_STORAGE_URI"
 readonly RATE_LIMIT_STORE_SECRET="backend-rate-limit-store"
 
 # Manifest tokens the operator supplies rather than this script deriving
-# them. Each is re-exported so a value set in the caller's shell without
-# `export` still reaches the renderer. The renderer owns the required-token
-# list and names any that is absent, so this script does not restate it.
-readonly OPERATOR_RENDER_TOKENS=(
-    "BACKEND_ENVIRONMENT"
+# them, split by whether the renderer carries a default for the token. The
+# renderer remains the authority for which tokens a manifest requires --
+# assert_manifest_tokens below asks it rather than restating its list -- and
+# these arrays exist so that every operator value is re-exported, so a value
+# set in the caller's shell without `export` still reaches it, and so the
+# usage text is printed from the same names the release reads.
+#
+# The renderer defaults nothing here, so each one must carry a value:
+readonly REQUIRED_RENDER_TOKENS=(
     "BACKEND_ALLOWED_ORIGINS"
     "BACKEND_ALLOWED_HOSTS"
+    "BACKEND_GCP_SERVICE_ACCOUNT_EMAIL"
     "PAYPAL_CLIENT_ID"
-    "PAYPAL_MODE"
-    "PAYPAL_API_BASE"
     "PAYPAL_RETURN_URL"
     "PAYPAL_CANCEL_URL"
     "ZILLOW_API_URL"
     "FROM_EMAIL"
+)
+
+# Required only while PROVISION_ADMIN_CREDENTIAL is "true", because the only
+# manifest carrying it is the administrator-credential Job, which no release
+# renders otherwise:
+readonly ADMIN_CREDENTIAL_RENDER_TOKENS=(
+    "ADMIN_PROVISIONER_GCP_SERVICE_ACCOUNT_EMAIL"
+)
+
+# Accepted, and defaulted by the renderer when absent:
+readonly DEFAULTED_RENDER_TOKENS=(
+    "BACKEND_ENVIRONMENT"
+    "PAYPAL_MODE"
+    "PAYPAL_API_BASE"
     "BACKEND_SERVICE_ACCOUNT"
     "FRONTEND_SERVICE_ACCOUNT"
     "MIGRATION_SERVICE_ACCOUNT"
     "MIGRATION_SERVICE_ACCOUNT_ID"
     "ADMIN_PROVISIONER_SERVICE_ACCOUNT"
+)
+
+readonly OPERATOR_RENDER_TOKENS=(
+    "${REQUIRED_RENDER_TOKENS[@]}"
+    "${ADMIN_CREDENTIAL_RENDER_TOKENS[@]}"
+    "${DEFAULTED_RENDER_TOKENS[@]}"
 )
 
 # Local port the readiness probe forwards to, and the bounds every probe
@@ -160,6 +183,14 @@ FUNCTION_SOURCE=""
 # Kubeconfig this run writes its one context into, removed by cleanup.
 KUBECONFIG_FILE=""
 
+# Process identifier of the readiness probe's port forward, set by
+# probe_health and closed by cleanup. It is declared at this scope, and not
+# inside probe_health, because the EXIT trap runs after that function has
+# returned: a value local to it would be out of scope by then, and reading an
+# unset name under `set -u` would abort the trap and leave the kubeconfig on
+# disk.
+HEALTH_FORWARD_PID=""
+
 # Digest-pinned image published per workload.
 declare -A PUBLISHED_IMAGE=()
 
@@ -188,6 +219,34 @@ Required:
                    names one PayPal application on both sides. The PayPal
                    secret is never a build argument.
 
+USAGE
+
+    # Printed from the arrays the release itself reads, so this contract
+    # cannot fall behind the values that are validated. The three lists
+    # below are the manifest tokens; every other input is prose above and
+    # below, because each one carries its own explanation.
+    printf '\n%s\n' "Required, and read when the manifests are rendered:"
+    printf '  %s\n' "${REQUIRED_RENDER_TOKENS[@]}"
+    printf '%s\n' \
+        "                   Every one is refused empty, before any" \
+        "                   credential is acquired. PAYPAL_CLIENT_ID is" \
+        "                   the same value as the build argument above."
+
+    printf '\n%s\n' \
+        "Required only when PROVISION_ADMIN_CREDENTIAL is \"true\":"
+    printf '  %s\n' "${ADMIN_CREDENTIAL_RENDER_TOKENS[@]}"
+    printf '%s\n' \
+        "                   The Google identity the administrator" \
+        "                   credential Job runs as."
+
+    printf '\n%s\n' "Accepted, each defaulted by the manifest renderer:"
+    printf '  %s\n' "${DEFAULTED_RENDER_TOKENS[@]}"
+    printf '%s\n' \
+        "                   scripts/render_kubernetes_manifests.sh" \
+        "                   records the default each one takes."
+
+    cat <<'USAGE'
+
 Optional:
   ARTIFACT_REGISTRY_REPOSITORY   Artifact Registry Docker repository the
                                  images are published to.
@@ -196,6 +255,10 @@ Optional:
                                  "true" runs the Cloud Function step.
                                  Default: false, which reports the step
                                  as blocked and performs it not at all.
+  PROVISION_ADMIN_CREDENTIAL     "true" applies the administrator
+                                 credential Job. Default: false.
+  ADMIN_CREDENTIAL_RESET         "true" replaces a credential already in
+                                 place. Default: false.
 
 Required only when CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED is "true", and
 read from the Terraform outputs of the same names:
@@ -218,7 +281,24 @@ report_failure() {
     echo "Nothing after that line ran." >&2
 }
 
+# The one EXIT handler this script installs. It closes the readiness
+# probe's port forward if one was started and removes the private
+# kubeconfig, so both happen on every exit path -- success, failure and
+# interruption alike. No other function replaces it: a second definition
+# would take effect globally and silently drop whichever teardown the
+# first one owned.
 cleanup() {
+    # shellcheck disable=SC2317
+    if [ -n "${HEALTH_FORWARD_PID}" ]; then
+        # shellcheck disable=SC2317
+        if kill "${HEALTH_FORWARD_PID}" 2>/dev/null; then
+            # shellcheck disable=SC2317
+            echo "closed the port forward"
+        fi
+        # shellcheck disable=SC2317
+        HEALTH_FORWARD_PID=""
+    fi
+
     # shellcheck disable=SC2317
     if [ -n "${KUBECONFIG_FILE}" ] && [ -e "${KUBECONFIG_FILE}" ]; then
         # shellcheck disable=SC2317
@@ -417,6 +497,47 @@ export_render_tokens() {
     else
         export FRONTEND_IMAGE="${IMAGE_PREFIX}/frontend:${VERSION}"
     fi
+}
+
+# Refuse a release whose manifests cannot be rendered, before it acquires a
+# credential or changes anything. Every value a manifest carries is resolved
+# here: the names below are checked directly so that all of the missing ones
+# are reported at once, and then every selected group is rendered and
+# discarded, which asks the renderer -- the authority for the required set --
+# about the tokens this script does not name, including the ones it derives.
+assert_manifest_tokens() {
+    echo "Checking the manifest values..."
+
+    local token
+    local missing=""
+    local -a required=("${REQUIRED_RENDER_TOKENS[@]}")
+
+    if [ "${PROVISION_ADMIN_CREDENTIAL:-false}" = "true" ]; then
+        required+=("${ADMIN_CREDENTIAL_RENDER_TOKENS[@]}")
+    fi
+
+    for token in "${required[@]}"; do
+        if [ -z "${!token-}" ]; then
+            missing="${missing} ${token}"
+        fi
+    done
+
+    if [ -n "${missing}" ]; then
+        echo "Required manifest value(s) not set:${missing}." >&2
+        echo "The manifest renderer defaults none of them, and a release" \
+            "that reached the cluster without them would fail after" \
+            "acquiring credentials. Run ${BASH_SOURCE[0]} --help for every" \
+            "input." >&2
+        exit 1
+    fi
+
+    "${RENDER}" all > /dev/null
+
+    if [ "${PROVISION_ADMIN_CREDENTIAL:-false}" = "true" ]; then
+        "${RENDER}" admin-credential > /dev/null
+    fi
+
+    echo "Every manifest this release applies renders."
 }
 
 acquire_cluster_credentials() {
@@ -982,17 +1103,13 @@ probe_endpoint() {
 }
 
 probe_health() {
-    local forward_pid
-
     kubectl --namespace="${K8S_NAMESPACE}" port-forward deployment/backend \
         "${HEALTH_PORT}:8000" &
-    forward_pid=$!
-    cleanup() {
-        if kill "${forward_pid}" 2>/dev/null; then
-            echo "closed the port forward"
-        fi
-    }
-    trap cleanup EXIT
+
+    # Recorded at script scope so the single EXIT trap installed above
+    # closes the forward, and closes it whether the probes below succeed,
+    # fail or are interrupted.
+    HEALTH_FORWARD_PID=$!
 
     sleep 5
 
@@ -1009,6 +1126,7 @@ main() {
     check_tools
     read_inputs
     build_references
+    assert_manifest_tokens
     acquire_cluster_credentials
     apply_prerequisites
     publish_rate_limit_store_address

@@ -63,41 +63,32 @@ Those two facts are why this runbook is staged rather than linear, and why the
 
 ### 1.2 Every previously exposed credential is already compromised
 
-This runbook covers two different kinds of work, and conflating them leads an operator
-to look for an exposure that never happened, or to skip a step that matters:
+This runbook covers three kinds of work, and conflating them leads an operator to look
+for an exposure that never happened, or to skip a step that matters. The dividing
+question is **where each value was disclosed**, not whether it was committed: one of the
+four exposed credentials never entered the repository at all.
 
-| | Previously exposed credentials | New credential to provision |
-|---|---|---|
-| Which | Sections [3.1](#31-database-credentials), [3.2](#32-google-cloud-service-account-key) and [3.3](#33-jwt-signing-key) | Section [3.4](#35-paypal-webhook-identifier-first-time-provisioning-not-rotation) |
-| Was the value ever committed? | Yes | **No** |
-| Why it is here | Incident response for a value in this repository's history | It is required by the remediation, must be created by an operator, and belongs in the same change window |
-| Steps 1 and 3 apply? | Yes | Not on first provisioning &mdash; there is nothing to revoke and nothing in history to remove |
-
-**For the three previously exposed credentials, do not reason about whether the values
-leaked. Assume they did, and act accordingly.** The paragraphs below concern those
-three.
-
-The webhook identifier is different and is stated as such where it appears: it is new
-configuration rather than an exposure, so Section 3.4 is a provisioning procedure that
-follows the same four headings for consistency and says explicitly which of them are
-inapplicable. If you are re-issuing a webhook identifier that has already been in use,
-all four apply again.
-
-**Three credentials were exposed** — the database credentials, the Google Cloud
-service-account key and the JWT signing key. For these, do not reason about
-whether the value leaked. Assume it did, and act accordingly.
-
-**This runbook covers two categories of credential, and only the first is
-compromised.** Keeping them apart matters operationally, because the two require
-different work and conflating them makes an operator do the wrong thing for one of
-them.
-
-| Category | Which credentials | Status | What the runbook asks for |
+| | Committed and exposed | Exposed through logs only | New, and never exposed |
 |---|---|---|---|
-| **Exposed — treat as compromised** | The database connection string and the cloud service-account key that the orchestration definition committed, and the signing key wherever the developer setup script's placeholder was ever used | Present in Git history. Assume disclosed | The full four-step sequence in order: revoke, rotate, delete from history, review prior access |
-| **New configuration — never exposed** | The PayPal webhook identifier | Introduced by this remediation. It was never committed and has no history to delete from | Provision it, in the same change window, because the webhook verifier cannot function without it. Its own steps at [Section 3.5](#35-paypal-webhook-identifier-first-time-provisioning-not-rotation) already say so: step 1 is skipped on first provisioning and step 3 records that there is nothing to remove |
+| Which | Sections [3.1](#31-database-credentials), [3.2](#32-google-cloud-service-account-key) and [3.3](#33-jwt-signing-key) | Section [3.4](#34-listing-provider-zillow-api-key) | Sections [3.5](#35-paypal-webhook-identifier-first-time-provisioning-not-rotation), [3.6](#36-seeded-administrator-credential) and [3.7](#37-shared-rate-limit-store-address) |
+| Was the value ever committed? | Yes | **No** — it travelled in URL query strings and was printed to standard output | **No** |
+| Why it is here | Incident response for a value in this repository's history | Incident response for a value in the log estate | It is required by the remediation, must be created by an operator, and belongs in the same change window |
+| Steps 1 and 3 apply? | Yes | Step 1 yes. Step 3 acts on the log estate rather than on Git history | Not on first provisioning — there is nothing to revoke and nothing in history to remove |
 
-For the exposed category, the reasoning is the reason this runbook exists. The
+**Four credentials were exposed** — the database credentials, the Google Cloud
+service-account key, the JWT signing key and the listing-provider (Zillow) API key. For
+all four, do not reason about whether the value leaked. Assume it did, and act
+accordingly. [Section 3](#3-credentials-in-scope) is the authority for that list, and
+[`../../SECURITY.md`](../../SECURITY.md) states the same four.
+
+**The first two columns differ operationally, not cosmetically.** A history rewrite
+addresses the three committed values and does nothing for the fourth, whose disclosure
+sits in logs rather than in Git. Its step 3 acts on the log estate enumerated in
+[Section 3.4](#34-listing-provider-zillow-api-key), and
+[Section 4.7](#47-confirm-the-listing-provider-key-has-left-urls-and-logs) is where that
+is verified.
+
+For every exposed credential, the reasoning is the reason this runbook exists. The
 remediation removed those values from the working tree. **That is not the same as
 removing them from the repository.** Git history is permanent: the values remain in
 every commit that ever carried them, and every clone anyone has ever taken carries
@@ -107,21 +98,20 @@ holding a clone, a fork, a mirror, a backup or a CI cache.
 Removal stops *future* exposure. Only revocation and rotation address the exposure
 that has already happened.
 
-For the new-configuration category none of that applies, and saying otherwise would
-send an operator looking for history that does not exist. It appears in this runbook
-for a different reason: it is a secret that an operator must provision by hand in the
-same window, and no code change can produce it.
+**Three secrets are new and were never exposed:** the PayPal webhook identifier, the
+seeded administrator credential and the shared rate-limit store address. Each is a
+secret in its own right, and each belongs in this runbook because an operator has to
+create it and no code change can. None is compromised, none has anything to revoke on
+first provisioning, and none has history to remove from — claiming otherwise would
+send an operator looking for history that does not exist. All three are provisioned in
+Stage A, and each is rotated later only if it is itself suspected of having leaked. Each
+of those sections follows the same four headings for consistency and says explicitly
+which of them are inapplicable; if you are re-issuing a value that has already been in
+use, all four apply again.
 
-**One credential is new and was never exposed:** the PayPal webhook identifier. It
-is a secret in its own right and it belongs in this runbook because an operator has
-to create it and no code change can, but it is **not compromised**, there is
-nothing to revoke on first provisioning, and nothing to remove from history. It is
-provisioned in Stage A, and only ever rotated later if it is itself suspected of
-having leaked.
-
-Do not apply compromise language to the webhook identifier, and do not apply
-"provision it" language to the three exposed credentials — those already exist and
-must be **replaced**, which is a different action with a different risk.
+Do not apply compromise language to those three, and do not apply "provision it"
+language to the four exposed credentials — those already exist and must be
+**replaced**, which is a different action with a different risk.
 
 ### 1.3 Three kinds of service impact, defined once
 
@@ -169,7 +159,7 @@ B and C is a change window rather than a step.
 |---|---|---|---|
 | **A — Provision** | Create every value the hardened code requires and does not have: the PayPal webhook identifier in the PayPal dashboard, a real signing key, and the remaining required settings, delivered through the secret store | **Before** the new code is deployed | Yes — nothing is destroyed |
 | **B — Deploy and verify** | Apply the migrations, deploy the new code, confirm it starts and is healthy, and confirm the security gates pass | After A, in the release window | Yes — by rollback |
-| **C — Revoke and rotate** | Revoke and replace the three exposed credentials, remove them from history, and review prior access | **After B is verified**, in its own change window | **No** |
+| **C — Revoke and rotate** | Revoke and replace the four exposed credentials, remove the three committed ones from history and the fourth from the log estate, and review prior access | **After B is verified**, in its own change window | **No** |
 
 ### 2.0 Stage A — provision what the new code requires
 
@@ -213,10 +203,10 @@ indistinguishable.
 ### 2.2 Stage C — revoke and rotate the exposed credentials
 
 Every **previously exposed** credential in [Section 3](#3-credentials-in-scope) —
-the three named there — is rotated by the same four steps, in this order. The webhook
-identifier in Section 3.5 is presented under the same four headings so that nothing is
-skipped by accident, but on first provisioning steps 1 and 3 have nothing to act on and
-say so:
+the four named there — is rotated by the same four steps, in this order. The three
+new secrets in Sections 3.5, 3.6 and 3.7 are presented under the same four headings so
+that nothing is skipped by accident, but on first provisioning steps 1 and 3 have nothing
+to act on and say so:
 
 | Step | Action | What it achieves | Reversible? |
 |------|--------|------------------|-------------|
@@ -312,11 +302,17 @@ it:
 
 ```bash
 git log --all --oneline -S'<the exposed value>'
-git rev-list --all | xargs -n 50 git grep -n -F '<the exposed value>' --
+git rev-list --all | xargs -n 50 git grep -n -F '<the exposed value>'
 ```
 
 The second form searches the content of every commit rather than only the diffs,
-which matters for a value introduced and reintroduced across several commits.
+which matters for a value introduced and reintroduced across several commits. **Read
+the output, not the exit status**, and note that it carries no trailing `--`:
+everything after `--` is a pathspec, so adding one hands the revisions to `git grep`
+as paths and the sweep silently searches nothing. The same sweep is used again after
+the rewrite, and
+[Expire everything that still reaches the old objects](#expire-everything-that-still-reaches-the-old-objects)
+below states both properties in full — a clean sweep prints nothing and returns 123.
 
 #### Rewrite
 
@@ -360,14 +356,27 @@ git gc --prune=now
 Then verify locally, before pushing anything:
 
 ```bash
-git rev-list --all | xargs -n 50 git grep -n -F '<the exposed value>' -- ; echo "exit=$?"
+git rev-list --all | xargs -n 50 git grep -n -F '<the exposed value>'
 git cat-file --batch-all-objects --batch-check | wc -l
 ```
 
-The `git grep` sweep must find nothing. `--batch-all-objects` walks every object in
-the object database including unreachable ones, so a count that has not fallen
-after `gc` means objects survived and the sweep above was searching a smaller set
-than the repository actually holds.
+**Read the output, not the exit status.** The sweep passes when it prints nothing. A
+surviving value prints `<commit>:<path>:<line>:<content>`. The status is not the verdict:
+`xargs` reports 123 when a child command exits non-zero and `git grep` exits 1 when it
+matches nothing, so **123 is what a clean sweep returns** and 0 means something was
+found.
+
+**The revision list carries no trailing `--`, and that is load-bearing.** Everything
+after `--` is a pathspec, so a sweep written `git grep -n -F '<value>' --` receives the
+revisions as paths, searches nothing, and prints nothing whether or not the value
+survives &mdash; measured on a scratch repository, that form is silent and returns 123
+both when the value is present and when it is absent. Without the `--`, each revision is
+read as a revision, and the same measurement prints one line per commit that carries the
+value.
+
+`--batch-all-objects` walks every object in the object database including unreachable
+ones, so a count that has not fallen after `gc` means objects survived and the sweep
+above was searching a smaller set than the repository actually holds.
 
 #### Publish the rewrite
 
@@ -827,8 +836,23 @@ has no reachable administrator — which is a safe state, not a broken one, and 
 this is not part of an automatic release.
 
 The step is `backend/app/core/admin_provisioning.py`. It reads the credential only
-from `ADMIN_SEED_PASSWORD` and never from an argument, so the value does not reach a
-shell history or a process listing. It writes only to the fixed address above,
+from `ADMIN_SEED_PASSWORD` and never from an argument, so the value never reaches the
+command's own argument vector: a positional argument is refused outright. That is a
+narrower guarantee than it sounds, and the difference matters when you type the command.
+An assignment written as a prefix, as in the form below, **is** recorded verbatim in an
+interactive shell's history file and **is** readable from the process environment while
+the command runs. Where either matters, supply the value the way the deployed path does
+&mdash; from the secret store, through the operator Job below &mdash; or, for a local
+run, export it from a mode-600 file with history recording disabled:
+
+```bash
+# Locally, without the value reaching a history file.
+set +o history
+set -a; . ./.admin-credential; set +a
+set -o history
+```
+
+It writes only to the fixed address above,
 refuses an account that does not already hold the administrative role — so it cannot
 grant privilege — holds the credential to the same policy every account is held to,
 and re-asserts that exactly one account holds the role before committing. It records
@@ -954,10 +978,13 @@ from a skipped one.
 
 ### 4.1 Confirm the documented order was followed
 
-For each of the three **previously exposed** credentials, confirm the four steps ran in
-order, and **specifically that revocation preceded any history rewrite.** For the
-webhook identifier, there is no order to confirm on first provisioning: verify instead
-that it exists in the secret store and that it was never committed, which
+For each of the four **previously exposed** credentials, confirm the four steps ran in
+order, and **specifically that revocation preceded any history rewrite** for the three
+that were committed. The fourth, the listing-provider key, has no history to rewrite;
+confirm instead that revocation preceded the log purge, which
+[Section 4.7](#47-confirm-the-listing-provider-key-has-left-urls-and-logs) verifies. For
+the three new secrets, there is no order to confirm on first provisioning: verify instead
+that each exists in the secret store and was never committed, which
 [Section 4.4](#44-confirm-the-replacements-are-delivered-through-the-secret-store)
 covers. Check the timestamps rather than asking:
 compare the revocation time recorded at the issuing system against the commit time
@@ -998,9 +1025,16 @@ covers each path a secret occupied or was directed to:
    ignored.
 
 Verify the rules actually match rather than reading them, by asking git whether it
-would ignore each path. Also confirm `.dockerignore` excludes the same paths, since
-the backend image copies the build context and would otherwise bake a local
-environment file or secrets directory into a published image.
+would ignore each path. **Ask with `--no-index` when the path is tracked.**
+`git check-ignore` skips any path present in the index, so `git check-ignore -q
+.env.example` reports "not ignored" for a tracked file even when a rule matches it, and a
+widened rule over a committed path looks clean. `git check-ignore -q --no-index
+.env.example` answers from the rules alone, which is the question being asked here.
+`.github/scripts/check_secret_policy.sh` uses that form for exactly this reason.
+
+Also confirm `.dockerignore` excludes the same paths, since the backend image copies the
+build context and would otherwise bake a local environment file or secrets directory into
+a published image.
 
 ### 4.4 Confirm the replacements are delivered through the secret store
 
@@ -1088,8 +1122,9 @@ guaranteed to look clean, because it is where you did the work.
 ```bash
 git clone --mirror <remote-url> verify-rewrite && cd verify-rewrite
 
-# 1. No commit, on any ref, carries the value.
-git rev-list --all | xargs -n 50 git grep -n -F '<the exposed value>' -- ; echo "exit=$?"
+# 1. No commit, on any ref, carries the value. No trailing "--": everything
+#    after it would be read as a pathspec rather than as a revision.
+git rev-list --all | xargs -n 50 git grep -n -F '<the exposed value>'
 
 # 2. No object at all carries it, reachable or not.
 git cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)' \
@@ -1101,9 +1136,11 @@ git cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)' \
 git for-each-ref --format='%(refname)'
 ```
 
-Check 1 must report no match; check 2 must report `0`; check 3 must show no branch
-or tag the rewrite was supposed to remove. A non-zero count in check 2 with no match
-in check 1 means the value survives in an object no ref reaches — usually a tag you
+Check 1 must print no match &mdash; its exit status is 123 when it is clean, for the
+reason [Section 2.5](#25-how-to-execute-step-3-eradicating-a-value-from-history) gives,
+so read the output rather than the status. Check 2 must report `0`, and check 3 must show
+no branch or tag the rewrite was supposed to remove. A non-zero count in check 2 with no
+match in check 1 means the value survives in an object no ref reaches — usually a tag you
 did not push, or a provider-side pull-request ref — and the value is still
 retrievable by anyone who can name the object.
 
@@ -1115,7 +1152,7 @@ evidence rather than assumption:
 | --- | --- |
 | Provider-side garbage collection | The support request reference and the provider's written confirmation that it completed |
 | Forks | The enumerated list, and for each one either the owner's confirmation or the deletion. Any fork you could not reach is recorded as an unresolved exposure |
-| Mirrors, backups, archives | Each one rotated or destroyed, including the offline backup Section 3.5 told you to take |
+| Mirrors, backups, archives | Each one rotated or destroyed, including the offline mirror clone Section 2.5 told you to take before the rewrite |
 | CI caches, artefacts, images | Caches purged, pre-rotation artefacts deleted, and every image that embedded the value rebuilt and republished |
 
 Finally, confirm the re-clone instruction was carried out. Ask for confirmation per
@@ -1166,14 +1203,14 @@ and **fails to start** on a value that is missing, weak, placeholder-shaped or
 internally inconsistent. That is deliberate — a misconfigured deployment stops
 loudly instead of running in a degraded state — but it is also why this runbook is
 staged, and it is the whole content of
-[Stage A](#20-stage-a-provision-what-the-new-code-requires):
+[Stage A](#20-stage-a--provision-what-the-new-code-requires):
 
 1. Put every required value in place **first**, in every environment. Seven settings
    have no default, and one of them, `PAYPAL_WEBHOOK_ID`, has to be created in the
    PayPal dashboard before it can be supplied at all.
 2. Then start the new code.
 3. Only once that deployment is verified, begin
-   [Stage C](#22-stage-c-revoke-and-rotate-the-exposed-credentials).
+   [Stage C](#22-stage-c--revoke-and-rotate-the-exposed-credentials).
 
 If you start the new code first, it will not come up, and the failure will name the
 setting rather than the cause. Confirm the value set before deploying, not after.

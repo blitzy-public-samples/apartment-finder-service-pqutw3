@@ -21,4 +21,7 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --no-proxy-headers leaves scope["client"] as the address the connection was
+# actually made from, so TRUSTED_PROXY_HOPS is the only setting that decides
+# which address a rate limit and a lockout are counted against.
+CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-proxy-headers"]

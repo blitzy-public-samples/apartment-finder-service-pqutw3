@@ -24,6 +24,7 @@ reintroduces any of them fails here rather than at a later review.
 
 import base64
 import hashlib
+import json
 import re
 import sys
 from datetime import datetime, timezone
@@ -62,10 +63,15 @@ from backend.app.main import (
     DOCUMENTATION_PATHS,
     DOCUMENTATION_VIEWER_ORIGIN,
     DOCUMENTATION_WORKER_SOURCE,
+    ERROR_RESPONSE_COMPONENT,
+    GENERATED_VALIDATION_COMPONENTS,
     INVALID_HOST_DETAIL,
     INVALID_REQUEST_DETAIL,
     OAUTH2_REDIRECT_PATH,
+    PUBLISHED_REFUSAL_STATUS,
     REDOC_PATH,
+    REFUSAL_DETAIL_FIELD,
+    RETRY_AFTER_FIELD,
     SECURITY_HEADERS,
     TOO_MANY_REQUESTS_DETAIL,
     app,
@@ -110,6 +116,49 @@ FORBIDDEN_RESPONSE_FIELDS = (
     "failed_login_attempts",
     "locked_until",
 )
+
+#: Media type the published document describes a refusal body under.
+JSON_MEDIA_TYPE = "application/json"
+
+#: Expression a published refusal names its body component by.
+ERROR_RESPONSE_REFERENCE = {
+    "$ref": "#/components/schemas/" + ERROR_RESPONSE_COMPONENT
+}
+
+#: Pattern every component reference in the published document matches.
+COMPONENT_REFERENCE = re.compile(
+    r'"\$ref":\s*"#/components/schemas/([^"]+)"'
+)
+
+#: A body the request contract of :data:`REFUSAL_ROUTE` refuses, so the
+#: route answers with the refusal whose shape is under test.
+REFUSED_BODY = {"email": "not-an-address", "password": "short"}
+
+#: Route the live refusal is read from.
+REFUSAL_ROUTE = "/auth/register"
+
+
+def published_document():
+    """Returns the document the application publishes."""
+    return app.openapi()
+
+
+def published_components():
+    """Returns the component schemas of the published document."""
+    return published_document()["components"]["schemas"]
+
+
+def published_refusals():
+    """Yields every published refusal response under test."""
+    for path, operations in published_document()["paths"].items():
+        for method, operation in operations.items():
+            if not isinstance(operation, dict):
+                continue
+            responses = operation.get("responses") or {}
+            refusal = responses.get(PUBLISHED_REFUSAL_STATUS)
+            if refusal is not None:
+                yield path, method, refusal
+
 
 #: Header carrying the policy under test.
 CSP_HEADER = "content-security-policy"
@@ -703,6 +752,91 @@ class TestSavedFilterHoldsSeveralPredicates:
         assert db.query(Filter).count() == 1
 
 
+class TestThePublishedRefusalIsTheOneReturned:
+    """The published refusal body is the body a route returns.
+
+    The generator publishes a validation body carrying a list of
+    per-field failures, which no route of this application returns: every
+    refusal carries one fixed string. A client generated from the
+    document therefore parsed every refusal wrongly. These cases hold the
+    published description and the returned body to one shape, and read
+    the returned one from a live route rather than restating it.
+    """
+
+    def test_at_least_one_refusal_is_published(self):
+        """The cases below assert over a non-empty set."""
+        assert list(published_refusals())
+
+    def test_every_published_refusal_names_the_error_component(self):
+        for path, method, refusal in published_refusals():
+            media = refusal["content"]
+            assert set(media) == {JSON_MEDIA_TYPE}, (path, method)
+            assert (
+                media[JSON_MEDIA_TYPE]["schema"]
+                == ERROR_RESPONSE_REFERENCE
+            ), (path, method)
+
+    def test_the_error_component_describes_one_string_member(self):
+        component = published_components()[ERROR_RESPONSE_COMPONENT]
+        assert component["type"] == "object"
+        assert set(component["properties"]) == {REFUSAL_DETAIL_FIELD}
+        assert (
+            component["properties"][REFUSAL_DETAIL_FIELD]["type"]
+            == "string"
+        )
+        assert component["required"] == [REFUSAL_DETAIL_FIELD]
+
+    def test_the_generated_validation_components_are_withdrawn(self):
+        declared = published_components()
+        text = json.dumps(published_document())
+        for name in GENERATED_VALIDATION_COMPONENTS:
+            assert name not in declared, name
+            assert name not in text, name
+
+    def test_no_published_reference_dangles(self):
+        """Removing a component left nothing pointing at it."""
+        document = published_document()
+        referenced = set(
+            COMPONENT_REFERENCE.findall(json.dumps(document))
+        )
+        assert referenced
+        assert referenced <= set(document["components"]["schemas"])
+
+    def test_the_document_is_aligned_once_and_reused(self):
+        assert published_document() is published_document()
+
+    def test_the_returned_refusal_matches_what_is_published(
+        self, client
+    ):
+        """The live body is read, not restated, then compared."""
+        response = client.post(REFUSAL_ROUTE, json=REFUSED_BODY)
+        assert response.status_code == int(PUBLISHED_REFUSAL_STATUS)
+        body = response.json()
+        component = published_components()[ERROR_RESPONSE_COMPONENT]
+        assert set(body) == set(component["properties"])
+        assert set(body) >= set(component["required"])
+        assert isinstance(body[REFUSAL_DETAIL_FIELD], str)
+        assert body[REFUSAL_DETAIL_FIELD] == INVALID_REQUEST_DETAIL
+
+    def test_the_published_route_answers_the_published_status(
+        self, client
+    ):
+        published = {
+            (path, method) for path, method, _ in published_refusals()
+        }
+        assert (REFUSAL_ROUTE, "post") in published
+
+    def test_the_schema_route_serves_the_aligned_document(self, client):
+        response = client.get("/openapi.json")
+        assert response.status_code == 200
+        served = response.json()
+        assert (
+            ERROR_RESPONSE_COMPONENT in served["components"]["schemas"]
+        )
+        for name in GENERATED_VALIDATION_COMPONENTS:
+            assert name not in response.text, name
+
+
 class TestRefusalsShareOneShape:
     """Every refusal answers with the shape the service uses."""
 
@@ -729,10 +863,16 @@ class TestRefusalsShareOneShape:
     ):
         throttled = self._exhaust_login(client, limiter)
         assert throttled.json() == {
-            "detail": TOO_MANY_REQUESTS_DETAIL
+            "detail": TOO_MANY_REQUESTS_DETAIL,
+            RETRY_AFTER_FIELD: int(
+                throttled.headers[RETRY_AFTER_HEADER]
+            ),
         }
         assert throttled.headers["content-type"].startswith(
             "application/json"
+        )
+        assert int(throttled.headers["content-length"]) == len(
+            throttled.content
         )
 
     def test_a_throttled_request_names_its_retry_interval(
@@ -740,6 +880,23 @@ class TestRefusalsShareOneShape:
     ):
         throttled = self._exhaust_login(client, limiter)
         assert int(throttled.headers[RETRY_AFTER_HEADER]) > 0
+
+    def test_a_throttled_body_names_the_wait_the_header_names(
+        self, client, limiter
+    ):
+        """The wait is readable without inspecting the headers.
+
+        A caller that reads only the body is told how long to wait, and
+        the number it reads is the one ``Retry-After`` carries.
+        """
+        throttled = self._exhaust_login(client, limiter)
+        body = throttled.json()
+        assert RETRY_AFTER_FIELD in body
+        seconds = body[RETRY_AFTER_FIELD]
+        assert isinstance(seconds, int)
+        assert not isinstance(seconds, bool)
+        assert seconds > 0
+        assert seconds == int(throttled.headers[RETRY_AFTER_HEADER])
 
     def test_a_throttled_request_carries_the_policy_headers(
         self, client, limiter

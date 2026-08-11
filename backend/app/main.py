@@ -4,6 +4,7 @@ exception handling.
 
 import base64
 import hashlib
+import math
 import re
 import threading
 import time
@@ -11,6 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from types import MappingProxyType
 from typing import (
+    Any,
     AsyncIterator,
     Callable,
     Dict,
@@ -19,6 +21,8 @@ from typing import (
     Tuple,
 )
 
+import anyio
+from anyio.lowlevel import RunVar
 from fastapi import Depends, FastAPI, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +31,7 @@ from fastapi.utils import is_body_allowed_for_status_code
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -65,13 +70,21 @@ from backend.app.core.logging import (
     reset_trace_context,
     unredacted_handler_names,
 )
+from backend.app.core.rate_limit import (
+    RATE_LIMIT_HEADERS,
+    RETRY_AFTER_HEADER,
+)
 
 __all__ = [
+    "ADMISSION_BOUND_MESSAGE",
+    "ADMISSION_REFUSED_MESSAGE",
     "BODY_TOO_LARGE_DETAIL",
+    "CAPACITY_DETAIL",
     "CORS_ALLOW_CREDENTIALS_HEADER",
     "CORS_ALLOW_HEADERS",
     "CORS_ALLOW_METHODS",
     "CORS_ALLOW_ORIGIN_HEADER",
+    "CORS_EXPOSE_HEADERS",
     "DOCS_PATH",
     "DOCUMENTATION_ENABLED",
     "DOCUMENTATION_FONT_ORIGIN",
@@ -81,6 +94,8 @@ __all__ = [
     "DOCUMENTATION_PATHS",
     "DOCUMENTATION_VIEWER_ORIGIN",
     "DOCUMENTATION_WORKER_SOURCE",
+    "ERROR_RESPONSE_COMPONENT",
+    "GENERATED_VALIDATION_COMPONENTS",
     "HEALTH_PATH",
     "HEALTH_STATUS",
     "INVALID_HOST_DETAIL",
@@ -89,6 +104,8 @@ __all__ = [
     "NOT_READY_STATUS",
     "OAUTH2_REDIRECT_PATH",
     "OPENAPI_PATH",
+    "POOL_EXHAUSTED_MESSAGE",
+    "PUBLISHED_REFUSAL_STATUS",
     "READINESS_BOUND_DIALECTS",
     "READINESS_BOUND_STATEMENTS",
     "READINESS_CONCURRENT_MESSAGE",
@@ -97,9 +114,11 @@ __all__ = [
     "READINESS_STATEMENT",
     "READINESS_STATUS",
     "REDOC_PATH",
+    "REFUSAL_DETAIL_FIELD",
     "REQUEST_ID_FIELD",
     "REQUEST_ID_HEADER",
     "REQUEST_ID_MAX_LENGTH",
+    "RETRY_AFTER_FIELD",
     "SINK_DEGRADED_MESSAGE",
     "SINK_DEGRADED_SIGNAL",
     "MIN_BODY_MESSAGES",
@@ -111,15 +130,20 @@ __all__ = [
     "SERVER_ERROR_DETAIL",
     "THROTTLED_MESSAGE",
     "TOO_MANY_REQUESTS_DETAIL",
+    "UNGATED_PATHS",
     "BodySizeLimitMiddleware",
+    "RequestAdmissionMiddleware",
     "RequestIdMiddleware",
     "RateLimitGateMiddleware",
     "SecurityHeadersMiddleware",
     "TrustedHostGateMiddleware",
+    "api_schema",
     "app",
+    "capacity_retry_after_seconds",
     "health_check",
     "http_exception_handler",
     "limiter",
+    "pool_timeout_handler",
     "rate_limit_exceeded_handler",
     "readiness_check",
     "readiness_outcome",
@@ -145,8 +169,10 @@ SECURITY_HEADERS: Mapping[str, str] = MappingProxyType(
             "default-src 'none'; frame-ancestors 'none'; "
             "base-uri 'none'; form-action 'none'"
         ),
+        # Every feature named here is one a browser recognises, so the header
+        # denies each without also reporting an unrecognised token.
         "Permissions-Policy": (
-            "accelerometer=(), ambient-light-sensor=(), autoplay=(), "
+            "accelerometer=(), autoplay=(), "
             "camera=(), display-capture=(), encrypted-media=(), "
             "geolocation=(), gyroscope=(), magnetometer=(), "
             "microphone=(), midi=(), payment=(), usb=(), "
@@ -162,6 +188,13 @@ CORS_ALLOW_HEADERS: Tuple[str, ...] = (
     "Authorization",
     "Content-Type",
     "Accept",
+)
+
+#: Response headers a cross-origin caller's own code may read. The set is
+#: the throttle policy a refused request is answered with: the window's
+#: allowance, what remains of it, when it resets, and how long to wait.
+CORS_EXPOSE_HEADERS: Tuple[str, ...] = RATE_LIMIT_HEADERS + (
+    RETRY_AFTER_HEADER,
 )
 
 #: Response header naming the single origin a response is shared with.
@@ -189,6 +222,21 @@ SERVER_ERROR_DETAIL = "Internal server error"
 #: Detail returned when a request exceeds its rate limit.
 TOO_MANY_REQUESTS_DETAIL = "Too many requests"
 
+#: Detail returned when the connection pool had no connection to give a
+#: request within ``settings.DB_POOL_TIMEOUT_SECONDS``. It names a
+#: capacity limit rather than a fault, and carries no pool figure.
+CAPACITY_DETAIL = "Service temporarily unavailable"
+
+#: Message of the record emitted for a request refused for capacity.
+POOL_EXHAUSTED_MESSAGE = "Database connection pool exhausted"
+
+#: Message of the record emitted for a request the admission gate
+#: refused, having waited its whole allowance for a slot.
+ADMISSION_REFUSED_MESSAGE = "Request not admitted within its allowance"
+
+#: Message reporting the admission bound in force at startup.
+ADMISSION_BOUND_MESSAGE = "Bounded the requests admitted to the database"
+
 #: Detail returned when the request names a host outside
 #: ``settings.ALLOWED_HOSTS``.
 INVALID_HOST_DETAIL = "Invalid host header"
@@ -204,6 +252,13 @@ HEALTH_PATH = "/health"
 #: :data:`HEALTH_PATH`, so a caller matching on a prefix would reach
 #: either one and the full path is named wherever a probe is configured.
 READINESS_PATH = "/health/ready"
+
+#: Routes the admission gate does not hold. Both are read by an
+#: orchestrator, which acts on a probe that does not answer, so neither
+#: may wait behind the requests the gate is bounding. The readiness route
+#: reads the database, and the connections the gate leaves unclaimed are
+#: what it draws on.
+UNGATED_PATHS: Tuple[str, ...] = (HEALTH_PATH, READINESS_PATH)
 
 #: Status reported when every dependency the probe reads answered.
 READINESS_STATUS = "ready"
@@ -260,6 +315,31 @@ OAUTH2_REDIRECT_PATH = DOCS_PATH + "/oauth2-redirect"
 #: Path the OpenAPI schema is published at.
 OPENAPI_PATH = "/openapi.json"
 
+#: Name of the published component describing a refusal body.
+ERROR_RESPONSE_COMPONENT = "ErrorResponse"
+
+#: Status the schema generator publishes a refusal body for, as the
+#: string form a published document keys its responses by.
+PUBLISHED_REFUSAL_STATUS = str(status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+#: Components the generator publishes for a refusal body carrying a list
+#: of per-field failures, which no route of this application returns.
+GENERATED_VALIDATION_COMPONENTS: Tuple[str, ...] = (
+    "HTTPValidationError",
+    "ValidationError",
+)
+
+#: Body field a refusal carries its fixed detail under.
+REFUSAL_DETAIL_FIELD = "detail"
+
+# Media type a published response body is described under.
+_JSON_MEDIA_TYPE = "application/json"
+
+# Reference expression naming ERROR_RESPONSE_COMPONENT.
+_ERROR_RESPONSE_REFERENCE = (
+    "#/components/schemas/" + ERROR_RESPONSE_COMPONENT
+)
+
 #: Paths answering with a documentation page rather than with API data,
 #: so :func:`_documentation_policy` governs them in place of the policy
 #: in :data:`SECURITY_HEADERS`.
@@ -302,6 +382,11 @@ REQUEST_ID_FIELD = "request_id"
 
 #: Longest inbound identifier accepted before one is generated instead.
 REQUEST_ID_MAX_LENGTH = 64
+
+#: Body field carrying the wait a throttled caller owes, in whole
+#: seconds. It restates the ``Retry-After`` header, which a caller
+#: reading only the body never sees.
+RETRY_AFTER_FIELD = "retry_after_seconds"
 
 #: Message of the record emitted for a throttled request.
 THROTTLED_MESSAGE = "Request throttled"
@@ -387,7 +472,12 @@ _RESPONSE_START_MESSAGE = "http.response.start"
 # ``app.state.limiter`` below.
 from backend.app.api.endpoints.auth import limiter  # noqa: E402
 from backend.app.api.router import api_router  # noqa: E402
-from backend.app.db.database import get_db  # noqa: E402
+from backend.app.core.rate_limit import RETRY_AFTER_HEADER  # noqa: E402
+from backend.app.db.database import (  # noqa: E402
+    admitted_concurrency,
+    get_db,
+    pool_capacity,
+)
 from backend.app.services.paypal_service import (  # noqa: E402
     close_http_client,
     open_http_client,
@@ -405,6 +495,9 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
     no record is lost when the process stops. A queue that still holds
     records once the drain timeout elapses is reported on standard error,
     which does not travel through the queue.
+
+    The admission bound in force is reported at startup, so a deployment
+    can see how many requests it will run against its database at once.
     """
     removed = unredacted_handler_names()
     if removed:
@@ -412,6 +505,15 @@ async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
             "Removed a log handler that would not have redacted records",
             extra={"handlers": list(removed)},
         )
+    admitted = admitted_concurrency(settings.DATABASE_URL)
+    logger.info(
+        ADMISSION_BOUND_MESSAGE,
+        extra={
+            "admitted_concurrency": admitted,
+            "pool_capacity": pool_capacity(settings.DATABASE_URL),
+            "admission_wait_seconds": settings.DB_POOL_TIMEOUT_SECONDS,
+        },
+    )
     await open_http_client()
     try:
         yield
@@ -536,8 +638,30 @@ async def _with_documentation_policy(response: Response) -> Response:
     )
 
 
+def _drop_orphan_credentials_header(response: Response) -> None:
+    """Removes :data:`CORS_ALLOW_CREDENTIALS_HEADER` when no origin is
+    shared.
+
+    That header is read only beside :data:`CORS_ALLOW_ORIGIN_HEADER`, so
+    a response carrying it without one names no origin it applies to and
+    has it removed before it leaves.
+    """
+    headers = response.headers
+    if CORS_ALLOW_CREDENTIALS_HEADER not in headers:
+        return
+    if CORS_ALLOW_ORIGIN_HEADER in headers:
+        return
+    del headers[CORS_ALLOW_CREDENTIALS_HEADER]
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Sets :data:`SECURITY_HEADERS` on every outgoing response.
+
+    The credentialed-response header is then dropped from any response
+    that names no shared origin, which is what
+    :func:`_drop_orphan_credentials_header` does. It runs before the
+    documentation branch below, because that branch rebuilds a response
+    from the headers this one leaves.
 
     A response on one of :data:`DOCUMENTATION_PATHS` then has its policy
     replaced by the one :func:`_documentation_policy` builds, so the
@@ -551,6 +675,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         for name, value in SECURITY_HEADERS.items():
             response.headers[name] = value
+        _drop_orphan_credentials_header(response)
         if _is_documentation_page(request, response):
             return await _with_documentation_policy(response)
         return response
@@ -576,8 +701,8 @@ def _accepted_request_id(scope: Scope) -> Optional[str]:
     return candidate
 
 
-def _scoped_request_id(request: Request) -> Optional[str]:
-    """Returns the identifier bound to ``request``, or ``None``.
+def _stated_request_id(scope: Scope) -> Optional[str]:
+    """Returns the identifier recorded in ``scope``, or ``None``.
 
     The value is read from the ASGI scope, where
     :class:`RequestIdMiddleware` records it, so it is still available to a
@@ -586,7 +711,7 @@ def _scoped_request_id(request: Request) -> Optional[str]:
     identifier is used when the scope carries none.
     """
     try:
-        state = request.scope.get("state")
+        state = scope.get("state")
         if isinstance(state, dict):
             scoped = state.get(REQUEST_ID_FIELD)
             if scoped:
@@ -594,6 +719,11 @@ def _scoped_request_id(request: Request) -> Optional[str]:
     except Exception:
         return current_request_id()
     return current_request_id()
+
+
+def _scoped_request_id(request: Request) -> Optional[str]:
+    """Returns the identifier bound to ``request``, or ``None``."""
+    return _stated_request_id(request.scope)
 
 
 def _accepted_trace_id(scope: Scope) -> Optional[str]:
@@ -787,6 +917,132 @@ class BodySizeLimitMiddleware:
                 "max_messages": self.max_body_messages,
             },
         )
+
+
+def capacity_retry_after_seconds() -> int:
+    """Returns the seconds a capacity refusal asks a client to wait.
+
+    The value is the configured wait for a pooled connection, rounded up
+    to whole seconds, which is the form the ``Retry-After`` header takes
+    in seconds and the longest a request already in flight can still be
+    holding one.
+    """
+    return max(1, int(math.ceil(settings.DB_POOL_TIMEOUT_SECONDS)))
+
+
+def _capacity_response(request_id: Optional[str]) -> JSONResponse:
+    """Returns the answer given to a request refused for capacity.
+
+    Both refusals -- the admission gate's and
+    :func:`pool_timeout_handler`'s -- return this, so a caller sees one
+    answer whichever refused it: the status says the service is
+    unavailable for now, ``Retry-After`` says for how long, and the body
+    carries :data:`CAPACITY_DETAIL` and the request identifier and nothing
+    else. No pool figure, no admission bound, no exception text and no
+    traceback reach the client.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "detail": CAPACITY_DETAIL,
+            REQUEST_ID_FIELD: request_id,
+        },
+        headers={RETRY_AFTER_HEADER: str(capacity_retry_after_seconds())},
+    )
+
+
+#: The admission bound in force, held per event loop. A process serving
+#: on one loop shares one bound across every request on it, and a second
+#: loop -- which each test client builds -- gets its own.
+_ADMISSION_LIMITER: RunVar = RunVar("_admission_limiter")
+
+
+class RequestAdmissionMiddleware:
+    """Bounds how many requests reach the router at once.
+
+    Every route that reads the database holds one pooled connection for
+    as long as its session is open, and the framework closes that session
+    inside the routed request -- before the router's own call returns and
+    therefore before this layer releases the slot. Holding the number of
+    requests inside this layer at or below :func:`admitted_concurrency`
+    therefore holds the number of connections wanted below the pool's
+    ceiling, so a request that reaches a route finds a connection rather
+    than waiting for one.
+
+    A request that does not get a slot within ``wait_seconds`` is
+    answered by :func:`_capacity_response`, which is the same answer
+    :func:`pool_timeout_handler` returns, so a caller cannot tell which
+    of the two refused it and both carry ``Retry-After``.
+
+    Paths in ``ungated_paths`` are passed straight through. The bound is
+    held per event loop, so a process serving on one loop shares one
+    bound across every request on it.
+
+    ``bound`` of ``None`` installs the layer as a pass-through, which is
+    what a backend whose pool has no ceiling gets.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        bound: Optional[int],
+        wait_seconds: float,
+        ungated_paths: Tuple[str, ...] = UNGATED_PATHS,
+    ) -> None:
+        self.app = app
+        self.bound = bound
+        self.wait_seconds = wait_seconds
+        self.ungated_paths = tuple(ungated_paths)
+
+    def _limiter(self) -> "anyio.Semaphore":
+        """Returns this event loop's admission bound, creating it once."""
+        try:
+            return _ADMISSION_LIMITER.get()
+        except LookupError:
+            limiter = anyio.Semaphore(int(self.bound))
+            _ADMISSION_LIMITER.set(limiter)
+            return limiter
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        if (
+            self.bound is None
+            or scope["type"] != _HTTP_SCOPE
+            or scope.get("path") in self.ungated_paths
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        limiter = self._limiter()
+        admitted = False
+        with anyio.move_on_after(self.wait_seconds):
+            await limiter.acquire()
+            admitted = True
+        if not admitted:
+            await self._refuse(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            limiter.release()
+
+    async def _refuse(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        """Answers one request that waited its whole allowance."""
+        request_id = _stated_request_id(scope)
+        logger.warning(
+            ADMISSION_REFUSED_MESSAGE,
+            extra={
+                "path": scope.get("path"),
+                "method": scope.get("method"),
+                REQUEST_ID_FIELD: request_id,
+                "admitted_concurrency": self.bound,
+                "admission_wait_seconds": self.wait_seconds,
+            },
+        )
+        await _capacity_response(request_id)(scope, receive, send)
 
 
 def _matched_endpoint(scope: Scope) -> Optional[Callable]:
@@ -1054,6 +1310,44 @@ async def unhandled_exception_handler(
     )
 
 
+async def pool_timeout_handler(
+    request: Request, exc: PoolTimeout
+) -> Response:
+    """Answers a request the connection pool had no connection for.
+
+    The pool raises this when a request has waited
+    ``settings.DB_POOL_TIMEOUT_SECONDS`` and no connection became free.
+    :class:`RequestAdmissionMiddleware` holds the number of requests that
+    can want one below the pool's ceiling, so this is reached by a route
+    that layer does not hold or by one whose demand it does not predict,
+    and the answer is the same either way: a capacity limit rather than a
+    fault, with ``Retry-After`` saying how long to wait, so a client or a
+    load balancer can retry rather than treating the answer as a failed
+    request. The body carries :data:`CAPACITY_DETAIL` and the request
+    identifier and nothing else -- no pool size, no exception text and no
+    traceback.
+
+    This handler is registered for the pool's own exception class, so it
+    is reached inside the middleware stack and the response it returns
+    carries :data:`SECURITY_HEADERS`, the cross-origin headers and
+    :data:`REQUEST_ID_HEADER` from the layers it travels back out
+    through.
+    """
+    request_id = _scoped_request_id(request)
+    log_exception(
+        logger,
+        POOL_EXHAUSTED_MESSAGE,
+        exc,
+        exception_message=None,
+        path=request.scope.get("path"),
+        method=request.scope.get("method"),
+        request_id=request_id,
+        pool_timeout_seconds=settings.DB_POOL_TIMEOUT_SECONDS,
+        retry_after_seconds=capacity_retry_after_seconds(),
+    )
+    return _capacity_response(request_id)
+
+
 def _throttled_response(
     request: Request, exc: RateLimitExceeded
 ) -> Response:
@@ -1065,7 +1359,9 @@ def _throttled_response(
     the body. The limiter writes those headers onto the response it is
     handed, so the reply carries ``Retry-After`` in seconds together with
     the request count the window admits, the count remaining and the
-    time the window resets.
+    time the window resets. The wait that header names is also carried in
+    the body under :data:`RETRY_AFTER_FIELD`, so a caller reading only
+    the body is told how long to wait and not merely that it must.
     """
     response = JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -1074,7 +1370,40 @@ def _throttled_response(
     evaluated = getattr(
         request.state, _EVALUATED_LIMIT_ATTRIBUTE, None
     )
-    return limiter._inject_headers(response, evaluated)
+    response = limiter._inject_headers(response, evaluated)
+    return _with_retry_window(response)
+
+
+def _with_retry_window(response: Response) -> Response:
+    """Restates a throttled response's ``Retry-After`` wait in its body.
+
+    The limiter writes the header after the body has been rendered, so
+    the body is rendered a second time here once the value is known, and
+    ``Content-Length`` is corrected to the new body. The header carries
+    whole seconds rather than an HTTP date, which
+    :data:`backend.app.core.rate_limit.RETRY_AFTER_FORMAT` fixes. A
+    header that is absent, non-numeric or negative leaves the body at the
+    shape :func:`_throttled_response` built, so the ``detail`` key is
+    present on every throttled reply whatever the limiter reported.
+    """
+    raw = response.headers.get(RETRY_AFTER_HEADER)
+    if raw is None:
+        return response
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return response
+    if seconds < 0:
+        return response
+    body = response.render(
+        {
+            "detail": TOO_MANY_REQUESTS_DETAIL,
+            RETRY_AFTER_FIELD: seconds,
+        }
+    )
+    response.body = body
+    response.headers["content-length"] = str(len(body))
+    return response
 
 
 async def rate_limit_exceeded_handler(
@@ -1110,6 +1439,79 @@ def _rate_limit_policy(exc: RateLimitExceeded) -> Optional[str]:
     return None
 
 
+def _error_response_schema() -> Dict[str, Any]:
+    """Returns the schema of the body a refusal carries.
+
+    It is the shape :func:`validation_exception_handler` and every other
+    refusal in this module return: an object carrying a single fixed
+    string under :data:`REFUSAL_DETAIL_FIELD`.
+    """
+    return {
+        "title": ERROR_RESPONSE_COMPONENT,
+        "type": "object",
+        "properties": {
+            REFUSAL_DETAIL_FIELD: {
+                "title": REFUSAL_DETAIL_FIELD.capitalize(),
+                "type": "string",
+            }
+        },
+        "required": [REFUSAL_DETAIL_FIELD],
+    }
+
+
+def _aligned_refusal_bodies(document: Dict[str, Any]) -> Dict[str, Any]:
+    """Publishes the refusal body the routes in ``document`` return.
+
+    :data:`ERROR_RESPONSE_COMPONENT` is added and named by every
+    published :data:`PUBLISHED_REFUSAL_STATUS` response, and the
+    :data:`GENERATED_VALIDATION_COMPONENTS` that naming leaves
+    unreferenced are removed. Only that status is rewritten, and the
+    document is returned rather than copied, so calling this twice on one
+    document leaves it as the first call did.
+    """
+    components = document.setdefault("components", {})
+    schemas = components.setdefault("schemas", {})
+    schemas[ERROR_RESPONSE_COMPONENT] = _error_response_schema()
+    for name in GENERATED_VALIDATION_COMPONENTS:
+        schemas.pop(name, None)
+    for operations in document.get("paths", {}).values():
+        for operation in operations.values():
+            if not isinstance(operation, dict):
+                continue
+            responses = operation.get("responses")
+            if not isinstance(responses, dict):
+                continue
+            refusal = responses.get(PUBLISHED_REFUSAL_STATUS)
+            if not isinstance(refusal, dict):
+                continue
+            refusal["content"] = {
+                _JSON_MEDIA_TYPE: {
+                    "schema": {"$ref": _ERROR_RESPONSE_REFERENCE}
+                }
+            }
+    return document
+
+
+_generated_api_schema = app.openapi
+
+
+def api_schema() -> Dict[str, Any]:
+    """Returns the published OpenAPI document, generating it once.
+
+    The generated document is passed through
+    :func:`_aligned_refusal_bodies` before it is published, and the
+    result is held on the application, so a later call returns the
+    document the first call aligned.
+    """
+    published = app.openapi_schema
+    if published is None:
+        published = _aligned_refusal_bodies(_generated_api_schema())
+        app.openapi_schema = published
+    return published
+
+
+app.openapi = api_schema
+
 app.add_exception_handler(
     StarletteHTTPException, http_exception_handler
 )
@@ -1119,16 +1521,31 @@ app.add_exception_handler(
 app.add_exception_handler(
     RateLimitExceeded, rate_limit_exceeded_handler
 )
+# Registered for the pool's own class rather than left to the catch-all
+# below, which answers 500 and re-raises so the failure also reaches the
+# server as an unhandled error.
+app.add_exception_handler(PoolTimeout, pool_timeout_handler)
 app.add_exception_handler(Exception, unhandled_exception_handler)
 
 # Registered innermost first: the layer added last is the first to run
 # on an inbound request. The resulting inbound order is request
 # identifier, response headers, cross-origin policy, host validation,
-# rate limiter, body-size cap, router. The rate limiter sits outside the
-# body-size cap, so a request over its limit is refused before any chunk
-# of its body is read, and the cross-origin layer encloses both the host
-# check and those two, so the 400, 429 and 413 they return carry the same
-# headers as any other response.
+# rate limiter, body-size cap, admission gate, router. The rate limiter
+# sits outside the body-size cap, so a request over its limit is refused
+# before any chunk of its body is read, and the cross-origin layer
+# encloses both the host check and those two, so the 400, 429 and 413
+# they return carry the same headers as any other response. The admission
+# gate is innermost, so it encloses the router and nothing else: a
+# request the limiter or the body cap refuses never takes an admission
+# slot, and every slot it does hand out is held for the whole of the
+# routed request, including the session teardown FastAPI runs before the
+# router returns. The 503 it returns travels back out through the six
+# layers above it, so it carries the same headers too.
+app.add_middleware(
+    RequestAdmissionMiddleware,
+    bound=admitted_concurrency(settings.DATABASE_URL),
+    wait_seconds=settings.DB_POOL_TIMEOUT_SECONDS,
+)
 app.add_middleware(
     BodySizeLimitMiddleware,
     max_body_bytes=settings.MAX_REQUEST_BODY_BYTES,
@@ -1144,6 +1561,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=list(CORS_ALLOW_METHODS),
     allow_headers=list(CORS_ALLOW_HEADERS),
+    expose_headers=list(CORS_EXPOSE_HEADERS),
 )
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestIdMiddleware)
@@ -1261,8 +1679,14 @@ def readiness_outcome(db: Session) -> bool:
 
 
 @app.get(HEALTH_PATH)
-def health_check() -> Dict[str, str]:
-    """Reports that the process is able to serve requests."""
+async def health_check() -> Dict[str, str]:
+    """Reports that the process is able to serve requests.
+
+    Answered on the event loop rather than in a worker thread. It reads
+    nothing and waits on nothing, and this path is exempt from the
+    admission bound, so the liveness reading is independent of how many
+    database-bound requests are in flight or waiting for admission.
+    """
     return {"status": HEALTH_STATUS}
 
 

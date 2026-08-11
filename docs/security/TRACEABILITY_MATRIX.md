@@ -319,7 +319,7 @@ rather than an intent:
 |---|---|---|
 | `docs/security/DECISION_LOG.md` | CREATE | Present. Sections 1 to 44 and 79 to 89, the 45-to-78 band having been removed as a duplicate re-issue; §89 is the final-state reconciliation |
 | `docs/security/TRACEABILITY_MATRIX.md` | CREATE | Present — this file |
-| `docs/security/RESIDUAL_RISK.md` | CREATE | Present. Two registers: seven accepted advisories in the packages the deployed image installs, with a one-to-one ledger over the nineteen, and seven more in the verification tooling |
+| `docs/security/RESIDUAL_RISK.md` | CREATE | Present. Two registers: seven accepted advisories in the packages the deployed image installs, with a one-to-one ledger over the nineteen, and one more in the verification tooling |
 | `docs/security/CREDENTIAL_ROTATION.md` | CREATE | Present. Staged runbook: provision, deploy and verify, then rotate |
 | `docs/review/CRITICAL_DECISIONS.md` | CREATE | Present, at the literal path Rule 3 names. Five risk-ordered decisions with reviewer personas and checks |
 | `blitzy-deck/executive-summary.html` | CREATE | Present. Single self-contained reveal.js file |
@@ -808,7 +808,7 @@ tables together and states what each contributes.
 | `backend/app/schema/subscription.py` | H-2 | `test_subscription_tampering.py` (`test_h2_*`) |
 | `backend/requirements.txt` | INFRA-5 | `pip-audit -r backend/requirements.txt` |
 | `backend/requirements-dev.txt` | INFRA-5 | `pip-audit -r backend/requirements-dev.txt`; `test_services.py`, whose module-scope imports depend on the client types this manifest declares |
-| `backend/alembic.ini` | H-1 | `alembic upgrade head`, then one `alembic downgrade -1` per revision in the chain — **five** reversals, the chain being `0001` to `0005`; `test_migration_gate.py::test_each_revision_reverses_and_the_chain_re_applies` walks it a step at a time, and the workflow instead runs `downgrade -1` followed by `downgrade base` so it reaches the empty schema without counting revisions |
+| `backend/alembic.ini` | H-1 | `alembic upgrade head`, then one `alembic downgrade -1` per revision in the chain — **five** reversals, the chain being `0001` to `0005`; `test_migration_gate.py::test_each_revision_reverses_and_the_chain_re_applies` walks it a step at a time, and both workflow gates loop `downgrade -1` once per revision with the step count read from the chain by `len(list(chain.walk_revisions()))`, then read the empty schema back from the database rather than assuming it |
 | `backend/migrations/env.py` | H-1 | `test_migrations.py` |
 | `backend/migrations/script.py.mako` | H-1 | `test_revision_contracts.py` |
 | `backend/migrations/versions/0001_add_rbac_and_subscription_columns.py` | H-1, H-3, H-4 | `test_migrations.py`, `test_migration_revisions.py` |
@@ -1760,6 +1760,112 @@ corrected documents and configuration that were already in the delivered set.
 
 ---
 
+## 12. The browser continuity review — this round's findings, both directions
+
+Sections 9, 10 and 11 map three earlier reviews. This section maps a read-only
+product-frontend continuity review that exercised the **running** service through a real
+browser across ten modules. Its findings carry the identifiers that review assigned —
+Issues 1 to 5 for its numbered findings, and `AoC 1` to `AoC 11` for its areas of concern —
+and are not the plan's twenty. `docs/security/DECISION_LOG.md` §98 holds the reasoning for
+every choice this round made, including the withdrawal of half of row 12.9, and none of that
+reasoning is repeated here.
+
+Four of the review's findings are defects in files this remediation owns. Each row names the
+file the root cause was fixed in and the cases that verify it.
+
+| # | Finding, as behaviour | Root cause fixed in | Verified by |
+|---|---|---|---|
+| AoC 8 | Every HTML page this service serves made the browser report an unrecognised feature in the `Permissions-Policy` header, once per load | `backend/app/main.py` — the `Permissions-Policy` entry of `SECURITY_HEADERS` | `test_application_surface.py::test_the_refusal_carries_the_protective_headers` and `::test_the_security_headers_are_still_set`, and `test_request_bounds_and_refusals.py::test_a_throttled_request_keeps_the_security_headers`, each iterating `SECURITY_HEADERS.items()` over a live response; a browser pass over six page loads with zero matches for five probe strings, calibrated against a control that does emit the warning |
+| AoC 3 | A cross-origin caller refused by its rate limit was sent `Retry-After` and the three `X-RateLimit-*` headers and could not read any of them, so it could not back off | `backend/app/main.py` — `CORS_EXPOSE_HEADERS`, and the `expose_headers` argument to the cross-origin layer | `test_application_surface.py::test_the_installed_exposed_headers_are_the_throttle_policy`, `::test_the_exposed_set_is_the_headers_a_refusal_carries`, `::test_a_shared_response_exposes_the_throttle_policy`, `::test_a_throttled_response_is_read_back_by_its_caller`, `::test_no_installed_value_is_a_wildcard` (extended to the exposed set) |
+| AoC 9 | A refused preflight answered `400` carrying `Access-Control-Allow-Credentials` and no `Access-Control-Allow-Origin`, advertising a credentialed relationship with an origin it had just refused | `backend/app/main.py` — `_drop_orphan_credentials_header`, called from `SecurityHeadersMiddleware.dispatch` | `test_application_surface.py::test_a_refused_preflight_shares_no_credentialed_response`, `::test_an_unlisted_origin_gets_no_credentialed_response`, and `::test_an_allowed_preflight_is_approved` for the pairing in the other direction |
+| AoC 4 | `/openapi.json` described every `422` as an array of per-field failures carrying `loc`, `msg` and `type`, while every refusal returns one fixed string, so a client generated from the document mis-parsed all of them | `backend/app/main.py` — `ERROR_RESPONSE_COMPONENT`, `_error_response_schema`, `_aligned_refusal_bodies` and `api_schema` | `test_request_bounds_and_refusals.py::TestThePublishedRefusalIsTheOneReturned` — nine cases, including one that reads the refusal body from a live route and compares it to the published component, and one that asserts no reference dangles |
+
+Reverse direction — every path this round changed, and the findings it was changed for.
+Six paths, none of them new:
+
+| Target path | Operation | Findings served |
+|---|---|---|
+| `backend/app/main.py` | UPDATED | AoC 3, AoC 4, AoC 8, AoC 9 — all four root causes sit in the application assembly |
+| `backend/tests/security/test_application_surface.py` | UPDATED | AoC 3, AoC 9 — six cases added to `TestCrossOriginPolicyIsExplicit` and the wildcard guard extended to the exposed set |
+| `backend/tests/security/test_request_bounds_and_refusals.py` | UPDATED | AoC 4 — the nine-case published-refusal class and its helpers |
+| `docs/security/DECISION_LOG.md` | UPDATED | AoC 3, AoC 4, AoC 8, AoC 9 for §98.1 and §98.2; Issues 1–5 and AoC 5, 6, 7, 10, 11 for §98.3; AoC 8 again for the withdrawal marked on row 12.9 |
+| `docs/security/TRACEABILITY_MATRIX.md` | UPDATED | This section, for all sixteen of the review's findings that name a file here |
+| `docs/security/RESIDUAL_RISK.md` | UPDATED | AoC 7 — the reachability register now records why self-hosting the viewer assets is refused |
+
+**Nine of this review's findings are repairs this work has no authority to make, and no
+file here changes for them.** Five are inside read-only `frontend/src/**` or the frontend
+build; one would be a behaviour addition no requirement names; one would break a named
+compensating control; and two are not product code at all. Each is recorded rather than
+remediated, which AAP §0.9.2 requires and §0.12.5 reinforces.
+
+| # | Finding, as behaviour | Where it is recorded | Why no file here changes |
+|---|---|---|---|
+| Issue 1 | The product React application does not compile, so all five product routes render an empty `#root` and no product screen could be exercised | `docs/security/DECISION_LOG.md` row 98.3.1; `docs/security/RESIDUAL_RISK.md` O-6 and O-9 for the two dependency halves | All thirteen blockers sit in `frontend/src/**`, `frontend/package.json` or `frontend/public/index.html`, which AAP §0.9.2 places out of scope |
+| Issue 2 | The authentication client reads a token field this service does not return, so the token it stores is `undefined` | `docs/security/DECISION_LOG.md` rows 29.7, 73.7, 80.6.3 and 98.3.2; `docs/security/RESIDUAL_RISK.md` O-5; §11 above as C1 | The repair is inside `frontend/src/services/auth.ts`. The alternative — adding a `token` alias here — is permitted by AAP §0.1.2's frozen-shape clause but is authority AAP §0.12.5 reserves to the user, as row 91.1.1 records |
+| Issue 3 | The client calls a profile route that has existed in no revision of this service, and is answered `404` | `docs/security/DECISION_LOG.md` rows 29.8, 73.8, 80.6.3 and 98.3.3; §11 above as C2 | Removing the call is a frontend change; adding the route is new product capability, which AAP §0.9.2 excludes |
+| Issue 4 | The client's filter creation sends a camelCase body this service's contract refuses, with no `Authorization` header | `docs/security/DECISION_LOG.md` rows 29.8, 73.8 and 98.3.4; §11 above as C2 | Both faults are inside `frontend/src/services/api.ts`, out of scope by AAP §0.9.2 |
+| Issue 5 | `users.last_login` and `filters.last_used` are declared and projected but never written | `docs/security/DECISION_LOG.md` rows 33.10 and 98.3.5 | Writing them is a feature addition unrelated to security, which AAP §0.9.2 excludes; removing the projected fields is forbidden by AAP §0.1.2 |
+| AoC 5 | Stored markup is neutralised by output encoding rather than by input sanitisation, so any other consumer of the stored value must encode independently | `docs/security/DECISION_LOG.md` row 98.3.6 | The review classified it an observation and measured the safety property; sanitising on input would destroy the user's literal data |
+| AoC 6 | `criteria[].field` is validated for shape rather than allowlisted against column names | `docs/security/DECISION_LOG.md` row 98.3.6 | An allowlist would reject values the published contract accepts by design, which is a breaking contract change no requirement names |
+| AoC 7 | The documentation viewers load their assets from external networks and would render unstyled where egress is filtered | `docs/security/DECISION_LOG.md` row 98.3.7; `docs/security/RESIDUAL_RISK.md`, the reachability section | Self-hosting them requires a static-file handler, and its absence is the named compensating control for accepted advisory PYSEC-2026-2281 |
+| AoC 10, AoC 11 | Port and database collisions between concurrent agents on one host, and accessibility and overflow items in the review's own test harness | `docs/security/DECISION_LOG.md` row 98.3.8 | Neither is product code. The harness was the review's own instrument and it deleted it; the two latent product analogues it named are both in read-only `frontend/src/**` |
+
+**Coverage of this set.** All 16 of the review's findings that name a file in this
+repository appear above: 4 in the forward table and 12 in the recorded-rather-than-remediated
+table, where AoC 10 and AoC 11 share one row. Every one is reachable from a reverse
+direction — the four fixed ones from the reverse path table, the rest from the record that
+holds them. Every finding maps to at least one path or record and every changed path maps to
+at least one finding. **No path is new**, so the delivered totals in the introduction and
+section 2.10 are unchanged by this round.
+
+---
+
+
+## 13. The runtime review &mdash; two findings, both directions
+
+Sections 9 to 11 map earlier reviews. This section maps a runtime pass over the
+infrastructure and configuration surface, whose two findings the review numbered Issue 1
+and Issue 2. Both are documentation-accuracy defects inside in-scope configuration files:
+one made `terraform plan` refuse a deployment over an input no resource reads, and one
+described a secret boundary that four other files and this repository's own suite
+contradict. Neither weakens a runtime control, and for the second the applied
+configuration is the narrower posture. `docs/security/DECISION_LOG.md` &sect;100 holds the
+reasoning for every choice, including the six alternatives refused, and none of it is
+repeated here.
+
+| # | Finding, as behaviour | Root cause fixed in | Verified by |
+|---|---|---|---|
+| Issue 1 | A plan refused a deployment naming an input nothing applies: `var.database_private_network` was required, read by no resource, and described as "applied as settings.ip_configuration.private_network on `google_sql_database_instance.main`" when the instance takes that value from the created VPC. Four sibling descriptions attributed an application to the wrong input, two named a resource this configuration does not declare, and one input's default disagreed with the literal the resource fixes | `infrastructure/terraform/variables.tf` (ten variable blocks), `infrastructure/terraform/main.tf` (two comments), `README.md` (both no-default paragraphs and the shared-VPC prerequisite row) | `terraform plan -refresh=false` with the input omitted, which refused before and now plans 72 resources; the two plans exported to JSON and compared address by address, identical in every change body; `test_infrastructure_contract.py::test_every_variable_without_a_default_is_read_by_the_configuration`, `::test_every_block_a_description_names_is_declared`, `::test_every_description_that_claims_application_names_a_reader`, and `::test_every_declared_variable_is_read_or_recorded_as_unread` reading code alone; `test_terraform_contract.py::test_the_cluster_and_the_database_share_one_network`; `terraform fmt -check -recursive`, `init -backend=false` and `validate`; `test_operator_documentation.py` for the readme |
+| Issue 2 | The six-secret `SecretProviderClass` named the migration Job and the administrator-credential Job among the workloads that mount it and said a narrower `DATABASE_URL`-only class was not declared, so a reviewer auditing the boundary from that file concluded the migration identity could read all six credentials. Both pods mount narrower classes of their own, the narrower class is declared, and the workload that does mount all six went unnamed; the migration Job additionally cited the six-secret manifest for its own mount | `infrastructure/kubernetes/30-backend-secrets.yaml`, `infrastructure/kubernetes/60-migration-job.yaml`, `infrastructure/kubernetes/35-migration-secrets.yaml`, `infrastructure/kubernetes/65-ingestion-cronjob.yaml` | `test_delivery_pipeline.py::test_each_delivery_class_names_the_workloads_that_mount_it` and `::test_each_workload_cites_the_file_declaring_the_class_it_mounts`, both calibrated against the pre-round text; `::test_the_migration_runs_under_its_own_narrow_identity`; the class-to-workload map re-derived from the parsed manifests; `test_infrastructure_contract.py::test_the_migration_identity_reads_the_database_url_alone` and `::test_the_migration_delivery_mounts_the_one_secret_it_is_granted`; `scripts/render_kubernetes_manifests.sh all`, which rendered every manifest with no surviving token; `.github/scripts/check_manifest_settings_contract.py` |
+
+Reverse direction &mdash; every path this round changed, and the findings it was changed
+for. Twelve paths, none of them new:
+
+| Target path | Operation | Findings served |
+|---|---|---|
+| `infrastructure/terraform/variables.tf` | UPDATED | Issue 1 &mdash; the default, and the eight descriptions corrected |
+| `infrastructure/terraform/main.tf` | UPDATED | Issue 1 &mdash; the two comments naming the wrong inputs as composing the workload-identity principal |
+| `README.md` | UPDATED | Issue 1 &mdash; the two no-default counts and the shared-VPC prerequisite row |
+| `infrastructure/kubernetes/30-backend-secrets.yaml` | UPDATED | Issue 2 &mdash; the workload list and the narrower-class paragraph |
+| `infrastructure/kubernetes/60-migration-job.yaml` | UPDATED | Issue 2 &mdash; the citation of its own mount |
+| `infrastructure/kubernetes/35-migration-secrets.yaml` | UPDATED | Issue 2 &mdash; the reverse citation of the workload that mounts it |
+| `infrastructure/kubernetes/65-ingestion-cronjob.yaml` | UPDATED | Issue 2 &mdash; the class it mounts, named in its own header |
+| `backend/tests/security/test_infrastructure_contract.py` | UPDATED | Issue 1 &mdash; three new cases, the code-only read comparison and the twenty-entry unread inventory |
+| `backend/tests/security/test_delivery_pipeline.py` | UPDATED | Issue 2 &mdash; the two secret-boundary cases |
+| `backend/tests/security/test_documentation_contract.py` | UPDATED | Issue 1 &mdash; rows 37.1 and 42.2.6 added to the withdrawn-claim inventory |
+| `docs/security/DECISION_LOG.md` | UPDATED | Both &mdash; &sect;100, and the two rows marked withdrawn in place |
+| `docs/security/TRACEABILITY_MATRIX.md` | UPDATED | Both &mdash; this section |
+
+**Coverage of this set.** Both findings appear above and both are reachable from the
+reverse table; every path maps to at least one finding and every finding to at least one
+path, so no cell is empty and no identifier appears that this review did not raise. Seven
+of the twelve paths are the configuration and documentation the findings name, three are
+the contract modules that now refuse each defect's shape, and two are the Rule 1
+documents. No path is new, so the delivered totals in the introduction and in section
+2.10 are unchanged: this round corrected configuration, documentation and contract cases
+already in the delivered set.
+
+---
 
 ### What this document deliberately does not contain
 
@@ -1768,7 +1874,7 @@ Each omission is a boundary with a sibling document, not a gap in coverage.
 - **No rationale.** Rule 1 makes `docs/security/DECISION_LOG.md` the single source of truth
   for *why*, and none of the tables above carries a "why" column.
 - **No residual-advisory evidence.** The accepted advisories — 7 in the runtime register
-  and 7 more in the development register, 14 in total and disjoint — the measured version
+  and 1 more in the development register, 8 in total and disjoint — the measured version
   ceilings under the runtime pin, and the reachability measurement behind each compensating
   control all belong to `docs/security/RESIDUAL_RISK.md`. Where a figure in this file names
   7, it names the runtime register alone, which is the set the deployed image installs.
@@ -1837,3 +1943,63 @@ notifications; none pulls cardholder data inward. No conformance to any complian
 framework is claimed.
 
 ---
+
+## 14. The performance and resource-control review — this round's findings, both directions
+
+Sections 9 to 11 map three earlier reviews. This section maps a final performance and
+resource-control review of the running service: eleven in-scope surfaces, around six hundred
+runtime checks, nine surfaces passing and two failing. Its findings carry the identifiers that
+review assigned — F-1 and F-2 for the two defects, and INFO-1 to INFO-3 for its observations —
+and are not the plan's twenty.
+
+Every row names the file the root cause was fixed in and the test or measurement that verifies
+it. `docs/security/DECISION_LOG.md` §97 holds the reasoning for every choice this round made,
+including the two it wrote and withdrew — a contract module in §97.1.2 and, more consequentially,
+its first repair for F-2 in §97.4 — and none of that reasoning is repeated here.
+
+| # | Finding, as behaviour | Root cause fixed in | Verified by |
+|---|---|---|---|
+| F-1 | Twelve consecutive logins for one address, each with a different `X-Forwarded-For`, were all answered `401` and none was throttled, against a policy of five per minute — because the ASGI server had already replaced the address in the scope with the header's value, so a caller varying it was a new client on every request | `infrastructure/docker/Dockerfile.backend`, `infrastructure/kubernetes/40-backend.yaml`, `README.md`, `.github/workflows/ci.yml` | `test_delivery_pipeline.py::test_every_start_command_leaves_the_client_address_alone`, `::test_no_start_command_restores_forwarded_header_trust`, `::test_each_start_command_source_carries_what_is_recorded_for_it`; `test_operator_documentation.py::test_the_documented_start_command_leaves_the_client_address_alone`; the twelve-request probe re-run against the running service, answered `401` five times and then `429` |
+| F-1 | The same root cause let one caller clear another's in-force throttle, because a key space the caller chooses can be flooded until the bounded in-process store evicts the entries closest to expiry | The same four files | Closed by the same change: with the key no longer caller-controlled there is no key space to flood. `test_rate_limit_store.py` holds the eviction behaviour itself, and `backend/app/core/config.py` already refuses every in-process store outside a local run |
+| F-1 | An operator raising `TRUSTED_PROXY_HOPS` was changing a value the ASGI server had already decided for them, and neither place the setting is documented said so | `README.md`, `.env.example` | `test_operator_documentation.py::test_each_document_pairs_the_flag_with_the_hop_setting`, `::test_the_readme_row_for_the_hop_setting_names_the_flag`, `::test_the_template_block_for_the_hop_setting_names_the_flag` |
+| F-2 | Driving the public listings collection at 60 concurrent connections produced 38 answers of HTTP 500 after a 10.44 s stall, with no `Retry-After`; at 100 it was 73 and the median was two stacked ten-second waits. A 500 is not retryable by a client or a load balancer and carries no backoff hint, so a capacity limit was indistinguishable from a fault | `backend/app/main.py` — a handler registered for the pool's own exception class answering 503 with `Retry-After`, a generic detail and the request identifier | `test_application_surface.py::TestCapacityRefusal` — the refusal is retryable, the body names the request and nothing else, the retry hint is the configured wait, the pool class is not the interpreter's timeout, the application registers the handler for it, and the refusal carries the protective, cross-origin and correlation headers because it is reached inside the middleware stack |
+| F-2 | The pool's ceiling was `size 5 + overflow 10` from the pool's own defaults while 40 requests were admitted to run a statement at once, so 25 could be waiting on a pool with nothing to give, each for the full `DB_POOL_TIMEOUT_SECONDS`, before any could be refused | `backend/app/core/config.py` (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`), `backend/app/db/database.py` (`_pool_args`, `pool_capacity`, `admitted_concurrency`), `backend/app/main.py` (`RequestAdmissionMiddleware`, registered innermost, with `UNGATED_PATHS` exempting the two probes) | `test_database_boundary.py::TestHowManyConnectionsOneProcessMayHold` — both bounds reach the pool, the ceiling is their sum, the admitted count is the persistent bound and is below the ceiling by exactly the overflow; `test_application_surface.py::TestAdmissionIsBoundedByThePool` — no more than the bound are inside the router, a caller that waits its whole allowance is refused with the pool refusal's own answer, a failing route gives its slot back, the probes are never held, and each event loop holds its own bound. The runtime ladder re-run at the concurrency that produced the 500s: 626 answers at 60 concurrent and 528 at 100, none of them a 500 or a 503, with a database-side peak of exactly the bound |
+| F-2 | **The first repair for the row above was a worker-thread cap. It was delivered, measured under load and withdrawn — at 60 concurrent it still stalled 10 703 ms at the median and throughput fell to 4.7 req/s.** `docs/security/DECISION_LOG.md` §97.4 records the measurement, why a thread cap cannot bound connection demand, and the mechanism above that replaced it; rows 97.2.3 and 97.2.4 are marked in place as the superseded position | The same three files. `admitted_request_concurrency` and the lifespan thread cap no longer exist | The comparison in §97.4, driven on the same corpus at the same five rungs |
+| F-2 | Every setting the repair adds had to be published wherever the others are, or a deployment would run on an implicit default again | `.env.example`, `infrastructure/docker/docker-compose.yml`, `infrastructure/kubernetes/20-backend-config.yaml`, `README.md`, `backend/tests/support.py` | `test_deployment_contract.py::test_the_backend_declares_every_published_setting`, which requires the Compose environment to name exactly the settings the class declares; `test_config_validation.py::test_every_declared_setting_is_supplied_by_the_suite` |
+| INFO-3 | 179 blocks of `Exception in ASGI application` in the server's error stream, all 179 ending in the same pool timeout, so the failure reached the server unhandled and its multi-frame traceback bypassed the redacting logger | `backend/app/main.py` — the same registration. The framework routes the `Exception` key to its outermost error layer, which answers and re-raises; a handler for a specific class is placed in the inner layer, which does not | `test_application_surface.py::TestCapacityRefusal::test_nothing_propagates_past_the_handler`, driven through a client that does not convert a propagating exception into a 500; and zero occurrences of the block in the server's error stream across the re-run ladder |
+| INFO-1 | No response compression is configured | Recorded, not changed — `docs/security/DECISION_LOG.md` row 97.3.1 | The row's own reasoning; the page-size cap that bounds every collection response |
+| INFO-2 | Rows beyond the absolute pagination offset ceiling are unreachable through the collection routes | Recorded, not changed — `docs/security/DECISION_LOG.md` row 97.3.2 | The row's own reasoning; `test_request_bounds_and_refusals.py`, which holds the bound the review confirmed effective |
+
+**No path in this round's remediation is new.** Every file it changes was already in the
+delivered set and already carries a row in section 4, which is why the delivered totals in the
+introduction and in §2.10 are unchanged by it. §97.1.2 records the module this round wrote for
+the same purpose and then withdrew, and the six published figures a new path would have moved;
+the cases it held were placed in the two modules that already read those files instead.
+
+Reverse direction — every path this round's remediation changed, and the findings it was
+changed for. Sixteen paths, none of them new:
+
+| Target path | Operation | Findings served |
+|---|---|---|
+| `infrastructure/docker/Dockerfile.backend` | UPDATED | F-1 — the image's own start command |
+| `infrastructure/kubernetes/40-backend.yaml` | UPDATED | F-1 — the deployment's start command |
+| `.github/workflows/ci.yml` | UPDATED | F-1 — both invocations the verification workflow serves the application from |
+| `README.md` | UPDATED | F-1 — the documented command, and the pairing stated in the hop setting's own row; F-2 — the two pool bounds in the settings table |
+| `.env.example` | UPDATED | F-1 — the pairing stated where the hop setting's value is written; F-2 — the two pool bounds |
+| `backend/app/core/config.py` | UPDATED | F-2 — `DB_POOL_SIZE` and `DB_MAX_OVERFLOW`, both range-bounded |
+| `backend/app/db/database.py` | UPDATED | F-2 — both bounds reach the pool, and `pool_capacity` and `admitted_concurrency` publish the two figures derived from them |
+| `backend/app/main.py` | UPDATED | F-2 and INFO-3 — the capacity handler and its registration, the retry hint, the admission gate and the two paths it exempts, the bound reported at startup, and the liveness route moving off the worker threads |
+| `infrastructure/docker/docker-compose.yml` | UPDATED | F-2 — both bounds published to the backend and the migration service through the shared environment anchor |
+| `infrastructure/kubernetes/20-backend-config.yaml` | UPDATED | F-2 — both bounds published to the cluster workload |
+| `backend/tests/support.py` | UPDATED | F-2 — both bounds supplied to the suite, which requires the settings it names to be exactly the ones the class declares |
+| `backend/tests/security/test_delivery_pipeline.py` | UPDATED | F-1 — the four shipped invocations |
+| `backend/tests/security/test_operator_documentation.py` | UPDATED | F-1 — the documented invocation and both documentation surfaces |
+| `backend/tests/security/test_database_boundary.py` | UPDATED | F-2 — the two bounds at the database boundary and the two figures derived from them |
+| `backend/tests/security/test_application_surface.py` | UPDATED | F-2 and INFO-3 — the capacity refusal, the admission bound and the liveness route |
+| `docs/security/DECISION_LOG.md` | UPDATED | F-1, F-2, INFO-1, INFO-2, INFO-3 — §97 |
+| `docs/security/TRACEABILITY_MATRIX.md` | UPDATED | This section, for every identifier above |
+
+**Coverage of this set.** All five identifiers appear above and all five are reachable from the
+reverse direction. Every finding maps to at least one path and every path maps to at least one
+finding — no cell is empty, and no identifier appears that this review did not raise.
+

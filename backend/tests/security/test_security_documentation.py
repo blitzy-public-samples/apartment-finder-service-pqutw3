@@ -25,6 +25,7 @@ restating it, so these assertions check agreement rather than duplication.
 """
 
 import re
+import unicodedata
 
 import pytest
 import yaml
@@ -108,6 +109,26 @@ SUPERSEDED_ABSENCE_ROWS = ("26.19", "29.11", "30.15", "32.12", "33.11")
 #: Log row that withdraws every row above.
 WITHDRAWAL_ROW = "35.1.1"
 
+#: Log rows that decided the first repair for the pool-exhaustion
+#: finding, which was delivered and then measured not to remove the
+#: stall. Each stands as chronology and points at the withdrawal.
+SUPERSEDED_REPAIR_ROWS = ("97.2.3", "97.2.4", "97.2.5")
+
+#: Section holding that withdrawal, as a reader cites it and as its
+#: heading reads.
+REPAIR_WITHDRAWAL_SECTION = "97.4"
+
+REPAIR_WITHDRAWAL_HEADING = "### %s " % REPAIR_WITHDRAWAL_SECTION
+
+#: Figures from the load run that falsified the first repair. The
+#: conclusion alone is not followable; these are what showed it.
+FALSIFYING_FIGURES = (
+    "10 703 ms",
+    "4.7 req/s",
+    "31 203 ms",
+    "2.2 req/s",
+)
+
 #: Paths the plan's mapping marks CREATE or UPDATE.
 PLANNED_CHANGED_PATHS = 59
 
@@ -165,6 +186,13 @@ REMOVED_SECTION_OFFSET = 44
 
 #: A same-document fragment link, as a reader's browser resolves it.
 FRAGMENT_LINK = re.compile(r"\]\(#([^)\s]+)\)")
+
+#: An ATX heading, which is the only construct that offers an anchor.
+_HEADING = re.compile(r"^#{1,6}[ \t]+(.+?)[ \t]*#*$")
+
+#: A fence, opening or closing. Headings inside one are not headings: a
+#: shell comment in an extracted command starts with the same character.
+_FENCE = re.compile(r"^\s*```")
 
 #: Placeholder contact values these documents once published. Each may
 #: still be named in prose that disowns it, never offered as a contact.
@@ -231,19 +259,54 @@ def _identifiers(text):
     return found
 
 
+def _slug(title):
+    """Returns the fragment identifier a heading offers, as GitHub builds it.
+
+    ``github-slugger`` lower-cases the rendered heading text, drops every
+    punctuation and symbol character other than the hyphen and the
+    underscore, and replaces **each** remaining space with a hyphen. The
+    per-space rule is the part that is easy to get wrong: collapsing runs
+    of whitespace instead produces a single hyphen where GitHub emits two,
+    so a heading separated by " -- " (an em dash between two spaces, the
+    dash dropped and both spaces surviving) resolves under this rule and
+    not under a collapsing one.
+    """
+    rendered = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", title)
+    rendered = rendered.replace("`", "").replace("*", "")
+    slug = []
+    for char in rendered.strip().lower():
+        if char in ("-", "_"):
+            slug.append(char)
+        elif char == " ":
+            slug.append("-")
+        elif not unicodedata.category(char).startswith(("P", "S")):
+            slug.append(char)
+    return "".join(slug)
+
+
 def _anchors(text):
     """Returns the fragment identifiers one document's headings offer.
 
-    Built the way a Markdown renderer builds them: lower-cased, with
-    punctuation dropped and spaces turned into hyphens.
+    Only ATX headings outside fenced blocks count, so a shell comment in
+    an extracted command cannot supply an anchor that masks a broken link.
+    A repeated heading is suffixed the way GitHub disambiguates it.
     """
     anchors = set()
+    occurrences = {}
+    inside_fence = False
     for line in text.splitlines():
-        if not line.startswith("#"):
+        if _FENCE.match(line):
+            inside_fence = not inside_fence
             continue
-        title = line.lstrip("#").strip()
-        slug = re.sub(r"[^\w\s-]", "", title.lower())
-        anchors.add(re.sub(r"\s+", "-", slug).strip("-"))
+        if inside_fence:
+            continue
+        heading = _HEADING.match(line)
+        if heading is None:
+            continue
+        base = _slug(heading.group(1))
+        seen = occurrences.get(base, 0)
+        occurrences[base] = seen + 1
+        anchors.add(base if seen == 0 else "%s-%d" % (base, seen))
     return anchors
 
 
@@ -775,3 +838,49 @@ def test_the_readme_records_the_renamed_location_input():
 
     assert "replaces `GKE_CLUSTER_ZONE`" in flowed
     assert "`jq`" in flowed
+
+
+@pytest.mark.parametrize("row", SUPERSEDED_REPAIR_ROWS)
+def test_the_withdrawn_repair_names_every_row_it_supersedes(row):
+    """Asserts each superseded row exists and is marked where it stands.
+
+    The first repair for the pool-exhaustion finding was delivered and
+    then measured not to work. Following the convention section 27
+    established, the rows that decided it keep their own chronology
+    rather than being rewritten, which is only safe while each carries
+    the pointer and the withdrawal names it back.
+    """
+    text = _text(DECISION_LOG)
+    withdrawal = _flowed(
+        text.split(REPAIR_WITHDRAWAL_HEADING)[-1]
+    )
+
+    assert row in _identifiers(text), row
+    assert row in withdrawal, row
+    marked = next(
+        line
+        for line in text.splitlines()
+        if line.startswith("| %s |" % row)
+    )
+    assert REPAIR_WITHDRAWAL_SECTION in marked, row
+    assert "superseded" in marked.lower(), row
+
+
+def test_the_withdrawn_repair_publishes_what_falsified_it():
+    """Asserts the measurement is recorded, not just the conclusion.
+
+    Rule 1 makes this log the authority for why, and "it did not work"
+    is only followable while the figures that showed it are beside it.
+    """
+    flowed = _flowed(_text(DECISION_LOG))
+
+    for figure in FALSIFYING_FIGURES:
+        assert figure in flowed, figure
+
+
+def test_the_matrix_carries_the_withdrawn_repair_pointer():
+    """Asserts the matrix does not restate the withdrawal on its own."""
+    flowed = _flowed(_text(TRACEABILITY_MATRIX))
+
+    assert REPAIR_WITHDRAWAL_SECTION in flowed
+    assert "worker-thread cap" in flowed

@@ -332,6 +332,7 @@ files_for() {
 main() {
     local selector
     local name
+    local selected
 
     if [ "$#" -eq 0 ]; then
         echo "Usage: $0 <prerequisites|migration|workloads|all" \
@@ -350,12 +351,22 @@ main() {
     fi
 
     for selector in "$@"; do
+        # Resolved into a variable, and its status tested, before anything
+        # is read: a command substitution inside the here-document below
+        # discards the exit status of what produced it, so an unrecognised
+        # selector would print its message and still leave this function
+        # reporting success with nothing on standard output -- which the
+        # `kubectl apply -f -` on the other end of the pipe would accept.
+        if ! selected="$(files_for "${selector}")"; then
+            return 1
+        fi
+
         while read -r name; do
             [ -n "${name}" ] || continue
             echo "---"
             render_file "${MANIFEST_DIR}/${name}"
         done <<EOF
-$(files_for "${selector}")
+${selected}
 EOF
     done
 }

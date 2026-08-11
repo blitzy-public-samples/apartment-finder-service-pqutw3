@@ -8,10 +8,13 @@ number, and an error record carrying a traceback whose database frames
 hold the values bound into the statement being run.
 """
 
+import inspect
 import logging
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -20,6 +23,7 @@ from conftest import CLIENT_BASE_URL, REPO_ROOT
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -30,6 +34,11 @@ from backend.app.core.authorization import (
     reset_audit_failure_count,
 )
 from backend.app.core.config import LOCAL_ENVIRONMENT, settings
+from backend.app.core.rate_limit import (
+    RATE_LIMIT_HEADERS,
+    RETRY_AFTER_HEADER,
+)
+from backend.app.schema.user import UserCreate, UserLogin
 from backend.app.db import database as database_module
 from backend.app.core.logging import (
     BASE_LOGGER_NAME,
@@ -69,6 +78,50 @@ SCHEMA_CREATION_ATTRIBUTE = "create_all"
 #: Name of the installed cross-origin middleware.
 CORS_MIDDLEWARE_NAME = "CORSMiddleware"
 
+#: URL whose pool carries the two size bounds, so the admitted count is
+#: read from it. It names a host nothing resolves: no case here opens a
+#: connection, only builds the figures the bounds produce.
+POOLED_URL = "postgresql://user:pw@db.internal:5432/apartment_finder"
+
+#: Seconds a holding caller waits before releasing itself, so a case that
+#: fails before releasing it still ends.
+HELD_THREAD_TIMEOUT_SECONDS = 30.0
+
+#: Seconds the liveness route is allowed while the gate is saturated. A
+#: route the gate held would instead wait the allowance below.
+LIVENESS_BUDGET_SECONDS = 10.0
+
+#: Route of the admission probe that stays inside the router until it is
+#: released, so a caller can saturate the gate on demand.
+GATED_HOLD_PATH = "/hold"
+
+#: Route of the admission probe that answers at once.
+GATED_QUICK_PATH = "/quick"
+
+#: Route of the admission probe that raises, so the slot it took is
+#: observed being given back.
+GATED_FAILING_PATH = "/fails"
+
+#: Route of the admission probe that reports which bound object served
+#: it, so two event loops are seen holding two.
+GATED_LIMITER_PATH = "/limiter"
+
+#: Seconds a gated request may wait for a slot in the cases that expect
+#: every caller to be admitted. It is far longer than any route here
+#: holds one, so a refusal in those cases is a real failure.
+GATE_WAIT_SECONDS = 5.0
+
+#: Seconds a gated request may wait for a slot in the cases that expect a
+#: refusal, kept short so the refusal is prompt.
+GATE_REFUSAL_WAIT_SECONDS = 0.2
+
+#: Seconds between readings while waiting for the router to fill.
+POLL_INTERVAL_SECONDS = 0.01
+
+#: Seconds an extra caller is watched for while the gate is already full,
+#: which is how long the crowd inside is asserted not to grow.
+CROWD_OBSERVATION_SECONDS = 0.5
+
 #: The value that must never appear in any cross-origin allowlist or in
 #: any cross-origin response header, because it is what a credentialed
 #: response may not be shared under.
@@ -99,6 +152,16 @@ CORS_ALLOW_METHODS_HEADER = "Access-Control-Allow-Methods"
 
 #: Response header naming the request headers a preflight approves.
 CORS_ALLOW_HEADERS_HEADER = "Access-Control-Allow-Headers"
+
+#: Response header naming the response headers a caller's code may read.
+CORS_EXPOSE_HEADERS_HEADER = "Access-Control-Expose-Headers"
+
+#: Status a request refused by its rate limit is answered with.
+TOO_MANY_REQUESTS = 429
+
+#: Address the throttle case registers with. The body it is sent in is
+#: refused by the request contract, so no account is ever created.
+REFUSED_ADDRESS = "throttle-surface@example.com"
 
 #: Module whose import must not create the schema.
 APPLICATION_MODULE = "backend.app.main"
@@ -1036,12 +1099,93 @@ class TestCrossOriginPolicy:
     def test_no_installed_value_is_a_wildcard(self):
         """A wildcard alongside credentials is what M-3 removed."""
         keywords = self.installed()
-        for name in ("allow_origins", "allow_methods", "allow_headers"):
+        for name in (
+            "allow_origins",
+            "allow_methods",
+            "allow_headers",
+            "expose_headers",
+        ):
             entries = keywords[name]
             assert entries
             assert CORS_WILDCARD not in entries, name
             for entry in entries:
                 assert CORS_WILDCARD not in entry, (name, entry)
+
+    def test_the_installed_exposed_headers_are_the_throttle_policy(self):
+        assert self.installed()["expose_headers"] == list(
+            main_module.CORS_EXPOSE_HEADERS
+        )
+
+    def test_the_exposed_set_is_the_headers_a_refusal_carries(self):
+        """Every header the limiter writes is readable by its caller."""
+        assert set(main_module.CORS_EXPOSE_HEADERS) == set(
+            RATE_LIMIT_HEADERS
+        ) | {RETRY_AFTER_HEADER}
+
+    def test_a_shared_response_exposes_the_throttle_policy(self):
+        origin = list(settings.ALLOWED_ORIGINS)[0]
+        response = self.client().get(
+            "/health", headers={"Origin": origin}
+        )
+        assert response.status_code == 200
+        exposed = response.headers[CORS_EXPOSE_HEADERS_HEADER]
+        for header in main_module.CORS_EXPOSE_HEADERS:
+            assert header in exposed
+
+    def test_a_throttled_response_is_read_back_by_its_caller(self):
+        """A refused caller can read every header it must back off on.
+
+        The refusal is produced by driving the limiter rather than by
+        constructing a response, so the case fails if the exposed set
+        and the set the limiter writes ever drift apart.
+        """
+        origin = list(settings.ALLOWED_ORIGINS)[0]
+        client = self.client()
+        allowed = int(settings.RATE_LIMIT_REGISTER.split("/", 1)[0])
+        refused = None
+        for _ in range(allowed + 1):
+            response = client.post(
+                "/auth/register",
+                json={"email": REFUSED_ADDRESS, "password": ""},
+                headers={"Origin": origin},
+            )
+            if response.status_code == TOO_MANY_REQUESTS:
+                refused = response
+                break
+        assert refused is not None
+        exposed = {
+            name.strip()
+            for name in refused.headers[
+                CORS_EXPOSE_HEADERS_HEADER
+            ].split(",")
+        }
+        for header in RATE_LIMIT_HEADERS + (RETRY_AFTER_HEADER,):
+            assert header in refused.headers, header
+            assert header in exposed, header
+
+    def test_a_refused_preflight_shares_no_credentialed_response(self):
+        """The credentials header never travels without its origin."""
+        response = self.preflight(DISALLOWED_ORIGIN)
+        assert response.status_code == 400
+        assert (
+            main_module.CORS_ALLOW_ORIGIN_HEADER not in response.headers
+        )
+        assert (
+            main_module.CORS_ALLOW_CREDENTIALS_HEADER
+            not in response.headers
+        )
+
+    def test_an_unlisted_origin_gets_no_credentialed_response(self):
+        response = self.client().get(
+            "/health", headers={"Origin": DISALLOWED_ORIGIN}
+        )
+        assert (
+            main_module.CORS_ALLOW_ORIGIN_HEADER not in response.headers
+        )
+        assert (
+            main_module.CORS_ALLOW_CREDENTIALS_HEADER
+            not in response.headers
+        )
 
     def test_an_allowed_preflight_is_approved(self):
         origin = list(settings.ALLOWED_ORIGINS)[0]
@@ -1218,6 +1362,473 @@ class TestEveryDatabaseWaitIsBounded:
         assert not inspect.iscoroutinefunction(
             main_module.readiness_check
         )
+
+
+class TestCapacityRefusal:
+    """Pool exhaustion is answered as a retryable capacity limit.
+
+    It used to reach the catch-all handler, which answers 500 and lets
+    the failure carry on to the server as an unhandled error: a client
+    cannot retry a 500, a load balancer cannot read a backoff from one,
+    and the raw traceback the server then wrote bypassed the redacting
+    logger entirely. A handler registered for the pool's own class
+    answers 503 with ``Retry-After`` and nothing propagates.
+    """
+
+    def build(self):
+        """Returns a client over a route the pool refuses a connection."""
+        probe = FastAPI()
+
+        @probe.get("/exhausted")
+        async def exhausted():
+            raise PoolTimeout(
+                "QueuePool limit of size 5 overflow 10 reached, "
+                "connection timed out, timeout 10.00"
+            )
+
+        probe.add_exception_handler(
+            PoolTimeout, main_module.pool_timeout_handler
+        )
+        probe.add_exception_handler(
+            Exception, main_module.unhandled_exception_handler
+        )
+        return TestClient(probe, raise_server_exceptions=False)
+
+    def test_the_pool_class_is_not_the_interpreter_timeout(self):
+        """The registration is narrow enough not to catch other waits.
+
+        The outbound provider and listing calls raise the interpreter's
+        own timeout and the transport library's. Registering the pool's
+        class must not answer either of those as a capacity refusal.
+        """
+        assert not issubclass(PoolTimeout, TimeoutError)
+        assert PoolTimeout is not TimeoutError
+
+    def test_the_application_registers_the_handler_for_that_class(self):
+        registered = main_module.app.exception_handlers
+
+        assert registered[PoolTimeout] is main_module.pool_timeout_handler
+
+    def test_the_refusal_is_retryable_rather_than_a_fault(self):
+        answered = self.build().get("/exhausted")
+
+        assert answered.status_code == 503
+        assert answered.headers["Retry-After"] == str(
+            main_module.capacity_retry_after_seconds()
+        )
+
+    def test_the_body_names_the_request_and_nothing_else(self):
+        """No pool figure, no exception text and no traceback."""
+        answered = self.build().get("/exhausted")
+        body = answered.json()
+
+        assert body["detail"] == main_module.CAPACITY_DETAIL
+        assert set(body) == {"detail", main_module.REQUEST_ID_FIELD}
+        for absent in ("QueuePool", "overflow", "sqlalchemy", "Traceback"):
+            assert absent not in answered.text, absent
+
+    def test_the_retry_hint_is_the_configured_wait(self, monkeypatch):
+        """Rounded up to whole seconds, with a floor of one."""
+        monkeypatch.setattr(settings, "DB_POOL_TIMEOUT_SECONDS", 2.5)
+        assert main_module.capacity_retry_after_seconds() == 3
+
+        monkeypatch.setattr(settings, "DB_POOL_TIMEOUT_SECONDS", 0.25)
+        assert main_module.capacity_retry_after_seconds() == 1
+
+    def test_the_refusal_is_recorded_without_the_pool_message(
+        self, records
+    ):
+        """The record names the class, the route and the correlation.
+
+        The pool's own message names its size and overflow, so it is
+        suppressed the way every other exception message is, and the
+        wait and the hint travel as discrete fields instead.
+        """
+        self.build().get("/exhausted")
+        recorded = [
+            record
+            for record in records
+            if record.getMessage() == main_module.POOL_EXHAUSTED_MESSAGE
+        ]
+
+        assert recorded
+        rendered = repr(vars(recorded[0]))
+        assert "QueuePool" not in rendered
+        assert "Traceback" not in rendered
+        assert getattr(recorded[0], "exception_type", None) == (
+            PoolTimeout.__name__
+        )
+        assert getattr(recorded[0], "retry_after_seconds", None) == (
+            main_module.capacity_retry_after_seconds()
+        )
+
+    def test_the_refusal_carries_the_protective_headers(
+        self, client, monkeypatch
+    ):
+        """Reached inside the middleware stack, so the layers apply.
+
+        The readiness route is driven because it is the one route whose
+        database work this case can make fail on demand. Its own 503
+        reports a status rather than a detail, so the body distinguishes
+        the two answers.
+        """
+
+        def refuse_connection(*arguments, **keywords):
+            raise PoolTimeout("connection timed out")
+
+        monkeypatch.setattr(
+            main_module, "readiness_outcome", refuse_connection
+        )
+
+        answered = client.get(main_module.READINESS_PATH)
+
+        assert answered.status_code == 503
+        assert answered.json()["detail"] == main_module.CAPACITY_DETAIL
+        assert answered.headers["Retry-After"]
+        assert answered.headers[main_module.REQUEST_ID_HEADER]
+        for name, value in main_module.SECURITY_HEADERS.items():
+            assert answered.headers[name] == value, name
+
+    def test_nothing_propagates_past_the_handler(self, client, monkeypatch):
+        """The client raises server exceptions, so a leak would fail here.
+
+        The fixture's client is built without the escape hatch that
+        converts a propagating exception into a 500, which is what the
+        earlier behaviour relied on.
+        """
+
+        def refuse_connection(*arguments, **keywords):
+            raise PoolTimeout("connection timed out")
+
+        monkeypatch.setattr(
+            main_module, "readiness_outcome", refuse_connection
+        )
+
+        assert client.get(main_module.READINESS_PATH).status_code == 503
+
+
+def _settles(predicate, timeout=HELD_THREAD_TIMEOUT_SECONDS):
+    """Returns whether ``predicate`` became true before ``timeout``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(POLL_INTERVAL_SECONDS)
+    return predicate()
+
+
+class _AdmissionProbe:
+    """A one-route application whose callers report the crowd inside it.
+
+    ``GATED_HOLD_PATH`` stays inside the router until :meth:`release` is
+    called and records how many callers were within it at once, so the
+    number the gate allowed is read from the router rather than inferred
+    from timings. The liveness route is published unchanged, so the path
+    the gate does not hold is driven against the same saturated process.
+    """
+
+    def __init__(self, bound, wait_seconds=GATE_WAIT_SECONDS):
+        self._lock = threading.Lock()
+        self._released = threading.Event()
+        self.inside = 0
+        self.peak = 0
+        self.app = FastAPI()
+
+        @self.app.get(GATED_HOLD_PATH)
+        def hold():
+            self._enter()
+            try:
+                self._released.wait(HELD_THREAD_TIMEOUT_SECONDS)
+            finally:
+                self._leave()
+            return {"held": True}
+
+        @self.app.get(GATED_QUICK_PATH)
+        def quick():
+            self._enter()
+            self._leave()
+            return {"quick": True}
+
+        @self.app.get(GATED_FAILING_PATH)
+        def failing():
+            raise RuntimeError("the probe route failed")
+
+        @self.app.get(GATED_LIMITER_PATH)
+        async def limiter_identity():
+            return {"limiter": id(main_module._ADMISSION_LIMITER.get())}
+
+        self.app.get(main_module.HEALTH_PATH)(main_module.health_check)
+        self.app.add_middleware(
+            main_module.RequestAdmissionMiddleware,
+            bound=bound,
+            wait_seconds=wait_seconds,
+        )
+
+    def _enter(self):
+        with self._lock:
+            self.inside += 1
+            self.peak = max(self.peak, self.inside)
+
+    def _leave(self):
+        with self._lock:
+            self.inside -= 1
+
+    def release(self):
+        self._released.set()
+
+    def client(self, raise_server_exceptions=True):
+        return TestClient(
+            self.app, raise_server_exceptions=raise_server_exceptions
+        )
+
+    def hold_from(self, client, callers):
+        """Starts ``callers`` threads holding the gated route."""
+        threads = [
+            threading.Thread(
+                target=client.get, args=(GATED_HOLD_PATH,), daemon=True
+            )
+            for _ in range(callers)
+        ]
+        for thread in threads:
+            thread.start()
+        return threads
+
+
+class TestAdmissionIsBoundedByThePool:
+    """The router is never entered by more requests than the pool serves.
+
+    Every route that reads the database holds one pooled connection for
+    as long as its session is open, and the session is closed inside the
+    routed request. The number of connections wanted at once is therefore
+    the number of requests inside this layer, and holding that below the
+    pool's ceiling is what stops a request waiting the whole checkout
+    timeout for a connection that was never going to be free.
+
+    Capping the worker threads instead was measured not to do this: the
+    session's close is a separate unit of work from the handler, so a
+    finished request's connection is still held while its close waits
+    behind the handlers that are blocked on checkout.
+    """
+
+    def _layer(self):
+        """Returns the one admission layer the application installs."""
+        installed = [
+            layer
+            for layer in main_module.app.user_middleware
+            if layer.cls is main_module.RequestAdmissionMiddleware
+        ]
+
+        assert len(installed) == 1
+        return installed[0]
+
+    def test_the_gate_is_the_innermost_layer(self):
+        """So a refused or oversized request never takes a slot.
+
+        The layer added first is the last to run on an inbound request,
+        so the gate encloses the router and nothing else: the rate
+        limiter and the body cap both sit outside it and refuse before a
+        slot is spent, and the 503 the gate returns still travels back
+        out through every layer above it.
+        """
+        assert (
+            main_module.app.user_middleware[-1].cls
+            is main_module.RequestAdmissionMiddleware
+        )
+
+    def test_the_bound_and_the_wait_come_from_the_configuration(self):
+        """Neither figure is a literal at the registration."""
+        registered = self._layer().kwargs
+
+        assert registered["bound"] == database_module.admitted_concurrency(
+            settings.DATABASE_URL
+        )
+        assert registered["wait_seconds"] == (
+            settings.DB_POOL_TIMEOUT_SECONDS
+        )
+
+    def test_the_paths_the_gate_does_not_hold_are_the_two_probes(self):
+        """An orchestrator acts on a probe that does not answer."""
+        assert main_module.UNGATED_PATHS == (
+            main_module.HEALTH_PATH,
+            main_module.READINESS_PATH,
+        )
+
+    def test_no_more_than_the_bound_are_inside_the_router(self):
+        """Two callers fill a bound of two and a third waits outside.
+
+        The crowd inside is read from the route itself and watched for
+        long enough that a third admission would have shown up in it.
+        """
+        probe = _AdmissionProbe(bound=2)
+        with probe.client() as client:
+            holders = probe.hold_from(client, 3)
+            try:
+                assert _settles(lambda: probe.inside == 2)
+                time.sleep(CROWD_OBSERVATION_SECONDS)
+
+                assert probe.inside == 2
+                assert probe.peak == 2
+            finally:
+                probe.release()
+                for holder in holders:
+                    holder.join(HELD_THREAD_TIMEOUT_SECONDS)
+
+            assert probe.peak == 2
+            assert client.get(GATED_QUICK_PATH).status_code == 200
+
+    def test_a_backend_with_no_pool_ceiling_is_a_pass_through(self):
+        """The suite's own configuration is one of these.
+
+        With no bound the three callers are all inside at once, which is
+        what distinguishes a pass-through from a bound of one.
+        """
+        probe = _AdmissionProbe(bound=None)
+        with probe.client() as client:
+            holders = probe.hold_from(client, 3)
+            try:
+                assert _settles(lambda: probe.inside == 3)
+            finally:
+                probe.release()
+                for holder in holders:
+                    holder.join(HELD_THREAD_TIMEOUT_SECONDS)
+
+            assert probe.peak == 3
+
+    def test_a_caller_that_waits_its_whole_allowance_is_refused(self):
+        """And is refused as a retryable capacity limit, not a fault."""
+        probe = _AdmissionProbe(
+            bound=1, wait_seconds=GATE_REFUSAL_WAIT_SECONDS
+        )
+        with probe.client() as client:
+            holders = probe.hold_from(client, 1)
+            try:
+                assert _settles(lambda: probe.inside == 1)
+                refused = client.get(GATED_QUICK_PATH)
+            finally:
+                probe.release()
+                for holder in holders:
+                    holder.join(HELD_THREAD_TIMEOUT_SECONDS)
+
+        assert refused.status_code == 503
+        assert refused.headers["Retry-After"] == str(
+            main_module.capacity_retry_after_seconds()
+        )
+
+    def test_the_refusal_is_the_answer_the_pool_refusal_gives(self):
+        """One answer, whichever of the two refused the request.
+
+        A caller cannot tell the gate's refusal from the pool's, and
+        neither carries the bound, a pool figure or a traceback.
+        """
+        probe = _AdmissionProbe(
+            bound=1, wait_seconds=GATE_REFUSAL_WAIT_SECONDS
+        )
+        with probe.client() as client:
+            holders = probe.hold_from(client, 1)
+            try:
+                assert _settles(lambda: probe.inside == 1)
+                refused = client.get(GATED_QUICK_PATH)
+            finally:
+                probe.release()
+                for holder in holders:
+                    holder.join(HELD_THREAD_TIMEOUT_SECONDS)
+
+        body = refused.json()
+
+        assert body["detail"] == main_module.CAPACITY_DETAIL
+        assert set(body) == {"detail", main_module.REQUEST_ID_FIELD}
+        for absent in ("QueuePool", "overflow", "bound", "Traceback"):
+            assert absent not in refused.text, absent
+
+    def test_the_refusal_is_recorded_with_what_it_applied(self, records):
+        """The record names the route, the bound and the allowance."""
+        probe = _AdmissionProbe(
+            bound=1, wait_seconds=GATE_REFUSAL_WAIT_SECONDS
+        )
+        with probe.client() as client:
+            holders = probe.hold_from(client, 1)
+            try:
+                assert _settles(lambda: probe.inside == 1)
+                client.get(GATED_QUICK_PATH)
+            finally:
+                probe.release()
+                for holder in holders:
+                    holder.join(HELD_THREAD_TIMEOUT_SECONDS)
+
+        recorded = [
+            record
+            for record in records
+            if record.getMessage() == main_module.ADMISSION_REFUSED_MESSAGE
+        ]
+
+        assert recorded
+        assert getattr(recorded[0], "path", None) == GATED_QUICK_PATH
+        assert getattr(recorded[0], "admitted_concurrency", None) == 1
+        assert getattr(recorded[0], "admission_wait_seconds", None) == (
+            GATE_REFUSAL_WAIT_SECONDS
+        )
+        assert "Traceback" not in repr(vars(recorded[0]))
+
+    def test_the_liveness_route_is_never_held_by_the_gate(self):
+        """Driven with the gate saturated by a caller that stays inside.
+
+        An orchestrator restarts a pod whose liveness route times out, so
+        a saturated gate must not be able to cause that.
+        """
+        probe = _AdmissionProbe(
+            bound=1, wait_seconds=GATE_REFUSAL_WAIT_SECONDS
+        )
+        with probe.client() as client:
+            holders = probe.hold_from(client, 1)
+            try:
+                assert _settles(lambda: probe.inside == 1)
+                started = time.monotonic()
+                answered = client.get(main_module.HEALTH_PATH)
+                elapsed = time.monotonic() - started
+            finally:
+                probe.release()
+                for holder in holders:
+                    holder.join(HELD_THREAD_TIMEOUT_SECONDS)
+
+        assert answered.status_code == 200
+        assert answered.json() == {"status": main_module.HEALTH_STATUS}
+        assert elapsed < LIVENESS_BUDGET_SECONDS, elapsed
+
+    def test_a_failing_route_gives_its_slot_back(self):
+        """A leaked slot would refuse every later caller for good."""
+        probe = _AdmissionProbe(
+            bound=1, wait_seconds=GATE_REFUSAL_WAIT_SECONDS
+        )
+        with probe.client(raise_server_exceptions=False) as client:
+            failed = client.get(GATED_FAILING_PATH)
+            after = client.get(GATED_QUICK_PATH)
+
+        assert failed.status_code == 500
+        assert after.status_code == 200
+
+    def test_each_event_loop_holds_its_own_bound(self):
+        """Every test client here builds a loop of its own.
+
+        A bound created on one loop and awaited on another would be a
+        bound shared between processes that do not share a scheduler, so
+        the layer resolves it per loop and each client sees its own.
+        """
+        probe = _AdmissionProbe(bound=1)
+        with probe.client() as first:
+            one = first.get(GATED_LIMITER_PATH).json()["limiter"]
+        with probe.client() as second:
+            two = second.get(GATED_LIMITER_PATH).json()["limiter"]
+
+        assert one != two
+
+    def test_the_liveness_route_is_answered_off_the_worker_threads(self):
+        """It reads nothing, so it must not need a worker thread.
+
+        Its path is named in :data:`main_module.UNGATED_PATHS`, so the
+        gate never holds it; answering on the event loop is what keeps it
+        independent of the worker threads the gated routes occupy too.
+        """
+        assert inspect.iscoroutinefunction(main_module.health_check)
 
 
 class TestIngestionFailureRecord:
@@ -1690,3 +2301,211 @@ class TestDegradedSinkReporting:
             main_module.audit_failure_count is audit_failure_count
         )
         assert "audit_failure_count" in authorization.__all__
+
+
+class TestThePublishedSchemaReadsAsDocumentation:
+    """Every published description is prose a consumer can read.
+
+    The viewers render a description verbatim and resolve no markup, so a
+    documentation-generator cross-reference reaches the reader with its
+    own punctuation intact and reads as broken documentation. A dotted
+    package name additionally hands this application's internal layout to
+    anyone who fetches the schema.
+    """
+
+    #: A documentation-generator cross-reference, in each of the forms the
+    #: descriptions once carried.
+    ROLE = re.compile(
+        r":(?:class|mod|func|data|meth|attr|exc|obj|ref):`"
+    )
+
+    #: A dotted path into this application's own package.
+    MODULE_PATH = re.compile(r"\bbackend\.app[\w.]*")
+
+    #: A configuration value named by its internal attribute.
+    SETTING_NAME = re.compile(r"\bsettings\.[A-Z_]+")
+
+    @staticmethod
+    def described():
+        """Yields every ``(location, text)`` pair the schema publishes."""
+        schema = main_module.app.openapi()
+        for path, operations in (schema.get("paths") or {}).items():
+            for method, operation in operations.items():
+                if not isinstance(operation, dict):
+                    continue
+                for key in ("summary", "description"):
+                    yield (
+                        "paths.%s.%s.%s" % (path, method, key),
+                        operation.get(key),
+                    )
+                parameters = operation.get("parameters") or []
+                for index, parameter in enumerate(parameters):
+                    yield (
+                        "paths.%s.%s.parameters[%d]"
+                        % (path, method, index),
+                        parameter.get("description"),
+                    )
+        components = schema.get("components") or {}
+        for name, model in (components.get("schemas") or {}).items():
+            yield (
+                "components.schemas.%s" % name,
+                model.get("description"),
+            )
+            for field, published in (
+                model.get("properties") or {}
+            ).items():
+                yield (
+                    "components.schemas.%s.%s" % (name, field),
+                    published.get("description"),
+                )
+        yield (
+            "info.description",
+            (schema.get("info") or {}).get("description"),
+        )
+
+    def offenders(self, pattern):
+        """Returns every published location ``pattern`` matches."""
+        return [
+            (where, pattern.search(text).group(0))
+            for where, text in self.described()
+            if isinstance(text, str) and pattern.search(text)
+        ]
+
+    def test_the_scan_reads_a_populated_schema(self):
+        """A silent scan over an empty schema would prove nothing."""
+        described = [
+            text
+            for _, text in self.described()
+            if isinstance(text, str) and text.strip()
+        ]
+        assert len(described) >= 10
+
+    def test_no_description_carries_a_generator_role(self):
+        assert self.offenders(self.ROLE) == []
+
+    def test_no_description_names_an_internal_module(self):
+        assert self.offenders(self.MODULE_PATH) == []
+
+    def test_no_description_names_a_configuration_attribute(self):
+        assert self.offenders(self.SETTING_NAME) == []
+
+    def test_the_scan_matches_what_was_removed(self):
+        """Each pattern is shown to match the construct it guards."""
+        assert self.ROLE.search(
+            "no field outside :class:`ListingCreate` reaches it"
+        )
+        assert self.MODULE_PATH.search(
+            "bounded by :mod:`backend.app.schema.filter`"
+        )
+        assert self.SETTING_NAME.search(
+            "``limit`` by ``settings.MAX_PAGE_SIZE``"
+        )
+
+
+class TestTheCredentialExampleIsUsable:
+    """A viewer pre-fills a credential body the contract accepts.
+
+    With no example published, the viewer synthesises one from each
+    field's own constraints. That produced an address of random
+    punctuation and the literal name of the password's type -- valid
+    JSON, so nothing warned the reader, and refused the moment it was
+    sent.
+    """
+
+    def published(self, name):
+        """Returns the example the schema publishes for ``name``."""
+        schema = main_module.app.openapi()
+        return schema["components"]["schemas"][name].get("example")
+
+    @pytest.mark.parametrize("name", ["UserCreate", "UserLogin"])
+    def test_the_schema_publishes_an_example(self, name):
+        example = self.published(name)
+        assert isinstance(example, dict)
+        assert set(example) == {"email", "password"}
+
+    @pytest.mark.parametrize(
+        "name,model",
+        [("UserCreate", UserCreate), ("UserLogin", UserLogin)],
+    )
+    def test_the_example_satisfies_the_contract_that_publishes_it(
+        self, name, model
+    ):
+        """The model accepts its own published example unedited."""
+        example = self.published(name)
+        parsed = model(**example)
+        assert parsed.email == example["email"]
+        assert parsed.password == example["password"]
+
+    def test_both_routes_publish_one_example(self):
+        """One body serves both, so a reader retypes nothing."""
+        assert self.published("UserCreate") == self.published(
+            "UserLogin"
+        )
+
+    def test_the_example_meets_the_registration_password_policy(self):
+        """The stricter of the two contracts is the one to satisfy."""
+        password = self.published("UserCreate")["password"]
+        assert len(password) >= 12
+        assert len(password.encode("utf-8")) <= 72
+        assert any(character.isupper() for character in password)
+        assert any(character.islower() for character in password)
+        assert any(character.isdigit() for character in password)
+
+    @pytest.mark.usefixtures("reset_rate_limits")
+    def test_the_example_registers_when_sent_unedited(self, client):
+        """Sent exactly as published, the body is not refused."""
+        response = client.post(
+            "/auth/register", json=self.published("UserCreate")
+        )
+        assert response.status_code == 200
+
+
+class TestThePermissionsPolicyNamesOnlyRealFeatures:
+    """The policy carries no directive a browser does not recognise.
+
+    An unrecognised directive is inert, so it buys no restriction, and
+    every browser that parses the header reports it once per document
+    load.
+    """
+
+    #: Directive shape the header carries: a feature name disallowed for
+    #: every origin.
+    DIRECTIVE = re.compile(r"^[a-z0-9-]+=\(\)$")
+
+    #: Feature the header once named, which no browser implements.
+    WITHDRAWN = "ambient-light-sensor"
+
+    def directives(self):
+        """Returns each directive the published policy carries."""
+        policy = main_module.SECURITY_HEADERS["Permissions-Policy"]
+        return [part.strip() for part in policy.split(",")]
+
+    def test_the_policy_is_published(self):
+        assert "Permissions-Policy" in main_module.SECURITY_HEADERS
+        assert len(self.directives()) >= 10
+
+    def test_every_directive_is_well_formed(self):
+        malformed = [
+            directive
+            for directive in self.directives()
+            if not self.DIRECTIVE.match(directive)
+        ]
+        assert malformed == []
+
+    def test_the_withdrawn_feature_is_not_named(self):
+        names = [
+            directive.split("=", 1)[0]
+            for directive in self.directives()
+        ]
+        assert self.WITHDRAWN not in names
+
+    def test_a_served_response_carries_the_same_policy(self, client):
+        """The header a response carries is the published one."""
+        response = client.get(main_module.HEALTH_PATH)
+        assert (
+            response.headers["Permissions-Policy"]
+            == main_module.SECURITY_HEADERS["Permissions-Policy"]
+        )
+        assert self.WITHDRAWN not in response.headers[
+            "Permissions-Policy"
+        ]

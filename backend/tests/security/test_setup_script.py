@@ -90,8 +90,21 @@ EXPECTED_MAIN_ORDER = (
     "run_migrations",
 )
 
-#: Longest either executing case waits for bash, in seconds.
+#: Longest a parse or a run of the declaration block alone waits for
+#: bash, in seconds. Both complete in a fraction of a second.
 SHELL_TIMEOUT_SECONDS = 60
+
+#: Longest a run of the whole script waits for bash, in seconds.
+#:
+#: A run reaches the step that builds a virtual environment, so its cost
+#: is that of a real ``python -m venv`` on the host it runs on rather
+#: than of parsing a file. Measured on this repository's Windows
+#: verification host, the longest such case takes a little under thirty
+#: seconds on an idle machine, and the budget is set an order of
+#: magnitude above that so host contention cannot turn a correct case
+#: red. Design rationale is recorded in
+#: ``docs/security/DECISION_LOG.md``.
+SCRIPT_TIMEOUT_SECONDS = 300
 
 #: One ``readonly`` declaration of a capitalised name.
 READONLY_DECLARATION = re.compile(
@@ -391,7 +404,7 @@ def _run_script(arguments=(), inputs=None, tmp_path=None, script=None):
         env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=SHELL_TIMEOUT_SECONDS,
+        timeout=SCRIPT_TIMEOUT_SECONDS,
     )
 
 
