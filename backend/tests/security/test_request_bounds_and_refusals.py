@@ -426,6 +426,111 @@ class TestPagedOffsetIsBounded:
         assert not hasattr(module, "MAX_PAGINATION_OFFSET")
 
 
+@pytest.fixture
+def stored_listings(db):
+    """Returns three stored listings, in the order the read serves them."""
+    recorded = datetime.now(timezone.utc)
+    for index in range(3):
+        db.add(
+            ListingModel(
+                created_at=recorded,
+                updated_at=recorded,
+                rent=1000.0 + index,
+                street_address="%d Page Street" % (index + 1),
+            )
+        )
+    db.commit()
+    return db.query(ListingModel).order_by(ListingModel.id).all()
+
+
+class TestThePageStartAliasIsHonoured:
+    """``offset`` names the page start rather than being dropped.
+
+    The public read declared ``skip`` alone, and an unmatched query
+    parameter is discarded by request validation, so a caller sending
+    ``offset`` was served the first page whatever it asked for and no
+    value of it -- negative, or far above the configured cap -- was ever
+    refused. It is now the same parameter under its other spelling: it
+    selects the same rows, carries the same bound, and disagreeing with
+    ``skip`` is refused rather than resolved silently.
+    """
+
+    def _addresses(self, response):
+        return [row["street_address"] for row in response.json()]
+
+    def test_the_alias_selects_the_same_page_as_the_canonical_name(
+        self, client, stored_listings
+    ):
+        canonical = client.get("/listings/?limit=1&skip=1")
+        alias = client.get("/listings/?limit=1&offset=1")
+
+        assert canonical.status_code == 200
+        assert alias.status_code == 200
+        assert self._addresses(alias) == self._addresses(canonical)
+        assert self._addresses(alias) != self._addresses(
+            client.get("/listings/?limit=1")
+        )
+
+    def test_the_alias_walks_the_page_it_names(
+        self, client, stored_listings
+    ):
+        seen = [
+            self._addresses(client.get("/listings/?limit=1&offset=%d" % start))
+            for start in range(len(stored_listings))
+        ]
+
+        assert seen == [
+            [listing.street_address] for listing in stored_listings
+        ]
+
+    @pytest.mark.parametrize("offset", REFUSED_OFFSETS)
+    def test_the_alias_refuses_an_offset_above_the_bound(
+        self, client, offset
+    ):
+        response = client.get("/listings/", params={"offset": offset})
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+
+    def test_the_alias_refuses_a_negative_offset(self, client):
+        assert client.get(
+            "/listings/", params={"offset": "-1"}
+        ).status_code == 422
+
+    def test_the_alias_serves_the_bound_itself(self, client):
+        response = client.get(
+            "/listings/",
+            params={"offset": str(settings.MAX_PAGINATION_OFFSET)},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_the_two_names_may_agree(self, client, stored_listings):
+        agreeing = client.get("/listings/?limit=1&skip=1&offset=1")
+
+        assert agreeing.status_code == 200
+        assert self._addresses(agreeing) == [
+            stored_listings[1].street_address
+        ]
+
+    def test_the_two_names_may_not_disagree(self, client, stored_listings):
+        response = client.get("/listings/?limit=1&skip=1&offset=2")
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": INVALID_REQUEST_DETAIL}
+
+    def test_the_published_schema_advertises_the_alias(self):
+        parameters = paged_parameters("/listings/")
+
+        assert "offset" in parameters
+        published = parameters["offset"]
+        assert published.get("maximum") == (
+            settings.MAX_PAGINATION_OFFSET
+        )
+        assert published.get("minimum") == 0
+
+
 class TestPagedSizeIsBounded:
     """A paged read refuses a page size above the configured cap.
 

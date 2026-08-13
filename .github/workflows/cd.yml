@@ -806,22 +806,62 @@ jobs:
         # What each container reports it is running, rather than the tag
         # that was asked for. A tag moved between the build job and now
         # would be visible here as a digest that does not match.
+        # The pod selector is read from the Deployment that owns the pods,
+        # so it is whatever the manifests label them with. A selector
+        # restated here would match nothing the moment the manifests
+        # labelled their pods differently, and an empty match reads back as
+        # an empty digest -- a rollout reported failed after the workloads
+        # have already changed.
+        pod_selector() {
+          local workload="$1"
+          local selector
+
+          # The braces and dollars below are Go template syntax read by
+          # kubectl, so the quotes stay single and the shell expands none
+          # of it.
+          # shellcheck disable=SC2016
+          selector="$(kubectl get "deployment/${workload}" \
+            --namespace="$K8S_NAMESPACE" \
+            --request-timeout=60s \
+            -o go-template='{{range $key, $value := .spec.selector.matchLabels}}{{$key}}={{$value}},{{end}}')"
+          selector="${selector%,}"
+
+          if [ -z "${selector}" ]; then
+            echo "::error::deployment/${workload} declares no pod selector," \
+              "so what is running cannot be read back."
+            exit 1
+          fi
+
+          printf '%s' "${selector}"
+        }
+
         verify_digest() {
           local workload="$1"
           local expected="$2"
+          local selector
           local running
+
+          selector="$(pod_selector "${workload}")"
 
           running="$(kubectl get pods \
             --namespace="$K8S_NAMESPACE" \
-            --selector="app=${workload}" \
+            --selector="${selector}" \
             --request-timeout=60s \
             -o jsonpath='{.items[*].status.containerStatuses[*].imageID}')"
+
+          if [ -z "${running}" ]; then
+            echo "::error::no ${workload} container matching [${selector}]" \
+              "reports an image, so ${expected} cannot be confirmed running."
+            exit 1
+          fi
 
           if [[ " ${running} " != *"${expected}"* ]]; then
             echo "::error::${workload} reports imageID [${running}]," \
               "which does not carry ${expected}."
             exit 1
           fi
+
+          echo "${workload} matched by [${selector}] reports ${expected}"
         }
 
         verify_digest backend "$BACKEND_DIGEST"

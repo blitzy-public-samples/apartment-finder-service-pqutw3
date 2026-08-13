@@ -554,6 +554,7 @@ CI job that runs each command, or says plainly that nothing but you runs it.
 | Reversibility, **against a disposable database only**: `alembic upgrade head`, then one `alembic downgrade -1` per revision in the chain (5 today: `0005` &rarr; `0004` &rarr; `0003` &rarr; `0002` &rarr; `0001` &rarr; base), then `alembic upgrade head`, `alembic current` | Each revision reverses independently, the chain reaches the base, every revision re-applies, and the sequence **ends at `0005 (head)`**. | **CI &mdash; `backend` and `runtime-integration` jobs**, each against a PostgreSQL 13 service. Both read the number of reversals from the revision chain, assert the base was reached, reapply afterwards and assert exactly one administrator |
 | `bash -n scripts/deploy.sh scripts/render_kubernetes_manifests.sh` | Exit code 0. | **Manual / local only.** No CI job parses the deployment scripts |
 | `kubectl create --dry-run=client -f <rendered manifest>` | Accepted for every built-in kind. | **Partly CI.** The `infrastructure` job checks the manifests against the settings contract — key sets, the secret backend, no literal secret, no inline environment entry — but does **not** run a client-side schema validation, which needs `kubectl` |
+| `cd frontend && npm audit --omit=dev --json > npm-audit-production.json; npm audit --json > npm-audit-full.json; node ../.github/scripts/check_frontend_audit_budget.js npm-audit-production.json production; node ../.github/scripts/check_frontend_audit_budget.js npm-audit-full.json full` | Exit code 0 for both trees. **Only** the advisories in the *Frontend register* of [`docs/security/RESIDUAL_RISK.md`](docs/security/RESIDUAL_RISK.md) — three moderate ones in the tree the client would ship with, eighteen more in the build and test toolchain. `npm audit` itself exits 1 while any advisory remains, so its status says nothing; the gate is what distinguishes a recorded advisory from a new one, and it also refuses one re-rated above the tree's ceiling. | **CI — `frontend` job**, step "Audit the frontend dependency tree" |
 | Opening `blitzy-deck/executive-summary.html` in a browser | Renders; every section carries a non-text visual. | **Manual / local only** |
 | The credential rotation runbook | Each step completed in order. | **Manual / operational only**, and irreversible. See [`docs/security/CREDENTIAL_ROTATION.md`](docs/security/CREDENTIAL_ROTATION.md) |
 
@@ -579,10 +580,10 @@ when it fails:
 | `runtime-integration` | Applies the revisions, reverses and reapplies them, asserts the administrator count, verifies the import, then serves the application and exercises it over HTTP |
 | `postgres-integration` | Reports the database version and runs the PostgreSQL migration and persistence suite against a real service |
 | `integration` | Applies the migrations, confirms exactly one administrator, starts the API and probes liveness, readiness, the public listing read, and registration, login and the role refusal |
-| `frontend` | Installs the declared dependencies, runs ESLint over `src`, and runs the frontend unit tests |
+| `frontend` | Installs the declared dependencies, runs ESLint over `src` against its recorded warning budget, **audits both npm dependency trees against the recorded acceptance**, and runs the frontend unit tests |
 | `infrastructure` | `terraform fmt -check -recursive`, `terraform validate`, and the deployment-manifest settings contract |
 
-**What CI runs that the command table above does not list:** the frontend lint job, the
+**What CI runs that the command table above does not list:** the frontend lint budget, the
 frontend unit tests, the two compensating-control guards below, both dependency audits in
 their strict form, the `backend` job's step **"Check the secret and ignore policy"**
 (`.github/scripts/check_secret_policy.sh`, which fails on a committed connection string,
@@ -757,7 +758,9 @@ is named alongside the guarantee it sits under.
   `GET /filters/`, `POST /subscriptions/`, `GET /subscriptions/`. One route is added:
   `POST /subscriptions/webhook`, mounted under the existing prefix.
 - **`GET /listings/` remains publicly reachable without authentication.** Its pagination
-  is now bounded by `MAX_PAGE_SIZE` and `MAX_PAGINATION_OFFSET`.
+  is now bounded by `MAX_PAGE_SIZE` and `MAX_PAGINATION_OFFSET`, and the page start is
+  accepted under either spelling a client already uses — see
+  [Paging `GET /listings/`](#paging-get-listings).
 - **The filter endpoints' ownership scoping is unchanged.**
 - Every stored password hash remains verifiable.
 
@@ -1011,6 +1014,25 @@ health endpoints sit outside the API router.
 A typical flow: register or log in, read the token from the login response, browse
 `GET /listings/`, save a filter, then subscribe by posting a `plan_id`.
 
+### Paging `GET /listings/`
+
+The page start is accepted under **two spellings**, `skip` and `offset`, and the page size
+under `limit`:
+
+| Parameter | Bound | Default |
+| --- | --- | --- |
+| `limit` | `1` to `MAX_PAGE_SIZE` | `MAX_PAGE_SIZE` |
+| `skip` | `0` to `MAX_PAGINATION_OFFSET` | `0` |
+| `offset` | `0` to `MAX_PAGINATION_OFFSET` | takes the value of `skip` |
+
+`offset` is an alias, not a second cursor: `?offset=20` and `?skip=20` select the same
+page, and both spellings carry the identical bounds, so a value above
+`MAX_PAGINATION_OFFSET` or below zero is refused with a validation error under either
+name. Sending both at once is accepted only when they **agree** — `?skip=20&offset=20`
+answers, `?skip=20&offset=40` is refused with a validation error naming both parameters,
+so an ambiguous request never silently returns the page one of the two spellings asked for.
+The two configured bounds are printed by the [Verification](#verification) settings dump.
+
 Two properties of the subscription flow are worth stating explicitly:
 
 - **The charge amount and the entitlement dates are server-owned.** `POST /subscriptions/`
@@ -1128,9 +1150,10 @@ operator action rather than fixed**, because remediating them falls outside the 
 or cannot be done from inside a commit. They are published as an itemised inventory — not as
 a count — at [`docs/security/DECISION_LOG.md`](docs/security/DECISION_LOG.md) §35.1, which
 [`SECURITY.md`](SECURITY.md) points at rather than restating. Several are the operator
-prerequisites this file names: a maintainer address and a monitored security mailbox, GitHub
-private vulnerability reporting, and the deployment inputs listed under
-[Deployment](#deployment).
+prerequisites this file names: a maintainer address and a monitored security mailbox,
+confirmation that a report filed through GitHub private vulnerability reporting reaches a
+person — the channel itself is enabled, so this is about monitoring rather than about
+enabling it — and the deployment inputs listed under [Deployment](#deployment).
 
 ## Contributing Guidelines
 
@@ -1172,9 +1195,11 @@ being kept up to date:
 - **Questions, bugs and feature requests** — open a GitHub issue on this repository.
 - **Suspected vulnerabilities** — **do not report a suspected vulnerability in an
   issue, a pull request, or a discussion.** Those are public, and opening one discloses
-  the weakness before a fix exists. Use the repository's **Security** tab and choose
-  **Report a vulnerability**, which is private to the maintainers. The full process is in
-  [`SECURITY.md`](SECURITY.md).
+  the weakness before a fix exists. Use the repository's **Security and quality** tab and
+  choose **Report a vulnerability**, which is private to the maintainers. That channel is
+  enabled, so a report can be filed today; what has not been confirmed is that a filed
+  report is read, and no response, disclosure or recognition terms have been authorized.
+  [`SECURITY.md`](SECURITY.md) keeps those three states apart and carries the full process.
 
 No email address is published here. An earlier revision carried a placeholder one, and a
 placeholder contact is worse than none: a reporter who uses it reaches nobody while

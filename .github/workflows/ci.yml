@@ -566,8 +566,13 @@ jobs:
       JWT_ALGORITHMS: '["HS256"]'
       JWT_ISSUER: apartment-finder-service
       JWT_AUDIENCE: apartment-finder-web
-      ALLOWED_ORIGINS: '["http://127.0.0.1:8000"]'
+      # The origins the frontend is served under, in both loopback
+      # spellings and with the default port omitted as a browser omits it.
+      # The API's own origin is not one of them.
+      ALLOWED_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000","http://localhost","http://127.0.0.1"]'
       ALLOWED_HOSTS: '["127.0.0.1","localhost"]'
+      # An origin outside the list above, used to prove a refusal.
+      FOREIGN_ORIGIN: https://attacker.example.com
       RATE_LIMIT_STORAGE_URI: bounded-memory://
       ZILLOW_API_KEY: ci_zillow_api_key_value
       PAYPAL_CLIENT_ID: ci_paypal_client_id_value
@@ -640,6 +645,54 @@ jobs:
           "$BASE_URL/listings/?limit=1")"
         echo "anonymous GET /listings/ -> $status"
         test "$status" = "200"
+
+    - name: Probe the cross-origin preflight from each served origin
+      run: |
+        set -euo pipefail
+
+        # Every origin the frontend is served under must survive a
+        # credentialed preflight and be echoed back exactly, since an
+        # origin is matched as a whole string and a browser sends the one
+        # it was addressed by.
+        for origin in \
+          http://localhost:3000 \
+          http://127.0.0.1:3000 \
+          http://localhost \
+          http://127.0.0.1
+        do
+          headers="$(curl --silent --show-error --dump-header - --output /dev/null \
+            -X OPTIONS \
+            -H "Origin: $origin" \
+            -H 'Access-Control-Request-Method: POST' \
+            -H 'Access-Control-Request-Headers: content-type,authorization' \
+            "$BASE_URL/auth/login")"
+
+          status="$(printf '%s' "$headers" | head -n 1)"
+          echo "preflight from $origin -> $status"
+          printf '%s' "$status" | grep -q ' 200 '
+          printf '%s' "$headers" \
+            | grep -qi "^access-control-allow-origin: $origin"'\r\?$'
+          printf '%s' "$headers" \
+            | grep -qi '^access-control-allow-credentials: true'
+          if printf '%s' "$headers" | grep -qi 'allow-origin: \*'; then
+            echo 'a credentialed response named a wildcard origin'
+            exit 1
+          fi
+        done
+
+        # An origin outside the list is refused, and no allow-origin
+        # header is returned for it.
+        refused="$(curl --silent --show-error --dump-header - --output /dev/null \
+          -X OPTIONS \
+          -H "Origin: $FOREIGN_ORIGIN" \
+          -H 'Access-Control-Request-Method: POST' \
+          "$BASE_URL/auth/login")"
+        echo "preflight from $FOREIGN_ORIGIN -> $(printf '%s' "$refused" | head -n 1)"
+        printf '%s' "$refused" | head -n 1 | grep -q ' 400 '
+        if printf '%s' "$refused" | grep -qi '^access-control-allow-origin:'; then
+          echo 'the refused origin was answered with an allow-origin header'
+          exit 1
+        fi
 
     - name: Probe registration, login and the role refusal
       run: |
@@ -735,6 +788,34 @@ jobs:
       with:
         name: frontend-eslint
         path: frontend/eslint-report.json
+
+    - name: Audit the frontend dependency tree
+      run: |
+        set -euo pipefail
+
+        cd frontend
+
+        # npm exits non-zero while any advisory remains, which says nothing
+        # about whether the advisory is one the register already carries, so
+        # each report is written here and judged by the gate below. The two
+        # trees are judged separately: the first is what the client would
+        # ship with, the second adds the build and test toolchain.
+        npm audit --omit=dev --json > npm-audit-production.json || true
+        npm audit --json > npm-audit-full.json || true
+
+        node ../.github/scripts/check_frontend_audit_budget.js \
+          npm-audit-production.json production
+        node ../.github/scripts/check_frontend_audit_budget.js \
+          npm-audit-full.json full
+
+    - name: Upload the frontend audit reports
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: frontend-npm-audit
+        path: |
+          frontend/npm-audit-production.json
+          frontend/npm-audit-full.json
 
     - name: Run frontend unit tests
       run: |

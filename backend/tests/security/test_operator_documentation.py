@@ -67,7 +67,7 @@ BASELINE_REVISION = "a26f7fb"
 #: confirmed unmodified and seventeen were withdrawn -- sixteen by the
 #: manifest consolidation and one by the provider-pinning revert -- which is
 #: the arithmetic section 2.10 publishes.
-MATRIX_REVERSE_ROWS = 156
+MATRIX_REVERSE_ROWS = 157
 
 #: Paths produced while verifying, never delivered, and removed
 #: before commit. ``blitzy/`` is where the browser-validation
@@ -819,9 +819,9 @@ def test_the_matrix_publishes_a_reconcilable_delivered_total():
     #: lists those six as superseded snapshots, so both halves are asserted:
     #: the current identity has to be present and each snapshot has to be
     #: labelled.
-    assert "`130 + 9 + 17 = 156`" in flat
-    assert "`69 + 26 + 61 = 156`" in flat
-    assert "`59 + 27 + 61 - 17 = 130`" in flat
+    assert "`131 + 9 + 17 = 157`" in flat
+    assert "`69 + 26 + 62 = 157`" in flat
+    assert "`59 + 27 + 62 - 17 = 131`" in flat
     assert "Delivered paths absent from the reverse index | **0**" in flat
     for snapshot in (
         "**86**", "**91**", "**93**", "**141**", "**125**", "**129**"

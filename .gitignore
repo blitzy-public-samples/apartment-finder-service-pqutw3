@@ -103,6 +103,8 @@ node_modules/
 frontend/build/
 frontend/coverage/
 frontend/eslint-report.json
+frontend/npm-audit-full.json
+frontend/npm-audit-production.json
 npm-debug.log*
 yarn-error.log*
 

@@ -55,7 +55,10 @@ x-backend-environment: &backend-environment
   # is refused while either still names sandbox.
   PAYPAL_MODE: ${PAYPAL_MODE:-sandbox}
   PAYPAL_API_BASE: ${PAYPAL_API_BASE:-https://api-m.sandbox.paypal.com}
-  ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-http://localhost,http://localhost:80}
+  # Both loopback spellings of the published frontend origin: a browser
+  # sends the origin as it was addressed, and the application matches an
+  # origin exactly.
+  ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-http://localhost,http://localhost:80,http://127.0.0.1,http://127.0.0.1:80}
   ALLOWED_HOSTS: ${BACKEND_ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
   # Addresses PayPal returns the payer to. They are browser destinations in
   # the frontend this stack publishes, which answers on port 80, so the
@@ -80,6 +83,8 @@ x-backend-environment: &backend-environment
   # Request bounds
   MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-1048576}
   MAX_REQUEST_BODY_CHUNKS: ${MAX_REQUEST_BODY_CHUNKS:-2048}
+  REQUEST_BODY_TIMEOUT_SECONDS: ${REQUEST_BODY_TIMEOUT_SECONDS:-10.0}
+  REQUEST_BODY_CHUNK_TIMEOUT_SECONDS: ${REQUEST_BODY_CHUNK_TIMEOUT_SECONDS:-5.0}
   MAX_PAGE_SIZE: ${MAX_PAGE_SIZE:-100}
   MAX_PAGINATION_OFFSET: ${MAX_PAGINATION_OFFSET:-10000}
   # Rate limits

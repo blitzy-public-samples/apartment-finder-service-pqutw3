@@ -111,10 +111,13 @@ html, body { margin: 0; padding: 0; background: var(--blitzy-primary-navy); }
   background: var(--gradient-accent-bar);
 }
 
+/* Sized at its parent's own size. A fraction of an em here compounds with
+   the parent's fraction of the root, and inside a table cell or a callout
+   that landed below the floor the rest of the scale holds. */
 .mono {
   font-family: var(--ff-mono);
   font-weight: 500;
-  font-size: 0.94em;
+  font-size: 1em;
   background: var(--blitzy-surface-2);
   color: var(--blitzy-primary-deep);
   padding: 0.1em 0.14em;
@@ -308,7 +311,7 @@ html.deck-static aside.notes {
 .slide-title .scope { font-size: 0.68em; font-weight: 500; max-width: 1400px; }
 .slide-title .audience {
   font-family: var(--ff-mono);
-  font-size: 0.44em;
+  font-size: 0.52em;
   letter-spacing: 0.08em;
   color: var(--blitzy-accent-teal);
   margin-top: 18px;
@@ -335,7 +338,7 @@ html.deck-static aside.notes {
 }
 .slide-divider .divider-note {
   font-family: var(--ff-mono);
-  font-size: 0.42em;
+  font-size: 0.52em;
   letter-spacing: 0.16em;
   color: rgba(255, 255, 255, 0.86);
   margin-top: 26px;
@@ -358,7 +361,7 @@ html.deck-static aside.notes {
   display: block;
   font-family: var(--ff-mono);
   font-weight: 500;
-  font-size: 0.44em;
+  font-size: 0.52em;
   letter-spacing: 0.24em;
   text-transform: uppercase;
   color: var(--blitzy-accent-teal);
@@ -422,7 +425,7 @@ html.deck-static aside.notes {
 .kpi-label {
   font-family: var(--ff-body);
   font-weight: 500;
-  font-size: 0.42em;
+  font-size: 0.5em;
   line-height: 1.38;
   color: var(--blitzy-text);
 }
@@ -455,7 +458,7 @@ html.deck-static aside.notes {
   margin-top: 14px;
   font-family: var(--ff-display);
   font-weight: 600;
-  font-size: 0.4em;
+  font-size: 0.5em;
   line-height: 1.3;
   color: var(--blitzy-primary-dark);
 }
@@ -487,7 +490,7 @@ html.deck-static aside.notes {
 .brand-lockup .brand-sub {
   font-family: var(--ff-mono);
   font-weight: 400;
-  font-size: 0.36em;
+  font-size: 0.5em;
   letter-spacing: 0.18em;
   text-transform: uppercase;
   margin-top: 8px;
@@ -497,7 +500,7 @@ html.deck-static aside.notes {
 .data-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.44em;
+  font-size: 0.5em;
   margin-top: 22px;
 }
 .data-table th {
@@ -528,11 +531,14 @@ html.deck-static aside.notes {
 .data-table tbody tr.row-flag td:first-child {
   border-left: 8px solid var(--blitzy-primary);
 }
+/* Carried at 500, the heaviest mono weight the font request loads. At 600
+   no file backed the declaration and the browser drew a synthesized
+   face. */
 .row-mark {
   display: inline-block;
   font-family: var(--ff-mono);
-  font-size: 0.92em;
-  font-weight: 600;
+  font-size: 1em;
+  font-weight: 500;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--blitzy-primary-deep);
@@ -593,6 +599,46 @@ html.deck-static aside.notes {
   max-height: 720px;
 }
 
+/* Diagram frame. It wraps the diagram source node, carries the region role
+   and the accessible name, and is the element that pans in flow mode. */
+.reveal .diagram-container {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  margin: 8px 0 0 0;
+  border-radius: 10px;
+}
+.reveal .diagram-container:focus-visible {
+  outline: 3px solid var(--blitzy-primary);
+  outline-offset: 4px;
+}
+
+/* The drawn edges and arrowheads. The library paints them from its own
+   theme value, and these two declarations carry the drawn stroke to a tone
+   that measures 5.3:1 against the slide surface. */
+.reveal .mermaid svg .flowchart-link,
+.reveal .mermaid svg .edgePath .path,
+.reveal .mermaid svg path.path {
+  stroke: #6B6B6B !important;
+  stroke-width: 2.2px !important;
+}
+.reveal .mermaid svg marker path,
+.reveal .mermaid svg defs marker path {
+  fill: #6B6B6B !important;
+  stroke: #6B6B6B !important;
+}
+
+/* Resume control on the framework's pause overlay, carried to a 44px
+   target. */
+.reveal .pause-overlay .resume-button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 10px 22px;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
 .reveal pre.mermaid[data-render-failed="true"] {
   font-family: var(--ff-body);
   font-size: 0.5em;
@@ -631,7 +677,7 @@ html.deck-static aside.notes {
 .reveal .slide-foot {
   margin-top: 34px;
   font-family: var(--ff-mono);
-  font-size: 0.38em;
+  font-size: 0.5em;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--blitzy-primary-dark);
@@ -670,22 +716,22 @@ html.deck-static aside.notes {
 /* Separation between a data table and the heading that follows it. */
 .reveal .data-table + h3 { margin-top: 28px; }
 
-/* Below 1025px the presentation canvas is the viewport's own box, which the
-   module at the foot of this file sets, and the type scale, the grids and the
-   diagrams reflow to it at their authored pixel sizes. Each block is scoped
-   away from the PDF export, which holds the 1920x1080 canvas. */
-@media (max-width: 1400px) {
-  html:not(.print-pdf) .slide-body { padding: 64px 76px; }
-}
-
 /* Flow mode. The framework paints one fixed 1920x1080 stage and scales it to
    the viewport, which takes the smaller type below a legible size and, once
    that scale reaches its floor, leaves the stage wider than the viewport with
-   the overhang unreachable. Below this width the stage is released: the
+   the overhang unreachable. At and below this width the stage is released: the
    present slide becomes an ordinary block that fills the viewport height and
    grows with its own content, every type size renders as authored, and the
-   navigation chrome is pinned to the viewport. */
-@media (max-width: 1024px) {
+   navigation chrome is pinned to the viewport.
+
+   The boundary sits at 1400px. With the stage filling the viewport the scale
+   there is 0.729, so the step between the two layouts is 1.37x and the
+   smallest authored tier, 0.5em of the 32px root, renders at 11.7px on the
+   stage side. The scale is the smaller of the width and height ratios, so
+   that tier holds above 11px for any viewport at least 742px tall. Each
+   block is scoped away from the PDF export, which holds the 1920x1080
+   canvas. */
+@media (max-width: 1400px) {
   html.reveal-full-page { height: auto; overflow: visible; }
   .reveal-viewport {
     height: auto;
@@ -713,13 +759,35 @@ html.deck-static aside.notes {
     transform: none !important;
   }
   .reveal .slides > section:not(.present) { display: none !important; }
+
+  /* The chrome is pinned to the viewport, so it stands over whatever part
+     of the slide is scrolled beneath it. The backdrop sits on each button,
+     which is the box that paints: the cluster element itself has no size
+     of its own, since the framework positions every button absolutely
+     within it. Each button's backdrop is opaque in the tone of the slide
+     behind it, and the slide body's bottom padding reserves the height of
+     the whole cluster, so content neither shows through a control nor ends
+     underneath one. */
   .reveal .controls { position: fixed; }
+  .reveal .controls button {
+    box-sizing: border-box;
+    border-radius: 12px;
+    background: var(--blitzy-surface-0);
+    box-shadow: 0 0 0 1px var(--blitzy-border), 0 6px 22px rgba(26, 16, 95, 0.16);
+  }
+  .reveal.has-dark-background .controls button {
+    background: var(--blitzy-primary-navy);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.28);
+  }
+  /* Full opacity: the framework holds a back arrow at 0.3, which would let
+     the slide show through the backdrop as well as the glyph. */
+  .reveal .controls button.enabled { opacity: 1; }
   .reveal .progress { position: fixed; bottom: 0; left: 0; }
   html:not(.print-pdf) .reveal .slide-body {
     height: auto;
     min-height: 100vh;
     justify-content: flex-start;
-    padding: 44px 30px 96px 30px;
+    padding: 44px 30px 148px 30px;
     /* The slide body presents no scrollport of its own here; the
        document carries the scroll and the sticky heading pins to it. */
     overflow: visible;
@@ -732,14 +800,14 @@ html.deck-static aside.notes {
   .reveal .slide-divider h2 { font-size: min(2.9em, 11.5vw); }
   .reveal .slide-closing h2 { font-size: min(2.35em, 10.5vw); }
   .reveal .kpi-value { font-size: min(1.72em, 9vw); }
-  .reveal .brand-lockup .brand-sub { font-size: 0.42em; }
+  .reveal .brand-lockup .brand-sub { font-size: 0.52em; }
   /* The inline code run is a single unbroken line at full width, which at
      these widths measures wider than its own column. */
   .reveal .mono { white-space: normal; overflow-wrap: anywhere; }
   .kpi-grid { gap: 20px; }
   .icon-row { gap: 20px; }
   .kpi-card { padding: 24px 20px; }
-  .data-table { font-size: 0.42em; }
+  .data-table { font-size: 0.5em; }
   .closing-foot { flex-direction: column; align-items: flex-start; gap: 24px; }
   html:not(.print-pdf) .hero-icon { margin-bottom: 22px; }
   html:not(.print-pdf) .hero-icon svg { width: 72px; height: 72px; }
@@ -748,29 +816,24 @@ html.deck-static aside.notes {
     height: 84px;
   }
 
-  /* The slide's own heading stays in view while its body scrolls. A sticky
-     element pins to the scroll container's content edge, and the offset shadow
-     repeats the heading's opaque box across the padding above that edge. */
+  /* The heading scrolls with its own slide here. It was previously pinned to
+     the top of the scrollport with an offset shadow that repeated its opaque
+     box over the 60px above it, and that box stood over the lede, the callout
+     or the first table header of whichever slide was scrolled beneath it. */
   html:not(.print-pdf) .slide-head {
-    position: sticky;
-    top: 0;
-    z-index: 2;
-    background: var(--blitzy-surface-0);
-    padding-bottom: 10px;
-    box-shadow: 0 -60px 0 0 var(--blitzy-surface-0);
+    position: static;
+    background: transparent;
+    box-shadow: none;
   }
 
-  /* A block container held at its content height by a zero shrink factor: a
-     diagram drawn at its intrinsic width overflows it and pans on the
-     horizontal axis, and a diagram taller than the slide extends the container,
-     which leaves the vertical axis to the slide body. The shaded side edge
-     marks a diagram wider than the container, on the same terms as the slide
-     body's own bottom edge. */
-  html:not(.print-pdf) .reveal pre.mermaid {
-    display: block;
+  /* The labelled frame is the pan region: it is focusable, it draws a
+     scrollbar whenever the drawing inside it is wider, and the arrow-key
+     handler in the module at the foot of this file pans it. A zero shrink
+     factor holds it at its content height, so a diagram taller than the
+     slide extends it and the vertical axis stays with the slide body. The
+     shaded side edge marks a drawing wider than the frame. */
+  html:not(.print-pdf) .reveal .diagram-container {
     flex-shrink: 0;
-    height: auto;
-    max-height: none;
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: thin;
@@ -790,14 +853,49 @@ html.deck-static aside.notes {
         right / 14px 100% no-repeat scroll;
     background-color: var(--blitzy-surface-0);
   }
+
+  /* An always-drawn horizontal scrollbar marks a drawing wider than the
+     frame, on the same terms as the slide body's own. */
+  html:not(.print-pdf) .reveal .diagram-container::-webkit-scrollbar {
+    height: 12px;
+  }
+  html:not(.print-pdf) .reveal .diagram-container::-webkit-scrollbar-track {
+    background: var(--blitzy-surface-2);
+    border-radius: 999px;
+  }
+  html:not(.print-pdf) .reveal .diagram-container::-webkit-scrollbar-thumb {
+    background: var(--blitzy-primary);
+    border-radius: 999px;
+    border: 2px solid var(--blitzy-surface-2);
+  }
+
+  html:not(.print-pdf) .reveal pre.mermaid {
+    display: block;
+    width: max-content;
+    max-width: none;
+    height: auto;
+    max-height: none;
+    margin: 0;
+    overflow: visible;
+  }
   html:not(.print-pdf) .reveal pre.mermaid svg {
     display: block;
     max-height: none;
-    /* The drawing takes its own intrinsic width, which the container
-       above pans over and shades at whichever edge it overruns. */
+    /* The drawing takes its own intrinsic width, which the frame above
+       pans over and shades at whichever edge it overruns. */
     width: max-content;
     max-width: none;
   }
+}
+
+/* Narrower than a small laptop the chrome takes a larger share of the
+   viewport, and the slide gives up horizontal padding to it. Every type
+   size is unchanged here. */
+@media (max-width: 1024px) {
+  html:not(.print-pdf) .reveal .slide-body { padding: 40px 26px 148px 26px; }
+  .kpi-grid { gap: 16px; }
+  .icon-row { gap: 16px; }
+  .kpi-card { padding: 20px 18px; }
 }
 
 @media (max-width: 720px) {
@@ -811,7 +909,7 @@ html.deck-static aside.notes {
     min-height: 0;
     overflow-y: auto;
   }
-  html:not(.print-pdf) .reveal .slide-body { padding: 36px 22px 92px 22px; }
+  html:not(.print-pdf) .reveal .slide-body { padding: 36px 20px 152px 20px; }
   /* Cell padding at the authored width carries the widest table past this
      viewport on its own. */
   .reveal .data-table th,
@@ -826,7 +924,7 @@ html.deck-static aside.notes {
   }
 }
 
-@media (max-height: 820px) and (min-width: 1025px) {
+@media (max-height: 820px) and (min-width: 1401px) {
   html:not(.print-pdf) .slide-body {
     min-height: 0;
     padding-top: 48px;
@@ -850,6 +948,7 @@ html.print-pdf .slide-body {
   overflow: visible;
 }
 html.print-pdf .reveal pre.mermaid { overflow: visible; }
+html.print-pdf .reveal .diagram-container { overflow: visible; }
 
 /* Honour a reduced-motion preference over the configured slide
    transition, which reveal.js applies as a CSS transform. The framework
@@ -954,8 +1053,12 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     background-color: Canvas;
     border: 1px solid CanvasText;
   }
+  /* The fill carries its colour as a gradient image, which paints over any
+     background colour named here, so the image is cleared as well. */
   .reveal .progress span {
     forced-color-adjust: none;
+    background: none;
+    background-image: none;
     background-color: Highlight;
   }
   .reveal li::before,
@@ -1025,13 +1128,27 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     forced-color-adjust: none;
     fill: CanvasText !important;
   }
+  /* An edge's own label and the chip behind it, on the same terms as the
+     band caption above. */
+  .mermaid svg .edgeLabel rect,
+  .mermaid svg .edgeLabels rect {
+    forced-color-adjust: none;
+    fill: Canvas !important;
+  }
+  .mermaid svg .edgeLabel text,
+  .mermaid svg .edgeLabel tspan,
+  .mermaid svg .edgeLabels text,
+  .mermaid svg .edgeLabels tspan {
+    forced-color-adjust: none;
+    fill: CanvasText !important;
+  }
 }
 </style>
 </head>
 <body>
 <!-- announcement point owned by this page, reachable when the framework's own status region never exists -->
 <span class="sr-only" role="status" aria-live="polite" id="deck-status"></span>
-<div class="reveal">
+<main class="reveal" aria-label="Executive summary presentation">
 <div class="slides">
 
 <section class="slide-title" data-background-color="#1A105F">
@@ -1054,44 +1171,44 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </aside>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
       <span class="eyebrow eyebrow-ink">Outcome</span>
       <h2>What the work delivered</h2>
     </div>
-    <p class="lede">Before this work the service could not start and its test suite collected no tests. Every figure below is measured in code and tests. None of it is a statement about a deployed environment, which this repository cannot see.</p>
+    <p class="lede">Every figure is measured in code and tests. None of it is a statement about a deployed environment, which this repository cannot see.</p>
     <div class="kpi-grid">
       <div class="kpi-card">
         <span class="kpi-icon" aria-hidden="true"><i data-lucide="shield-check" aria-hidden="true"></i></span>
         <span class="kpi-value">20</span>
-        <span class="kpi-label">findings remediated in code, across four vulnerability clusters, split fifteen and five below</span>
+        <span class="kpi-label">findings remediated in code</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="git-branch" aria-hidden="true"></i></span>
         <span class="kpi-value">19 &rarr; 7</span>
-        <span class="kpi-label">dependency advisories in the deployed service, falling from seven packages to three</span>
+        <span class="kpi-label">dependency advisories</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="terminal" aria-hidden="true"></i></span>
         <span class="kpi-value">1 &rarr; 0</span>
-        <span class="kpi-label">medium-severity scan findings</span>
+        <span class="kpi-label">medium scan findings</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="file-check" aria-hidden="true"></i></span>
         <span class="kpi-value">130</span>
-        <span class="kpi-label">files changed: 100 new, 30 updated</span>
+        <span class="kpi-label">files changed</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="check-circle" aria-hidden="true"></i></span>
         <span class="kpi-value">15</span>
-        <span class="kpi-label">proven by automated test</span>
+        <span class="kpi-label">proven by test</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon"><i data-lucide="alert-triangle" aria-hidden="true"></i></span>
         <span class="kpi-value">5</span>
-        <span class="kpi-label">with a named operational step</span>
+        <span class="kpi-label">carry an operator step</span>
       </div>
       <div class="kpi-card">
         <span class="kpi-icon" aria-hidden="true"><i data-lucide="alert-triangle" aria-hidden="true"></i></span>
@@ -1106,7 +1223,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
       <div class="kpi-card">
         <span class="kpi-icon" aria-hidden="true"><i data-lucide="map" aria-hidden="true"></i></span>
         <span class="kpi-value">68</span>
-        <span class="kpi-label">planned changes mapped end to end: 30 created, 29 updated, 9 read-only</span>
+        <span class="kpi-label">mapped: 30 created, 29 updated, 9 read-only</span>
       </div>
     </div>
 </div>
@@ -1126,7 +1243,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </aside>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1134,6 +1251,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
       <h2>Where the new controls sit</h2>
     </div>
     <p class="lede">The delivered request path, with hardened boundaries highlighted. Secrets reach each workload through a per-secret read grant and a workload identity. Two components are drawn unconnected: nothing uses them.</p>
+  <div class="diagram-container" role="region" tabindex="0" aria-label="Delivered request path and secret delivery chain. Scrollable diagram: use the left and right arrow keys to pan.">
   <pre class="mermaid">
   graph LR
     accTitle: Delivered request path and secret delivery chain
@@ -1172,6 +1290,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     class HDR,AUTHZ,VAULT,GRANT,IDENT hardened;
     class CLIENT,PLATFORM pending;
   </pre>
+  </div>
 </div>
 <aside class="notes">
   Two boxes deliberately have no arrows. Object storage is provisioned by the
@@ -1197,7 +1316,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </div>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1240,7 +1359,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </div>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1248,10 +1367,10 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
       <h2>Four roles, one central decision, denied by default</h2>
     </div>
     <ul>
-      <li>Four documented roles, ordered.</li>
-      <li>One central check; denied by default.</li>
-      <li>Role read from the account record.</li>
-      <li>One administrator, granted separately.</li>
+      <li>Four ordered roles.</li>
+      <li>One check, denied by default.</li>
+      <li>Role read from the record.</li>
+      <li>One administrator, seeded separately.</li>
     </ul>
     <table class="data-table">
       <caption class="sr-only">Role capabilities</caption>
@@ -1260,16 +1379,11 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
       </thead>
       <tbody>
         <tr><td class="role-cell">Guest</td><td>Browse listings</td></tr>
-        <tr><td class="role-cell">Registered</td><td>Save filters, subscribe</td></tr>
-        <tr><td class="role-cell">Premium</td><td>Paid entitlement</td></tr>
+        <tr><td class="role-cell">Registered</td><td>Save filters</td></tr>
+        <tr><td class="role-cell">Premium</td><td>Entitlement</td></tr>
         <tr><td class="role-cell">Admin</td><td>Write the corpus</td></tr>
       </tbody>
     </table>
-    <div class="icon-row">
-      <div><i data-lucide="user-check" aria-hidden="true"></i><span>Roles from records</span></div>
-      <div><i data-lucide="lock" aria-hidden="true"></i><span>Denied by default</span></div>
-      <div><i data-lucide="shield-check" aria-hidden="true"></i><span>One administrator</span></div>
-    </div>
 </div>
 <aside class="notes">
   These four roles are not new scope; they are the project's own documented design
@@ -1294,7 +1408,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </div>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1337,7 +1451,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </div>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1345,8 +1459,8 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
       <h2>Credentials are out of the code, and still need replacing</h2>
     </div>
     <ul>
-      <li>Removed from the code, but readable in past versions.</li>
-      <li>A partner key left web addresses and logs.</li>
+      <li>Removed from code; readable in past versions.</li>
+      <li>A partner key left addresses and logs.</li>
       <li>Containers, read grants and workload identity are declared; delivery still pending.</li>
       <li>Protective headers and a narrowed cross-origin policy apply.</li>
     </ul>
@@ -1372,7 +1486,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </aside>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1380,6 +1494,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
       <h2>Deciding a paid request</h2>
     </div>
     <p class="lede">Access is granted only after the payment provider confirms the charge settled.</p>
+  <div class="diagram-container" role="region" tabindex="0" aria-label="How a paid request is decided, before and after. Scrollable diagram: use the left and right arrow keys to pan.">
   <pre class="mermaid">
   graph LR
     accTitle: How a paid request is decided, before and after
@@ -1419,10 +1534,11 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     class RQ1,SAVE1,Q1,NEV risk;
     class AZ,ROLE,CAT,PEND,HOOK,CAPT,CHK,ACT good;
   </pre>
+  </div>
 </div>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1437,28 +1553,28 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     <table class="data-table">
       <caption class="sr-only">Replacement reasons. The row marked Total gives the figure for the whole set.</caption>
       <thead scope="col">
-        <tr><th scope="col">Replaced</th><th scope="col">Now in use</th><th scope="col">Why it had to go</th></tr>
+        <tr><th scope="col">Replaced</th><th scope="col">Now</th><th scope="col">Why it had to go</th></tr>
       </thead>
       <tbody>
         <tr>
           <td class="role-cell">Token library</td>
-          <td>Maintained token library</td>
+          <td>Maintained library</td>
           <td>Needs a component nobody will fix</td>
         </tr>
         <tr>
           <td class="role-cell">Hashing wrapper</td>
-          <td>Hashing library, called directly</td>
+          <td>Called directly</td>
           <td>Unmaintained; had stopped working</td>
         </tr>
         <tr>
           <td class="role-cell">Payment kit</td>
-          <td>Direct provider calls</td>
+          <td>Direct calls</td>
           <td>Archived; cannot verify notifications</td>
         </tr>
         <tr class="row-flag">
-          <td class="role-cell"><span class="row-mark">Total</span>Overall</td>
+          <td class="role-cell"><span class="row-mark">Total</span></td>
           <td>19 &rarr; 7 advisories</td>
-          <td>Four closed by removal alone</td>
+          <td>Four by removal</td>
         </tr>
       </tbody>
     </table>
@@ -1478,7 +1594,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </aside>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1488,25 +1604,19 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     <table class="data-table">
       <caption class="sr-only">Pipeline checks on every change. The row marked Guard holds an accepted risk in place; the others test the code.</caption>
       <thead scope="col">
-        <tr><th scope="col">Check</th><th scope="col">What it covers, exactly</th></tr>
+        <tr><th scope="col">Check</th><th scope="col">What it covers</th></tr>
       </thead>
       <tbody>
         <tr><td class="role-cell">Dependency audit</td><td>Both package lists</td></tr>
         <tr><td class="role-cell">Code scan</td><td>No medium or high findings</td></tr>
-        <tr><td class="role-cell">Security suite</td><td>Forty-five access-control assertions</td></tr>
-        <tr class="row-flag"><td class="role-cell"><span class="row-mark">Guard</span>Two guards</td><td>One package stays absent; eight code patterns stay unused</td></tr>
+        <tr><td class="role-cell">Security suite</td><td>Forty-five access assertions</td></tr>
+        <tr class="row-flag"><td class="role-cell"><span class="row-mark">Guard</span>Two guards</td><td>One package absent; eight patterns unused</td></tr>
       </tbody>
     </table>
-    <div class="icon-row">
-      <div><i data-lucide="git-branch" aria-hidden="true"></i><span>Audit both lists</span></div>
-      <div><i data-lucide="terminal" aria-hidden="true"></i><span>Scan the code</span></div>
-      <div><i data-lucide="check-circle" aria-hidden="true"></i><span>Prove access control</span></div>
-      <div><i data-lucide="lock" aria-hidden="true"></i><span>Two narrow guards</span></div>
-    </div>
 </div>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1528,16 +1638,16 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
           <td>Measured impact; announced, not silent</td>
         </tr>
         <tr>
-          <td>Eight dependency advisories are accepted as residual risk: seven in the deployed service, one in the test framework that is never deployed.</td>
-          <td>No fix for any of them is installable on the runtime this service deliberately pins. Each one carries a named compensating control, both sets are registered, and two automated guards run on every change.</td>
+          <td>Eight accepted dependency advisories</td>
+          <td>No fix on the pinned runtime; each has a control</td>
         </tr>
         <tr>
           <td>Exposed credentials must be treated as compromised until rotated</td>
-          <td>Announced as the next step. Rotation is not performed here, it needs provider consoles, and it cannot be undone</td>
+          <td>Rotation is not performed here, and cannot be undone</td>
         </tr>
         <tr>
-          <td>New required settings must be present before the service will start, and the shipped configuration template will not start it as delivered.</td>
-          <td>Every setting is documented, and the non-secret ones carry a working local default. The signing key ships as a placeholder that startup refuses outright, and the remaining secrets are refused anywhere but a local run, so they must be replaced first.</td>
+          <td>New settings gate startup</td>
+          <td>The template will not start it as delivered</td>
         </tr>
       </tbody>
     </table>
@@ -1545,7 +1655,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     <div class="icon-row">
       <div><i data-lucide="key-round" aria-hidden="true"></i><span>Rotate the exposed credentials</span></div>
       <div><i data-lucide="server" aria-hidden="true"></i><span>Mount the provisioned secrets</span></div>
-      <div><i data-lucide="mail" aria-hidden="true"></i><span>Enable private reporting</span></div>
+      <div><i data-lucide="mail" aria-hidden="true"></i><span>Confirm reports are read</span></div>
     </div>
     <p class="slide-foot">Detail in docs/security</p>
 </div>
@@ -1561,13 +1671,19 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
   package stays absent. The other has two layers, and the first layer is a text search
   that an aliased import or a dynamic call would evade, which is why a second layer
   parses the code and follows aliases. Together they detect the realistic ways an
-  acceptance could lapse; they are not a proof that it cannot. On credentials: removal
-  stops future exposure only. Rotation is the required next step, is irreversible, and
-  is therefore sequenced last.
+  acceptance could lapse; they are not a proof that it cannot. No fix for any of the
+  eight is installable on the runtime this service deliberately pins. On credentials:
+  removal stops future exposure only. Rotation is the required next step, is
+  irreversible, and is therefore sequenced last. On configuration: new required
+  settings must be present before the service will start, and the shipped template
+  will not start it as delivered. Every setting is documented, and the non-secret ones
+  carry a working local default. The signing key ships as a placeholder that startup
+  refuses outright, and the remaining secrets are refused anywhere but a local run, so
+  they must be replaced first.
 </aside>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1576,38 +1692,32 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     </div>
     <div class="callout">
       <i data-lucide="alert-triangle" aria-hidden="true"></i>
-      <p>The code is remediated and tested. <span class="mono">Four gates stand before a first release</span>, and none can be settled from inside a commit.</p>
+      <p><span class="mono">Four gates stand before a first release</span>; none can be settled from inside a commit.</p>
     </div>
     <table class="data-table no-zebra">
       <caption class="sr-only">Release gates. The rows marked Blocked cannot proceed until an owner acts.</caption>
       <thead scope="col">
-        <tr><th scope="col">Gate</th><th scope="col">What it needs, and what happens until then</th></tr>
+        <tr><th scope="col">Gate</th><th scope="col">What it needs</th></tr>
       </thead>
       <tbody>
         <tr class="row-flag">
-          <td><span class="row-mark">Blocked</span>The cluster's control plane is private, and the release now reaches it over an authorized path rather than a public one.</td>
-          <td>Access is granted by permission, not by network location, so the deploying identity needs that permission granted. Until it is, no release path can reach the cluster at all &mdash; which was already true before this work, silently.</td>
+          <td><span class="row-mark">Blocked</span>The control plane is private</td>
+          <td>Access is granted by permission, not location</td>
         </tr>
         <tr>
-          <td>Images now publish to a newly defined registry, because the previous one stopped accepting them.</td>
-          <td>The registry must be created and the release identity given write access to it. The release refuses to reuse a version label and verifies which image is actually running, so a release that changes nothing can no longer report success.</td>
+          <td>A newly defined image registry</td>
+          <td>It must be created and the release identity given access</td>
         </tr>
         <tr class="row-flag">
-          <td><span class="row-mark">Blocked</span>One small cloud function runs on a language version its platform no longer accepts for new or updated deployments.</td>
-          <td>The version is a fixed constraint of this work and was not raised. That function is therefore left out of the deployment until an owner decides between raising the constraint and retiring the function. Everything else releases normally; this step reports itself blocked rather than failing the release or quietly weakening the constraint.</td>
+          <td><span class="row-mark">Blocked</span>A withdrawn function runtime</td>
+          <td>Platform no longer accepts for new or updated deployments</td>
         </tr>
         <tr>
-          <td>The release updates cluster objects it will not create, so a brand-new cluster needs one apply first.</td>
-          <td>The definitions are versioned here and both release paths apply them, but each path first checks the two serving objects exist and stops naming whatever is missing. Nothing is created implicitly, so a misnamed target fails early instead of half-way through.</td>
+          <td>Two serving cluster objects</td>
+          <td>The release updates cluster objects it will not create</td>
         </tr>
       </tbody>
     </table>
-    <div class="icon-row">
-      <div><i data-lucide="lock" aria-hidden="true"></i><span>Cluster access by permission</span></div>
-      <div><i data-lucide="server" aria-hidden="true"></i><span>New image registry</span></div>
-      <div><i data-lucide="alert-triangle" aria-hidden="true"></i><span>One function blocked</span></div>
-      <div><i data-lucide="check-circle" aria-hidden="true"></i><span>Applied state to confirm</span></div>
-    </div>
 </div>
 <aside class="notes">
   These are the operator items counted on the metrics slide that gate a first
@@ -1623,14 +1733,28 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
   group against a cluster that does not have the two serving objects yet.
   The deployment inputs include a renamed cluster-location secret, federated identity
   replacing a long-lived key that must be deleted rather than left unused, and a runner
-  with a network path to the now-private control plane. The disclosure channel needs
-  private reporting switched on and a mailbox someone is accountable for reading; until
-  then the security policy publishes no address and commits to no response times, which
-  it says plainly. Every item is listed in the decision log's reconciliation section.
+  with a network path to the now-private control plane. The disclosure channel is open:
+  private reporting is switched on, so a report can be filed today. What it needs is
+  someone accountable for reading one, and a mailbox; until then the security policy
+  publishes no address and commits to no response times, which it says plainly. Every
+  item is listed in the decision log's reconciliation section.
+  On each gate in turn. The release reaches the control plane over an authorized path,
+  and the deploying identity needs that permission granted; until it is, no release
+  path reaches the cluster at all, which was already true before this work, silently.
+  The registry replaces one that stopped accepting images; the release refuses to reuse
+  a version label and verifies which image is actually running, so a release that
+  changes nothing can no longer report success. On the function runtime: The version is
+  a fixed constraint of this work and was not raised, so that function is left out of the
+  deployment until an owner decides between raising the constraint and retiring the
+  function; everything else releases normally, and this step reports itself blocked
+  rather than failing the release or quietly weakening the constraint. The two serving
+  objects are versioned here and both release paths apply them, but each path first
+  checks they exist and stops naming whatever is missing, so a misnamed target fails
+  early instead of half-way through.
 </aside>
 </section>
 
-<section>
+<section class="slide-content">
 <div class="slide-body">
 
     <div class="slide-head">
@@ -1638,9 +1762,9 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
       <h2>Everything needed to pick this up</h2>
     </div>
     <ul>
-      <li>Copy the committed <span class="mono">.env.example</span>; its placeholder secrets must be replaced before startup.</li>
+      <li>Copy <span class="mono">.env.example</span>; its placeholder secrets must be replaced before startup.</li>
       <li>Seven required values include five provider credentials.</li>
-      <li>Audit, code scan and security suite run in the pipeline.</li>
+      <li>Audit, code scan and security suite run on every change.</li>
       <li>The <span class="mono">docs/</span> set records decisions, traceability, risk and rotation.</li>
     </ul>
     <div class="icon-row">
@@ -1693,7 +1817,7 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
 </section>
 
 </div>
-</div>
+</main>
 
 <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js" integrity="sha384-M/JtqCVlLcK9lwVnBnMXP0V577CBULkjodKsR/PITOe4MSKNbbwqCemEyluOw0+5" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 
@@ -1997,12 +2121,90 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
      there takes a step the width query alone never reports. */
   window.addEventListener('resize', scheduleReshape);
 
-  var flowWidth = window.matchMedia('(max-width: 1024px)');
+  var flowWidth = window.matchMedia('(max-width: 1400px)');
   if (typeof flowWidth.addEventListener === 'function') {
     flowWidth.addEventListener('change', scheduleReshape);
   } else if (typeof flowWidth.addListener === 'function') {
     flowWidth.addListener(scheduleReshape);
   }
+
+  /* Panning inside a diagram frame. The frame is the scroll container for a
+     drawing wider than the slide, and it is reachable by keyboard: the
+     horizontal arrows pan by a step, Home and End reach either edge. The
+     framework binds those same keys to slide navigation on the document, so
+     every key handled here is stopped before it arrives there, and a key
+     arriving at a frame with nothing to pan is left alone. */
+  var PAN_STEP = 120;
+
+  function panFrame(event) {
+    var frame = event.currentTarget;
+    var span = frame.scrollWidth - frame.clientWidth;
+    var next = null;
+    if (span <= 0) {
+      return;
+    }
+    if (event.key === 'ArrowRight') {
+      next = frame.scrollLeft + PAN_STEP;
+    } else if (event.key === 'ArrowLeft') {
+      next = frame.scrollLeft - PAN_STEP;
+    } else if (event.key === 'Home') {
+      next = 0;
+    } else if (event.key === 'End') {
+      next = span;
+    }
+    if (next === null) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    frame.scrollLeft = Math.max(0, Math.min(span, next));
+  }
+
+  function diagramFrames() {
+    return document.querySelectorAll('.diagram-container');
+  }
+
+  function bindDiagramFrames() {
+    Array.prototype.forEach.call(diagramFrames(), function (frame) {
+      frame.addEventListener('keydown', panFrame);
+    });
+  }
+
+  /* Every frame opens at its left edge, so the first thing drawn is the
+     first thing seen. */
+  function resetDiagramFrames() {
+    Array.prototype.forEach.call(diagramFrames(), function (frame) {
+      frame.scrollLeft = 0;
+    });
+  }
+
+  /* A gesture that begins on a navigation control belongs to that control.
+     The framework binds its swipe handler to the presentation element, and
+     each gesture event is stopped in the capture phase before it reaches
+     there. Both event families are covered: the framework reads pointer
+     events where the browser provides them, and touch events where it does
+     not. Propagation alone is stopped, so the control still receives the
+     click the browser derives from the gesture. */
+  function holdGesture(event) {
+    var target = event.target;
+    if (
+      target
+      && typeof target.closest === 'function'
+      && target.closest('.reveal .controls')
+    ) {
+      event.stopPropagation();
+    }
+  }
+
+  var GESTURE_EVENTS = [
+    'touchstart', 'touchmove', 'touchend', 'touchcancel',
+    'pointerdown', 'pointermove', 'pointerup', 'pointercancel'
+  ];
+  for (var gesture = 0; gesture < GESTURE_EVENTS.length; gesture += 1) {
+    document.addEventListener(GESTURE_EVENTS[gesture], holdGesture, true);
+  }
+
+  bindDiagramFrames();
 
   window.deckRuntime = {
     fontsSettled: fontsSettled,
@@ -2031,14 +2233,27 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     return;
   }
 
+  /* The framework stamps role="application" on the presentation element
+     during initialization, which replaces the landmark role the element
+     carries as a main element. The landmark is restored here, after that
+     assignment. */
+  function restoreLandmarkRole() {
+    var root = document.querySelector('main.reveal');
+    if (root !== null) {
+      root.setAttribute('role', 'main');
+    }
+  }
+
   Reveal.on('ready', function () {
     lucide.createIcons();
     describeProgress();
+    restoreLandmarkRole();
   });
 
   Reveal.on('slidechanged', function () {
     lucide.createIcons();
     describeProgress();
+    resetDiagramFrames();
     window.setTimeout(restoreActivationFocus, 0);
   });
 
@@ -2048,6 +2263,10 @@ html.print-pdf .reveal pre.mermaid { overflow: visible; }
     controlsTutorial: false,
     width: 1920,
     height: 1080,
+    /* The stage fills the viewport. The framework's default inset of 4%
+       reduced the scale, and every authored size with it; the slide body
+       carries its own padding. */
+    margin: 0,
     history: true,
     navigationMode: 'linear',
     controlsBackArrows: 'visible',
@@ -2107,7 +2326,7 @@ function settle() {
 
 /* Viewport width at and below which the stage is released and the slide
    flows down the page. It matches the stylesheet's own breakpoint. */
-var FLOW_QUERY = '(max-width: 1024px)';
+var FLOW_QUERY = '(max-width: 1400px)';
 
 /* True while the deck is laid out as a flowing page. */
 function flowMode() {

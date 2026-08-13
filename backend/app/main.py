@@ -16,6 +16,7 @@ from typing import (
     AsyncIterator,
     Callable,
     Dict,
+    List,
     Mapping,
     Optional,
     Tuple,
@@ -78,7 +79,10 @@ from backend.app.core.rate_limit import (
 __all__ = [
     "ADMISSION_BOUND_MESSAGE",
     "ADMISSION_REFUSED_MESSAGE",
+    "BODY_NOT_RECEIVED_DETAIL",
+    "BODY_NOT_RECEIVED_MESSAGE",
     "BODY_TOO_LARGE_DETAIL",
+    "BODYLESS_METHODS",
     "CAPACITY_DETAIL",
     "CORS_ALLOW_CREDENTIALS_HEADER",
     "CORS_ALLOW_HEADERS",
@@ -124,13 +128,16 @@ __all__ = [
     "MIN_BODY_MESSAGES",
     "MIN_CHUNK_BYTES",
     "REASON_BYTE_COUNT",
+    "REASON_CHUNK_DEADLINE",
     "REASON_DECLARED_SIZE",
     "REASON_MESSAGE_COUNT",
+    "REASON_TOTAL_DEADLINE",
     "SECURITY_HEADERS",
     "SERVER_ERROR_DETAIL",
     "THROTTLED_MESSAGE",
     "TOO_MANY_REQUESTS_DETAIL",
     "UNGATED_PATHS",
+    "BodyPrefetchMiddleware",
     "BodySizeLimitMiddleware",
     "RequestAdmissionMiddleware",
     "RequestIdMiddleware",
@@ -417,6 +424,25 @@ REASON_BYTE_COUNT = "byte_count"
 
 #: Rejection reason: the body message count exceeded its allowance.
 REASON_MESSAGE_COUNT = "message_count"
+
+#: Rejection reason: the whole body did not arrive within its deadline.
+REASON_TOTAL_DEADLINE = "body_read_deadline"
+
+#: Rejection reason: one further chunk of the body did not arrive within
+#: its deadline.
+REASON_CHUNK_DEADLINE = "body_chunk_deadline"
+
+#: Detail returned when a request body did not arrive within its
+#: deadline. It names the body rather than the deadline's value, so no
+#: response reveals how long a client may stall for.
+BODY_NOT_RECEIVED_DETAIL = "Request body not received in time"
+
+#: Message of the record emitted for a body refused for its deadline.
+BODY_NOT_RECEIVED_MESSAGE = "Request body did not arrive within its deadline"
+
+#: Methods that carry no request body, so a request using one is passed
+#: to the layers below without a body being read for it.
+BODYLESS_METHODS: Tuple[str, ...] = ("GET", "HEAD", "OPTIONS", "TRACE")
 
 #: Failures a route raises for a scope it cannot read, such as one
 #: carrying no method or no path, or a candidate that answers no match
@@ -915,6 +941,157 @@ class BodySizeLimitMiddleware:
                 "received_bytes": received,
                 "max_bytes": self.max_body_bytes,
                 "max_messages": self.max_body_messages,
+            },
+        )
+
+
+class _BodyDeadlineExpired(Exception):
+    """Raised inside the prefetch layer when a body deadline elapsed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _body_not_received_response() -> JSONResponse:
+    """Returns the answer given to a body that did not arrive in time."""
+    return JSONResponse(
+        status_code=status.HTTP_408_REQUEST_TIMEOUT,
+        content={"detail": BODY_NOT_RECEIVED_DETAIL},
+    )
+
+
+class BodyPrefetchMiddleware:
+    """Read a request body to completion, under deadlines, before the
+    layers below it are entered.
+
+    The layer below this one is :class:`RequestAdmissionMiddleware`, whose
+    slot is held for the whole of the routed request. A route reads its
+    body inside that request, so a client that opens a connection,
+    declares a body and then sends one byte of it used to hold an
+    admission slot for as long as it kept the socket open: enough such
+    connections held every slot, and unrelated requests -- including the
+    public listings read -- waited the whole admission allowance and were
+    then refused, while both probes stayed green because their paths are
+    ungated.
+
+    Reading the body here moves that wait outside the gate. A stalled body
+    occupies no admission slot at all, so capacity is unaffected by how
+    long a client takes to send one, and the two deadlines bound how long
+    the connection itself is held: the whole body must arrive within
+    ``total_seconds`` and each further chunk of it within
+    ``chunk_seconds``. A body that misses either deadline is answered
+    :data:`BODY_NOT_RECEIVED_DETAIL` with status 408.
+
+    The bytes held are bounded by the cap :class:`BodySizeLimitMiddleware`
+    applies, which sits immediately outside this layer, so the messages
+    counted through its receive channel are the messages buffered here and
+    a body over the cap is refused rather than held. Requests using a
+    method in ``bodyless_methods`` are passed straight through.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        total_seconds: float,
+        chunk_seconds: float,
+        bodyless_methods: Tuple[str, ...] = BODYLESS_METHODS,
+    ) -> None:
+        self.app = app
+        self.total_seconds = total_seconds
+        self.chunk_seconds = chunk_seconds
+        self.bodyless_methods = tuple(
+            method.upper() for method in bodyless_methods
+        )
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        if scope["type"] != _HTTP_SCOPE or self._carries_no_body(scope):
+            await self.app(scope, receive, send)
+            return
+
+        try:
+            body = await self._read_body(scope, receive)
+        except _BodyDeadlineExpired as expired:
+            self._log_rejection(scope, expired.reason)
+            await _body_not_received_response()(scope, receive, send)
+            return
+        except StarletteHTTPException as refused:
+            # The receive channel outside this layer refuses a body past
+            # its cap by raising, and this layer sits outside the handler
+            # that renders such a refusal, so it is rendered here. The
+            # refusal is already recorded by the layer that raised it.
+            await JSONResponse(
+                status_code=refused.status_code,
+                content={"detail": refused.detail},
+            )(scope, receive, send)
+            return
+
+        await self.app(scope, self._replayed(body, receive), send)
+
+    def _carries_no_body(self, scope: Scope) -> bool:
+        """Returns whether the request's method carries no body."""
+        method = scope.get("method")
+        if not isinstance(method, str):
+            return True
+        return method.upper() in self.bodyless_methods
+
+    async def _read_body(
+        self, scope: Scope, receive: Receive
+    ) -> Tuple[Message, ...]:
+        """Returns every body message the request sent, in order.
+
+        Reading stops at the message that completes the body, or at a
+        disconnect. Each individual wait is bounded by ``chunk_seconds``
+        and the whole read by ``total_seconds``; whichever elapses first
+        raises :class:`_BodyDeadlineExpired` naming that deadline.
+        """
+        messages: List[Message] = []
+        try:
+            with anyio.fail_after(self.total_seconds):
+                while True:
+                    try:
+                        with anyio.fail_after(self.chunk_seconds):
+                            message = await receive()
+                    except TimeoutError:
+                        raise _BodyDeadlineExpired(REASON_CHUNK_DEADLINE)
+                    messages.append(message)
+                    if message["type"] != _REQUEST_MESSAGE:
+                        break
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            raise _BodyDeadlineExpired(REASON_TOTAL_DEADLINE) from None
+        return tuple(messages)
+
+    @staticmethod
+    def _replayed(body: Tuple[Message, ...], receive: Receive) -> Receive:
+        """Returns a channel that hands ``body`` on and then defers.
+
+        The buffered messages are returned once each, in order, and every
+        call after them is answered by the request's own channel, so a
+        disconnect is still delivered by the server rather than
+        manufactured here.
+        """
+        remaining = list(body)
+
+        async def replayed() -> Message:
+            if remaining:
+                return remaining.pop(0)
+            return await receive()
+
+        return replayed
+
+    def _log_rejection(self, scope: Scope, reason: str) -> None:
+        logger.warning(
+            BODY_NOT_RECEIVED_MESSAGE,
+            extra={
+                "path": scope.get("path"),
+                "method": scope.get("method"),
+                "reason": reason,
+                "body_timeout_seconds": self.total_seconds,
+                "body_chunk_timeout_seconds": self.chunk_seconds,
             },
         )
 
@@ -1530,21 +1707,31 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 # Registered innermost first: the layer added last is the first to run
 # on an inbound request. The resulting inbound order is request
 # identifier, response headers, cross-origin policy, host validation,
-# rate limiter, body-size cap, admission gate, router. The rate limiter
-# sits outside the body-size cap, so a request over its limit is refused
-# before any chunk of its body is read, and the cross-origin layer
-# encloses both the host check and those two, so the 400, 429 and 413
-# they return carry the same headers as any other response. The admission
-# gate is innermost, so it encloses the router and nothing else: a
-# request the limiter or the body cap refuses never takes an admission
-# slot, and every slot it does hand out is held for the whole of the
-# routed request, including the session teardown FastAPI runs before the
-# router returns. The 503 it returns travels back out through the six
-# layers above it, so it carries the same headers too.
+# rate limiter, body-size cap, body prefetch, admission gate, router. The
+# rate limiter sits outside the body-size cap, so a request over its
+# limit is refused before any chunk of its body is read, and the
+# cross-origin layer encloses both the host check and those two, so the
+# 400, 429 and 413 they return carry the same headers as any other
+# response. The admission gate is innermost, so it encloses the router
+# and nothing else: a request the limiter or the body cap refuses never
+# takes an admission slot, and every slot it does hand out is held for
+# the whole of the routed request, including the session teardown FastAPI
+# runs before the router returns. The 503 it returns travels back out
+# through the layers above it, so it carries the same headers too.
+#
+# The prefetch layer sits between the body cap and the gate, so a body is
+# read under the cap's counting channel and under its own deadlines
+# before a slot is taken: a client that stalls part-way through sending
+# one is answered 408 and never occupies capacity the routes need.
 app.add_middleware(
     RequestAdmissionMiddleware,
     bound=admitted_concurrency(settings.DATABASE_URL),
     wait_seconds=settings.DB_POOL_TIMEOUT_SECONDS,
+)
+app.add_middleware(
+    BodyPrefetchMiddleware,
+    total_seconds=settings.REQUEST_BODY_TIMEOUT_SECONDS,
+    chunk_seconds=settings.REQUEST_BODY_CHUNK_TIMEOUT_SECONDS,
 )
 app.add_middleware(
     BodySizeLimitMiddleware,

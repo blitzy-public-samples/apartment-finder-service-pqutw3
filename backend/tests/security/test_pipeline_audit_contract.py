@@ -216,10 +216,97 @@ DEPLOYMENT_READ = re.compile(r"\bkubectl\s+get\s+deployment\b")
 #: Longest a shell parse is waited on, in seconds.
 SHELL_TIMEOUT_SECONDS = 60
 
+#: Gate that judges an npm audit report against the recorded acceptance.
+FRONTEND_AUDIT_GATE = (
+    REPO_ROOT / ".github" / "scripts" / "check_frontend_audit_budget.js"
+)
+
+#: Register the gate's acceptance is recorded in.
+RESIDUAL_RISK_REGISTER = (
+    REPO_ROOT / "docs" / "security" / "RESIDUAL_RISK.md"
+)
+
+#: Heading of the register section covering the client's dependency tree,
+#: and the heading level a following section opens at. The identifiers are
+#: read from that section alone: the Python registers above it cite
+#: advisories of their own, and a gate entry must not be satisfied by one
+#: of those.
+FRONTEND_REGISTER_HEADING = "## Frontend register:"
+SECTION_BREAK = "\n## "
+
+#: Job of :data:`CI_WORKFLOW` carrying the client's gates, and the step
+#: that audits its dependency tree.
+FRONTEND_JOB = "frontend"
+FRONTEND_AUDIT_STEP = "Audit the frontend dependency tree"
+
+#: One advisory identifier, in the form both the gate and the register
+#: write it.
+ADVISORY_IDENTIFIER = re.compile(r"GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}")
+
+#: One tree the gate accepts advisories for, with the block of identifiers
+#: recorded against it.
+GATE_TREE_BLOCK = re.compile(
+    r"^  (?P<tree>[a-z]+): \[(?P<block>[^\]]*)\]", re.M
+)
+
+#: One tree's severity ceiling, as the gate declares it.
+GATE_CEILING = re.compile(r'^  (?P<tree>[a-z]+): "(?P<ceiling>[a-z]+)"', re.M)
+
+#: Whole numbers as the register writes them in prose, indexed by value, so
+#: a count stated in words can be compared with the gate's own list length
+#: rather than restated as a second figure here.
+COUNT_WORDS = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+    "twenty-one", "twenty-two", "twenty-three", "twenty-four",
+    "twenty-five", "twenty-six", "twenty-seven", "twenty-eight",
+    "twenty-nine", "thirty",
+)
+
 
 def _text(path):
     """Return one file's source."""
     return path.read_text(encoding="utf-8")
+
+
+def _gate_source():
+    """Return the frontend audit gate's source, and assert it exists."""
+    assert FRONTEND_AUDIT_GATE.is_file(), str(FRONTEND_AUDIT_GATE)
+    return _text(FRONTEND_AUDIT_GATE)
+
+
+def _gate_accepted():
+    """Return each tree's accepted advisory identifiers, from the gate.
+
+    Read from the source rather than by running node, so the case states
+    the same property whether or not a JavaScript runtime is installed on
+    the host running the suite.
+    """
+    source = _gate_source()
+    accepted = {}
+    for match in GATE_TREE_BLOCK.finditer(source):
+        accepted[match.group("tree")] = frozenset(
+            ADVISORY_IDENTIFIER.findall(match.group("block"))
+        )
+    return accepted
+
+
+def _gate_ceilings():
+    """Return each tree's severity ceiling, as the gate declares it."""
+    return dict(
+        (match.group("tree"), match.group("ceiling"))
+        for match in GATE_CEILING.finditer(_gate_source())
+    )
+
+
+def _frontend_register_section():
+    """Return the register section covering the client's dependency tree."""
+    register = _text(RESIDUAL_RISK_REGISTER)
+    assert FRONTEND_REGISTER_HEADING in register, FRONTEND_REGISTER_HEADING
+    section = register[register.index(FRONTEND_REGISTER_HEADING):]
+    tail = section.find(SECTION_BREAK, len(FRONTEND_REGISTER_HEADING))
+    return section if tail == -1 else section[:tail]
 
 
 def _document(path):
@@ -1104,3 +1191,90 @@ def test_every_command_parses(path, job, tmp_path):
             position,
             completed.stderr.decode("utf-8", "replace"),
         )
+
+
+def test_frontend_audit_register_matches_the_gate():
+    """The advisories the gate accepts are the advisories the register records.
+
+    An audit gate that carries its own allowance is a second register, and
+    the two drift the moment either changes: an identifier accepted in the
+    gate and absent from the register is an acceptance nobody reviewed,
+    and one recorded in the register and absent from the gate is a build
+    the gate still refuses. The identifiers are read from the register's
+    frontend section alone, so an entry cannot be satisfied by an advisory
+    belonging to one of the Python registers above it.
+    """
+    accepted = _gate_accepted()
+    assert sorted(accepted) == ["full", "production"], sorted(accepted)
+
+    section = _frontend_register_section()
+    recorded = frozenset(ADVISORY_IDENTIFIER.findall(section))
+
+    for tree in sorted(accepted):
+        assert accepted[tree], tree
+        unrecorded = sorted(accepted[tree] - recorded)
+        assert unrecorded == [], (tree, unrecorded)
+
+    ungated = sorted(recorded - accepted["full"] - accepted["production"])
+    assert ungated == [], ungated
+
+    #: The shipping tree is a subset of the tree that adds the toolchain,
+    #: which is what npm reports and what makes the two ceilings comparable.
+    assert accepted["production"] <= accepted["full"]
+
+    #: The count the section's heading states in words is the count the
+    #: gate holds, rather than a figure maintained separately.
+    heading = section.splitlines()[0]
+    assert COUNT_WORDS[len(accepted["full"])] in heading, heading
+
+
+def test_the_frontend_audit_gate_is_wired_into_the_pipeline():
+    """Both trees are audited, and each report is judged after it is written.
+
+    npm exits non-zero while any advisory remains, so a step that ran the
+    audit without the gate would fail on a recorded advisory, and one that
+    ran the audit with its exit status discarded and no gate would pass on
+    a new one. The step has to do both things in that order.
+    """
+    step = _step_named(CI_WORKFLOW, FRONTEND_JOB, FRONTEND_AUDIT_STEP)
+    command = step["run"]
+    gate = "check_frontend_audit_budget.js"
+
+    assert command.count(gate) == len(_gate_accepted())
+    assert "npm audit --omit=dev --json" in command
+    assert re.search(r"(?m)^\s*npm audit --json", command), command
+
+    for tree in sorted(_gate_accepted()):
+        assert re.search(
+            r"npm-audit-\S+\.json " + tree + r"\b", command
+        ), tree
+
+    assert command.index("npm audit --omit=dev") < command.index(gate)
+    assert FRONTEND_AUDIT_GATE.is_file(), str(FRONTEND_AUDIT_GATE)
+
+    #: The release path runs this workflow rather than a copy of it, so the
+    #: gate reaches a release without being written twice.
+    assert "uses: ./.github/workflows/ci.yml" in _text(CD_WORKFLOW)
+
+
+def test_the_frontend_audit_ceilings_are_recorded():
+    """Each tree's severity ceiling is published where the acceptance is.
+
+    The ceiling is the half of the gate that a list of identifiers cannot
+    express: a recorded advisory that is re-rated upwards is a different
+    risk from the one that was accepted, and the gate refuses it. A reader
+    of the register has to be able to see what each tree is allowed to
+    carry without reading the gate.
+    """
+    ceilings = _gate_ceilings()
+    section = _frontend_register_section()
+    flowed = " ".join(section.split())
+
+    assert set(ceilings) == set(_gate_accepted()), ceilings
+    assert "critical" not in set(ceilings.values()), ceilings
+
+    for tree in sorted(ceilings):
+        assert "**" + ceilings[tree] + "**" in section, (tree, ceilings[tree])
+
+    assert "Neither ceiling admits a critical" in flowed
+    assert "check_frontend_audit_budget.js" in flowed

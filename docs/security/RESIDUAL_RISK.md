@@ -1230,6 +1230,148 @@ is what the seven entries in
 belong to, so a development-only advisory can never be mistaken for a runtime
 one.
 
+## Frontend register: twenty-one accepted client-tree advisories
+
+**This is a third register and it enters none of the counts above.** Every count
+in this document up to this point describes advisories in the two Python
+manifests, `backend/requirements.txt` and `backend/requirements-dev.txt`. This
+section describes the npm dependency tree under `frontend/`, which is audited by
+a different instrument, is accepted for a different reason, and is gated by a
+different guard. The eight-suppression total, the seven-runtime and
+one-development split, and the arithmetic that reconciles them are unchanged by
+anything below.
+
+**Why it is accepted rather than fixed.** `frontend/package.json`,
+`frontend/package-lock.json`, `frontend/tsconfig.json` and
+`infrastructure/docker/Dockerfile.frontend` are reference-only in this change
+set: AAP &sect;0.6.1.7 lists the client's files as read-only references, and
+&sect;0.9.2 places the frontend and build files out of scope, stating explicitly
+that remediation requiring a frontend dependency lock to be generated and
+committed is reported rather than performed. Every remediation below is a change
+to one of those files, so each is reported here with the evidence that bounds it.
+
+**What the guard is.** The integration workflow's frontend job writes two
+reports and judges each one:
+
+```bash
+cd frontend
+npm audit --omit=dev --json > npm-audit-production.json || true
+npm audit --json > npm-audit-full.json || true
+node ../.github/scripts/check_frontend_audit_budget.js \
+  npm-audit-production.json production
+node ../.github/scripts/check_frontend_audit_budget.js \
+  npm-audit-full.json full
+```
+
+`npm audit` exits non-zero while any advisory remains, which cannot distinguish
+a new advisory from a recorded one, so the judgement is made by
+`.github/scripts/check_frontend_audit_budget.js`. That gate refuses a build on
+two independent grounds: an advisory identifier this register does not record,
+and an advisory whose severity is above the ceiling the tree carries &mdash;
+**moderate** for the tree the client would ship with, **high** for the tree that
+adds the build and test toolchain. Neither ceiling admits a critical. An
+identifier that stops being reported produces a notice naming it, so a fix
+upstream prompts this register to be trimmed rather than silently widening it.
+`test_frontend_audit_register_matches_the_gate`,
+`test_the_frontend_audit_gate_is_wired_into_the_pipeline` and
+`test_the_frontend_audit_ceilings_are_recorded` in
+`backend/tests/security/test_pipeline_audit_contract.py` bind this section, the
+gate and the workflow together, so none of the three can move without the other
+two.
+
+### The shipping tree: three advisories, all moderate
+
+Audited as `npm audit --omit=dev`: two vulnerable packages, three distinct
+advisories, no high and no critical.
+
+| # | Advisory | Package and affected range | The defect | Reachability in this client | Control |
+|---|---|---|---|---|---|
+| F-1 | GHSA-wrjc-x8rr-h8h6 | `react-router` `>=6.0.0 <7.18.0`, resolved 6.30.x | Open redirect via a backslash in `<Link>` and `useNavigate`, a bypass of CVE-2025-68470 | **No sink exists.** Every `<Link to=...>` in `frontend/src` is a string literal &mdash; `/`, `/about`, `/contact`, `/profile`, `/login` &mdash; and `useNavigate` is called nowhere in the tree, so no navigation target is derived from input | The absence of a caller is the control, and it is asserted: the client's source is read-only, so a `useNavigate` call cannot be added by this change set. The gate's moderate ceiling refuses this identifier the moment it is re-rated |
+| F-2 | GHSA-337j-9hxr-rhxg | `react-router` `>=6.4.0 <7.18.0`, resolved 6.30.x | Arbitrary constructor injection through `deserializeErrors()` during server-side-rendering hydration | **The affected mode is not used.** `frontend/src/app.tsx` mounts `BrowserRouter`; there is no `StaticRouter`, no server entry point and no render-to-string anywhere, so no hydration path exists to inject into | The client is a static bundle served by nginx from `infrastructure/docker/Dockerfile.frontend`, which has no server-rendering stage to reach |
+| F-3 | GHSA-jjmj-jmhj-qwj2 | `react-router-dom` `>=6.30.2 <=6.30.4` | Open redirect leading to cross-site scripting | Same as F-1: the redirect target would have to come from input, and every route target in this client is a literal | Same as F-1, plus the fact below that nothing built from this tree is currently running |
+
+**npm reports a fix available for all three** as `"fixAvailable": true`, meaning
+`npm audit fix` would resolve them by rewriting `frontend/package-lock.json`.
+That is stated plainly rather than implied away: the reason they are open is not
+that no fix exists but that the fix is a change to a file &sect;0.9.2 excludes,
+and the same section is explicit that a frontend lock change is reported rather
+than made. An operator who owns the client can close all three by taking
+`react-router-dom` to 7.18.0 or later, which is a semver-major move, and
+regenerating the lock.
+
+### The build and test toolchain: eighteen further advisories
+
+Audited as `npm audit`: thirty vulnerable package nodes and twenty-one distinct
+advisories in total, of which the three above are the shipping ones. The
+eighteen below reach the tree through `react-scripts` 5.0.1 and through the test
+framework, and **none of them is present in the image the client is served
+from**: `Dockerfile.frontend` is a two-stage build whose first stage is
+discarded, and the second stage copies only `/app/build` into `nginx:alpine`.
+
+| # | Advisories | Package | Severity | Reachability, and what bounds it |
+|---|---|---|---|---|
+| F-4 | GHSA-4v9v-hfq4-rm2v, GHSA-79cf-xcqc-c78w, GHSA-9jgg-88mc-972h, GHSA-f5vj-f2hx-8m93, GHSA-m28w-2pqf-7qgj, GHSA-mx8g-39q3-5c79 | `webpack-dev-server` | moderate | Every one of the six requires the development server to be running. It is started only by `react-scripts start`, and **no workflow, script or image runs that command** &mdash; the pipeline runs `npm ci`, ESLint and `npm test`, and the image runs `npm run build`. A developer who runs it locally is the only exposure, and it is a local one |
+| F-5 | GHSA-6g55-p6wh-862q, GHSA-r28c-9q8g-f849, GHSA-7fh5-64p2-3v2j, GHSA-fxqj-rqcc-2cmp, GHSA-qx2v-qp2m-jg93 | `postcss` | high, high, moderate, moderate, moderate | Reached at build time only, through the CSS pipeline. Three of the five turn on an attacker-controlled `sourceMappingURL` in a stylesheet; the stylesheets built here are the ones committed in `frontend/src`, and no build step accepts CSS from anywhere else |
+| F-6 | GHSA-2p49-hgcm-8545 | `svgo` | high | Reached at build time only, optimising the SVG assets committed in this repository. No untrusted SVG enters the build |
+| F-7 | GHSA-rp65-9cf3-cjxr | `nth-check` | high | An inefficient regular expression reached through the same CSS selector parsing as F-5, on committed input, at build time only |
+| F-8 | GHSA-5c6j-r48x-rmvq, GHSA-qj8w-gfj5-8c6v | `serialize-javascript` | high, moderate | Reached at build time by the minifier and the service-worker generator, serialising the build's own configuration rather than input |
+| F-9 | GHSA-w5hq-g745-h8pq | `uuid` | moderate | A missing buffer bounds check in v3/v5/v6 when a buffer is supplied. Reached only by the build tooling, which supplies none |
+| F-10 | GHSA-qpx9-hpmf-5gmw | `underscore` | high | Unbounded recursion in `_.flatten` and `_.isEqual`, reached through `jsonpath` inside the test and build toolchain, never at runtime |
+| F-11 | GHSA-vpq2-c234-7xj6 | `@tootallnate/once` | low | Reached through the test framework's HTTP proxy agent. The test framework is not installed into any image |
+
+**npm's own report is the evidence that no upgrade path exists for sixteen of
+the thirty nodes.** For each of them the report reads
+`"fixAvailable": {"name": "react-scripts", "version": "0.0.0",
+"isSemVerMajor": true}` &mdash; npm resolves the fix to a semver-major move of
+`react-scripts` to a version that is the deprecation placeholder rather than a
+release. Create React App is unmaintained, so its transitive pins cannot be
+raised while it is the toolchain. Closing this group means replacing the
+toolchain, which is a change to `frontend/package.json` and the lock, and
+therefore outside &sect;0.9.2.
+
+### A fact that bounds the whole frontend register
+
+Nothing built from this tree is currently running. The client's build fails on a
+missing payment package and eighteen type errors in one module, which
+[O-5 and O-6](#o-5-and-o-6--the-browser-client-contract) and
+[O-7](#o-7--the-first-cluster-apply-and-the-frontend-builds-two-prerequisites)
+record, and the delivered architecture draws the client as an unconnected node
+for that reason. The three shipping advisories therefore describe a bundle that
+does not exist yet, and the eighteen toolchain advisories describe a build that
+does not complete. That is a bound on today's exposure, not a remedy: the moment
+the client builds, F-1 to F-3 ship with it, which is why they are registered
+against the shipping tree and gated at a moderate ceiling rather than folded in
+with the toolchain.
+
+### Reproducing these figures
+
+```bash
+cd frontend
+npm ci
+npm audit --omit=dev --json > npm-audit-production.json
+npm audit --json > npm-audit-full.json
+node ../.github/scripts/check_frontend_audit_budget.js \
+  npm-audit-production.json production
+node ../.github/scripts/check_frontend_audit_budget.js \
+  npm-audit-full.json full
+```
+
+Measured on the tree this register ships with: the shipping audit reports
+**2 vulnerable nodes and 3 distinct advisories, all moderate**; the full audit
+reports **30 vulnerable nodes** &mdash; npm's own severity tally being 14 high,
+7 moderate and 9 low, which counts nodes rather than advisories &mdash; and
+**21 distinct advisories**, of which 6 are high, 14 moderate and 1 low. The two
+tallies differ because one package node can carry several advisories and one
+advisory can affect several nodes; the gate prints both figures side by side so
+neither can be mistaken for the other.
+
+The gate was driven against mutated reports to establish that it can refuse:
+an unrecorded identifier fails with the identifier named, a recorded identifier
+re-rated above the tree's ceiling fails, a critical in the toolchain tree fails,
+a report npm could not produce fails, a report missing its summary fails, an
+unknown tree name fails, and a recorded identifier that has disappeared passes
+with a notice naming it.
+
 ## Findings outside this register
 
 This remediation additionally surfaced findings outside the stated scope. They are

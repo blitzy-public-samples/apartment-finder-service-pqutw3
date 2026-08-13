@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 
+import anyio
 import pytest
 from conftest import CLIENT_BASE_URL, REPO_ROOT
 from fastapi import FastAPI
@@ -805,6 +806,272 @@ class TestRequestBodyCaps:
                 )
                 return
         raise AssertionError("the body cap middleware is not installed")
+
+
+class TestBodyIsReadBeforeAdmission:
+    """A body that never finishes arriving costs no serving capacity.
+
+    The admission gate holds its slot for the whole of the routed
+    request, and a route reads its body inside that request. A client
+    that declared a body, sent one byte of it and then held the socket
+    open therefore held a slot for as long as it liked: measured, ten
+    such connections took every slot, and the public listings read waited
+    the whole admission allowance and was then refused 503 while both
+    probes stayed green because their paths are ungated.
+
+    The prefetch layer reads the body outside the gate, under a
+    whole-body deadline and a per-chunk deadline, so a stalled body is
+    answered 408 and occupies no slot at all.
+    """
+
+    SCOPE = {
+        "type": "http",
+        "method": "POST",
+        "path": "/filters/",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    def _stalling_receive(self, opening=None):
+        """Returns a channel that answers once and then never again."""
+        answered = []
+
+        async def receive():
+            if opening is not None and not answered:
+                answered.append(opening)
+                return opening
+            await anyio.sleep_forever()
+
+        return receive
+
+    def _collecting_send(self, sent):
+        async def send(message):
+            sent.append(message)
+
+        return send
+
+    def _recording_downstream(self, entered, read=None):
+        async def downstream(scope, receive, send):
+            entered.append(scope["path"])
+            if read is not None:
+                while True:
+                    message = await receive()
+                    read.append(message)
+                    if message["type"] != "http.request":
+                        return
+                    if not message.get("more_body", False):
+                        return
+
+        return downstream
+
+    def _layer(self):
+        """Returns the one prefetch layer the application installs."""
+        installed = [
+            layer
+            for layer in main_module.app.user_middleware
+            if layer.cls is main_module.BodyPrefetchMiddleware
+        ]
+        assert len(installed) == 1
+        return installed[0]
+
+    def test_the_layer_sits_between_the_body_cap_and_the_gate(self):
+        """So the cap still applies and the gate is still innermost."""
+        installed = [
+            layer.cls for layer in main_module.app.user_middleware
+        ]
+
+        assert installed[-1] is main_module.RequestAdmissionMiddleware
+        assert installed[-2] is main_module.BodyPrefetchMiddleware
+        assert installed[-3] is main_module.BodySizeLimitMiddleware
+
+    def test_both_deadlines_come_from_the_configuration(self):
+        """Neither figure is a literal at the registration."""
+        registered = self._layer().kwargs
+
+        assert registered["total_seconds"] == (
+            settings.REQUEST_BODY_TIMEOUT_SECONDS
+        )
+        assert registered["chunk_seconds"] == (
+            settings.REQUEST_BODY_CHUNK_TIMEOUT_SECONDS
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_body_that_never_arrives_is_refused_408(self):
+        sent = []
+        entered = []
+        middleware = main_module.BodyPrefetchMiddleware(
+            self._recording_downstream(entered),
+            total_seconds=0.2,
+            chunk_seconds=0.1,
+        )
+
+        await middleware(
+            dict(self.SCOPE),
+            self._stalling_receive(),
+            self._collecting_send(sent),
+        )
+
+        assert entered == []
+        assert sent[0]["status"] == 408
+        assert main_module.BODY_NOT_RECEIVED_DETAIL.encode() in sent[1][
+            "body"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_body_that_stops_part_way_is_refused_408(self):
+        sent = []
+        entered = []
+        middleware = main_module.BodyPrefetchMiddleware(
+            self._recording_downstream(entered),
+            total_seconds=0.4,
+            chunk_seconds=0.1,
+        )
+
+        await middleware(
+            dict(self.SCOPE),
+            self._stalling_receive(
+                {"type": "http.request", "body": b"{", "more_body": True}
+            ),
+            self._collecting_send(sent),
+        )
+
+        assert entered == []
+        assert sent[0]["status"] == 408
+
+    @pytest.mark.asyncio
+    async def test_a_complete_body_is_replayed_in_order(self):
+        prepared = [
+            {"type": "http.request", "body": b'{"a"', "more_body": True},
+            {"type": "http.request", "body": b":1}", "more_body": False},
+        ]
+        pending = list(prepared)
+
+        async def receive():
+            if pending:
+                return pending.pop(0)
+            return {"type": "http.disconnect"}
+
+        read = []
+        entered = []
+        middleware = main_module.BodyPrefetchMiddleware(
+            self._recording_downstream(entered, read),
+            total_seconds=5.0,
+            chunk_seconds=5.0,
+        )
+
+        await middleware(dict(self.SCOPE), receive, self._collecting_send([]))
+
+        assert entered == ["/filters/"]
+        assert read == prepared
+
+    @pytest.mark.asyncio
+    async def test_a_read_past_the_body_is_answered_by_the_request(self):
+        """A disconnect is delivered by the server, not manufactured."""
+        pending = [
+            {"type": "http.request", "body": b"{}", "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+
+        async def receive():
+            if pending:
+                return pending.pop(0)
+            raise AssertionError("the channel was read past its end")
+
+        read = []
+
+        async def downstream(scope, receive_, send_):
+            read.append(await receive_())
+            read.append(await receive_())
+
+        middleware = main_module.BodyPrefetchMiddleware(
+            downstream, total_seconds=5.0, chunk_seconds=5.0
+        )
+
+        await middleware(dict(self.SCOPE), receive, self._collecting_send([]))
+
+        assert [message["type"] for message in read] == [
+            "http.request",
+            "http.disconnect",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", main_module.BODYLESS_METHODS)
+    async def test_a_bodyless_method_is_passed_straight_through(
+        self, method
+    ):
+        entered = []
+        middleware = main_module.BodyPrefetchMiddleware(
+            self._recording_downstream(entered),
+            total_seconds=0.05,
+            chunk_seconds=0.05,
+        )
+        scope = dict(self.SCOPE, method=method)
+
+        await middleware(
+            scope, self._stalling_receive(), self._collecting_send([])
+        )
+
+        assert entered == ["/filters/"]
+
+    def test_a_body_over_the_cap_is_answered_rather_than_raised(self):
+        """The cap's refusal is rendered, not left to the server.
+
+        The counting channel refuses by raising, and this layer sits
+        outside the handler that turns such a refusal into a response, so
+        the response is produced here instead of reaching the server as an
+        unhandled error.
+        """
+        probe = FastAPI()
+
+        @probe.post("/echo")
+        async def echo(payload: dict):
+            return {"keys": sorted(payload)}
+
+        probe.add_middleware(
+            main_module.BodyPrefetchMiddleware,
+            total_seconds=5.0,
+            chunk_seconds=5.0,
+        )
+        probe.add_middleware(
+            main_module.BodySizeLimitMiddleware,
+            max_body_bytes=64,
+            max_messages=16,
+        )
+        client = TestClient(probe, raise_server_exceptions=False)
+
+        response = client.post(
+            "/echo",
+            content=b'{"a":"' + b"x" * 512 + b'"}',
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 413
+        assert response.json() == {
+            "detail": main_module.BODY_TOO_LARGE_DETAIL
+        }
+
+    def test_a_stalled_body_leaves_the_public_read_served(self, client):
+        """The assembled application answers while a body is stalled.
+
+        The bound the gate applies is per event loop and the client here
+        drives one loop per request, so this case asserts the property the
+        measurement showed rather than reproducing the ten-connection
+        exhaustion: the prefetch layer refuses the stalled body itself,
+        and the read that shares the process is answered.
+        """
+        prefetch = main_module.BodyPrefetchMiddleware(
+            None, total_seconds=0.2, chunk_seconds=0.1
+        )
+        sent = []
+
+        async def drive():
+            await prefetch(dict(self.SCOPE), self._stalling_receive(), (
+                self._collecting_send(sent)
+            ))
+
+        anyio.run(drive)
+
+        assert sent[0]["status"] == 408
+        assert client.get("/listings/").status_code == 200
 
 
 class TestBodyReadingCost:

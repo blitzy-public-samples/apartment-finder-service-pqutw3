@@ -25,8 +25,10 @@ import pytest
 from backend.app.core import logging as app_logging
 from backend.app.core.logging import (
     BASE_LOGGER_NAME,
+    GOVERNED_LOGGER_NAMES,
     HANDLER_NAME,
     REDACTION_PLACEHOLDER,
+    SERVER_LOGGER_NAMES,
     RedactingFilter,
     RedactingJsonFormatter,
     configure_logging,
@@ -622,6 +624,32 @@ class TestOriginList:
     )
     def test_wildcard_and_empty_origins_are_rejected(self, origins):
         assert_rejected(ALLOWED_ORIGINS=origins)
+
+    def test_the_shipped_default_covers_both_loopback_spellings(self):
+        """A frontend opened at 127.0.0.1 is a distinct origin.
+
+        An origin is matched exactly, and a browser sends the one it was
+        addressed by. The shipped default named only the ``localhost``
+        spelling, so a frontend served at ``http://127.0.0.1:3000`` was
+        answered ``400`` with no allow-origin header while the otherwise
+        identical ``localhost`` origin succeeded.
+        """
+        shipped = Settings.__fields__["ALLOWED_ORIGINS"].default
+
+        for port in ("", ":3000"):
+            assert "http://localhost" + port in shipped, port
+            assert "http://127.0.0.1" + port in shipped, port
+
+    def test_the_shipped_default_names_no_origin_a_browser_omits(self):
+        """A browser drops the port when it is the scheme's default.
+
+        ``http://localhost:80`` is therefore an origin no browser ever
+        sends, so listing it in place of the port-less form allowed
+        nothing.
+        """
+        shipped = Settings.__fields__["ALLOWED_ORIGINS"].default
+
+        assert not [entry for entry in shipped if entry.endswith(":80")]
 
 
 # Settings that together describe one deployed, non-local environment.
@@ -2016,6 +2044,132 @@ class TestOutboundHttpNamespacesAreGoverned:
         assert SENTINEL not in rendered
         assert "zip_codes" not in rendered
         assert REDACTION_PLACEHOLDER in rendered
+
+
+class TestServerNamespacesAreGoverned:
+    """The ASGI server's own records reach the redacting handler.
+
+    The server configures ``uvicorn``, ``uvicorn.error`` and
+    ``uvicorn.access`` itself, with its own stream handlers and no
+    propagation, before this application's modules are imported. Before
+    the fix those handlers survived, so the production command emitted a
+    raw traceback carrying whatever the failing request held -- values,
+    internal paths -- and an access line carrying the complete query
+    string, alongside the application's own redacted record.
+    """
+
+    NAMES = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+    #: A value carried in a query string, as an access record renders one.
+    QUERY_VALUE = "CANARY-QUERY-VALUE"
+
+    def test_every_server_namespace_is_declared_governed(self):
+        assert set(SERVER_LOGGER_NAMES) == set(self.NAMES)
+        for name in self.NAMES:
+            assert name in GOVERNED_LOGGER_NAMES, name
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_the_namespace_carries_exactly_the_governed_handler(
+        self, name
+    ):
+        configure_logging()
+        governed = logging.getLogger(name)
+
+        assert [
+            getattr(entry, "name", None) for entry in governed.handlers
+        ] == [HANDLER_NAME]
+        assert governed.propagate is False
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_the_access_and_error_levels_are_admitted(self, name):
+        """The access record is written at INFO, so INFO is admitted."""
+        configure_logging()
+
+        assert logging.getLogger(name).isEnabledFor(logging.INFO) is True
+
+    @pytest.mark.parametrize("name", NAMES)
+    def test_a_foreign_handler_on_the_namespace_is_removed(self, name):
+        configure_logging()
+        governed = logging.getLogger(name)
+        foreign = logging.StreamHandler(io.StringIO())
+        foreign.set_name("server-bypass-" + name)
+        governed.addHandler(foreign)
+        try:
+            configure_logging()
+            assert foreign not in governed.handlers
+        finally:
+            if foreign in governed.handlers:
+                governed.removeHandler(foreign)
+            configure_logging()
+
+    def test_an_access_record_loses_its_query_string(self):
+        """The target of an access record carries no scheme or host."""
+        rendered = emit(
+            lambda logger: logger.info(
+                '%s - "%s %s HTTP/%s" %d',
+                "127.0.0.1:5000",
+                "GET",
+                "/listings/?zip_codes=11201&token=" + self.QUERY_VALUE,
+                "1.1",
+                200,
+            )
+        )
+
+        assert self.QUERY_VALUE not in rendered
+        assert "zip_codes" not in rendered
+        assert "/listings/?" + REDACTION_PLACEHOLDER in rendered
+
+    def test_a_target_without_a_query_keeps_its_path(self):
+        rendered = emit(
+            lambda logger: logger.info(
+                '%s - "%s %s HTTP/%s" %d',
+                "127.0.0.1:5000",
+                "GET",
+                "/health/ready",
+                "1.1",
+                200,
+            )
+        )
+
+        assert "/health/ready" in rendered
+
+    def test_a_template_whose_specifiers_would_break_is_kept(self):
+        """The server's own start-up record still renders its address.
+
+        ``"Uvicorn running on %s://%s:%d"`` keeps its three percent signs
+        under redaction while its first specifier is rewritten into text
+        no interpolation accepts, so counting percent signs admitted a
+        template that then raised while the record was rendered and the
+        whole message was replaced by the placeholder.
+        """
+        rendered = emit(
+            lambda logger: logger.info(
+                "Uvicorn running on %s://%s:%d (Press CTRL+C to quit)",
+                "http",
+                "127.0.0.1",
+                8000,
+            )
+        )
+
+        assert "http://127.0.0.1:8000" in rendered
+        assert REDACTION_PLACEHOLDER not in rendered
+
+    def test_the_terminal_coloured_duplicate_is_not_emitted(self):
+        """``color_message`` repeats the message with escape sequences."""
+        rendered = emit(
+            lambda logger: logger.info(
+                "Started server process [%d]",
+                4242,
+                extra={
+                    "color_message": "Started server process [\u001b[36m%d"
+                    "\u001b[0m]"
+                },
+            )
+        )
+
+        assert "color_message" not in rendered
+        assert "\u001b" not in rendered
+        assert "Started server process [4242]" in rendered
 
 
 class TestMigrationNamespacesAreGoverned:

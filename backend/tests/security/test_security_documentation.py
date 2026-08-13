@@ -140,7 +140,7 @@ UNPLANNED_DELIVERED_PATHS = 27
 
 #: Paths the rounds after that one delivered beyond the plan, carried by
 #: the matrix's section 2.9 second table and its section 4.3.
-LATER_ROUND_PATHS = 61
+LATER_ROUND_PATHS = 62
 
 #: Of those, the ones later rounds withdrew: sixteen retired by the
 #: manifest consolidation and one, the provider lock file, withdrawn with
@@ -720,16 +720,73 @@ def test_no_placeholder_is_offered_as_a_contact(path, placeholder):
 def test_the_policy_names_an_operator_prerequisite_per_channel():
     """Asserts each reporting channel says what makes it real.
 
-    Private reporting is off by default on a GitHub repository, and no
-    mailbox is provisioned, so a policy that simply lists both channels
-    would describe a reporting path that does not exist.
+    The two channels are in different states and each carries its own
+    prerequisite: private reporting is off by default on a GitHub
+    repository and is enabled here, so what it still needs is
+    confirmation that a report filed through it is read, while no mailbox
+    is provisioned at all. A policy that simply listed both would leave a
+    reporter to assume the terms around them are settled.
+
+    An earlier revision asserted the sentence "No monitored private
+    channel is operational yet" here, and the policy carried it twice.
+    That claim was measured false against this repository's own Security
+    and quality tab, which carries the Report a vulnerability button, so
+    what is asserted is now the separation the policy draws in its place
+    -- an enabled channel, unverified monitoring, unauthorized terms.
+    ``docs/security/DECISION_LOG.md`` row 104.6.1 owns the restatement.
     """
     flowed = _flowed(_text(SECURITY_POLICY))
 
-    assert "No monitored private channel is operational yet" in flowed
+    assert "No monitored private channel is operational yet" not in flowed
+    assert "**Three things are in three different states here" in flowed
+    assert "The **channel is enabled**" in flowed
+    assert "**Monitoring is unverified**" in flowed
+    assert "**The terms are unauthorized**" in flowed
+    assert "**Confirmation that a private report is read.**" in flowed
     assert flowed.count("*Operator prerequisite:*") >= 2
     assert "is **off** by default" in flowed
     assert "No address is published here" in flowed
+
+
+def test_the_policy_names_the_navigation_a_reporter_will_see():
+    """Asserts the published route matches the provider's own names.
+
+    A reporter following a tab or a settings page that is not on the
+    screen concludes the channel is missing, and both names had moved:
+    the tab reads "Security and quality" and the switch sits under
+    "Advanced Security". The superseded spellings are asserted absent so
+    a correction cannot be applied to one half only.
+
+    The "No security policy detected" notice is separately required to be
+    explained rather than left standing, because it is a statement about
+    this file -- a policy is linked from a repository's default branch --
+    and a reader who is not told that reads it as evidence the channel
+    does not exist either.
+    """
+    flowed = _flowed(_text(SECURITY_POLICY))
+
+    assert "**Security and quality** tab" in flowed
+    assert "**Security** tab" not in flowed
+    assert "**Advanced Security**" in flowed
+    assert "Code security and analysis" not in flowed
+    assert "*No security policy detected*" in flowed
+    assert "default branch" in flowed
+
+
+def test_both_documents_agree_on_what_the_channel_offers():
+    """Asserts the readme does not overstate the policy it points at.
+
+    The readme is where a reader meets the channel first, so a summary
+    there that promised a monitored channel would be believed over the
+    policy's own qualification. Both name the current tab, and the readme
+    carries the same three-state split in one sentence.
+    """
+    readme = _flowed(_text(README))
+
+    assert "**Security and quality** tab" in readme
+    assert "**Security** tab" not in readme
+    assert "channel is" in readme
+    assert "has not been confirmed" in readme
 
 
 def test_the_policy_publishes_no_response_commitment():

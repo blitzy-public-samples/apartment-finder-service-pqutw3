@@ -28,6 +28,8 @@ __all__ = [
     "DEFAULT_INGESTION_MAX_ZIP_CODES",
     "DEFAULT_INGESTION_ZIP_CODE_CHUNK",
     "DEFAULT_MAX_PAGINATION_OFFSET",
+    "DEFAULT_REQUEST_BODY_CHUNK_TIMEOUT_SECONDS",
+    "DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS",
     "DEPLOYABLE_RATE_LIMIT_STORAGE_SCHEMES",
     "ENVIRONMENT_BACKEND_NAME",
     "ENV_FILE_VARIABLE",
@@ -49,6 +51,7 @@ __all__ = [
     "MIN_SIGNING_KEY_BYTES_BY_ALGORITHM",
     "MIN_SIGNING_KEY_DISTINCT_CHARS",
     "PROVIDER_SECRET_SETTINGS",
+    "REQUEST_BODY_TIMEOUT_CEILING_SECONDS",
     "PAYPAL_API_BASES",
     "PAYPAL_MODES",
     "PRODUCTION_ENVIRONMENT",
@@ -251,6 +254,22 @@ MAX_PAGINATION_OFFSET_CEILING = 1000000
 #: Row offset applied to ``Settings.MAX_PAGINATION_OFFSET`` when the
 #: environment names none.
 DEFAULT_MAX_PAGINATION_OFFSET = 10000
+
+#: Largest value either request-body deadline may be set to, in seconds.
+#: A longer deadline is refused by settings validation, because both
+#: deadlines bound how long one connection may hold the memory its body
+#: is read into.
+REQUEST_BODY_TIMEOUT_CEILING_SECONDS = 120.0
+
+#: Seconds a whole request body is given to arrive when the environment
+#: names no deadline.
+DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS = 10.0
+
+#: Seconds one further chunk of a request body is given to arrive when
+#: the environment names no deadline. It is below
+#: :data:`DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS`, so a body that stalls
+#: part-way is refused before the whole-body deadline expires.
+DEFAULT_REQUEST_BODY_CHUNK_TIMEOUT_SECONDS = 5.0
 
 #: Largest value any request-path database timeout may be set to, in
 #: seconds. A value above it is refused by settings validation.
@@ -849,14 +868,33 @@ class Settings(BaseSettings):
     # Password hashing
     BCRYPT_ROUNDS: int = Field(12, ge=10, le=15)
 
-    # HTTP surface, CORS and hosts
+    # HTTP surface, CORS and hosts. Each local frontend origin is listed
+    # in both of its loopback spellings, written the way a browser sends
+    # it: an origin is matched exactly, a frontend reached at 127.0.0.1
+    # presents an origin the localhost spelling does not cover, and a
+    # browser omits the port when it is the scheme's default, so the
+    # container origin is listed without one.
     ALLOWED_ORIGINS: List[str] = [
         "http://localhost:3000",
-        "http://localhost:80",
+        "http://127.0.0.1:3000",
+        "http://localhost",
+        "http://127.0.0.1",
     ]
     ALLOWED_HOSTS: List[str] = ["localhost", "127.0.0.1"]
     MAX_REQUEST_BODY_BYTES: int = Field(1048576, ge=1, le=104857600)
     MAX_REQUEST_BODY_CHUNKS: int = Field(2048, ge=1, le=1048576)
+    # Deadlines a request body is read under. The whole body must arrive
+    # within the first, and each further chunk of it within the second.
+    REQUEST_BODY_TIMEOUT_SECONDS: float = Field(
+        DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS,
+        gt=0,
+        le=REQUEST_BODY_TIMEOUT_CEILING_SECONDS,
+    )
+    REQUEST_BODY_CHUNK_TIMEOUT_SECONDS: float = Field(
+        DEFAULT_REQUEST_BODY_CHUNK_TIMEOUT_SECONDS,
+        gt=0,
+        le=REQUEST_BODY_TIMEOUT_CEILING_SECONDS,
+    )
     MAX_PAGE_SIZE: int = Field(100, ge=1, le=1000)
     MAX_PAGINATION_OFFSET: int = Field(
         DEFAULT_MAX_PAGINATION_OFFSET,
@@ -1179,6 +1217,23 @@ class Settings(BaseSettings):
                 )
             hosts.append(candidate)
         return hosts
+
+    @validator("REQUEST_BODY_CHUNK_TIMEOUT_SECONDS")
+    def _check_body_chunk_deadline(
+        cls, value: float, values: Dict[str, Any]
+    ) -> float:
+        """Return the per-chunk deadline, refusing one above the total.
+
+        A per-chunk deadline longer than the whole-body deadline could
+        never be reached, so the pair would state a bound the reader does
+        not apply.
+        """
+        total = values.get("REQUEST_BODY_TIMEOUT_SECONDS")
+        if total is not None and value > total:
+            raise ValueError(
+                "must not exceed REQUEST_BODY_TIMEOUT_SECONDS"
+            )
+        return value
 
     @validator("RATE_LIMIT_STORAGE_URI")
     def _check_rate_limit_storage(cls, value: str) -> str:

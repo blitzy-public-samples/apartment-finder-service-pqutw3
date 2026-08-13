@@ -672,13 +672,22 @@ def test_the_deck_reports_the_open_items_explicitly():
 
     The deck previously described the work as finished. Three kinds of
     work cannot be done from this repository, so the deck names them.
+
+    The third item read "Enable private reporting" until that step was
+    observed already done on the repository's Security and quality tab.
+    What is open is narrower and is what the item now names: nothing
+    inside this repository can establish that a filed report is read.
+    ``docs/security/DECISION_LOG.md`` row 104.6.1 owns the restatement,
+    and the superseded label is asserted absent so the deck cannot drift
+    back to asking an operator for work that is finished.
     """
     text = _text()
 
     assert "What still needs an owner" in text
     assert "Rotate the exposed credentials" in text
     assert "Mount the provisioned secrets" in text
-    assert "Enable private reporting" in text
+    assert "Confirm reports are read" in text
+    assert "Enable private reporting" not in text
 
 
 def test_the_architecture_diagram_draws_no_absent_flow():
@@ -710,3 +719,457 @@ def test_the_architecture_diagram_draws_no_absent_flow():
     for node in ("VAULT[", "PLATFORM[", "CLIENT["):
         assert node in diagram, node
     assert "stroke-dasharray" in diagram
+
+
+# ---------------------------------------------------------------------
+# Readability of the rendered slide.
+#
+# The body-word cap above counts prose and excludes each declared visual,
+# which is the model row 96.5.1 of the decision log settles. A review of
+# the rendered deck counted every visible word instead, including each
+# cell of a table and each label of a metric card, and reported eight
+# slides between 44 and 290 words on that count. Both models measure
+# something real: the first is what Rule 2's forty-word cap governs, and
+# the second is how much text a reader actually faces. The cases below
+# bound the second one, so density is held by test on the same terms it
+# was measured on. Row 104.8.1 of the decision log holds the two models
+# and why the strictest slides cannot reach forty on the wider count.
+
+#: Ceiling on the words a content slide renders in total, counting every
+#: visible word including each table cell and metric label. Measured at 78
+#: on the densest slide after the reduction, from 290 before it.
+MAX_VISIBLE_WORDS = 80
+
+#: Ceiling on the words one cell or one bullet may carry. A cell above this
+#: is prose sitting inside a table, which is the shape the review found at
+#: forty words. Running prose is bounded by the body-word cap above
+#: instead, which is the measure Rule 2 states.
+MAX_UNIT_WORDS = 13
+
+#: The units that cap holds: table cells, table headers and bullets.
+TEXT_UNITS = re.compile(r"<(td|th|li)\b[^>]*>(.*?)</\1>", re.S)
+
+#: A screen-reader-only unit, which no sighted reader faces.
+SCREEN_READER_ONLY = re.compile(r'class="[^"]*\bsr-only\b')
+
+
+def _rendered_words(section):
+    """Returns every word a slide renders, on the review's own model.
+
+    Headings, diagram source, speaker notes and screen-reader-only text
+    are excluded; every other visible word is counted, whichever element
+    carries it.
+    """
+    without_diagram = re.sub(
+        r'<pre class="mermaid">.*?</pre>', " ", section, flags=re.S
+    )
+    without_notes = re.sub(
+        r'<aside class="notes">.*?</aside>', " ", without_diagram, flags=re.S
+    )
+    without_headings = re.sub(
+        r"<h[1-4][^>]*>.*?</h[1-4]>", " ", without_notes, flags=re.S
+    )
+    without_hidden = re.sub(
+        r'<(span|caption)\b[^>]*class="[^"]*\bsr-only\b[^"]*"[^>]*>'
+        r".*?</\1>",
+        " ",
+        without_headings,
+        flags=re.S,
+    )
+    return re.sub(r"<[^>]+>", " ", without_hidden).split()
+
+
+def test_every_content_slide_is_within_the_rendered_word_ceiling():
+    """No content slide faces a reader with more than the ceiling."""
+    over = {}
+    for number, section in enumerate(_slides(_text()), 1):
+        if _kind(section) != "content":
+            continue
+        count = len(_rendered_words(section))
+        if count > MAX_VISIBLE_WORDS:
+            over[number] = count
+
+    assert not over, over
+
+
+def test_no_rendered_text_unit_carries_a_paragraph():
+    """No cell, bullet, label or line exceeds the per-unit ceiling.
+
+    The slide-level ceiling can be met by many short units or by one long
+    one, and one long one is what the review found: a single table cell
+    carrying forty words. This bounds the unit.
+    """
+    over = []
+    for number, section in enumerate(_slides(_text()), 1):
+        without_diagram = re.sub(
+            r'<pre class="mermaid">.*?</pre>', " ", section, flags=re.S
+        )
+        without_notes = re.sub(
+            r'<aside class="notes">.*?</aside>',
+            " ",
+            without_diagram,
+            flags=re.S,
+        )
+        for match in TEXT_UNITS.finditer(without_notes):
+            opening = match.group(0)[: match.group(0).find(">") + 1]
+            if SCREEN_READER_ONLY.search(opening):
+                continue
+            body = re.sub(r"<[^>]+>", " ", match.group(2))
+            words = body.split()
+            if len(words) > MAX_UNIT_WORDS:
+                over.append((number, len(words), " ".join(words)[:60]))
+
+    assert not over, over
+
+
+# ---------------------------------------------------------------------
+# The authored type scale, the layout mode boundary and the navigation
+# chrome.
+#
+# The stage the framework paints is a fixed 1920x1080 box scaled to the
+# viewport, so every authored size is multiplied by that scale. A review
+# of the rendered deck measured 6.23px text at 1025px wide and a 1.0 to
+# 0.5125 step across a one-pixel change of width. The floor and the
+# boundary below are what hold both.
+
+#: Smallest authored size, as a fraction of the 32px root. At the lowest
+#: stage scale the stylesheet still uses, 0.729, this renders at 11.7px.
+#: Every rule is measured, including the two that size against their own
+#: parent: a fraction of an em inside an already-fractional parent
+#: compounds, and both of those landed under the floor at 0.92em and 0.94em
+#: inside a 0.5em cell before they were carried to 1em.
+MIN_ROOT_RELATIVE_EM = 0.5
+
+#: Width at and below which the stage is released and the slide flows.
+FLOW_BOUNDARY = "1400px"
+
+#: Bottom padding the flowing slide reserves for the pinned chrome.
+MIN_CHROME_RESERVE = 140
+
+
+def _stylesheet():
+    """Returns the deck's inline stylesheet."""
+    return re.search(r"<style>(.*?)</style>", _text(), re.S).group(1)
+
+
+def test_no_authored_type_tier_sits_below_the_legible_floor():
+    """Every root-relative size is at or above the floor.
+
+    A tier below the floor renders in single digits of pixels once the
+    stage is scaled, which is what the review measured.
+    """
+    sheet = _stylesheet()
+    low = []
+    for block in re.finditer(r"([^{}]+)\{([^{}]*)\}", sheet):
+        selector = " ".join(block.group(1).split())
+        for size in re.finditer(
+            r"font-size:\s*(?:min\()?([0-9.]+)em", block.group(2)
+        ):
+            if float(size.group(1)) < MIN_ROOT_RELATIVE_EM:
+                low.append((selector, size.group(1)))
+
+    assert not low, low
+
+
+def test_the_stage_fills_the_viewport():
+    """The framework's own inset is not applied.
+
+    It defaults to four percent, which multiplies into every authored size
+    through the stage scale and took the smallest tier under the floor at
+    the layout-mode boundary.
+    """
+    assert "margin: 0," in _text()
+
+
+def test_the_layout_mode_boundary_is_declared_once_everywhere():
+    """The stylesheet and both scripts name the same boundary.
+
+    The stylesheet releases the stage, one script re-shapes the diagram
+    text when the mode changes and the other sizes the drawings for the
+    mode it finds. A boundary that differed between them would leave one
+    of the three in the wrong mode.
+    """
+    text = _text()
+    sheet = _stylesheet()
+
+    #: The flow-mode block, identified by the declaration only it makes.
+    flow = re.search(
+        r"@media \(max-width: ([0-9]+px)\) \{[^@]*?"
+        r"\.reveal \.slides > section:not\(\.present\)",
+        sheet,
+        re.S,
+    )
+    assert flow is not None
+    assert flow.group(1) == FLOW_BOUNDARY, flow.group(1)
+
+    assert (
+        "window.matchMedia('(max-width: %s)')" % FLOW_BOUNDARY
+    ) in text
+    assert ("FLOW_QUERY = '(max-width: %s)'" % FLOW_BOUNDARY) in text
+
+
+def test_the_flowing_slide_reserves_room_for_the_pinned_chrome():
+    """The chrome stands on its own ground and masks what passes beneath.
+
+    Pinned to the viewport over a slide taller than it, the chrome has
+    content pass under it at every intermediate scroll offset, which
+    padding cannot prevent; what padding does guarantee is that no slide
+    ends underneath it. The backdrop is what covers the rest, and it sits
+    on the button rather than on the cluster element, whose own box is
+    empty: the framework positions every button absolutely inside it, so a
+    backdrop there measured 20px square while the buttons that paint
+    measure 44px each.
+    """
+    sheet = _stylesheet()
+    reserves = [
+        int(value)
+        for value in re.findall(
+            r"\.slide-body \{ padding: [0-9]+px [0-9]+px ([0-9]+)px",
+            sheet,
+        )
+    ]
+
+    assert reserves, "no flowing slide padding found"
+    for reserve in reserves:
+        assert reserve >= MIN_CHROME_RESERVE, reserve
+
+    #: The backdrop is on the painting box, in both slide tones, and is
+    #: fully opaque: a token, never a colour with an alpha channel.
+    light = re.search(
+        r"\.reveal \.controls button \{([^}]*)\}", sheet, re.S
+    )
+    dark = re.search(
+        r"\.reveal\.has-dark-background \.controls button \{([^}]*)\}",
+        sheet,
+        re.S,
+    )
+
+    assert light is not None
+    assert dark is not None
+    assert "background: var(--blitzy-surface-0);" in light.group(1)
+    assert "background: var(--blitzy-primary-navy);" in dark.group(1)
+    assert "rgba" not in light.group(1).split("box-shadow")[0]
+
+    #: And the framework's own dimmed back arrow is returned to full
+    #: opacity, which the backdrop depends on.
+    assert ".reveal .controls button.enabled { opacity: 1; }" in sheet
+
+
+def test_the_slide_heading_occludes_nothing():
+    """The heading scrolls with its slide.
+
+    It was pinned to the top of the scrollport with an offset shadow that
+    painted its opaque box over the 60px above it, which stood over the
+    lede, the callout or the first table header beneath it.
+    """
+    sheet = _stylesheet()
+    head = re.search(
+        r"\.slide-head \{[^}]*position: static;[^}]*\}", sheet, re.S
+    )
+
+    assert head is not None
+    assert "position: sticky" not in sheet
+    assert "box-shadow: 0 -60px" not in sheet
+
+
+# ---------------------------------------------------------------------
+# The diagram pan region, the control gesture and the remaining
+# accessibility affordances.
+
+def test_each_diagram_is_a_named_focusable_pan_region():
+    """Both diagrams sit in a labelled region a keyboard can reach.
+
+    A drawing wider than the slide pans, and the review found the pan
+    region unreachable without a pointer and unmarked by a scrollbar.
+    """
+    text = _text()
+    frames = re.findall(r'<div class="diagram-container"[^>]*>', text)
+    sheet = _stylesheet()
+
+    assert len(frames) == 2, frames
+    for frame in frames:
+        assert 'role="region"' in frame, frame
+        assert 'tabindex="0"' in frame, frame
+        assert 'aria-label="' in frame, frame
+        assert "arrow keys" in frame, frame
+
+    #: The frame is the scrollport, it draws a marked scrollbar, and it
+    #: shows a focus ring.
+    assert re.search(
+        r"\.diagram-container \{[^}]*overflow-x: auto;", sheet, re.S
+    )
+    assert "scrollbar-width: thin" in sheet
+    assert "scrollbar-color: var(--blitzy-primary)" in sheet
+    assert ".diagram-container::-webkit-scrollbar {" in sheet
+    assert ".reveal .diagram-container:focus-visible {" in sheet
+
+    #: A stable gutter is not declared. It reserves an inline-end strip for
+    #: a vertical scrollbar the frame can never show, since its vertical
+    #: overflow is hidden, and that strip left the horizontal extent 10px
+    #: short of the drawing's own end.
+    assert "scrollbar-gutter" not in sheet
+
+
+def test_the_pan_region_answers_the_keyboard_without_changing_slide():
+    """Arrow, Home and End pan the frame and go no further.
+
+    The framework binds the same keys to slide navigation on the
+    document, so a key the frame handles is stopped before it arrives
+    there. Each frame also opens at its left edge.
+    """
+    text = _text()
+    handler = re.search(
+        r"function panFrame\(event\) \{(.*?)\n  \}", text, re.S
+    )
+
+    assert handler is not None
+    body = handler.group(1)
+    for key in ("'ArrowRight'", "'ArrowLeft'", "'Home'", "'End'"):
+        assert key in body, key
+    assert "event.stopPropagation();" in body
+    assert "event.preventDefault();" in body
+    assert "frame.addEventListener('keydown', panFrame);" in text
+    assert "frame.scrollLeft = 0;" in text
+    assert "resetDiagramFrames();" in text
+
+
+def test_a_gesture_on_a_control_never_reaches_the_swipe_handler():
+    """A drag that starts on a control drives that control alone.
+
+    One trusted drag on a chevron advanced two slides: the control acted
+    and the framework's swipe acted on the same gesture.
+    """
+    text = _text()
+    hold = re.search(
+        r"function holdGesture\(event\) \{(.*?)\n  \}", text, re.S
+    )
+
+    assert hold is not None
+    assert "closest('.reveal .controls')" in hold.group(1)
+    assert "event.stopPropagation();" in hold.group(1)
+    assert "event.preventDefault()" not in hold.group(1)
+    assert (
+        "document.addEventListener(GESTURE_EVENTS[gesture], holdGesture, true)"
+        in text
+    )
+
+    #: Both gesture families are covered. The framework reads pointer
+    #: events wherever the browser provides them, which every current
+    #: browser does, and touch events otherwise; stopping only the touch
+    #: family left the swipe reachable on the pointer one.
+    guarded = re.search(r"var GESTURE_EVENTS = \[(.*?)\];", text, re.S)
+    assert guarded is not None
+    for event in (
+        "'touchstart'", "'touchmove'", "'touchend'", "'touchcancel'",
+        "'pointerdown'", "'pointermove'", "'pointerup'", "'pointercancel'",
+    ):
+        assert event in guarded.group(1), event
+
+
+def test_the_landmark_role_survives_the_framework():
+    """The landmark role is re-asserted after initialization.
+
+    The framework stamps ``role="application"`` on the presentation
+    element while it sets the document up, which replaces the landmark
+    role a ``main`` element carries and left the accessibility tree with
+    no main landmark at all.
+    """
+    text = _text()
+    restore = re.search(
+        r"function restoreLandmarkRole\(\) \{(.*?)\n  \}", text, re.S
+    )
+
+    assert restore is not None
+    assert "querySelector('main.reveal')" in restore.group(1)
+    assert "setAttribute('role', 'main')" in restore.group(1)
+    assert "restoreLandmarkRole();" in text
+
+    #: Called from the ready handler, which runs after that assignment.
+    ready = re.search(
+        r"Reveal\.on\('ready', function \(\) \{(.*?)\n  \}\);", text, re.S
+    )
+    assert ready is not None
+    assert "restoreLandmarkRole();" in ready.group(1)
+
+
+def test_the_presentation_is_a_landmark_with_a_name():
+    """The slides sit in one named landmark."""
+    text = _text()
+
+    assert '<main class="reveal" aria-label="' in text
+    assert '<div class="reveal">' not in text
+
+
+def test_the_resume_control_carries_a_full_size_target():
+    """The framework's resume control reaches 44px."""
+    sheet = _stylesheet()
+    rule = re.search(
+        r"\.pause-overlay \.resume-button \{([^}]*)\}", sheet, re.S
+    )
+
+    assert rule is not None
+    assert "min-height: 44px" in rule.group(1)
+    assert "min-width: 44px" in rule.group(1)
+
+
+def test_the_drawn_diagram_edges_clear_the_contrast_floor():
+    """The drawn edge is darker than the theme value the Rule fixes.
+
+    Rule 2 fixes ``lineColor: '#999999'`` as the library's theme value,
+    and that value measures 2.85:1 against the slide surface. The theme
+    value is unchanged and the drawn stroke is carried to #6B6B6B, which
+    measures 5.3:1.
+    """
+    text = _text()
+    sheet = _stylesheet()
+
+    assert "lineColor: '#999999'" in text
+    assert ".flowchart-link" in sheet
+    for rule in re.findall(
+        r"\.reveal \.mermaid svg [^{]*\{([^}]*)\}", sheet, re.S
+    ):
+        assert UNDERCONTRAST_GREY not in rule, rule
+    assert "stroke: #6B6B6B !important" in sheet
+    assert "fill: #6B6B6B !important" in sheet
+
+
+def test_the_progress_fill_survives_a_forced_palette():
+    """The fill names a system colour and clears its gradient.
+
+    The gradient is a background image, which paints over any background
+    colour a forced palette substitutes.
+    """
+    sheet = _stylesheet()
+    forced = sheet.split("@media (forced-colors: active) {", 1)[1]
+    fill = re.search(
+        r"\.reveal \.progress span \{([^}]*)\}", forced, re.S
+    )
+
+    assert fill is not None
+    assert "background-image: none" in fill.group(1)
+    assert "background-color: Highlight" in fill.group(1)
+
+
+def test_every_mono_rule_names_a_weight_the_font_request_loads():
+    """No mono declaration asks for a weight with no file behind it.
+
+    ``.row-mark`` asked for 600 while the request loads 400 and 500, and
+    the browser drew a synthesized face.
+    """
+    sheet = _stylesheet()
+    request = re.search(r"Fira\+Code:wght@([0-9;]+)", _text()).group(1)
+    loaded = set(request.split(";"))
+
+    for block in re.finditer(r"([^{}]+)\{([^{}]*)\}", sheet):
+        declarations = block.group(2)
+        if "var(--ff-mono)" not in declarations:
+            continue
+        for weight in re.findall(r"font-weight:\s*([0-9]+)", declarations):
+            assert weight in loaded, (block.group(1).strip(), weight)
+
+
+def test_every_content_slide_declares_its_type():
+    """Rule 2 names four slide types, and each slide carries its own."""
+    for number, section in enumerate(_slides(_text()), 1):
+        opening = re.match(r"<section\b[^>]*>", section).group(0)
+        assert 'class="slide-' in opening, (number, opening)

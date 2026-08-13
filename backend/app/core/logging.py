@@ -37,6 +37,8 @@ __all__ = [
     "QUEUE_DRAIN_TIMEOUT_SECONDS",
     "REDACTION_PLACEHOLDER",
     "REQUEST_ID_FIELD",
+    "SERVER_LOGGER_NAMES",
+    "SERVER_LOG_LEVEL",
     "SIGNAL_FIELD",
     "SPAN_ID_FIELD",
     "SPAN_ID_LENGTH",
@@ -109,6 +111,23 @@ THIRD_PARTY_LOGGER_NAMES = (
 #: Level applied to the third-party loggers named above.
 THIRD_PARTY_LOG_LEVEL = logging.WARNING
 
+#: Namespaces the ASGI server writes its own records to, placed under the
+#: redacting handler. The server configures these itself, with its own
+#: stream handlers and no propagation, before this application's modules
+#: are imported: ``uvicorn.error`` carries the traceback of an unhandled
+#: exception and ``uvicorn.access`` carries the request target of every
+#: request, complete with its query string. Governing them is what routes
+#: both through the redaction rules rather than straight to the console.
+SERVER_LOGGER_NAMES = (
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+)
+
+#: Level applied to the server namespaces named above. It admits the
+#: access record, which the server writes at INFO.
+SERVER_LOG_LEVEL = logging.INFO
+
 #: Migration logger namespaces placed under the redacting handler by
 #: :func:`configure_migration_logging`.
 MIGRATION_LOGGER_NAMES = ("alembic", "sqlalchemy")
@@ -132,7 +151,10 @@ DEFAULT_LOG_LEVEL = logging.INFO
 
 #: Every logger namespace this module governs.
 GOVERNED_LOGGER_NAMES = (
-    (BASE_LOGGER_NAME,) + THIRD_PARTY_LOGGER_NAMES + MIGRATION_LOGGER_NAMES
+    (BASE_LOGGER_NAME,)
+    + THIRD_PARTY_LOGGER_NAMES
+    + MIGRATION_LOGGER_NAMES
+    + SERVER_LOGGER_NAMES
 )
 
 #: JSON context key carrying the bound request identifier.
@@ -368,6 +390,29 @@ _URL_CREDENTIAL_RE = re.compile(
 _URL_QUERY_RE = re.compile(
     r"(?P<url>[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s\"'<>\\?]{0,2048})"
     r"\?(?P<query>[^\s\"'<>\\]{1,4096})",
+)
+
+# The query string of a request target that carries no scheme or host,
+# which is the form an access record writes: the path is kept and the
+# whole query replaced. The target must start a token -- the character
+# before it, if any, is whitespace, a quote, an opening bracket or an
+# equals sign -- so a query already matched by the rule above, and a
+# fragment of some longer value, are not matched again here.
+_TARGET_QUERY_RE = re.compile(
+    r"(?<![^\s\"'(\[=])"
+    r"(?P<url>/[^\s\"'<>\\?]{0,2048})"
+    r"\?(?P<query>[^\s\"'<>\\]{1,4096})",
+)
+
+# One printf-style conversion specifier, in each of the forms the
+# logging module interpolates: an optional mapping key, optional flags,
+# width and precision, an optional length modifier, and the conversion
+# character. The whole specifier is captured, so two templates are
+# compared by the specifiers they carry rather than by how many percent
+# signs they hold.
+_FORMAT_SPECIFIERS_RE = re.compile(
+    r"%(?:\([^)]*\))?[-+ #0]*(?:\*|\d+)?(?:\.(?:\*|\d+))?"
+    r"[hlL]?[diouxXeEfFgGcrsa%]"
 )
 
 # Marker substituted for the directory part of an internal path.
@@ -611,15 +656,17 @@ def _replace_url_query(match: "re.Match") -> str:
 
 
 # Redaction rules in application order. Each pattern is compiled once at
-# module import. The URL query rule runs before the mapping and
+# module import. The two query rules run before the mapping and
 # assignment rules, so a parameter carried in a query is replaced with
-# the whole query. The traceback frame rule runs before the general path
+# the whole query, and the scheme-bearing form runs before the
+# scheme-less one. The traceback frame rule runs before the general path
 # rules so a frame header keeps its quoted shape.
 _REDACTION_RULES: Tuple[Tuple[Any, Callable[[Any], str]], ...] = (
     (_AUTH_HEADER_RE, _replace_auth_header),
     (_BEARER_RE, _replace_bearer),
     (_URL_CREDENTIAL_RE, _replace_url_credential),
     (_URL_QUERY_RE, _replace_url_query),
+    (_TARGET_QUERY_RE, _replace_url_query),
     (_MAPPING_RE, _replace_mapping),
     (_ENCODED_MAPPING_RE, _replace_mapping),
     (_ASSIGNMENT_RE, _replace_assignment),
@@ -807,11 +854,19 @@ def _redact_args(args: Any) -> Any:
 def _redact_format(template: str, has_args: bool) -> str:
     """Redacts a message template, keeping its conversion specifiers.
 
-    A template whose specifier count changes under redaction is returned
-    unchanged; the rendered record is redacted by the formatter.
+    A template whose specifiers do not survive redaction unchanged is
+    returned as it was; the rendered record is redacted by the formatter,
+    so nothing is emitted unredacted either way. The specifiers
+    themselves are compared rather than the number of percent signs: a
+    template such as ``"%s://%s:%d"`` keeps its three percent signs while
+    the first specifier is rewritten into text no interpolation accepts,
+    which counting alone does not detect and which would raise while the
+    record was rendered.
     """
     rewritten = redact(template)
-    if has_args and rewritten.count("%") != template.count("%"):
+    if has_args and _FORMAT_SPECIFIERS_RE.findall(
+        rewritten
+    ) != _FORMAT_SPECIFIERS_RE.findall(template):
         return template
     return rewritten
 
@@ -1300,16 +1355,25 @@ _RESERVED_RECORD_ATTRS = frozenset(
     )
 )
 
+# Attributes dropped from the emitted context. The ASGI server attaches
+# ``color_message`` to its own records: the same message again, carrying
+# terminal escape sequences, which is both a duplicate and the one source
+# of control characters reaching the sink.
+_DISCARDED_RECORD_ATTRS = frozenset(("color_message",))
+
 
 def _extract_context(record: logging.LogRecord) -> Dict[str, Any]:
     """Collects the redacted fields supplied through ``extra={...}``.
 
     A field whose name is credential-shaped is replaced outright; every
-    other field is walked by :func:`_redact_deep`.
+    other field is walked by :func:`_redact_deep`. A field named in
+    :data:`_DISCARDED_RECORD_ATTRS` is left out.
     """
     context: Dict[str, Any] = {}
     for name, value in vars(record).items():
         if name in _RESERVED_RECORD_ATTRS or name.startswith("_"):
+            continue
+        if name in _DISCARDED_RECORD_ATTRS:
             continue
         if _is_sensitive_key(name):
             context[name] = REDACTION_PLACEHOLDER
@@ -1741,7 +1805,15 @@ def unredacted_handler_names() -> Tuple[str, ...]:
 
 
 def _governed_descendants() -> List[logging.Logger]:
+    """Returns every logger under a governed namespace, roots excluded.
+
+    A governed namespace may itself sit under another -- ``uvicorn.error``
+    under ``uvicorn`` -- and such a logger is governed in its own right,
+    with its own handler and no propagation, so it is not treated as a
+    descendant to be normalized.
+    """
     prefixes = tuple(name + "." for name in GOVERNED_LOGGER_NAMES)
+    roots = frozenset(GOVERNED_LOGGER_NAMES)
     descendants: List[logging.Logger] = []
     try:
         registry = dict(logging.Logger.manager.loggerDict)
@@ -1749,6 +1821,8 @@ def _governed_descendants() -> List[logging.Logger]:
         return descendants
     for name, entry in registry.items():
         if not isinstance(name, str) or not name.startswith(prefixes):
+            continue
+        if name in roots:
             continue
         if not isinstance(entry, logging.Logger):
             continue
@@ -1779,7 +1853,10 @@ def _governed_namespace_levels() -> Tuple[Tuple[str, int], ...]:
     ``alembic`` is held at :data:`MIGRATION_LOG_LEVEL` so each revision's
     own record of what it changed is emitted, and ``sqlalchemy`` at
     :data:`SQL_LOG_LEVEL`, which is above the level its statement records
-    are written at.
+    are written at. The server namespaces are held at
+    :data:`SERVER_LOG_LEVEL`, which admits the access record, and every
+    record they carry passes the redaction rules on its way to the
+    handler.
     """
     entries: List[Tuple[str, int]] = [
         (name, THIRD_PARTY_LOG_LEVEL) for name in THIRD_PARTY_LOGGER_NAMES
@@ -1793,6 +1870,9 @@ def _governed_namespace_levels() -> Tuple[Tuple[str, int], ...]:
                 else SQL_LOG_LEVEL,
             )
         )
+    entries.extend(
+        (name, SERVER_LOG_LEVEL) for name in SERVER_LOGGER_NAMES
+    )
     return tuple(entries)
 
 

@@ -302,7 +302,11 @@ RETIRED_ONBOARDING_CLAIM = "every setting has a safe local default"
 #: Slides, diagrams and icon placeholders the presentation must keep.
 DECK_SLIDES = 18
 DECK_DIAGRAMS = 2
-DECK_ICONS = 44
+
+#: Thirty-three icon placeholders. Three icon rows were removed from the
+#: access, pipeline and release-gate slides, where each one repeated the
+#: first column of the table beside it word for word.
+DECK_ICONS = 33
 
 #: Remote assets the presentation fetches that must carry an integrity hash,
 #: by the substring identifying each.

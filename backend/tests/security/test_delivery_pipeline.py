@@ -390,6 +390,9 @@ JSON_ARRAY_CHARACTERS = re.compile(r"[\"\[\],]")
 
 #: Flag every ``kubectl`` call that reaches the API server carries, so a
 #: call that does not answer ends its step rather than holding the job.
+#: One pod selector passed to ``kubectl``, in either spelling.
+POD_SELECTOR = re.compile(r'--selector=(?:"([^"]*)"|([^\s\\]+))')
+
 KUBECTL_DEADLINE_FLAG = "--request-timeout"
 
 #: Deadline a watch carries instead, because a watch is answered over the
@@ -1899,6 +1902,78 @@ def test_the_deployment_confirms_the_image_it_asked_for_is_running():
     assert "exit 1" in verification
     for token in sorted(IMAGE_TOKENS):
         assert "verify_digest %s" % token in verification, token
+
+
+def _pod_selectors(text):
+    """Returns every pod selector one release path passes to ``kubectl``."""
+    return [
+        quoted or bare for quoted, bare in POD_SELECTOR.findall(text)
+    ]
+
+
+def _release_paths():
+    """Returns the text of each path that reads back a running pod."""
+    scripts = dict(
+        (step, script) for _, step, script in _scripts(CD_WORKFLOW)
+    )
+    return {
+        "cd.yml Run post-deployment health checks": scripts[
+            "Run post-deployment health checks"
+        ],
+        "scripts/deploy.sh": DEPLOY_SCRIPT.read_text(encoding="utf-8"),
+    }
+
+
+@pytest.mark.parametrize("path", sorted(_release_paths()))
+def test_no_release_path_restates_a_pod_selector(path):
+    """Asserts a selector is derived from the object that owns the pods.
+
+    A selector written out here is a second declaration of a label only
+    the manifests define. When the two disagree the selector matches no
+    pod, and no pod matched reads back as no image -- so the release is
+    reported failed after the workloads have already changed, which is
+    what a restated ``app=`` selector did.
+    """
+    text = _release_paths()[path]
+    selectors = _pod_selectors(text)
+
+    assert selectors, path
+    for selector in selectors:
+        assert "$" in selector, (path, selector)
+        assert "=" not in selector.replace("${", "").replace("}", ""), (
+            path,
+            selector,
+        )
+
+
+@pytest.mark.parametrize("path", sorted(_release_paths()))
+def test_every_release_path_derives_the_selector_the_manifests_declare(path):
+    """Asserts the derived value is read from the Deployment's own field."""
+    text = _release_paths()[path]
+
+    assert ".spec.selector.matchLabels" in text, path
+    for workload in sorted(WORKLOAD_MANIFESTS):
+        assert 'deployment/${workload}' in text or (
+            "deployment/%s" % workload
+        ) in text, (path, workload)
+    assert "declares no pod selector" in text, path
+
+
+@pytest.mark.parametrize("workload", sorted(WORKLOAD_MANIFESTS))
+def test_the_pods_carry_every_label_their_selector_requires(workload):
+    """Asserts the derived selector matches the pods it is derived from.
+
+    A Deployment may select on labels its own template does not set, and
+    a cluster refuses that; asserting the containment here means the
+    value the release derives is a value that matches something.
+    """
+    deployment = _one(WORKLOAD_MANIFESTS[workload], "Deployment")
+    required = deployment["spec"]["selector"]["matchLabels"]
+    carried = deployment["spec"]["template"]["metadata"]["labels"]
+
+    assert required, workload
+    for key, value in sorted(required.items()):
+        assert carried.get(key) == value, (workload, key)
 
 
 def test_every_remote_call_the_workflow_makes_is_bounded():

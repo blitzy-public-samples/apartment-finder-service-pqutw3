@@ -72,10 +72,15 @@ TEST_SETTINGS: Dict[str, str] = {
     "JWT_AUDIENCE": "apartment-finder-web",
     "ACCESS_TOKEN_EXPIRE_MINUTES": "30",
     "BCRYPT_ROUNDS": "12",
-    "ALLOWED_ORIGINS": "http://localhost:3000,http://localhost:80",
+    "ALLOWED_ORIGINS": (
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost,http://127.0.0.1"
+    ),
     "ALLOWED_HOSTS": "localhost,127.0.0.1",
     "MAX_REQUEST_BODY_BYTES": "1048576",
     "MAX_REQUEST_BODY_CHUNKS": "2048",
+    "REQUEST_BODY_TIMEOUT_SECONDS": "10.0",
+    "REQUEST_BODY_CHUNK_TIMEOUT_SECONDS": "5.0",
     "MAX_PAGE_SIZE": "100",
     "MAX_PAGINATION_OFFSET": "10000",
     "RATE_LIMIT_LOGIN": "5/minute",

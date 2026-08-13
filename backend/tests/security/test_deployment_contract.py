@@ -3267,9 +3267,22 @@ def _deck_sections():
 
 
 def _deck_slide_kind(section):
-    """Returns the slide type, defaulting to a content slide."""
-    match = re.search(r'<section class="([^"]+)"', section)
-    return match.group(1) if match else "content"
+    """Returns the slide type, defaulting to a content slide.
+
+    Rule 2 names four slide types, and three of them carry a class that
+    names them. The fourth is the content slide, which carries
+    ``slide-content``. The name is read out of the class attribute
+    rather than taken as the whole attribute, so a slide that also
+    carries a modifier class is still recognised for what it is, and so
+    the body-word cap keeps applying to every content slide rather than
+    skipping the ones that declare their type.
+    """
+    match = re.search(r"<section\b[^>]*>", section)
+    attributes = match.group(0) if match else ""
+    for name in ("slide-title", "slide-divider", "slide-closing"):
+        if name in attributes:
+            return name
+    return "content"
 
 
 #: Components Rule 2 counts as a slide's non-text visual rather than as its

@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 from datetime import datetime, timezone
 
 from backend.app.core.authorization import Role, require_role
@@ -28,22 +29,73 @@ LISTING_NOT_STORED_MESSAGE = "Failed to store a listing"
 
 REASON_NOT_STORED = "listing_not_stored"
 
+#: Query parameter naming the first row of a page. It is the canonical
+#: name, and ``filters.py`` names it the same way.
+PAGE_START_PARAMETER = "skip"
+
+#: Accepted alias of :data:`PAGE_START_PARAMETER`. Both names carry the
+#: same bounds and select the same rows.
+PAGE_START_ALIAS = "offset"
+
+#: Rejection raised when a request names both page-start parameters with
+#: values that do not agree. It states which two names disagree and
+#: carries neither value.
+PAGE_START_CONFLICT_MESSAGE = (
+    "skip and offset name the same page start and must not disagree"
+)
+
+
+def _page_start(skip: int, offset: Optional[int]) -> int:
+    """Returns the first row of the page a request asked for.
+
+    ``skip`` is the canonical parameter and ``offset`` its alias, so a
+    request naming either one is served the same page and a request
+    naming neither starts at the first row. A request naming both with
+    values that disagree is refused through the application's own
+    request-validation path, which answers with the same status and the
+    same fixed detail as any other rejected query parameter, so the
+    refused values are neither returned nor logged.
+    """
+    if offset is None or offset == skip:
+        return skip
+    if skip == 0:
+        return offset
+    raise RequestValidationError(
+        [
+            {
+                "loc": ("query", PAGE_START_ALIAS),
+                "msg": PAGE_START_CONFLICT_MESSAGE,
+                "type": "value_error.pagination_conflict",
+            }
+        ]
+    )
+
 
 @router.get("/")
 def get_listings(
     db: Session = Depends(get_db),
     skip: int = Query(0, ge=0, le=settings.MAX_PAGINATION_OFFSET),
+    offset: Optional[int] = Query(
+        None, ge=0, le=settings.MAX_PAGINATION_OFFSET
+    ),
     limit: int = Query(
         DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE
     ),
 ) -> List[Listing]:
     """Return a bounded, ID-ordered public listings page; fail if any
     stored row violates the response schema.
+
+    The page starts at ``skip``, or at ``offset``, which names the same
+    page start under the other spelling a client may send. Both carry the
+    same configured bound, so neither can walk further than that many
+    rows, and a value outside the bound is rejected rather than ignored.
+    Naming both with values that disagree is rejected too.
     """
+    start = _page_start(skip, offset)
     listings = (
         db.query(ListingModel)
         .order_by(ListingModel.id)
-        .offset(skip)
+        .offset(start)
         .limit(limit)
         .all()
     )

@@ -5,12 +5,15 @@ code exist to receive a fix, what this repository's code does and does not cover
 its security posture is recorded, and how its verification gates are run.
 
 > [!IMPORTANT]
-> **The vulnerability-reporting process is not yet operational.** No monitored private
-> channel has been configured and no response, disclosure, recognition or legal terms
-> have been authorized by the repository owner. See
-> [Reporting a Vulnerability](#reporting-a-vulnerability), which lists exactly what the
-> owner must settle. Everything else in this document is a statement of fact about the
-> repository and stands on its own.
+> **A vulnerability can be reported privately today; the terms around that report cannot
+> be relied on yet.** The repository's **Security and quality** tab offers **Report a
+> vulnerability**, so the channel exists and works. Two things remain unsettled: nothing
+> inside this repository can establish that a filed report is *read*, and no response,
+> disclosure, recognition or legal terms have been authorized by the repository owner. See
+> [Reporting a Vulnerability](#reporting-a-vulnerability), which keeps the working channel
+> and the unsettled terms apart, and [Owner action required](#owner-action-required), which
+> lists exactly what the owner must settle. Everything else in this document is a statement
+> of fact about the repository and stands on its own.
 
 This document states policy and fact only. Where a reader would ask *why* a control was
 built a particular way, or *why* an advisory was accepted rather than fixed, the answer is
@@ -109,32 +112,54 @@ answers it, and it is explicit about the limits of that evidence.
 ## Reporting a Vulnerability
 
 > [!IMPORTANT]
-> **This section is not yet operational. No monitored private channel is operational yet.**
-> No monitored private reporting channel has been configured for this repository, and no response, disclosure, recognition or
-> legal terms have been authorized by the repository owner. Until the owner completes
-> [Owner action required](#owner-action-required) below, **treat this section as
-> incomplete rather than as a commitment**, and see
-> [If no channel is configured yet](#if-no-channel-is-configured-yet) for what to do
-> in the meantime.
+> **Three things are in three different states here, and this section keeps them apart.**
+> The **channel is enabled** — the **Report a vulnerability** button is present on this
+> repository's public **Security and quality** tab, so a report can be filed now.
+> **Monitoring is unverified** — a report notifies whoever holds maintainer access through
+> notification settings held in their own personal accounts, and no file inside this
+> repository can establish that one of them reads it. **The terms are unauthorized** — no
+> response, disclosure, recognition or legal terms have been settled by the repository
+> owner, so until it completes [Owner action required](#owner-action-required) below,
+> **treat those terms as incomplete rather than as a commitment**. See
+> [Until monitoring is confirmed](#until-monitoring-is-confirmed) for what to do with a
+> finding in the meantime.
 
 **Do not open a public issue, pull request, or discussion for a suspected
 vulnerability.** Doing so discloses the weakness to everyone before a fix exists.
 That instruction stands regardless of the state of this section.
 
-**Channel — GitHub private vulnerability reporting.** Open the repository's **Security**
-tab and choose **Report a vulnerability**. This creates a draft advisory visible only to
-the repository's maintainers, notifies them through their existing GitHub notification
-settings, and requires no email address from either side. It is the only channel this
-policy publishes, and it is monitored by whoever holds maintainer access to the
-repository.
+**Channel — GitHub private vulnerability reporting.** Open the repository's **Security and
+quality** tab and choose **Report a vulnerability**, which is on the overview the tab opens
+on. The same button appears again on the **Advisories** page, reached from the sidebar's
+**Reporting** group — a sidebar that is shown once you are on Advisories or Security policy
+rather than on the overview itself, so the one-step route above is the shorter one. Filing
+creates a draft advisory visible only to the repository's maintainers, notifies them through
+their existing GitHub notification settings, and requires no email address from either
+side; it does require a GitHub account, because the form asks an unauthenticated visitor to
+sign in first and returns them to it afterwards. It is the only channel this policy
+publishes.
 
-*Operator prerequisite:* private vulnerability reporting is **off** by default on a
-GitHub repository and must be enabled explicitly, under Settings → Code security and
-analysis → Private vulnerability reporting. Until it is enabled the **Report a
-vulnerability** button does not appear and this channel does not exist. A reporter can
-check in one step: if the Security tab offers no such button, the channel is not
-enabled. It is the repository owner's responsibility to ensure the channel is
-monitored.
+**What has been observed about it.** On this repository's public **Security and quality**
+tab, read while signed out, the **Report a vulnerability** button is present and enabled, on
+the overview and again on the Advisories page — so private vulnerability reporting is
+enabled here and a report can be filed today. No advisory has been published, and the
+Advisories list is empty. The same page also reads *No security policy detected*. That is a
+statement about this file, not about the channel: GitHub links a policy only from a
+repository's default branch, and this document is not on it yet. The two are independent
+surfaces — GitHub's own documentation notes that private vulnerability reporting is separate
+from a repository's `SECURITY.md` — and neither of them says anything about whether a filed
+report is read.
+
+*Operator prerequisite:* private vulnerability reporting is **off** by default on a GitHub
+repository and has to be enabled explicitly — Settings, then **Advanced Security** under the
+sidebar's Security section, then *Private vulnerability reporting* — and on this repository
+that step is already done, which is what the observation above records. What is not
+established is monitoring. A privately reported vulnerability notifies maintainers and
+security managers only when they watch the repository for all activity or for security
+alerts and have notifications enabled, so whether a report reaches a person depends on
+settings held in personal accounts, outside this repository. Confirming that is item 1 of
+[Owner action required](#owner-action-required). A reporter can check the channel itself in
+one step: if the **Security and quality** tab offers the button, the channel is enabled.
 
 **On email.** This policy deliberately publishes **no email address.** An earlier revision
 carried a placeholder one, which is worse than publishing none: a reporter who uses it
@@ -154,39 +179,42 @@ security contact once someone is accountable for reading it.
 
 ### Owner action required
 
-The channel above is a repository surface and needs no address, but four further things
-must be settled by the repository owner — with legal input where the last one is
-concerned — before a reporter can rely on more than the channel itself. They are listed
+The channel above is a repository surface, it is enabled, and it needs no address — but four
+further things must be settled by the repository owner, with legal input where the last one
+is concerned, before a reporter can rely on more than the channel itself. They are listed
 rather than assumed, because a disclosure policy that promises what nobody has agreed to
 is worse than one that is visibly unfinished: it misdirects reports and creates
 expectations the project may not meet.
 
 | # | What must be decided or configured | Why it cannot be filled in here |
 | --- | --- | --- |
-| 1 | **Verification that the private channel is monitored** — confirm private vulnerability reporting is enabled under **Settings → Code security**, then send a test report and observe that it is received | Whether private reporting is enabled, and whether anyone reads it, are repository settings and human arrangements that cannot be asserted from a file inside the repository |
+| 1 | **Confirmation that a private report is read.** Enablement is done and needs no repeating; what remains is to watch this repository for security alerts with email notification on, file a test report, and observe that it arrives and is answered | Notification delivery turns on settings held in maintainers' personal accounts, and whether a person then reads what arrives is a human arrangement. Neither can be asserted from a file inside the repository |
 | 2 | **Response targets**, if any are to be offered — acknowledgement, assessment and update intervals | A target is a commitment by whoever is on the other end of the channel. No maintainer rota or on-call arrangement exists here to make one against |
 | 3 | **Disclosure and recognition terms** — any coordinated-disclosure window the project asks reporters to observe, and whether credit is offered | Both bind the project's future conduct, and one of them binds a reporter's |
 | 4 | **Safe-harbour terms, and whether a bug-bounty programme exists.** `documentation/Technical Specifications.md` records a bug bounty as an intended part of this project's vulnerability-management protocol; **no such programme is in operation today**, and whether one is established, and on what terms, is the owner's decision | Safe harbour is a legal undertaking not to pursue good-faith research, and a bounty is a financial commitment. Neither can be published on a project's behalf without its authorization |
 
-Until item 1 is confirmed, this repository cannot demonstrate that a private report will
-be **read**. That is a gap in the project's security posture, and it is stated here rather
-than papered over with a placeholder address.
+Until item 1 is confirmed, this repository can demonstrate that a private report will be
+**received** but not that it will be **read**. That is a narrower gap than an absent
+channel, and it is still a gap in the project's security posture, so it is stated here
+rather than papered over with a placeholder address.
 
-### If no channel is configured yet
+### Until monitoring is confirmed
 
-If you have found something and item 1 above is still outstanding, please:
+If you have found something while item 1 above is still outstanding, please:
 
 - **Do not** post details publicly, and do not include a working exploit anywhere
   public.
-- File the report through the **Security** tab anyway — it is private — and, if you can,
-  contact the repository owner through whatever private channel their profile or
-  organization publishes, asking them to confirm private vulnerability reporting is on.
-- Keep the details until the channel is confirmed. A finding held quietly for a week
-  is far better than one disclosed publicly today.
+- **File the report through the Security and quality tab.** The channel is enabled and the
+  report is private, so filing it is the right first step rather than a fallback.
+- If nothing acknowledges it, contact the repository owner through whatever private channel
+  their profile or organization publishes, and ask them to confirm that advisory
+  notifications reach them.
+- Keep the details until you hear back. A finding held quietly for a week is far better
+  than one disclosed publicly today.
 
 ### What to include
 
-Whenever a channel does exist, a report is easiest to act on when it carries:
+A report is easiest to act on when it carries:
 
 - The affected component or file path, and the branch or commit you observed it on.
 - The impact — what an attacker gains, in terms of confidentiality, integrity, or availability.
@@ -195,16 +223,17 @@ Whenever a channel does exist, a report is easiest to act on when it carries:
 
 ### What to expect
 
-**No response times are committed, because no channel is monitored yet.** A commitment to
-acknowledge a report within a number of days is only meaningful if something receives the
-report and someone is accountable for reading it. **Item 1 above is what establishes both**
-— enabling private vulnerability reporting is what receives a report, and confirming that a
-test report was read is what makes someone accountable for it — and until it is completed
-neither condition holds, so publishing a schedule here would be a promise this repository
-cannot keep. Item 2 is what would set the targets themselves.
+**No response times are committed, because nobody is yet accountable for reading what the
+channel receives.** A commitment to acknowledge a report within a number of days needs two
+conditions: something that receives the report, and someone answerable for reading it. The
+first holds — the channel is enabled. **Item 1 above is what establishes the second**:
+watching this repository for security alerts is what carries a report to a person, and
+observing that a test report was answered is what makes someone accountable for it. Until
+that is confirmed, publishing a schedule here would be a promise this repository cannot
+keep. Item 2 is what would set the targets themselves.
 
 The targets below are therefore a **proposal, not a commitment**. They take effect only when
-an operator turns them on — that is, once a channel is operational and this paragraph is
+an operator turns them on — that is, once monitoring is confirmed and this paragraph is
 replaced by a statement that it is.
 
 | Stage | Proposed target, not yet in force |
