@@ -1,0 +1,91 @@
+# Non-secret settings the backend and the migration job read.
+#
+# The two statement bounds below are separate values: the migration job runs
+# schema statements under DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS, while the
+# backend holds a request-path statement to DB_STATEMENT_TIMEOUT_SECONDS.
+#
+# Every entry here is a value the browser or an operator may see. The six
+# settings that are credentials are absent from this document: they are
+# delivered separately by 30-backend-secrets.yaml, which reads them from
+# Secret Manager at pod start.
+#
+# Each name is documented in the repository's .env.example, which is the
+# authoritative catalog of every setting the application accepts.
+#
+# Every non-credential setting the application declares appears here, so the
+# deployed configuration is stated rather than left to the code's defaults.
+# The set is asserted against `Settings.__fields__ - MANAGED_SECRET_SETTINGS`
+# by the infrastructure job of .github/workflows/ci.yml, so a setting added
+# to the model without a value here fails the build. Values that must differ
+# per deployment are substitution tokens; the rest carry the value the
+# application would otherwise have defaulted to, written out so that a
+# reader can see it.
+#
+# RATE_LIMIT_STORAGE_URI is absent from this document even though it is not
+# one of the six Secret Manager credentials. The store requires an AUTH
+# string, so the assembled address is itself a credential and a ConfigMap is
+# readable by anything that can read the namespace. The deployment reads it
+# from the RATE_LIMIT_STORAGE_URI Secret Manager secret and publishes it as
+# the backend-rate-limit-store Kubernetes secret, which every workload here
+# references. config.py names it in PIPELINE_SECRET_SETTINGS, which is what
+# excludes it from the key-set assertion above.
+#
+# SECRET_BACKEND is written out rather than substituted: config.py refuses
+# any backend other than the managed one whenever ENVIRONMENT is not local,
+# so there is no deployment for which this value could legitimately differ.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: apartment-finder
+data:
+  ENVIRONMENT: ${BACKEND_ENVIRONMENT}
+  DB_CONNECT_TIMEOUT_SECONDS: "3"
+  DB_STATEMENT_TIMEOUT_SECONDS: "3"
+  DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS: "600"
+  DB_TCP_USER_TIMEOUT_SECONDS: "4"
+  DB_POOL_TIMEOUT_SECONDS: "10.0"
+  DB_POOL_RECYCLE_SECONDS: "1800"
+  DB_POOL_SIZE: "10"
+  DB_MAX_OVERFLOW: "5"
+  JWT_ALGORITHMS: "HS256"
+  JWT_ISSUER: ${JWT_ISSUER}
+  JWT_AUDIENCE: ${JWT_AUDIENCE}
+  ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+  BCRYPT_ROUNDS: "12"
+  ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS}
+  ALLOWED_HOSTS: ${BACKEND_ALLOWED_HOSTS}
+  MAX_REQUEST_BODY_BYTES: "1048576"
+  MAX_REQUEST_BODY_CHUNKS: "2048"
+  REQUEST_BODY_TIMEOUT_SECONDS: "10.0"
+  REQUEST_BODY_CHUNK_TIMEOUT_SECONDS: "5.0"
+  MAX_PAGE_SIZE: "100"
+  MAX_PAGINATION_OFFSET: "10000"
+  RATE_LIMIT_LOGIN: "5/minute"
+  RATE_LIMIT_REGISTER: "3/minute"
+  RATE_LIMIT_WEBHOOK: "60/minute"
+  RATE_LIMIT_READINESS: "60/minute"
+  RATE_LIMIT_MAX_TRACKED_KEYS: "4096"
+  TRUSTED_PROXY_HOPS: "0"
+  READINESS_CACHE_SECONDS: "5.0"
+  READINESS_TIMEOUT_SECONDS: "2.0"
+  LOGIN_MAX_ATTEMPTS: "5"
+  LOGIN_LOCKOUT_MINUTES: "15"
+  ZILLOW_API_URL: ${ZILLOW_API_URL}
+  HTTP_TIMEOUT_SECONDS: "10"
+  INGESTION_MAX_ZIP_CODES: "1000"
+  INGESTION_ZIP_CODE_CHUNK: "50"
+  PAYPAL_MODE: ${PAYPAL_MODE}
+  PAYPAL_API_BASE: ${PAYPAL_API_BASE}
+  PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID}
+  PAYPAL_CERT_HOST_ALLOWLIST: "api.paypal.com,api.sandbox.paypal.com,api-m.paypal.com,api-m.sandbox.paypal.com"
+  PAYPAL_MAX_CONNECTIONS: "20"
+  PAYPAL_RETURN_URL: ${PAYPAL_RETURN_URL}
+  PAYPAL_CANCEL_URL: ${PAYPAL_CANCEL_URL}
+  FROM_EMAIL: ${FROM_EMAIL}
+  SECRET_BACKEND: "gcp-secret-manager"
+  LOG_LEVEL: "INFO"
+  SENTRY_DSN: ""

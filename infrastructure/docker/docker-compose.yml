@@ -1,18 +1,158 @@
-version: '3.8'
+# Local and Cloud SQL development stacks; required values come from the
+# invoking environment or an uncommitted .env file.
+#
+# The project name declared below prefixes every container, the network
+# and the db-data volume this stack creates.
+name: apartment-finder
+
+# The local stack runs against the PostgreSQL service defined below:
+#   docker compose --profile local up -d
+# The Cloud SQL stack runs against the proxy defined below:
+#   docker compose --profile gcp up -d
+# COMPOSE_PROFILES carries the profile name when the flag is not passed.
+# Every name is documented in .env.example.
+
+x-backend-environment: &backend-environment
+  # Required, with no default. It selects every non-local guard the
+  # settings module applies.
+  ENVIRONMENT: ${BACKEND_ENVIRONMENT:?BACKEND_ENVIRONMENT must be set to local, development, staging or production}
+  DATABASE_URL: ${COMPOSE_DATABASE_URL:?COMPOSE_DATABASE_URL must be set}
+  # Bounds on the database boundary: the libpq handshake, the server-side
+  # statement, the socket holding unacknowledged data, the wait for a free
+  # pooled connection, and the age at which a pooled connection is
+  # replaced. Applied to a postgresql:// URL only. The first three form a
+  # ladder below the 5-second client timeout the backend health check below
+  # waits under, so an abandoned probe leaves no connection attempt,
+  # statement or socket wait running behind it. The statement bound also
+  # sits below HTTP_TIMEOUT_SECONDS, so a contended write is ended by the
+  # server before the provider call it waits behind returns; the webhook
+  # route reads the delivery identifier back and attempts its write again
+  # when that happens. The migrations run under
+  # DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS instead.
+  DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-3}
+  DB_STATEMENT_TIMEOUT_SECONDS: ${DB_STATEMENT_TIMEOUT_SECONDS:-3}
+  # Bound on one schema statement. A revision rewrites whatever the tables
+  # already hold, so it is given its own budget in minutes rather than the
+  # seconds a request-path read is held to, and the migration job's
+  # wall-clock deadline stays the outer bound on the run as a whole.
+  DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS: ${DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS:-600}
+  DB_TCP_USER_TIMEOUT_SECONDS: ${DB_TCP_USER_TIMEOUT_SECONDS:-4}
+  DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-10.0}
+  DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+  SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+  # The endpoint is not a credential and the code defaults it, so it
+  # carries that default here. The key beside it is a credential.
+  ZILLOW_API_URL: ${ZILLOW_API_URL:-https://zillow-api.example.com/v2/listings}
+  ZILLOW_API_KEY: ${ZILLOW_API_KEY:?ZILLOW_API_KEY must be set}
+  PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:?PAYPAL_CLIENT_ID must be set}
+  PAYPAL_CLIENT_SECRET: ${PAYPAL_CLIENT_SECRET:?PAYPAL_CLIENT_SECRET must be set}
+  PAYPAL_WEBHOOK_ID: ${PAYPAL_WEBHOOK_ID:?PAYPAL_WEBHOOK_ID must be set}
+  SENDGRID_API_KEY: ${SENDGRID_API_KEY:?SENDGRID_API_KEY must be set}
+  FROM_EMAIL: ${FROM_EMAIL:-no-reply@example.com}
+  # Payment mode and the API base it must agree with. ENVIRONMENT production
+  # is refused while either still names sandbox.
+  PAYPAL_MODE: ${PAYPAL_MODE:-sandbox}
+  PAYPAL_API_BASE: ${PAYPAL_API_BASE:-https://api-m.sandbox.paypal.com}
+  # Both loopback spellings of the published frontend origin: a browser
+  # sends the origin as it was addressed, and the application matches an
+  # origin exactly.
+  ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-http://localhost,http://localhost:80,http://127.0.0.1,http://127.0.0.1:80}
+  ALLOWED_HOSTS: ${BACKEND_ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+  # Addresses PayPal returns the payer to. They are browser destinations in
+  # the frontend this stack publishes, which answers on port 80, so the
+  # defaults below name that origin. They are read from compose-side names
+  # for the same reason ENVIRONMENT, DATABASE_URL and the two host lists
+  # are: a developer's `.env` carries PAYPAL_RETURN_URL and
+  # PAYPAL_CANCEL_URL for a host-run frontend on port 3000, docker compose
+  # loads that file automatically, and injecting those values here would
+  # send the payer back to a port this stack does not publish. The two
+  # names below are documented in .env.example and are the only way to
+  # override the compose redirects.
+  PAYPAL_RETURN_URL: ${COMPOSE_PAYPAL_RETURN_URL:-http://localhost/subscription?paypal=return}
+  PAYPAL_CANCEL_URL: ${COMPOSE_PAYPAL_CANCEL_URL:-http://localhost/subscription?paypal=cancel}
+  RATE_LIMIT_STORAGE_URI: ${RATE_LIMIT_STORAGE_URI:-bounded-memory://}
+  # Token minting and verification
+  JWT_ALGORITHMS: ${JWT_ALGORITHMS:-HS256}
+  JWT_ISSUER: ${JWT_ISSUER:-apartment-finder-service}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:-apartment-finder-web}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+  # Password hashing
+  BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+  # Request bounds
+  MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-1048576}
+  MAX_REQUEST_BODY_CHUNKS: ${MAX_REQUEST_BODY_CHUNKS:-2048}
+  REQUEST_BODY_TIMEOUT_SECONDS: ${REQUEST_BODY_TIMEOUT_SECONDS:-10.0}
+  REQUEST_BODY_CHUNK_TIMEOUT_SECONDS: ${REQUEST_BODY_CHUNK_TIMEOUT_SECONDS:-5.0}
+  MAX_PAGE_SIZE: ${MAX_PAGE_SIZE:-100}
+  MAX_PAGINATION_OFFSET: ${MAX_PAGINATION_OFFSET:-10000}
+  # Rate limits
+  RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-5/minute}
+  RATE_LIMIT_REGISTER: ${RATE_LIMIT_REGISTER:-3/minute}
+  RATE_LIMIT_WEBHOOK: ${RATE_LIMIT_WEBHOOK:-60/minute}
+  RATE_LIMIT_READINESS: ${RATE_LIMIT_READINESS:-60/minute}
+  RATE_LIMIT_MAX_TRACKED_KEYS: ${RATE_LIMIT_MAX_TRACKED_KEYS:-4096}
+  # Proxies of our own a request passes through before it reaches the
+  # backend. The compose stack publishes the backend port directly, so a
+  # browser reaches it with no proxy of ours in between and the default of
+  # zero is correct here. A deployment behind an ingress or a load
+  # balancer names the real number.
+  TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
+  # Readiness probe bounds. The cache window is below the probe interval
+  # declared on the backend service, so a probe never reads a stale outcome.
+  READINESS_CACHE_SECONDS: ${READINESS_CACHE_SECONDS:-5.0}
+  READINESS_TIMEOUT_SECONDS: ${READINESS_TIMEOUT_SECONDS:-2.0}
+  # Login lockout
+  LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+  LOGIN_LOCKOUT_MINUTES: ${LOGIN_LOCKOUT_MINUTES:-15}
+  # Outbound HTTP. The value sits above DB_STATEMENT_TIMEOUT_SECONDS, so a
+  # statement contending with a request that is waiting on one of these
+  # calls is ended by the server first.
+  HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-10}
+  PAYPAL_MAX_CONNECTIONS: ${PAYPAL_MAX_CONNECTIONS:-20}
+  # Listing ingestion bounds
+  INGESTION_MAX_ZIP_CODES: ${INGESTION_MAX_ZIP_CODES:-1000}
+  INGESTION_ZIP_CODE_CHUNK: ${INGESTION_ZIP_CODE_CHUNK:-50}
+  # Webhook certificate hosts the verifier will fetch from
+  PAYPAL_CERT_HOST_ALLOWLIST: ${PAYPAL_CERT_HOST_ALLOWLIST:-api.paypal.com,api.sandbox.paypal.com,api-m.paypal.com,api-m.sandbox.paypal.com}
+  # Secret delivery and observability. The default reads each secret from
+  # this environment block, which the settings module accepts only while
+  # ENVIRONMENT is local; a non-local environment requires the managed
+  # backend and refuses to start on this default.
+  SECRET_BACKEND: ${SECRET_BACKEND:-env}
+  # Threshold every structured record is filtered at. DEBUG is accepted
+  # only while ENVIRONMENT names local.
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # Telemetry endpoint. Optional, and read by no code path in this
+  # service, so a value here activates no reporting.
+  SENTRY_DSN: ${SENTRY_DSN:-}
 
 services:
   frontend:
     build:
       context: ../../frontend
-      dockerfile: Dockerfile
+      dockerfile: ../infrastructure/docker/Dockerfile.frontend
+      args:
+        # The bundle is produced at build time and cannot read a runtime
+        # variable, so these are build arguments. Dockerfile.frontend
+        # declares an `ARG` of each name and exports it ahead of
+        # `npm run build`, so both values are inlined into the built
+        # bundle. Both are read by the browser, so neither may carry a
+        # secret. The API origin is the published backend port, which the
+        # browser resolves itself rather than over the compose network.
+        REACT_APP_API_BASE_URL: ${REACT_APP_API_BASE_URL:-http://localhost:8000}
+        REACT_APP_PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:?PAYPAL_CLIENT_ID must be set}
+    profiles:
+      - local
+      - gcp
     ports:
       - "80:80"
     depends_on:
       - backend
-    environment:
-      - REACT_APP_API_URL=http://backend:5000
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      # nginx:alpine carries BusyBox wget and no curl.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:80/"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -21,37 +161,121 @@ services:
   backend:
     build:
       context: ../../backend
-      dockerfile: Dockerfile
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
+    profiles:
+      - local
+      - gcp
     ports:
-      - "5000:5000"
+      - "8000:8000"
     depends_on:
-      - db
+      migrate:
+        condition: service_completed_successfully
+      cache:
+        condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/myapp
-      - JWT_SECRET=${JWT_SECRET}
+      <<: *backend-environment
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      # Probes the readiness path, which answers 503 while the database
+      # is unreachable and 200 once it is usable.
+      # Requests the readiness path with the interpreter in the image and
+      # reports healthy only on 200.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).getcode() == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Applies the Alembic revisions and exits. The backend starts only
+  # after this service has exited successfully.
+  migrate:
+    build:
+      context: ../../backend
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
+    profiles:
+      - local
+      - gcp
+    environment:
+      <<: *backend-environment
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        attempt=1;
+        while [ "$$attempt" -le 10 ]; do
+        python -m alembic -c backend/alembic.ini upgrade head && exit 0;
+        echo "migration attempt $$attempt did not complete, retrying";
+        attempt=$$((attempt + 1));
+        sleep 3;
+        done;
+        exit 1
+    restart: "no"
+
+  # Store the rate-limit counters are shared through, declared on both
+  # profiles. Set RATE_LIMIT_STORAGE_URI to redis://cache:6379/0 to use
+  # it. Nothing is persisted, the working set is evicted by least recent
+  # use, and no port is published.
+  cache:
+    image: redis:7-alpine
+    profiles:
+      - local
+      - gcp
+    command:
+      - "redis-server"
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
+      - "--maxmemory"
+      - "${CACHE_MAXMEMORY:-128mb}"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+    healthcheck:
+      # redis:7-alpine carries redis-cli and no curl.
+      test: ["CMD", "redis-cli", "ping"]
       interval: 30s
       timeout: 10s
       retries: 3
     restart: unless-stopped
 
   db:
-    image: gcr.io/cloudsql-docker/gce-proxy:1.19.1
-    command:
-      - "/cloud_sql_proxy"
-      - "-instances=<INSTANCE_CONNECTION_NAME>=tcp:5432"
-    ports:
-      - "5432:5432"
-    volumes:
-      - ./secrets:/secrets
+    image: postgres:13-alpine
+    profiles:
+      - local
     environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-credentials.json
+      POSTGRES_DB: ${POSTGRES_DB:-apartment_finder}
+      POSTGRES_USER: ${POSTGRES_USER:-apartment_finder}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "5432"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 30s
       timeout: 10s
       retries: 3
+    restart: unless-stopped
+
+  # Reached under the network alias db, the same name the local
+  # PostgreSQL service answers to. It authenticates with the ambient
+  # credentials of its host and connects to the instance's private
+  # address, so no credential file is mounted and none is read from
+  # this repository. Set CLOUD_SQL_INSTANCE_CONNECTION_NAME to a
+  # project:region:instance value before starting the gcp profile.
+  cloud-sql-proxy:
+    image: gcr.io/cloudsql-docker/gce-proxy:1.19.1
+    profiles:
+      - gcp
+    command:
+      - "/cloud_sql_proxy"
+      - "-instances=${CLOUD_SQL_INSTANCE_CONNECTION_NAME:?CLOUD_SQL_INSTANCE_CONNECTION_NAME must be set to a project:region:instance value under the gcp profile}=tcp:0.0.0.0:5432"
+      - "-ip_address_types=PRIVATE"
+    networks:
+      default:
+        aliases:
+          - db
     restart: unless-stopped
 
 networks:
@@ -61,7 +285,3 @@ networks:
 volumes:
   db-data:
     driver: local
-
-# HUMAN ASSISTANCE NEEDED
-# Please replace <INSTANCE_CONNECTION_NAME> with the actual Google Cloud SQL instance connection name.
-# Also, ensure that the google-credentials.json file is placed in the ./secrets directory.

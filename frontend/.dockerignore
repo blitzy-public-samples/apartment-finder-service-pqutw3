@@ -1,0 +1,149 @@
+# Docker build context exclusions.
+# Effective when the build context is the frontend directory, which is the
+# context declared by infrastructure/docker/docker-compose.yml. The
+# repository-root .dockerignore does not apply to this context.
+# What the image build needs is kept: package.json, package-lock.json,
+# tsconfig.json, public/ and src/.
+
+# Environment files
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Secrets directory
+secrets/
+**/secrets/
+
+# Cloud service-account and credential files
+google-credentials.json
+**/google-credentials.json
+*service-account*.json
+**/*service-account*.json
+*credentials*.json
+**/*credentials*.json
+gcp-*.json
+**/gcp-*.json
+# Short-lived federated credential google-github-actions/auth writes into
+# the workspace, so it is present in the build context of any image built
+# by the deployment workflow. Its name carries "creds" and not
+# "credentials", so the patterns above do not match it. Both entries below
+# cover the context root and any depth beneath it.
+gha-creds-*.json
+**/gha-creds-*.json
+
+# Generic credential directories and secret files
+credentials/
+**/credentials/
+.secrets/
+**/.secrets/
+secrets.json
+**/secrets.json
+secret.json
+**/secret.json
+*.secrets.json
+**/*.secrets.json
+
+# Private keys, certificates, and keystores
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.crt
+**/*.crt
+*.cer
+**/*.cer
+*.der
+**/*.der
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
+*.jks
+**/*.jks
+*.keystore
+**/*.keystore
+id_rsa
+**/id_rsa
+id_dsa
+**/id_dsa
+id_ecdsa
+**/id_ecdsa
+id_ed25519
+**/id_ed25519
+
+# Machine credential files read by command-line tools
+.npmrc
+**/.npmrc
+.netrc
+**/.netrc
+.git-credentials
+**/.git-credentials
+
+# Version-control metadata
+.git/
+**/.git/
+.gitignore
+**/.gitignore
+.gitattributes
+**/.gitattributes
+.dockerignore
+**/.dockerignore
+
+# Node dependencies and build output
+node_modules/
+**/node_modules/
+build/
+**/build/
+dist/
+**/dist/
+coverage/
+**/coverage/
+npm-debug.log*
+**/npm-debug.log*
+yarn-error.log*
+**/yarn-error.log*
+
+# Caches
+.cache/
+**/.cache/
+.parcel-cache/
+**/.parcel-cache/
+.eslintcache
+**/.eslintcache
+.npm/
+**/.npm/
+
+# Local and generated database files
+*.db
+**/*.db
+*.db-journal
+**/*.db-journal
+*.db-shm
+**/*.db-shm
+*.db-wal
+**/*.db-wal
+*.sqlite
+**/*.sqlite
+*.sqlite3
+**/*.sqlite3
+
+# Logs
+*.log
+**/*.log
+logs/
+**/logs/
+
+# Editor and OS files
+.DS_Store
+**/.DS_Store
+Thumbs.db
+**/Thumbs.db
+.idea/
+**/.idea/
+.vscode/
+**/.vscode/
+*.swp
+**/*.swp
+*~
+**/*~

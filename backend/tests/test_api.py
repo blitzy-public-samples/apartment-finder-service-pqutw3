@@ -1,106 +1,3080 @@
+import asyncio
+import importlib
+import json
+import logging as stdlib_logging
+import os
+import subprocess
+import sys
+import threading
+from contextlib import asynccontextmanager, contextmanager
+from itertools import count
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlsplit
+
+import httpx
 import pytest
-from fastapi.testclient import TestClient
-from main import app
+from conftest import (
+    assert_capture_body,
+    assert_create_order_body,
+    assert_paypal_call,
+    assert_paypal_request,
+)
+from fastapi import HTTPException
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Query as SqlAlchemyQuery
+from sqlalchemy.orm import Session as SqlAlchemySession
+from sqlalchemy.orm.attributes import InstrumentedAttribute
+from starlette.exceptions import (
+    HTTPException as StarletteHTTPException,
+)
 
-client = TestClient(app)
+from backend.app.api.endpoints import auth as auth_module
+from backend.app.api.endpoints import (
+    subscriptions as subscriptions_module,
+)
+from backend.app.api.endpoints.auth import DUPLICATE_EMAIL_DETAIL
+from backend.app.api.endpoints.auth import limiter as auth_limiter
+from backend.app.api.endpoints.filters import FILTER_NOT_STORED_DETAIL
+from backend.app.api.endpoints.listings import LISTING_NOT_STORED_DETAIL
+from backend.app.api.endpoints.subscriptions import RECONCILIATION_DETAIL
+from backend.app.core import authorization
+from backend.app.core.authorization import (
+    REFUSAL_MESSAGE,
+    Role,
+    audit_failure_count,
+    reset_audit_failure_count,
+)
+from backend.app.core.config import settings
+from backend.app.core.logging import (
+    CONTEXT_FIELD,
+    HANDLER_NAME,
+    RedactingFilter,
+    RedactingJsonFormatter,
+    configure_logging,
+    log_exception,
+    redact,
+    unredacted_handler_names,
+)
+from backend.app.core.plans import (
+    PREMIUM_MONTHLY,
+    STATUS_ACTIVE,
+    STATUS_FAILED,
+    STATUS_PENDING,
+    format_amount,
+    get_plan,
+)
+from backend.app.core.security import (
+    get_password_hash,
+    verify_password,
+)
+from backend.app.db.models import (
+    Filter,
+    Filter as FilterModel,
+    Listing as ListingModel,
+    Subscription as SubscriptionModel,
+    User,
+    WebhookEvent,
+    ZipCode,
+)
+from backend.app.main import (
+    REQUEST_ID_HEADER,
+    THROTTLED_MESSAGE,
+    BodySizeLimitMiddleware,
+    app,
+)
+from backend.app.schema import subscription as subscription_schema
+from backend.app.schema.subscription import SubscriptionCreate
+from backend.app.services import paypal_service as paypal_module
+from backend.app.services.paypal_service import (
+    CATEGORY_PROVIDER_CLIENT,
+    CATEGORY_PROVIDER_SERVER,
+    IDEMPOTENCY_HEADER,
+    ISSUE_ORDER_ALREADY_CAPTURED,
+    CaptureOutcome,
+    PayPalAPIError,
+    PayPalError,
+    WebhookVerification,
+)
+from backend.tests.support import REPO_ROOT, VALID_TEST_PASSWORD
 
-def test_user_registration():
-    response = client.post("/api/users/register", json={
-        "username": "testuser",
-        "email": "testuser@example.com",
-        "password": "testpassword123"
-    })
-    assert response.status_code == 201
-    assert "id" in response.json()
-    assert response.json()["username"] == "testuser"
-    assert response.json()["email"] == "testuser@example.com"
 
-def test_user_login():
-    response = client.post("/api/users/login", data={
-        "username": "testuser",
-        "password": "testpassword123"
+AUTH_MODULE = 'backend.app.api.endpoints.auth'
+
+CONTENTION_BOUND_SECONDS = 30.0
+
+SUBSCRIPTIONS_MODULE = 'backend.app.api.endpoints.subscriptions'
+
+ORDER_ID = 'ORDER-TEST-1'
+
+APPROVAL_URL = 'https://www.paypal.com/checkoutnow?token=' + ORDER_ID
+
+SUPPLIED_REQUEST_ID = 'caller0trace0denial1'
+
+STARTUP_IMPORT_TIMEOUT_SECONDS = 180.0
+
+PAYPAL_HEADERS = {
+    'PAYPAL-AUTH-ALGO': 'SHA256withRSA',
+    'PAYPAL-CERT-URL': 'https://api.sandbox.paypal.com/certs/CERT-1',
+    'PAYPAL-TRANSMISSION-ID': 'transmission-test-1',
+    'PAYPAL-TRANSMISSION-SIG': 'signature',
+    'PAYPAL-TRANSMISSION-TIME': '2026-01-01T00:00:00Z',
+}
+
+
+def order_response(order_id=ORDER_ID):
+    return {
+        'id': order_id,
+        'status': 'PAYER_ACTION_REQUIRED',
+        'links': [
+            {
+                'rel': 'payer-action',
+                'href': (
+                    'https://www.paypal.com/checkoutnow?token=' + order_id
+                ),
+                'method': 'GET',
+            }
+        ],
+    }
+
+
+def capture_response(order_id=ORDER_ID, status='COMPLETED', value='9.99'):
+    return {
+        'id': order_id,
+        'status': status,
+        'purchase_units': [
+            {
+                'payments': {
+                    'captures': [
+                        {
+                            'id': 'CAPTURE-1',
+                            'status': status,
+                            'amount': {
+                                'currency_code': 'USD',
+                                'value': value,
+                            },
+                        }
+                    ]
+                }
+            }
+        ],
+    }
+
+
+def approved_event(order_id=ORDER_ID):
+    return {
+        'event_type': 'CHECKOUT.ORDER.APPROVED',
+        'resource': {'id': order_id},
+    }
+
+
+def verified_approval(transmission_id=None):
+    return WebhookVerification(
+        verified=True,
+        transmission_id=(
+            transmission_id or PAYPAL_HEADERS['PAYPAL-TRANSMISSION-ID']
+        ),
+        event_type='CHECKOUT.ORDER.APPROVED',
+    )
+
+
+_deliveries = count(1)
+
+
+def verified_delivery(transmission_id=None, event_type=None):
+    return WebhookVerification(
+        verified=True,
+        transmission_id=(
+            transmission_id or 'transmission-%d' % next(_deliveries)
+        ),
+        event_type=event_type or 'CHECKOUT.ORDER.APPROVED',
+    )
+
+
+def deliver_approval(
+    client,
+    order_id=ORDER_ID,
+    capture=None,
+    transmission_id=None,
+    verification=None,
+):
+    """Delivers one signature-verified approval and settles the order.
+
+    The signature check and the capture call are both stood in for. The
+    delivery identifier is distinct per call unless one is supplied.
+    Returns the response together with the capture stand-in, so a caller
+    can assert how many times the provider was asked to settle.
+    """
+    checked = verification or verified_delivery(transmission_id)
+    settlement = (
+        capture
+        if capture is not None
+        else AsyncMock(return_value=capture_response())
+    )
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        new=AsyncMock(return_value=checked),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order', new=settlement
+    ):
+        response = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(order_id),
+            headers=PAYPAL_HEADERS,
+        )
+    return response, settlement
+
+
+def test_user_registration(client, db):
+    response = client.post('/auth/register', json={
+        'email': 'newuser@example.com',
+        'password': VALID_TEST_PASSWORD
     })
     assert response.status_code == 200
-    assert "access_token" in response.json()
-    assert "token_type" in response.json()
+    body = response.json()
+    assert body['user']['email'] == 'newuser@example.com'
+    assert 'id' in body['user']
+    assert 'access_token' in body
+    assert body['token_type'] == 'bearer'
+    assert 'hashed_password' not in response.text
 
-def test_listing_retrieval():
-    response = client.get("/api/listings")
+
+def test_user_login_accepts_a_json_body(client, registered_user):
+    response = client.post('/auth/login', json={
+        'email': registered_user.email,
+        'password': VALID_TEST_PASSWORD
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert 'access_token' in body
+    assert 'token_type' in body
+
+
+def test_login_response_shape_is_unchanged(client, registered_user):
+    response = client.post('/auth/login', json={
+        'email': registered_user.email,
+        'password': VALID_TEST_PASSWORD
+    })
+    assert response.status_code == 200
+    assert {'access_token', 'token_type'} <= set(response.json())
+    assert response.json()['token_type'] == 'bearer'
+
+
+def test_register_response_shape_is_unchanged(client):
+    response = client.post('/auth/register', json={
+        'email': 'shape@example.com',
+        'password': VALID_TEST_PASSWORD
+    })
+    assert response.status_code == 200
+
+    body = response.json()
+    assert {'user', 'access_token', 'token_type'} <= set(body)
+    assert body['token_type'] == 'bearer'
+    assert body['access_token']
+    assert {'id', 'email'} <= set(body['user'])
+    assert body['user']['email'] == 'shape@example.com'
+    assert isinstance(body['user']['id'], int)
+    assert 'token' not in body
+    assert 'hashed_password' not in response.text
+
+
+def test_login_rejects_a_wrong_password(client, registered_user):
+    response = client.post('/auth/login', json={
+        'email': registered_user.email,
+        'password': 'not-the-password'
+    })
+    assert response.status_code == 401
+
+
+def test_a_relationship_attribute_is_not_an_accepted_lookup_column(db):
+    for model, relationship_name in (
+        (User, 'filters'),
+        (User, 'subscriptions'),
+        (Filter, 'criteria'),
+        (Filter, 'zip_codes'),
+    ):
+        assert isinstance(
+            getattr(model, relationship_name), InstrumentedAttribute
+        )
+        with pytest.raises(ValueError):
+            authorization._lookup_conditions(
+                model, {relationship_name: 'x'}
+            )
+
+
+def test_a_mapped_column_is_an_accepted_lookup_column(db):
+    conditions = authorization._lookup_conditions(
+        SubscriptionModel, {'paypal_order_id': ORDER_ID}
+    )
+    assert len(conditions) == 1
+
+
+def test_an_unmapped_class_is_refused_as_a_lookup_model(db):
+    with pytest.raises(ValueError):
+        authorization._lookup_conditions(dict, {'id': 1})
+
+
+def test_a_non_unique_lookup_prefers_the_row_the_caller_owns(
+    db, registered_user, second_registered_user
+):
+    moment = datetime.now(timezone.utc)
+    foreign = SubscriptionModel(
+        user_id=second_registered_user.id,
+        status=STATUS_ACTIVE,
+        start_date=moment,
+        end_date=moment + timedelta(days=30),
+    )
+    owned = SubscriptionModel(
+        user_id=registered_user.id,
+        status=STATUS_ACTIVE,
+        start_date=moment,
+        end_date=moment + timedelta(days=30),
+    )
+    db.add_all([foreign, owned])
+    db.commit()
+
+    resolved = authorization.load_owned(
+        db, SubscriptionModel, registered_user, status=STATUS_ACTIVE
+    )
+    assert resolved.id == owned.id
+    assert resolved.user_id == registered_user.id
+
+
+def test_a_lookup_matching_only_a_foreign_row_is_not_found(
+    db, registered_user, second_registered_user
+):
+    moment = datetime.now(timezone.utc)
+    db.add(
+        SubscriptionModel(
+            user_id=second_registered_user.id,
+            status=STATUS_ACTIVE,
+            start_date=moment,
+            end_date=moment + timedelta(days=30),
+        )
+    )
+    db.commit()
+
+    with pytest.raises(HTTPException) as refused:
+        authorization.load_owned(
+            db, SubscriptionModel, registered_user, status=STATUS_ACTIVE
+        )
+    assert refused.value.status_code == 404
+
+
+def test_a_lookup_matching_no_row_is_not_found(db, registered_user):
+    with pytest.raises(HTTPException) as refused:
+        authorization.load_owned(
+            db, SubscriptionModel, registered_user, status=STATUS_ACTIVE
+        )
+    assert refused.value.status_code == 404
+
+
+def test_an_active_subscription_derives_the_premium_role(
+    db, registered_user
+):
+    assert registered_user.role == 'registered'
+    assert authorization.effective_role(db, registered_user) is Role.REGISTERED
+
+    moment = datetime.now(timezone.utc)
+    db.add(
+        SubscriptionModel(
+            user_id=registered_user.id,
+            plan_id=PREMIUM_MONTHLY,
+            status=STATUS_ACTIVE,
+            start_date=moment,
+            end_date=moment + timedelta(days=30),
+        )
+    )
+    db.commit()
+
+    assert authorization.entitled_role(db, registered_user) is Role.PREMIUM
+    assert authorization.effective_role(db, registered_user) is Role.PREMIUM
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'registered'
+
+
+def test_an_expired_subscription_derives_nothing(db, registered_user):
+    moment = datetime.now(timezone.utc)
+    db.add(
+        SubscriptionModel(
+            user_id=registered_user.id,
+            plan_id=PREMIUM_MONTHLY,
+            status=STATUS_ACTIVE,
+            start_date=moment - timedelta(days=60),
+            end_date=moment - timedelta(days=1),
+        )
+    )
+    db.commit()
+
+    assert authorization.entitled_role(db, registered_user) is None
+    assert authorization.effective_role(db, registered_user) is Role.REGISTERED
+
+
+def test_a_pending_subscription_derives_nothing(db, registered_user):
+    moment = datetime.now(timezone.utc)
+    db.add(
+        SubscriptionModel(
+            user_id=registered_user.id,
+            plan_id=PREMIUM_MONTHLY,
+            status=STATUS_PENDING,
+            start_date=moment,
+            end_date=moment + timedelta(days=30),
+        )
+    )
+    db.commit()
+
+    assert authorization.entitled_role(db, registered_user) is None
+
+
+def test_another_users_subscription_derives_nothing(
+    db, registered_user, second_registered_user
+):
+    moment = datetime.now(timezone.utc)
+    db.add(
+        SubscriptionModel(
+            user_id=second_registered_user.id,
+            plan_id=PREMIUM_MONTHLY,
+            status=STATUS_ACTIVE,
+            start_date=moment,
+            end_date=moment + timedelta(days=30),
+        )
+    )
+    db.commit()
+
+    assert authorization.entitled_role(db, registered_user) is None
+
+
+def test_an_unknown_plan_derives_nothing(db, registered_user):
+    moment = datetime.now(timezone.utc)
+    db.add(
+        SubscriptionModel(
+            user_id=registered_user.id,
+            plan_id='not_a_published_plan',
+            status=STATUS_ACTIVE,
+            start_date=moment,
+            end_date=moment + timedelta(days=30),
+        )
+    )
+    db.commit()
+
+    assert authorization.entitled_role(db, registered_user) is None
+
+
+def test_a_stored_admin_role_is_never_lowered_by_derivation(
+    db, registered_user
+):
+    registered_user.role = 'admin'
+    db.commit()
+    assert authorization.effective_role(db, registered_user) is Role.ADMIN
+
+
+def test_the_failed_attempt_write_takes_a_row_lock(
+    registered_user, db, monkeypatch
+):
+    locking_queries = []
+    request_lock = SqlAlchemyQuery.with_for_update
+
+    def capture(query, *args, **kwargs):
+        locked = request_lock(query, *args, **kwargs)
+        locking_queries.append(locked)
+        return locked
+
+    monkeypatch.setattr(SqlAlchemyQuery, 'with_for_update', capture)
+
+    row = auth_module._lock_row(db, registered_user.id)
+
+    assert row is not None
+    assert row.id == registered_user.id
+    assert len(locking_queries) == 1, locking_queries
+    compiled = str(
+        locking_queries[0].statement.compile(
+            dialect=postgresql.dialect()
+        )
+    )
+    assert 'FOR UPDATE' in compiled
+
+
+def test_the_counted_failure_reaches_that_helper(
+    registered_user, db, monkeypatch
+):
+    calls = []
+    resolve = auth_module._lock_row
+
+    def record(session, user_id):
+        calls.append(user_id)
+        return resolve(session, user_id)
+
+    monkeypatch.setattr(auth_module, '_lock_row', record)
+
+    auth_module._record_failed_attempt(
+        db, registered_user, datetime.now(timezone.utc)
+    )
+
+    assert calls == [registered_user.id]
+
+
+def test_repeated_failures_lock_the_account(registered_user, db):
+    moment = datetime.now(timezone.utc)
+    for _ in range(settings.LOGIN_MAX_ATTEMPTS):
+        auth_module._record_failed_attempt(db, registered_user, moment)
+
+    db.expire_all()
+    locked = db.query(User).filter(User.id == registered_user.id).one()
+    assert locked.failed_login_attempts == settings.LOGIN_MAX_ATTEMPTS
+    assert locked.locked_until is not None
+    assert auth_module._is_locked(locked, moment)
+
+
+def test_no_counted_failure_is_lost_across_repeated_writes(
+    registered_user, db
+):
+    moment = datetime.now(timezone.utc)
+    for expected in range(1, settings.LOGIN_MAX_ATTEMPTS):
+        auth_module._record_failed_attempt(db, registered_user, moment)
+        db.expire_all()
+        assert db.query(User).filter(
+            User.id == registered_user.id
+        ).one().failed_login_attempts == expected
+
+
+def test_an_expired_lock_restarts_the_count(registered_user, db):
+    moment = datetime.now(timezone.utc)
+    registered_user.failed_login_attempts = 4
+    registered_user.locked_until = moment - timedelta(minutes=1)
+    db.commit()
+
+    auth_module._record_failed_attempt(db, registered_user, moment)
+
+    db.expire_all()
+    row = db.query(User).filter(User.id == registered_user.id).one()
+    assert row.failed_login_attempts == 1
+    assert row.locked_until is None
+
+
+def test_a_successful_attempt_clears_the_count_and_the_lock(
+    registered_user, db
+):
+    moment = datetime.now(timezone.utc)
+    auth_module._record_failed_attempt(db, registered_user, moment)
+
+    auth_module._record_successful_attempt(db, registered_user)
+
+    db.expire_all()
+    row = db.query(User).filter(User.id == registered_user.id).one()
+    assert row.failed_login_attempts == 0
+    assert row.locked_until is None
+
+
+@pytest.mark.postgres
+def test_two_concurrent_failures_are_both_counted_on_postgres(
+    postgres_session_factory, postgres_observer, password_hash, monkeypatch
+):
+    moment = datetime.now(timezone.utc)
+    seeding = postgres_session_factory()
+    try:
+        account = User(
+            email='contended@example.com',
+            hashed_password=password_hash,
+            created_at=moment,
+            role=Role.REGISTERED.value,
+        )
+        seeding.add(account)
+        seeding.commit()
+        account_id = account.id
+    finally:
+        seeding.close()
+
+    holder_locked = threading.Event()
+    release_holder = threading.Event()
+    held = []
+    resolve = auth_module._lock_row
+
+    def hold_the_first(session, user_id):
+        row = resolve(session, user_id)
+        if not held:
+            held.append(session)
+            holder_locked.set()
+            assert release_holder.wait(CONTENTION_BOUND_SECONDS), (
+                'the first attempt was never released'
+            )
+        return row
+
+    monkeypatch.setattr(auth_module, '_lock_row', hold_the_first)
+
+    def count_one_failure():
+        session = postgres_session_factory()
+        try:
+            auth_module._record_failed_attempt(
+                session, session.query(User).get(account_id), moment
+            )
+        finally:
+            session.close()
+
+    first = threading.Thread(target=count_one_failure)
+    first.start()
+    try:
+        assert holder_locked.wait(CONTENTION_BOUND_SECONDS), (
+            'the first attempt never took the lock'
+        )
+        second = threading.Thread(target=count_one_failure)
+        second.start()
+        try:
+            assert postgres_observer(1), (
+                'the second attempt was never seen waiting on the lock '
+                'the first holds'
+            )
+        finally:
+            release_holder.set()
+            second.join(CONTENTION_BOUND_SECONDS)
+    finally:
+        release_holder.set()
+        first.join(CONTENTION_BOUND_SECONDS)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+
+    reading = postgres_session_factory()
+    try:
+        stored = reading.query(User).get(account_id)
+        assert stored.failed_login_attempts == 2, (
+            stored.failed_login_attempts
+        )
+    finally:
+        reading.close()
+
+
+def test_a_failed_persistence_is_recorded_rather_than_raised(
+    registered_user, db
+):
+    moment = datetime.now(timezone.utc)
+    with patch(
+        AUTH_MODULE + '._lock_row',
+        side_effect=SQLAlchemyError('lock unavailable'),
+    ):
+        auth_module._record_failed_attempt(db, registered_user, moment)
+        auth_module._record_successful_attempt(db, registered_user)
+
+    assert not db.dirty
+    assert not db.new
+
+
+def test_a_registration_race_answers_as_an_ordinary_duplicate(client):
+    violation = IntegrityError(
+        'INSERT INTO users', {}, Exception('duplicate key value')
+    )
+    with patch.object(
+        SqlAlchemySession, 'commit', side_effect=violation
+    ):
+        response = client.post(
+            '/auth/register',
+            json={
+                'email': 'racer@example.com',
+                'password': VALID_TEST_PASSWORD,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()['detail'] == DUPLICATE_EMAIL_DETAIL
+
+
+def test_listing_retrieval_is_public(client):
+    response = client.get('/listings/')
     assert response.status_code == 200
     assert isinstance(response.json(), list)
-    
-    # Test single listing retrieval
-    if len(response.json()) > 0:
-        listing_id = response.json()[0]["id"]
-        response = client.get(f"/api/listings/{listing_id}")
-        assert response.status_code == 200
-        assert "id" in response.json()
-        assert "title" in response.json()
 
-def test_filter_creation():
-    # Login first to get the token
-    login_response = client.post("/api/users/login", data={
-        "username": "testuser",
-        "password": "testpassword123"
-    })
-    token = login_response.json()["access_token"]
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    response = client.post("/api/filters", json={
-        "name": "Test Filter",
-        "criteria": {
-            "min_price": 100000,
-            "max_price": 500000,
-            "bedrooms": 3,
-            "bathrooms": 2
-        }
-    }, headers=headers)
-    assert response.status_code == 201
-    assert "id" in response.json()
-    assert response.json()["name"] == "Test Filter"
 
-def test_subscription_management():
-    # Login first to get the token
-    login_response = client.post("/api/users/login", data={
-        "username": "testuser",
-        "password": "testpassword123"
-    })
-    token = login_response.json()["access_token"]
-    
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    # Create a subscription
-    response = client.post("/api/subscriptions", json={
-        "filter_id": 1,  # Assuming filter with id 1 exists
-        "notification_frequency": "daily"
-    }, headers=headers)
-    assert response.status_code == 201
-    assert "id" in response.json()
-    
-    # Get subscriptions
-    response = client.get("/api/subscriptions", headers=headers)
+def test_listing_retrieval_needs_no_authorization_header(
+    anonymous_client
+):
+    response = anonymous_client.get('/listings/')
+    assert 'authorization' not in {
+        name.lower() for name in response.request.headers
+    }
     assert response.status_code == 200
     assert isinstance(response.json(), list)
-    
-    # Update a subscription
-    if len(response.json()) > 0:
-        subscription_id = response.json()[0]["id"]
-        response = client.put(f"/api/subscriptions/{subscription_id}", json={
-            "notification_frequency": "weekly"
-        }, headers=headers)
-        assert response.status_code == 200
-        assert response.json()["notification_frequency"] == "weekly"
-    
-    # Delete a subscription
-    if len(response.json()) > 0:
-        subscription_id = response.json()[0]["id"]
-        response = client.delete(f"/api/subscriptions/{subscription_id}", headers=headers)
-        assert response.status_code == 204
 
-# HUMAN ASSISTANCE NEEDED
-# The following tests may need to be adjusted based on the actual implementation details:
-# 1. Ensure that the endpoint URLs match the actual API routes
-# 2. Verify that the JSON structures for requests and responses align with the API specifications
-# 3. Add more specific assertions to check for expected data in responses
-# 4. Implement proper test data setup and teardown to ensure test isolation
-# 5. Add error case testing for each endpoint (e.g., invalid inputs, unauthorized access)
+
+def test_filter_creation_requires_authentication(client):
+    response = client.post('/filters/', json={
+        'name': 'Test Filter',
+        'criteria': []
+    })
+    assert response.status_code == 401
+
+
+def test_filter_listing_is_scoped_to_the_caller(
+    client, registered_user, auth_header_factory
+):
+    response = client.get(
+        '/filters/', headers=auth_header_factory(registered_user)
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def _filter_body(**overrides):
+    body = {
+        'name': 'Cambridge two-bed',
+        'zip_codes': [{'code': '02139'}, {'code': '02140'}],
+        'criteria': [{'field': 'rent', 'operator': 'lte', 'value': '3000'}],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_an_accepted_zip_code_is_persisted_as_a_child_row(
+    client, registered_user, db, auth_header_factory
+):
+    created = client.post(
+        '/filters/',
+        json=_filter_body(),
+        headers=auth_header_factory(registered_user),
+    )
+    assert created.status_code == 200
+
+    assert sorted(z['code'] for z in created.json()['zip_codes']) == [
+        '02139', '02140'
+    ]
+
+    db.expire_all()
+    stored = db.query(FilterModel).one()
+    assert sorted(z.code for z in stored.zip_codes) == ['02139', '02140']
+    assert all(z.filter_id == stored.id for z in stored.zip_codes)
+    assert db.query(ZipCode).count() == 2
+
+    assert [c.field for c in stored.criteria] == ['rent']
+
+
+def test_a_filter_without_zip_codes_still_stores(
+    client, registered_user, db, auth_header_factory
+):
+    created = client.post(
+        '/filters/',
+        json=_filter_body(zip_codes=[]),
+        headers=auth_header_factory(registered_user),
+    )
+    assert created.status_code == 200
+    assert created.json()['zip_codes'] == []
+    assert db.query(ZipCode).count() == 0
+
+
+def test_a_filter_that_cannot_be_stored_is_rolled_back(
+    client, registered_user, db, auth_header_factory
+):
+    with patch.object(
+        SqlAlchemySession,
+        'commit',
+        side_effect=SQLAlchemyError('disk full'),
+    ):
+        response = client.post(
+            '/filters/',
+            json=_filter_body(),
+            headers=auth_header_factory(registered_user),
+        )
+
+    assert response.status_code == 500
+    assert response.json()['detail'] == FILTER_NOT_STORED_DETAIL
+    db.expire_all()
+    assert db.query(FilterModel).count() == 0
+    assert db.query(ZipCode).count() == 0
+
+
+def test_a_listing_that_cannot_be_stored_is_rolled_back(
+    client, admin_user, db, auth_header_factory
+):
+    with patch.object(
+        SqlAlchemySession,
+        'commit',
+        side_effect=SQLAlchemyError('disk full'),
+    ):
+        response = client.post(
+            '/listings/',
+            json={'rent': 2400.0},
+            headers=auth_header_factory(admin_user),
+        )
+
+    assert response.status_code == 500
+    assert response.json()['detail'] == LISTING_NOT_STORED_DETAIL
+    db.expire_all()
+    assert db.query(ListingModel).count() == 0
+
+
+def test_a_listing_is_stored_by_an_administrator(
+    client, admin_user, db, auth_header_factory
+):
+    response = client.post(
+        '/listings/',
+        json={'rent': 2400.0, 'bedrooms': 2},
+        headers=auth_header_factory(admin_user),
+    )
+    assert response.status_code == 200
+    db.expire_all()
+    stored = db.query(ListingModel).one()
+    assert stored.rent == 2400.0
+    assert stored.bedrooms == 2
+
+
+def test_a_registered_user_cannot_store_a_listing(
+    client, registered_user, db, auth_header_factory
+):
+    response = client.post(
+        '/listings/',
+        json={'rent': 2400.0},
+        headers=auth_header_factory(registered_user),
+    )
+    assert response.status_code == 403
+    assert db.query(ListingModel).count() == 0
+
+
+def test_subscription_creation_and_retrieval(
+    client, registered_user, auth_header_factory
+):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+    ) as capture:
+        created = client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=auth_header_factory(registered_user),
+        )
+    assert created.status_code == 200
+    body = created.json()
+    assert body['user_id'] == registered_user.id
+    assert body['status'] == 'pending'
+    assert body['approval_url'] == APPROVAL_URL
+    assert capture.call_count == 0
+
+    pending = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert pending.status_code == 200
+    assert pending.json() is None
+
+    settled, _ = deliver_approval(client)
+    assert settled.status_code == 200
+    assert settled.json() == {'status': 'processed'}
+
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()['id'] == body['id']
+    assert fetched.json()['status'] == 'active'
+
+
+def test_subscription_creation_prices_from_the_catalog(
+    client, db, registered_user, auth_header_factory
+):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ):
+        created = client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=auth_header_factory(registered_user),
+        )
+    assert created.status_code == 200
+    plan = get_plan('premium_monthly')
+    row = db.query(SubscriptionModel).filter_by(
+        id=created.json()['id']
+    ).first()
+    assert Decimal(str(row.amount)) == plan.amount
+    assert row.currency == plan.currency
+    assert row.paypal_order_id == ORDER_ID
+    assert row.end_date is None
+
+
+def test_subscription_creation_rejects_a_client_amount(
+    client, registered_user, auth_header_factory
+):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ):
+        response = client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly', 'amount': '0.01'},
+            headers=auth_header_factory(registered_user),
+        )
+    assert response.status_code == 422
+
+
+def test_verified_approval_captures_and_grants_the_plan_role(
+    client, db, registered_user, auth_header_factory
+):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ):
+        created = client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=auth_header_factory(registered_user),
+        )
+    assert created.json()['status'] == 'pending'
+
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=verified_approval(),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+        return_value=capture_response(),
+    ):
+        delivered = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(),
+            headers=PAYPAL_HEADERS,
+        )
+    assert delivered.status_code == 200
+    assert delivered.json() == {'status': 'processed'}
+
+    db.expire_all()
+    row = db.query(SubscriptionModel).filter_by(
+        id=created.json()['id']
+    ).first()
+    assert row.status == 'active'
+    assert row.end_date is not None
+    assert db.query(User).filter_by(
+        id=registered_user.id
+    ).first().role == 'premium'
+
+
+def test_a_capture_that_is_not_complete_grants_nothing(
+    client, db, registered_user, auth_header_factory
+):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ):
+        created = client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=auth_header_factory(registered_user),
+        )
+
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=verified_approval(),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+        return_value=capture_response(value='0.01'),
+    ):
+        delivered = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(),
+            headers=PAYPAL_HEADERS,
+        )
+    assert delivered.status_code == 200
+    assert delivered.json() == {'status': 'ignored'}
+
+    db.expire_all()
+    row = db.query(SubscriptionModel).filter_by(
+        id=created.json()['id']
+    ).first()
+    assert row.status == 'pending'
+    assert db.query(User).filter_by(
+        id=registered_user.id
+    ).first().role == 'registered'
+
+
+def test_a_repeated_delivery_is_acknowledged_without_reprocessing(
+    client, registered_user, auth_header_factory
+):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ):
+        client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=auth_header_factory(registered_user),
+        )
+
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=verified_approval(),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+        return_value=capture_response(),
+    ) as capture:
+        first = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(),
+            headers=PAYPAL_HEADERS,
+        )
+        second = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(),
+            headers=PAYPAL_HEADERS,
+        )
+    assert first.json() == {'status': 'processed'}
+    assert second.status_code == 200
+    assert second.json() == {'status': 'duplicate'}
+    assert capture.call_count == 1
+
+
+def test_an_unverified_notification_changes_no_state(client, db):
+    rejected = WebhookVerification(
+        verified=False, reason='signature_not_verified'
+    )
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=rejected,
+    ):
+        response = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(),
+            headers=PAYPAL_HEADERS,
+        )
+    assert response.status_code == 400
+    assert db.query(WebhookEvent).count() == 0
+    assert db.query(SubscriptionModel).count() == 0
+
+
+def test_a_provider_outage_is_not_reported_as_a_client_error(
+    client, registered_user, db, auth_header_factory
+):
+    outage = PayPalAPIError(
+        'unavailable', category=CATEGORY_PROVIDER_SERVER, status_code=503
+    )
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order', side_effect=outage
+    ):
+        response = client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=auth_header_factory(registered_user),
+        )
+    assert response.status_code == 502
+    stored = db.query(SubscriptionModel).one()
+    assert stored.status == STATUS_FAILED
+    assert stored.end_date is None
+
+
+def _open_subscription(client, headers, plan_id=PREMIUM_MONTHLY):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ):
+        return client.post(
+            '/subscriptions/',
+            json={'plan_id': plan_id},
+            headers=headers,
+        )
+
+
+def test_the_ownership_row_is_durable_before_the_capture(
+    client, registered_user, session_factory, auth_header_factory
+):
+    seen = {}
+
+    async def observing_capture(db, order_id, current_user, **kwargs):
+        independent = session_factory()
+        try:
+            row = independent.query(SubscriptionModel).filter(
+                SubscriptionModel.paypal_order_id == order_id
+            ).one_or_none()
+            seen['committed'] = row is not None
+            seen['status'] = row.status if row else None
+            seen['end_date'] = row.end_date if row else None
+            seen['user_id'] = row.user_id if row else None
+            seen['request_id'] = (
+                paypal_module.order_request_id(row.id) if row else None
+            )
+        finally:
+            independent.close()
+        return capture_response()
+
+    created = _open_subscription(client, auth_header_factory(registered_user))
+    assert created.status_code == 200
+    assert created.json()['status'] == STATUS_PENDING
+    assert created.json()['end_date'] is None
+
+    settled, _ = deliver_approval(
+        client, capture=AsyncMock(side_effect=observing_capture)
+    )
+
+    assert settled.status_code == 200
+    assert seen['committed'] is True
+    assert seen['status'] == STATUS_PENDING
+    assert seen['end_date'] is None
+    assert seen['user_id'] == registered_user.id
+    assert seen['request_id']
+
+    entitling = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    ).json()
+    assert entitling['status'] == STATUS_ACTIVE
+    assert entitling['end_date'] is not None
+
+
+def test_a_failed_capture_leaves_a_failed_row_and_no_entitlement(
+    client, registered_user, db, auth_header_factory
+):
+    assert _open_subscription(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    refused, _ = deliver_approval(
+        client,
+        capture=AsyncMock(
+            side_effect=PayPalAPIError('capture declined')
+        ),
+    )
+
+    assert refused.status_code == 502
+
+    db.expire_all()
+    row = db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one()
+    assert row.status == STATUS_PENDING
+    assert row.end_date is None
+    assert authorization.entitled_role(db, registered_user) is None
+    assert client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    ).json() is None
+    assert db.query(WebhookEvent).count() == 0
+
+
+def test_a_duplicate_order_identifier_is_not_captured_again(
+    client, registered_user, db, auth_header_factory
+):
+    moment = datetime.now(timezone.utc)
+    db.add(
+        SubscriptionModel(
+            user_id=registered_user.id,
+            status=STATUS_PENDING,
+            start_date=moment,
+            paypal_order_id=ORDER_ID,
+        )
+    )
+    db.commit()
+
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order'
+    ) as mock_capture:
+        refused = client.post(
+            '/subscriptions/',
+            json={'plan_id': PREMIUM_MONTHLY},
+            headers=auth_header_factory(registered_user),
+        )
+
+    assert refused.status_code == 400
+    assert mock_capture.call_count == 0
+
+
+def test_a_settled_charge_that_cannot_activate_reports_reconciliation(
+    client, registered_user, auth_header_factory
+):
+    assert _open_subscription(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    def fail_the_activation(self):
+        raise SQLAlchemyError('activation could not be committed')
+
+    with patch.object(SqlAlchemySession, 'commit', fail_the_activation):
+        response, _ = deliver_approval(client)
+
+    assert response.status_code == 503
+    assert response.json()['detail'] == RECONCILIATION_DETAIL
+
+
+def test_a_successful_subscription_derives_the_premium_entitlement(
+    client, registered_user, db, auth_header_factory
+):
+    assert _open_subscription(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    settled, _ = deliver_approval(client)
+    assert settled.status_code == 200
+
+    db.expire_all()
+    assert authorization.entitled_role(db, registered_user) is Role.PREMIUM
+    assert authorization.effective_role(db, registered_user) is Role.PREMIUM
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'premium'
+
+
+def test_no_client_field_can_influence_the_charge_or_the_window(
+    client, registered_user, db, auth_header_factory
+):
+    tampered = client.post(
+        '/subscriptions/',
+        json={
+            'plan_id': PREMIUM_MONTHLY,
+            'amount': '0.01',
+            'currency': 'XXX',
+            'status': STATUS_ACTIVE,
+            'start_date': '2000-01-01T00:00:00Z',
+            'end_date': '2099-01-01T00:00:00Z',
+            'paypal_order_id': 'ATTACKER-ORDER',
+        },
+        headers=auth_header_factory(registered_user),
+    )
+    assert tampered.status_code == 422
+    assert db.query(SubscriptionModel).count() == 0
+
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=order_response(),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+        return_value={'status': 'COMPLETED'},
+    ):
+        created = client.post(
+            '/subscriptions/',
+            json={'plan_id': PREMIUM_MONTHLY},
+            headers=auth_header_factory(registered_user),
+        )
+    assert created.status_code == 200
+
+    db.expire_all()
+    row = db.query(SubscriptionModel).one()
+    plan = get_plan(PREMIUM_MONTHLY)
+    assert Decimal(str(row.amount)) == plan.amount
+    assert row.currency == plan.currency
+    assert row.paypal_order_id == ORDER_ID
+    assert row.start_date.year >= 2020
+    assert 'amount' not in created.json()
+    assert 'paypal_order_id' not in created.json()
+
+
+def test_subscription_retrieval_requires_authentication(client):
+    assert client.get('/subscriptions/').status_code == 401
+
+
+def test_health_endpoint_reports_ready(client):
+    response = client.get('/health')
+    assert response.status_code == 200
+    assert response.json() == {'status': 'ok'}
+
+
+def test_every_response_carries_a_correlation_id(client):
+    response = client.get('/health')
+    assert response.status_code == 200
+    identifier = response.headers.get(REQUEST_ID_HEADER)
+    assert identifier
+    assert identifier.isalnum()
+
+
+def test_a_supplied_correlation_id_is_honoured(client):
+    response = client.get(
+        '/health', headers={REQUEST_ID_HEADER: 'caller0trace1'}
+    )
+    assert response.headers[REQUEST_ID_HEADER] == 'caller0trace1'
+
+
+@pytest.mark.parametrize('supplied', [
+    'has spaces',
+    'has/separators',
+    'has\nnewline',
+    '',
+    'x' * 200,
+])
+def test_an_unusable_correlation_id_is_replaced(client, supplied):
+    response = client.get(
+        '/health', headers={REQUEST_ID_HEADER: supplied}
+    )
+    returned = response.headers[REQUEST_ID_HEADER]
+    assert returned != supplied
+    assert returned.isalnum()
+
+
+def test_a_rejected_request_still_carries_a_correlation_id(client):
+    response = client.get('/subscriptions/')
+    assert response.status_code == 401
+    assert response.headers.get(REQUEST_ID_HEADER)
+
+
+def test_a_supplied_correlation_id_reaches_the_refusal_record(
+    client, registered_user, auth_header_factory
+):
+    headers = auth_header_factory(registered_user)
+    headers[REQUEST_ID_HEADER] = SUPPLIED_REQUEST_ID
+
+    with watching_audit_trail() as records:
+        response = client.post(
+            '/listings/',
+            json={'street_address': '1 Main St', 'rent': 1000.0},
+            headers=headers,
+        )
+
+    assert response.status_code == 403
+    assert response.headers[REQUEST_ID_HEADER] == SUPPLIED_REQUEST_ID
+
+    refusals = [
+        record
+        for record in records
+        if record.getMessage() == REFUSAL_MESSAGE
+    ]
+    assert len(refusals) == 1
+    contexts = [
+        json.loads(line)[CONTEXT_FIELD]
+        for line in formatted_lines(refusals)
+    ]
+    assert contexts[0]['request_id'] == SUPPLIED_REQUEST_ID
+    assert contexts[0]['path'] == '/listings/'
+    assert contexts[0]['decision']
+
+
+@pytest.mark.parametrize('text, expected', [
+    ('boot /srv/app/backend/app/main.py', 'boot <path>/main.py'),
+    ('read C:\\app\\backend\\app\\main.py', 'read <path>/main.py'),
+    ('owner alice.smith@example.com', 'owner [REDACTED]'),
+])
+def test_redaction_covers_internal_paths_and_pii(text, expected):
+    assert redact(text) == expected
+
+
+@pytest.mark.parametrize('value', [
+    'api_key=SUPERSECRET',
+    'token=abc.def.ghi',
+    'password=hunter2',
+])
+def test_redaction_still_covers_credentials(value):
+    assert 'SUPERSECRET' not in redact(value)
+    assert redact(value) != value
+
+
+@pytest.mark.parametrize('path', [
+    '/subscriptions/webhook',
+    '/health',
+    '/listings/',
+])
+def test_redaction_leaves_route_paths_intact(path):
+    assert redact(path) == path
+
+
+def collected(logger_name):
+    records = []
+
+    class Collector(stdlib_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger = stdlib_logging.getLogger(logger_name)
+    logger.handlers = [Collector()]
+    logger.setLevel(stdlib_logging.INFO)
+    logger.propagate = False
+    return logger, records
+
+
+def test_a_logged_exception_carries_no_traceback():
+    logger, records = collected('test.f11.exception')
+    try:
+        raise RuntimeError('failed reading /srv/app/backend/key.py')
+    except RuntimeError as error:
+        log_exception(logger, 'Ingestion failed', error)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.exc_info is None
+    assert 'Traceback' not in record.getMessage()
+    assert record.exception_type == 'RuntimeError'
+    assert '/srv/app/backend' not in record.exception_message
+    assert '<path>/key.py' in record.exception_message
+
+
+@contextmanager
+def watching_audit_trail():
+    records = []
+
+    class Collector(stdlib_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    collector = Collector()
+    governed = stdlib_logging.getLogger('backend')
+    previous = governed.level
+    governed.addHandler(collector)
+    governed.setLevel(stdlib_logging.INFO)
+    try:
+        yield records
+    finally:
+        governed.removeHandler(collector)
+        governed.setLevel(previous)
+
+
+def messages(records):
+    return [record.getMessage() for record in records]
+
+
+def formatted_lines(records):
+    """Returns each collected record as the line the process writes.
+
+    The application's redacting filter and formatter are applied, so an
+    assertion reads the serialised record rather than its attributes.
+    """
+    log_filter = RedactingFilter()
+    formatter = RedactingJsonFormatter()
+    return [
+        formatter.format(record)
+        for record in records
+        if log_filter.filter(record)
+    ]
+
+
+def test_a_denial_survives_a_failing_audit_sink(
+    client, registered_user, capsys, auth_header_factory
+):
+    reset_audit_failure_count()
+    broken = Mock()
+    broken.warning.side_effect = RuntimeError('sink down')
+    broken.info.side_effect = RuntimeError('sink down')
+    try:
+        with patch(
+            'backend.app.core.authorization.logger', broken
+        ):
+            response = client.post(
+                '/listings/',
+                json={'street_address': '1 Main St', 'rent': '1000.00'},
+                headers=auth_header_factory(registered_user),
+            )
+        assert response.status_code == 403
+        assert audit_failure_count() >= 1
+        assert REFUSAL_MESSAGE in capsys.readouterr().err
+    finally:
+        reset_audit_failure_count()
+
+
+def test_a_refusal_is_audited_exactly_once(
+    client, registered_user, auth_header_factory
+):
+    with watching_audit_trail() as records:
+        response = client.post(
+            '/listings/',
+            json={'street_address': '1 Main St', 'rent': '1000.00'},
+            headers=auth_header_factory(registered_user),
+        )
+    assert response.status_code == 403
+    written = messages(records)
+    assert written.count(REFUSAL_MESSAGE) == 1
+    assert 'Request rejected' not in written
+
+
+def test_a_foreign_log_handler_is_removed_and_reported():
+    governed = stdlib_logging.getLogger('backend')
+    foreign = stdlib_logging.StreamHandler()
+    governed.addHandler(foreign)
+    try:
+        assert foreign in governed.handlers
+        configure_logging()
+        assert foreign not in governed.handlers
+        assert any(
+            'StreamHandler' in name
+            for name in unredacted_handler_names()
+        )
+        kept = [
+            handler for handler in governed.handlers
+            if getattr(handler, 'name', None) == HANDLER_NAME
+        ]
+        assert len(kept) == 1
+    finally:
+        if foreign in governed.handlers:
+            governed.removeHandler(foreign)
+        configure_logging()
+
+
+def test_a_child_logger_cannot_bypass_redaction():
+    child = stdlib_logging.getLogger('backend.child.bypass')
+    escape = stdlib_logging.StreamHandler()
+    child.addHandler(escape)
+    child.propagate = False
+    try:
+        configure_logging()
+        assert child.handlers == []
+        assert child.propagate is True
+    finally:
+        if escape in child.handlers:
+            child.removeHandler(escape)
+        configure_logging()
+
+
+def test_an_oversized_body_is_rejected(client):
+    oversized = 'x' * (1024 * 1024 + 512)
+    response = client.post(
+        '/filters/',
+        content=('{"note": "' + oversized + '"}').encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+    )
+    assert response.status_code == 413
+
+
+def drive_capped_request(declared, chunks, cap=32):
+    """Returns the statuses a capped middleware produces for a body.
+
+    A declared oversize is answered before the request is handled at
+    all. A body that overruns while it is being read is refused from
+    inside ``receive``, which raises through the handler reading it,
+    so ``reached`` reports whether the body was read to its end
+    rather than whether the handler was entered.
+    """
+    reached = []
+    statuses = []
+
+    async def inner(scope, receive, send):
+        while True:
+            message = await receive()
+            if not message.get('more_body'):
+                break
+        reached.append(True)
+        await send({
+            'type': 'http.response.start',
+            'status': 200,
+            'headers': [],
+        })
+        await send({'type': 'http.response.body', 'body': b''})
+
+    guarded = BodySizeLimitMiddleware(inner, max_body_bytes=cap)
+    headers = []
+    if declared is not None:
+        headers.append((b'content-length', str(declared).encode()))
+    scope = {
+        'type': 'http',
+        'method': 'POST',
+        'path': '/filters/',
+        'headers': headers,
+        'query_string': b'',
+        'client': ('1.2.3.4', 1),
+    }
+    pending = list(chunks)
+
+    async def receive():
+        if pending:
+            chunk = pending.pop(0)
+            return {
+                'type': 'http.request',
+                'body': chunk,
+                'more_body': bool(pending),
+            }
+        return {'type': 'http.request', 'body': b'', 'more_body': False}
+
+    async def send(message):
+        if message['type'] == 'http.response.start':
+            statuses.append(message['status'])
+
+    try:
+        asyncio.run(guarded(scope, receive, send))
+    except StarletteHTTPException as refused:
+        statuses.append(refused.status_code)
+    return statuses, bool(reached)
+
+
+def test_a_body_within_its_declaration_is_served():
+    statuses, reached = drive_capped_request(8, [b'x' * 8])
+    assert statuses == [200]
+    assert reached
+
+
+def test_a_body_that_understates_its_length_is_rejected():
+    statuses, reached = drive_capped_request(
+        10, [b'x' * 26, b'y' * 26]
+    )
+    assert statuses == [413]
+    assert not reached
+
+
+def test_a_body_declaring_no_length_is_rejected():
+    statuses, reached = drive_capped_request(
+        None, [b'x' * 20, b'y' * 20]
+    )
+    assert statuses == [413]
+    assert not reached
+
+
+def test_an_oversized_declaration_is_rejected_early():
+    statuses, reached = drive_capped_request(4096, [b'x' * 8])
+    assert statuses == [413]
+    assert not reached
+
+
+def test_throttling_is_audited_and_answered_429(client):
+    limiter = app.state.limiter
+    limiter.reset()
+    try:
+        with watching_audit_trail() as records:
+            statuses = []
+            for _ in range(12):
+                statuses.append(client.post('/auth/login', json={
+                    'email': 'absent@example.com',
+                    'password': 'whatever-value-1'
+                }).status_code)
+                if statuses[-1] == 429:
+                    break
+        assert 429 in statuses
+        throttled = [
+            record for record in records
+            if record.getMessage() == THROTTLED_MESSAGE
+        ]
+        assert len(throttled) == 1
+        assert throttled[0].policy
+        assert throttled[0].path == '/auth/login'
+        assert throttled[0].method == 'POST'
+    finally:
+        limiter.reset()
+
+
+class FakeResponse:
+
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.content = json.dumps(self._payload).encode("utf-8")
+        self.headers = {"Content-Length": str(len(self.content))}
+
+    async def aiter_bytes(self):
+        yield self.content
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+class FakeClient:
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+        self.routes = []
+
+    def _serve(self, method, url, kwargs):
+        self.routes.append(assert_paypal_call(method, url, **kwargs))
+        self.calls.append((url, kwargs))
+        if len(self._responses) > 1:
+            return self._responses.pop(0)
+        return self._responses[0]
+
+    def stream(self, method, url, **kwargs):
+        response = self._serve(method, url, kwargs)
+
+        @asynccontextmanager
+        async def opened():
+            yield response
+
+        return opened()
+
+
+@contextmanager
+def provider_transport(responses):
+    """Yields a fake transport installed on the provider module.
+
+    The client is recorded against a loop, and only a call running on
+    that loop is given it, so the stand-in is installed through the same
+    context manager the provider functions acquire it from.
+    """
+    fake = FakeClient(responses)
+
+    @asynccontextmanager
+    async def lend_the_stand_in():
+        yield fake
+
+    with patch.object(paypal_module, '_client', lend_the_stand_in):
+        with patch.object(
+            paypal_module,
+            '_bearer_credential',
+            AsyncMock(return_value='token-value'),
+        ):
+            yield fake
+
+
+def test_order_creation_sends_a_stable_idempotency_key():
+    from backend.app.services.paypal_service import (
+        capture_request_id,
+        order_request_id,
+    )
+
+    assert order_request_id(7) == order_request_id(7)
+    assert order_request_id(7) != order_request_id(8)
+    assert order_request_id(7) != capture_request_id(7)
+
+    with provider_transport([FakeResponse(200, order_response())]) as fake:
+        asyncio.run(paypal_module.create_order(
+            'premium_monthly',
+            'https://example.test/return',
+            'https://example.test/cancel',
+            idempotency_key=order_request_id(7),
+        ))
+    _, kwargs = fake.calls[0]
+    assert kwargs['headers'][IDEMPOTENCY_HEADER] == order_request_id(7)
+
+
+def test_order_creation_uses_the_current_experience_context():
+    with provider_transport([FakeResponse(200, order_response())]) as fake:
+        asyncio.run(paypal_module.create_order(
+            'premium_monthly',
+            'https://example.test/return',
+            'https://example.test/cancel',
+        ))
+    _, kwargs = fake.calls[0]
+    body = kwargs['json']
+    context = body['payment_source']['paypal']['experience_context']
+    assert context['return_url'] == 'https://example.test/return'
+    assert context['cancel_url'] == 'https://example.test/cancel'
+    assert 'application_context' not in body
+
+
+def test_order_creation_sends_the_complete_documented_document():
+    plan = get_plan(PREMIUM_MONTHLY)
+    with provider_transport([FakeResponse(200, order_response())]) as fake:
+        asyncio.run(paypal_module.create_order(
+            PREMIUM_MONTHLY,
+            'https://example.test/return',
+            'https://example.test/cancel',
+        ))
+    _, kwargs = fake.calls[0]
+
+    assert kwargs['json'] == {
+        'intent': 'CAPTURE',
+        'purchase_units': [
+            {
+                'amount': {
+                    'currency_code': plan.currency,
+                    'value': format_amount(plan.amount),
+                },
+                'description': 'Subscription Payment',
+            }
+        ],
+        'payment_source': {
+            'paypal': {
+                'experience_context': {
+                    'return_url': 'https://example.test/return',
+                    'cancel_url': 'https://example.test/cancel',
+                    'user_action': 'PAY_NOW',
+                    'shipping_preference': 'NO_SHIPPING',
+                    'payment_method_preference': (
+                        'IMMEDIATE_PAYMENT_REQUIRED'
+                    ),
+                }
+            }
+        },
+    }
+    assert_create_order_body(kwargs['json'])
+    assert fake.routes == ['create_order']
+
+
+def test_the_settle_call_sends_an_empty_body(db, registered_user):
+    owned_order(db, registered_user)
+    with provider_transport(
+        [FakeResponse(200, capture_response())]
+    ) as fake:
+        asyncio.run(paypal_module.capture_order(
+            db, ORDER_ID, registered_user
+        ))
+    _, kwargs = fake.calls[0]
+
+    assert kwargs['json'] == {}
+    assert_capture_body(kwargs['json'])
+    assert fake.routes == ['capture_order']
+
+
+def test_a_rejected_token_is_refreshed_once():
+    responses = [
+        FakeResponse(401, {'name': 'INVALID_TOKEN'}),
+        FakeResponse(200, order_response()),
+    ]
+    discard = Mock()
+    with provider_transport(responses) as fake:
+        with patch.object(
+            paypal_module, 'reset_access_token_cache', discard
+        ):
+            order = asyncio.run(paypal_module.create_order(
+                'premium_monthly',
+                'https://example.test/return',
+                'https://example.test/cancel',
+            ))
+    assert order['id'] == ORDER_ID
+    assert discard.call_count == 1
+    assert len(fake.calls) == 2
+
+
+def owned_order(db, user, order_id=ORDER_ID):
+    plan = get_plan('premium_monthly')
+    subscription = SubscriptionModel(
+        user_id=user.id,
+        plan_id='premium_monthly',
+        amount=plan.amount,
+        currency=plan.currency,
+        status='pending',
+        paypal_order_id=order_id,
+        start_date=datetime.now(timezone.utc),
+    )
+    db.add(subscription)
+    db.commit()
+    db.refresh(subscription)
+    return subscription
+
+
+def test_capture_is_refused_for_another_principals_order(db, registered_user):
+    owned_order(db, registered_user)
+    intruder = User(
+        email='intruder@example.com',
+        hashed_password=get_password_hash(VALID_TEST_PASSWORD),
+        created_at=datetime.now(timezone.utc),
+        role='registered',
+    )
+    db.add(intruder)
+    db.commit()
+    db.refresh(intruder)
+
+    with provider_transport([FakeResponse(200, capture_response())]) as fake:
+        with pytest.raises(paypal_module.OrderOwnershipError):
+            asyncio.run(paypal_module.capture_order(
+                db, ORDER_ID, intruder
+            ))
+    assert fake.calls == []
+
+
+def test_capture_is_refused_for_an_unknown_order(db, registered_user):
+    with provider_transport([FakeResponse(200, capture_response())]) as fake:
+        with pytest.raises(paypal_module.OrderOwnershipError):
+            asyncio.run(paypal_module.capture_order(
+                db, 'ORDER-DOES-NOT-EXIST', registered_user
+            ))
+    assert fake.calls == []
+
+
+def test_capture_proceeds_for_the_owning_principal(db, registered_user):
+    owned_order(db, registered_user)
+    with provider_transport([FakeResponse(200, capture_response())]) as fake:
+        captured = asyncio.run(paypal_module.capture_order(
+            db, ORDER_ID, registered_user
+        ))
+    assert captured['status'] == 'COMPLETED'
+    assert len(fake.calls) == 1
+
+
+def _published_routes():
+    pairs = set()
+    for route in app.routes:
+        for method in getattr(route, 'methods', None) or []:
+            pairs.add((method, route.path))
+    return pairs
+
+
+def test_route_paths_and_prefixes_are_unchanged():
+    pairs = _published_routes()
+    for expected in [
+        ('POST', '/auth/register'),
+        ('POST', '/auth/login'),
+        ('GET', '/listings/'),
+        ('POST', '/listings/'),
+        ('GET', '/filters/'),
+        ('POST', '/filters/'),
+        ('GET', '/subscriptions/'),
+        ('POST', '/subscriptions/'),
+    ]:
+        assert expected in pairs, expected
+
+
+def test_the_webhook_is_the_only_additive_subscription_route():
+    published = {
+        pair
+        for pair in _published_routes()
+        if pair[1].startswith('/subscriptions')
+    }
+    assert published == {
+        ('GET', '/subscriptions/'),
+        ('POST', '/subscriptions/'),
+        ('POST', '/subscriptions/webhook'),
+    }
+    assert ('POST', '/subscriptions/capture') not in published
+
+
+def test_no_route_accepts_a_paypal_identifier_from_a_client():
+    assert not hasattr(subscription_schema, 'SubscriptionCapture')
+    assert set(SubscriptionCreate.__fields__) == {'plan_id'}
+
+
+OVER_LIMIT_PASSWORD = 'Aa1!' + 'x' * 69
+
+
+LEGACY_HASHES = {
+    '2a': '$2a$10$Fx4O/LGGE3rYIYARvyIzguVGMsohviwF6Jy2xHFo.LQO3vKPT8LqG',
+    '2b': '$2b$10$QwmIv/qx/tUqhtOhYXa1ZOtRIA9lhyut9TfdHKBdOdD4mxT.DMjlO',
+}
+
+
+MALFORMED_HASHES = (
+    '',
+    'not-a-hash',
+    '$2b$12$short',
+    '$2y$10$' + 'x' * 53,
+    '$2b$99$' + 'y' * 53,
+)
+
+
+API_PREFIXES = ('/auth', '/listings', '/filters', '/subscriptions')
+
+
+EXPECTED_API_ROUTES = {
+    ('POST', '/auth/register'),
+    ('POST', '/auth/login'),
+    ('GET', '/listings/'),
+    ('POST', '/listings/'),
+    ('GET', '/filters/'),
+    ('POST', '/filters/'),
+    ('GET', '/subscriptions/'),
+    ('POST', '/subscriptions/'),
+    ('POST', '/subscriptions/webhook'),
+}
+
+
+@pytest.fixture
+def unthrottled():
+    """Suspends the shared rate limiter for a burst of requests.
+
+    The lockout counter and the rate limiter are separate controls. These
+    cases exercise the counter over more requests than the per-address
+    rate allows, so the limiter is suspended and its state cleared here.
+    """
+    was_enabled = auth_limiter.enabled
+    auth_limiter.enabled = False
+    try:
+        yield
+    finally:
+        auth_limiter.enabled = was_enabled
+        auth_limiter.reset()
+
+
+def test_each_failed_login_is_counted_exactly_once(
+    client, db, registered_user, unthrottled
+):
+    for expected in (1, 2, 3):
+        response = client.post('/auth/login', json={
+            'email': registered_user.email,
+            'password': 'not-the-password'
+        })
+        assert response.status_code == 401
+        db.expire_all()
+        stored = db.query(User).filter(
+            User.id == registered_user.id
+        ).one()
+        assert stored.failed_login_attempts == expected
+        assert stored.locked_until is None
+
+
+def test_reaching_the_attempt_limit_locks_the_account(
+    client, db, registered_user, unthrottled
+):
+    limit = settings.LOGIN_MAX_ATTEMPTS
+    for _ in range(limit):
+        client.post('/auth/login', json={
+            'email': registered_user.email,
+            'password': 'not-the-password'
+        })
+    db.expire_all()
+    stored = db.query(User).filter(User.id == registered_user.id).one()
+    assert stored.failed_login_attempts == limit
+    assert stored.locked_until is not None
+
+    locked = client.post('/auth/login', json={
+        'email': registered_user.email,
+        'password': VALID_TEST_PASSWORD
+    })
+    assert locked.status_code == 401
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().failed_login_attempts == limit
+
+
+def test_a_successful_login_clears_the_counter(
+    client, db, registered_user, unthrottled
+):
+    client.post('/auth/login', json={
+        'email': registered_user.email,
+        'password': 'not-the-password'
+    })
+    response = client.post('/auth/login', json={
+        'email': registered_user.email,
+        'password': VALID_TEST_PASSWORD
+    })
+    assert response.status_code == 200
+    db.expire_all()
+    stored = db.query(User).filter(User.id == registered_user.id).one()
+    assert stored.failed_login_attempts == 0
+    assert stored.locked_until is None
+
+
+def test_filter_creation_persists_the_submitted_zip_codes(
+    client, db, registered_user, auth_header_factory
+):
+    response = client.post(
+        '/filters/',
+        json={
+            'name': 'Downtown',
+            'zip_codes': [{'code': '94105'}, {'code': '94107-1234'}],
+            'criteria': [
+                {'field': 'rent', 'operator': 'lte', 'value': '3500'}
+            ],
+        },
+        headers=auth_header_factory(registered_user),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert [entry['code'] for entry in body['zip_codes']] == [
+        '94105', '94107-1234'
+    ]
+    assert body['user_id'] == registered_user.id
+
+    db.expire_all()
+    stored = db.query(FilterModel).filter(
+        FilterModel.user_id == registered_user.id
+    ).one()
+    assert sorted(row.code for row in stored.zip_codes) == [
+        '94105', '94107-1234'
+    ]
+    assert [row.field for row in stored.criteria] == ['rent']
+
+
+def test_filter_creation_accepts_no_zip_codes(
+    client, db, registered_user, auth_header_factory
+):
+    response = client.post(
+        '/filters/',
+        json={
+            'name': 'Anywhere',
+            'criteria': [
+                {'field': 'rent', 'operator': 'lte', 'value': '3500'}
+            ],
+        },
+        headers=auth_header_factory(registered_user),
+    )
+    assert response.status_code == 200
+    assert response.json()['zip_codes'] == []
+
+    db.expire_all()
+    stored = db.query(FilterModel).filter(
+        FilterModel.user_id == registered_user.id
+    ).one()
+    assert stored.zip_codes == []
+
+
+def test_a_filter_is_not_visible_to_another_account(
+    client, db, registered_user, second_registered_user, auth_header_factory
+):
+    created = client.post(
+        '/filters/',
+        json={
+            'name': 'Mine',
+            'zip_codes': [{'code': '94105'}],
+            'criteria': [
+                {'field': 'rent', 'operator': 'lte', 'value': '3500'}
+            ],
+        },
+        headers=auth_header_factory(registered_user),
+    )
+    assert created.status_code == 200
+    assert client.get(
+        '/filters/', headers=auth_header_factory(second_registered_user)
+    ).json() == []
+    assert len(client.get(
+        '/filters/', headers=auth_header_factory(registered_user)
+    ).json()) == 1
+
+
+def _created_order(order_id=ORDER_ID):
+    return {
+        'id': order_id,
+        'status': 'PAYER_ACTION_REQUIRED',
+        'links': [
+            {'rel': 'self', 'href': 'https://api.example/o/' + order_id},
+            {'rel': 'payer-action', 'href': APPROVAL_URL},
+        ],
+    }
+
+
+def _settled(plan_id='premium_monthly'):
+    """Returns the settled capture response the service reports.
+
+    The amount and currency are read from the catalog, so the response
+    matches what the endpoint validates the settlement against.
+    """
+    plan = get_plan(plan_id)
+    return capture_response(value=str(plan.amount))
+
+
+def _post_plan(client, headers, plan_id='premium_monthly'):
+    return client.post(
+        '/subscriptions/',
+        json={'plan_id': plan_id},
+        headers=headers,
+    )
+
+
+def _open_order(client, headers, plan_id='premium_monthly'):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        new=AsyncMock(return_value=_created_order()),
+    ):
+        return _post_plan(client, headers, plan_id)
+
+
+def test_subscription_creation_returns_the_approval_redirect(
+    client, db, registered_user, auth_header_factory
+):
+    created = _open_order(client, auth_header_factory(registered_user))
+    assert created.status_code == 200
+    body = created.json()
+    assert body['user_id'] == registered_user.id
+    assert body['status'] == 'pending'
+    assert body['approval_url'] == APPROVAL_URL
+
+    db.expire_all()
+    stored = db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one()
+    assert stored.status == 'pending'
+    assert stored.end_date is None
+    assert str(stored.amount) == str(get_plan('premium_monthly').amount)
+
+
+def test_creation_grants_no_entitlement_before_settlement(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.status_code == 200
+    assert fetched.json() is None
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'registered'
+
+
+def test_capture_activates_and_grants_the_plan_role(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    captured, _ = deliver_approval(
+        client, capture=AsyncMock(return_value=_settled())
+    )
+    assert captured.status_code == 200
+    assert captured.json() == {'status': 'processed'}
+
+    db.expire_all()
+    stored = db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one()
+    assert stored.status == 'active'
+    assert stored.end_date is not None
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'premium'
+
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()['id'] == stored.id
+
+
+def test_an_unsettled_capture_changes_nothing(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    refused, _ = deliver_approval(
+        client,
+        capture=AsyncMock(return_value=capture_response(value='0.01')),
+    )
+    assert refused.status_code == 200
+    assert refused.json() == {'status': 'ignored'}
+
+    db.expire_all()
+    stored = db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one()
+    assert stored.status == 'pending'
+    assert stored.end_date is None
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'registered'
+
+
+def test_capture_is_repeatable_without_a_second_settlement(
+    client, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    first_response, first = deliver_approval(
+        client, capture=AsyncMock(return_value=_settled())
+    )
+    assert first_response.status_code == 200
+    assert first.await_count == 1
+
+    repeated, second = deliver_approval(
+        client, capture=AsyncMock(return_value=_settled())
+    )
+    assert repeated.status_code == 200
+    assert repeated.json() == {'status': 'processed'}
+    assert second.await_count == 0
+    assert client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    ).json()['status'] == 'active'
+
+
+def test_the_order_idempotency_key_is_derived_from_the_stored_row(
+    client, db, registered_user, auth_header_factory
+):
+    creator = AsyncMock(return_value=_created_order())
+    with patch(SUBSCRIPTIONS_MODULE + '.create_order', new=creator):
+        assert _post_plan(
+            client, auth_header_factory(registered_user)
+        ).status_code == 200
+
+    stored = db.query(SubscriptionModel).one()
+    sent = creator.await_args.kwargs['idempotency_key']
+    assert sent == paypal_module.order_request_id(stored.id)
+    assert sent == paypal_module.order_request_id(stored.id)
+    assert not hasattr(stored, 'paypal_request_id')
+
+
+def test_the_capture_identifier_is_carried_in_the_audit_record(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    with watching_audit_trail() as records:
+        settled, _ = deliver_approval(
+            client, capture=AsyncMock(return_value=_settled())
+        )
+    assert settled.status_code == 200
+
+    activations = [
+        record for record in records
+        if getattr(record, 'paypal_capture_id', None) is not None
+    ]
+    assert activations, messages(records)
+    record = activations[0]
+    assert record.paypal_capture_id == 'CAPTURE-1'
+    assert record.paypal_order_id == ORDER_ID
+    assert record.subscription_status == 'active'
+    assert db.query(SubscriptionModel).one().status == 'active'
+    assert not hasattr(
+        db.query(SubscriptionModel).one(), 'paypal_capture_id'
+    )
+
+
+def test_an_order_already_captured_is_read_back_and_activated(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    plan = get_plan(PREMIUM_MONTHLY)
+    already = PayPalAPIError(
+        'ORDER_ALREADY_CAPTURED',
+        category=CATEGORY_PROVIDER_CLIENT,
+        status_code=422,
+        issue=ISSUE_ORDER_ALREADY_CAPTURED,
+    )
+    read_back = AsyncMock(return_value=CaptureOutcome(
+        completed=True,
+        order_id=ORDER_ID,
+        status='COMPLETED',
+        amount=str(plan.amount),
+        currency=plan.currency,
+        capture_id='CAPTURE-READ-BACK',
+    ))
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_settled_order', new=read_back
+    ):
+        delivered, _ = deliver_approval(
+            client, capture=AsyncMock(side_effect=already)
+        )
+
+    assert delivered.status_code == 200
+    assert delivered.json() == {'status': 'processed'}
+    assert read_back.await_count == 1
+
+    db.expire_all()
+    stored = db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one()
+    assert stored.status == 'active'
+    assert stored.end_date is not None
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'premium'
+
+
+OTHER_PROVIDER_ISSUE = 'INSTRUMENT_DECLINED'
+
+
+@contextmanager
+def provider_mock_transport(handler):
+    """Lends the provider a real client over a stand-in transport.
+
+    ``handler`` is given each outbound request and returns the response
+    for it, so the service's own status handling and error
+    classification -- including the provider issue code it reads out of
+    an error body -- run end to end rather than being stood in for. The
+    client is lent through the funnel the provider functions acquire one
+    from, so no request reaches a socket.
+    """
+
+    @asynccontextmanager
+    async def lend_the_stand_in():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as stand_in:
+            yield stand_in
+
+    paypal_module.reset_access_token_cache()
+    try:
+        with patch.object(paypal_module, '_client', lend_the_stand_in):
+            yield
+    finally:
+        paypal_module.reset_access_token_cache()
+
+
+def _refusing_capture_handler(issue, status_code=422):
+
+    def handle(outbound):
+        assert_paypal_request(outbound)
+        if outbound.url.path.endswith('/v1/oauth2/token'):
+            return httpx.Response(
+                200,
+                json={'access_token': 'grant', 'expires_in': 3600},
+            )
+        return httpx.Response(
+            status_code,
+            json={
+                'name': 'UNPROCESSABLE_ENTITY',
+                'details': [{'issue': issue}],
+            },
+        )
+
+    return handle
+
+
+def test_a_non_settlement_refusal_is_not_read_back_or_consumed(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    read_back = AsyncMock()
+    with provider_mock_transport(
+        _refusing_capture_handler(OTHER_PROVIDER_ISSUE)
+    ):
+        with patch(
+            SUBSCRIPTIONS_MODULE + '.verify_settled_order', new=read_back
+        ), patch(
+            SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+            new=AsyncMock(return_value=verified_delivery()),
+        ):
+            delivered = client.post(
+                '/subscriptions/webhook',
+                json=approved_event(),
+                headers=PAYPAL_HEADERS,
+            )
+
+    assert delivered.status_code // 100 != 2
+    read_back.assert_not_awaited()
+
+    db.expire_all()
+    stored = db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one()
+    assert stored.status == 'pending'
+    assert stored.end_date is None
+    assert db.query(WebhookEvent).count() == 0
+
+
+def test_the_already_captured_issue_is_the_only_recovered_refusal(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    plan = get_plan(PREMIUM_MONTHLY)
+    read_back = AsyncMock(return_value=CaptureOutcome(
+        completed=True,
+        order_id=ORDER_ID,
+        status='COMPLETED',
+        amount=str(plan.amount),
+        currency=plan.currency,
+        capture_id='CAPTURE-READ-BACK',
+    ))
+    with provider_mock_transport(
+        _refusing_capture_handler(ISSUE_ORDER_ALREADY_CAPTURED)
+    ):
+        with patch(
+            SUBSCRIPTIONS_MODULE + '.verify_settled_order', new=read_back
+        ), patch(
+            SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+            new=AsyncMock(return_value=verified_delivery()),
+        ):
+            delivered = client.post(
+                '/subscriptions/webhook',
+                json=approved_event(),
+                headers=PAYPAL_HEADERS,
+            )
+
+    assert delivered.status_code == 200
+    assert delivered.json() == {'status': 'processed'}
+    assert read_back.await_count == 1
+
+    db.expire_all()
+    assert db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one().status == 'active'
+
+
+def test_a_provider_refusal_at_capture_is_not_read_back(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    refused = PayPalAPIError(
+        'capture declined',
+        category=CATEGORY_PROVIDER_SERVER,
+        status_code=503,
+    )
+    read_back = AsyncMock()
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_settled_order', new=read_back
+    ):
+        delivered, _ = deliver_approval(
+            client, capture=AsyncMock(side_effect=refused)
+        )
+
+    assert delivered.status_code == 502
+    read_back.assert_not_awaited()
+
+    db.expire_all()
+    assert db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one().status == 'pending'
+    assert db.query(WebhookEvent).count() == 0
+
+
+def test_an_approval_naming_a_foreign_order_activates_nothing(
+    client, db, registered_user, second_registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    delivered, _ = deliver_approval(
+        client, capture=AsyncMock(return_value=_settled())
+    )
+    assert delivered.status_code == 200
+
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == second_registered_user.id
+    ).one().role == 'registered'
+    assert client.get(
+        '/subscriptions/', headers=auth_header_factory(second_registered_user)
+    ).json() is None
+
+
+def test_an_approval_naming_an_unknown_order_activates_nothing(
+    client, db, registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    attempted = AsyncMock(return_value=_settled())
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=verified_approval(),
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order', new=attempted
+    ):
+        response = client.post(
+            '/subscriptions/webhook',
+            json=approved_event(order_id='ORDER-DOES-NOT-EXIST'),
+            headers=PAYPAL_HEADERS,
+        )
+    assert response.status_code == 200
+    assert response.json() == {'status': 'ignored'}
+
+
+def test_a_notification_naming_an_unopened_order_is_ignored(
+    client, db, registered_user, second_registered_user, auth_header_factory
+):
+    assert _open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+
+    ignored, attempted = deliver_approval(
+        client, order_id='ORDER-DOES-NOT-EXIST'
+    )
+    assert ignored.status_code == 200
+    assert ignored.json() == {'status': 'ignored'}
+    assert attempted.await_count == 0
+
+    db.expire_all()
+    assert db.query(SubscriptionModel).filter(
+        SubscriptionModel.paypal_order_id == ORDER_ID
+    ).one().status == 'pending'
+    assert db.query(User).filter(
+        User.id == second_registered_user.id
+    ).one().role == 'registered'
+
+
+def test_the_payer_return_target_is_not_the_first_cors_origin(
+    client, registered_user, monkeypatch, auth_header_factory
+):
+    monkeypatch.setattr(
+        settings,
+        'ALLOWED_ORIGINS',
+        ['https://attacker.example.com', 'http://localhost:3000'],
+    )
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        new=AsyncMock(return_value=_created_order()),
+    ) as opened:
+        assert _post_plan(
+            client, auth_header_factory(registered_user)
+        ).status_code == 200
+    _plan_id, return_url, cancel_url = opened.await_args.args
+    assert return_url == settings.PAYPAL_RETURN_URL
+    assert cancel_url == settings.PAYPAL_CANCEL_URL
+    assert return_url != cancel_url
+    assert settings.ALLOWED_ORIGINS[0] not in return_url
+
+
+def test_both_payer_return_targets_use_the_declared_frontend_path(
+    client, registered_user, auth_header_factory
+):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        new=AsyncMock(return_value=_created_order()),
+    ) as opened:
+        assert _post_plan(
+            client, auth_header_factory(registered_user)
+        ).status_code == 200
+    _plan_id, return_url, cancel_url = opened.await_args.args
+
+    declared = '/subscription'
+    assert urlsplit(settings.PAYPAL_RETURN_URL).path == declared
+    assert urlsplit(settings.PAYPAL_CANCEL_URL).path == declared
+    for target in (return_url, cancel_url):
+        parts = urlsplit(target)
+        assert parts.path == declared
+        assert parts.query
+    assert urlsplit(return_url).query != urlsplit(cancel_url).query
+
+
+def test_expired_entitlement_is_withdrawn_on_retrieval(
+    client, db, registered_user, auth_header_factory
+):
+    started = datetime.now(timezone.utc) - timedelta(days=60)
+    db.add(SubscriptionModel(
+        user_id=registered_user.id,
+        plan_id='premium_monthly',
+        amount=get_plan('premium_monthly').amount,
+        currency='USD',
+        status='active',
+        start_date=started,
+        end_date=started + timedelta(days=30),
+        paypal_order_id='ORDER-EXPIRED-1',
+    ))
+    registered_user.role = 'premium'
+    db.commit()
+
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.status_code == 200
+    assert fetched.json() is None
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'registered'
+
+
+def test_an_administrator_is_never_demoted_on_retrieval(
+    client, db, admin_user, auth_header_factory
+):
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(admin_user)
+    )
+    assert fetched.status_code == 200
+    assert fetched.json() is None
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == admin_user.id
+    ).one().role == 'admin'
+
+
+def _api_routes():
+    pairs = set()
+    for route in app.routes:
+        path = getattr(route, 'path', '')
+        if not path.startswith(API_PREFIXES):
+            continue
+        for method in getattr(route, 'methods', None) or []:
+            if method in ('HEAD', 'OPTIONS'):
+                continue
+            pairs.add((method, path))
+    return pairs
+
+
+def test_every_router_prefix_is_still_mounted():
+    mounted = {path.split('/')[1] for _, path in _api_routes()}
+    assert mounted == {
+        'auth', 'listings', 'filters', 'subscriptions'
+    }
+
+
+def test_the_api_route_surface_is_exactly_the_expected_nine():
+    assert _api_routes() == EXPECTED_API_ROUTES
+
+
+@pytest.mark.parametrize('prefix', sorted(LEGACY_HASHES))
+def test_pre_existing_bcrypt_hashes_still_verify(prefix):
+    stored = LEGACY_HASHES[prefix]
+    assert stored.startswith('$' + prefix + '$')
+    assert verify_password(VALID_TEST_PASSWORD, stored) is True
+    assert verify_password('Wrong-Passw0rd!9', stored) is False
+
+
+@pytest.mark.parametrize('prefix', sorted(LEGACY_HASHES))
+def test_a_pre_existing_hash_is_accepted_at_the_login_endpoint(
+    client, db, prefix
+):
+    email = 'legacy-' + prefix + '@example.com'
+    db.add(User(
+        email=email,
+        hashed_password=LEGACY_HASHES[prefix],
+        created_at=datetime.now(timezone.utc),
+        role='registered',
+    ))
+    db.commit()
+
+    response = client.post('/auth/login', json={
+        'email': email,
+        'password': VALID_TEST_PASSWORD,
+    })
+    assert response.status_code == 200
+    assert 'access_token' in response.json()
+
+
+@pytest.mark.parametrize('stored', MALFORMED_HASHES)
+def test_a_malformed_stored_hash_is_refused_without_raising(stored):
+    assert verify_password(VALID_TEST_PASSWORD, stored) is False
+
+
+def test_a_password_past_the_byte_ceiling_is_refused_cleanly(client):
+    assert len(OVER_LIMIT_PASSWORD.encode()) == 73
+
+    registered = client.post('/auth/register', json={
+        'email': 'toolong@example.com',
+        'password': OVER_LIMIT_PASSWORD,
+    })
+    assert registered.status_code == 422
+    assert registered.status_code < 500
+
+    attempted = client.post('/auth/login', json={
+        'email': 'toolong@example.com',
+        'password': OVER_LIMIT_PASSWORD,
+    })
+    assert attempted.status_code == 422
+    assert attempted.status_code < 500
+
+
+def test_the_shared_test_values_are_held_by_one_module_object():
+    loaded = sorted(
+        name for name in sys.modules
+        if name in ('support', 'backend.tests.support')
+    )
+    assert loaded == ['backend.tests.support']
+    assert 'backend.tests.conftest' not in sys.modules
+    assert REPO_ROOT is sys.modules['backend.tests.support'].REPO_ROOT
+
+
+def test_the_application_entrypoint_imports():
+    module = importlib.import_module('backend.app.main')
+    assert module.app is app
+    assert module.app.routes
+
+
+def test_the_application_entrypoint_imports_in_a_fresh_interpreter():
+    environment = dict(os.environ)
+    environment['PYTHONPATH'] = str(REPO_ROOT)
+    try:
+        completed = subprocess.run(
+            [sys.executable, '-c', 'import backend.app.main'],
+            cwd=str(REPO_ROOT),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=STARTUP_IMPORT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as expired:
+        raise AssertionError(
+            'importing backend.app.main did not finish within '
+            '{0} seconds; stdout={1!r} stderr={2!r}'.format(
+                STARTUP_IMPORT_TIMEOUT_SECONDS,
+                expired.stdout,
+                expired.stderr,
+            )
+        ) from None
+    assert completed.returncode == 0, completed.stderr.decode(
+        'utf-8', 'replace'
+    )
+
+
+PAYPAL_ORDER = {
+    'id': ORDER_ID,
+    'status': 'CREATED',
+    'links': [
+        {'rel': 'self', 'href': 'https://api-m.sandbox.paypal.com/o/1'},
+        {'rel': 'approve', 'href': APPROVAL_URL},
+    ],
+}
+
+
+TRANSMISSION_ID = 'TRANSMISSION-TEST-1'
+
+
+APPROVAL_NOTIFICATION = {
+    'event_type': 'CHECKOUT.ORDER.APPROVED',
+    'resource': {'id': ORDER_ID},
+}
+
+
+def open_subscription(client, headers):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=PAYPAL_ORDER,
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+    ) as capture:
+        created = client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=headers,
+        )
+    capture.assert_not_called()
+    return created
+
+
+def approve_subscription(client, transmission_id=TRANSMISSION_ID):
+    verification = WebhookVerification(
+        verified=True,
+        transmission_id=transmission_id,
+        event_type='CHECKOUT.ORDER.APPROVED',
+    )
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=verification,
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+        return_value=capture_response(),
+    ) as capture:
+        delivered = client.post(
+            '/subscriptions/webhook', json=APPROVAL_NOTIFICATION
+        )
+    return delivered, capture
+
+
+def test_subscription_creation_returns_the_hosted_approval_target(
+    client, registered_user, auth_header_factory
+):
+    created = open_subscription(client, auth_header_factory(registered_user))
+
+    assert created.status_code == 200
+    body = created.json()
+    assert body['user_id'] == registered_user.id
+    assert body['status'] == 'pending'
+    assert body['end_date'] is None
+    assert body['approval_url'] == APPROVAL_URL
+    assert 'paypal_order_id' not in body
+
+
+def test_a_pending_subscription_grants_no_entitlement(
+    client, registered_user, auth_header_factory
+):
+    open_subscription(client, auth_header_factory(registered_user))
+
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.status_code == 200
+    assert fetched.json() is None
+
+
+def test_a_verified_approval_captures_and_activates(
+    client, registered_user, auth_header_factory
+):
+    created = open_subscription(client, auth_header_factory(registered_user))
+    delivered, capture = approve_subscription(client)
+
+    assert delivered.status_code == 200
+    assert capture.call_args.args[1] == ORDER_ID
+
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.status_code == 200
+    body = fetched.json()
+    assert body['id'] == created.json()['id']
+    assert body['status'] == 'active'
+    assert body['end_date'] is not None
+
+
+def test_a_replayed_approval_is_acknowledged_and_captures_once(
+    client, registered_user, auth_header_factory
+):
+    open_subscription(client, auth_header_factory(registered_user))
+    assert approve_subscription(client)[0].status_code == 200
+
+    replayed, capture = approve_subscription(client)
+    assert replayed.status_code == 200
+    assert replayed.json() == {
+        'status': subscriptions_module.OUTCOME_DUPLICATE
+    }
+    capture.assert_not_called()
+
+
+def test_an_unsettled_approval_leaves_no_change(
+    client, registered_user, auth_header_factory
+):
+    open_subscription(client, auth_header_factory(registered_user))
+    verification = WebhookVerification(
+        verified=True,
+        transmission_id=TRANSMISSION_ID,
+        event_type='CHECKOUT.ORDER.APPROVED',
+    )
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=verification,
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+        side_effect=PayPalError('capture refused'),
+    ):
+        unsettled = client.post(
+            '/subscriptions/webhook', json=APPROVAL_NOTIFICATION
+        )
+
+    assert unsettled.status_code == 502
+    assert client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    ).json() is None
+
+    assert approve_subscription(client)[0].status_code == 200
+    assert client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    ).json()['status'] == 'active'
+
+
+def test_an_unverified_notification_changes_nothing(
+    client, registered_user, auth_header_factory
+):
+    open_subscription(client, auth_header_factory(registered_user))
+    verification = WebhookVerification(
+        verified=False, reason='signature_not_verified'
+    )
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.verify_webhook_signature',
+        return_value=verification,
+    ), patch(
+        SUBSCRIPTIONS_MODULE + '.capture_order',
+    ) as capture:
+        rejected = client.post(
+            '/subscriptions/webhook', json=APPROVAL_NOTIFICATION
+        )
+
+    assert rejected.status_code == 400
+    capture.assert_not_called()
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.json() is None
+
+
+OPENED_ORDER = {
+    'id': ORDER_ID,
+    'status': 'CREATED',
+    'links': [
+        {'rel': 'self', 'href': 'https://api-m.sandbox.paypal.com/x'},
+        {'rel': 'approve', 'href': APPROVAL_URL},
+    ],
+}
+
+
+SETTLED_CAPTURE = capture_response()
+
+
+def open_order(client, headers):
+    with patch(
+        SUBSCRIPTIONS_MODULE + '.create_order',
+        return_value=OPENED_ORDER,
+    ):
+        return client.post(
+            '/subscriptions/',
+            json={'plan_id': 'premium_monthly'},
+            headers=headers,
+        )
+
+
+def settle_order(client, order_id=ORDER_ID):
+    return deliver_approval(
+        client,
+        order_id=order_id,
+        capture=AsyncMock(return_value=SETTLED_CAPTURE),
+    )
+
+
+def test_subscription_creation_captures_nothing(
+    client, db, registered_user, auth_header_factory
+):
+    with patch(SUBSCRIPTIONS_MODULE + '.capture_order') as capture:
+        created = open_order(client, auth_header_factory(registered_user))
+    assert created.status_code == 200
+    capture.assert_not_called()
+
+    stored = db.query(SubscriptionModel).one()
+    assert stored.status == 'pending'
+    assert stored.end_date is None
+    assert stored.paypal_order_id == ORDER_ID
+
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'registered'
+
+
+def test_subscription_capture_activates_and_grants_the_plan_role(
+    client, db, registered_user, auth_header_factory
+):
+    created = open_order(client, auth_header_factory(registered_user))
+    assert created.status_code == 200
+
+    settled, capture = settle_order(client)
+    assert settled.status_code == 200
+    capture.assert_awaited_once()
+    assert settled.json() == {'status': 'processed'}
+
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.json()['status'] == 'active'
+    assert fetched.json()['id'] == created.json()['id']
+
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == registered_user.id
+    ).one().role == 'premium'
+
+
+def test_subscription_retrieval_returns_the_settled_row(
+    client, db, registered_user, auth_header_factory
+):
+    created = open_order(client, auth_header_factory(registered_user))
+    settle_order(client)
+
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()['id'] == created.json()['id']
+    assert fetched.json()['status'] == 'active'
+
+
+def test_a_pending_subscription_is_not_reported_as_active(
+    client, db, registered_user, auth_header_factory
+):
+    assert open_order(
+        client, auth_header_factory(registered_user)
+    ).status_code == 200
+    fetched = client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    )
+    assert fetched.status_code == 200
+    assert fetched.json() is None
+
+
+def test_repeating_the_capture_settles_nothing_twice(
+    client, db, registered_user, auth_header_factory
+):
+    open_order(client, auth_header_factory(registered_user))
+    settle_order(client)
+
+    repeated, capture = settle_order(client)
+    assert repeated.status_code == 200
+    assert repeated.json() == {'status': 'processed'}
+    capture.assert_not_awaited()
+    assert client.get(
+        '/subscriptions/', headers=auth_header_factory(registered_user)
+    ).json()['status'] == 'active'
+
+
+def test_a_settlement_entitles_only_the_account_that_opened_it(
+    client, db, registered_user, auth_header_factory
+):
+    open_order(client, auth_header_factory(registered_user))
+    intruder = User(
+        email='intruder@example.com',
+        hashed_password=get_password_hash(VALID_TEST_PASSWORD),
+        created_at=datetime.now(timezone.utc),
+        role='registered',
+    )
+    db.add(intruder)
+    db.commit()
+    db.refresh(intruder)
+
+    bound = {}
+
+    async def recording_capture(session, order_id, current_user, **kwargs):
+        bound['owner_id'] = current_user.id
+        return SETTLED_CAPTURE
+
+    settled, capture = deliver_approval(
+        client, capture=AsyncMock(side_effect=recording_capture)
+    )
+    assert settled.status_code == 200
+    capture.assert_awaited_once()
+    assert bound['owner_id'] == registered_user.id
+
+    db.expire_all()
+    assert db.query(User).filter(
+        User.id == intruder.id
+    ).one().role == 'registered'
+    assert client.get(
+        '/subscriptions/', headers=auth_header_factory(intruder)
+    ).json() is None

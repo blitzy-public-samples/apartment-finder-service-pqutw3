@@ -1,72 +1,884 @@
 name: CI
 
+# CI success is the deployment workflow's release gate.
+
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_call:
+    inputs:
+      verified_ref:
+        description: >-
+          Commit the caller is releasing. Every checkout below resolves to
+          it, so a called run verifies that commit rather than the revision
+          a reusable workflow resolves to by default. Left empty on push
+          and pull_request, where the triggering commit is used.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Commit every checkout below resolves to. A called run receives it from
+  # the caller; a push or pull_request run has no input and falls back to
+  # its own triggering commit.
+  CHECKOUT_REF: ${{ inputs.verified_ref || github.sha }}
+  # Version of the bootstrap installer every job installs before it reads
+  # a manifest. It is pinned here and read from here alone, so the five
+  # installs cannot drift from one another and none of them resolves
+  # whatever release the index happens to serve. The value is the release
+  # the repository is verified with, and it is inventoried in
+  # backend/requirements-dev.txt and docs/security/RESIDUAL_RISK.md.
+  PIP_VERSION: '26.0.1'
 
 jobs:
-  build-and-test:
+  # Security gates, backend tests and the database-backed integration
+  # check. This job declares no dependency on the frontend job, so a
+  # frontend failure cannot prevent these gates from running and
+  # reporting.
+  backend:
+    name: Backend gates and tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    services:
+      # The database the production-dialect tests run against. The tag
+      # matches the major the Compose stack and the Terraform instance
+      # both pin, so a behaviour that differs between majors is seen here
+      # rather than after a deployment.
+      postgres:
+        image: postgres:13-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_placeholder_not_a_credential
+          POSTGRES_DB: apartment_finder_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Settings the migration and integration steps need. No environment
+      # file is read: ENV_FILE is empty, so every value below comes from
+      # the process environment and nothing can be inherited from a file a
+      # runner happened to carry.
+      ENV_FILE: ''
+      ENVIRONMENT: local
+      SECRET_KEY: ci_only_signing_key_7b3f9a1c4e8d2065af5319cbd47e0f82
+      DATABASE_URL: >-
+        postgresql://postgres:ci_placeholder_not_a_credential@localhost:5432/apartment_finder_ci
+      ZILLOW_API_KEY: ci-zillow-key-not-a-real-credential
+      PAYPAL_CLIENT_ID: ci-paypal-client-id-not-real
+      PAYPAL_CLIENT_SECRET: ci-paypal-client-secret-not-real
+      PAYPAL_WEBHOOK_ID: ci-paypal-webhook-id-not-real
+      SENDGRID_API_KEY: ci-sendgrid-key-not-a-real-credential
+      # The production-dialect tests read their server from the first
+      # name and refuse to be skipped because of the second, so a runner
+      # without a reachable database fails this job instead of quietly
+      # reporting success over a suite that never ran.
+      POSTGRES_TEST_URL: >-
+        postgresql://postgres:ci_placeholder_not_a_credential@localhost:5432/apartment_finder_ci
+      REQUIRE_POSTGRES_TESTS: '1'
 
     steps:
-    - uses: actions/checkout@v2
+    # Every action is referenced by the commit its release tag pointed at,
+    # so a tag repointed at different code cannot change what this workflow
+    # runs. Every checkout resolves CHECKOUT_REF, so a called run reads the
+    # commit its caller is releasing.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
+        fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
       with:
         python-version: '3.9'
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v2
+    - name: Install Python dependencies
+      run: |
+        set -euo pipefail
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
+        pip install -r backend/requirements.txt
+        pip install -r backend/requirements-dev.txt
+        # The audit instrument, declared apart from the manifests it reads
+        # so its own dependency tree is not one of them.
+        pip install -r backend/requirements-audit.txt
+
+    - name: Check the secret and ignore policy
+      run: |
+        bash .github/scripts/check_secret_policy.sh
+
+    - name: Run Flake8
+      run: |
+        set -euo pipefail
+        cd backend
+        flake8 .
+
+    - name: Run pip-audit against the runtime manifest
+      run: |
+        set -euo pipefail
+        # Each audited manifest is audited against its own register in
+        # docs/security/RESIDUAL_RISK.md: the runtime identifiers below
+        # are the "Runtime register" set, and the development identifier
+        # in the next step is the "Development register" set. Eight
+        # identifiers are suppressed in total across the two.
+        #
+        # backend/requirements-audit.txt is not audited. It declares the
+        # instrument performing the audit, whose own dependency tree is
+        # tooling rather than this project's dependency surface.
+        #
+        # These seven are the runtime register. Each is recorded there with
+        # the version that fixes it, the reason that version is unreachable
+        # under the pinned interpreter, and its compensating control.
+        pip-audit --strict -r backend/requirements.txt \
+          --ignore-vuln PYSEC-2026-161 \
+          --ignore-vuln PYSEC-2026-248 \
+          --ignore-vuln PYSEC-2026-249 \
+          --ignore-vuln PYSEC-2026-2280 \
+          --ignore-vuln PYSEC-2026-2281 \
+          --ignore-vuln PYSEC-2026-2270 \
+          --ignore-vuln PYSEC-2026-2132
+
+    - name: Run pip-audit against the development manifest
+      run: |
+        set -euo pipefail
+        # This one is a separate, development-only set. It reaches no
+        # deployed artifact. Its authority is the Development register
+        # section of docs/security/RESIDUAL_RISK.md, and it is inventoried
+        # in the comment block at backend/requirements-dev.txt.
+        pip-audit --strict -r backend/requirements-dev.txt \
+          --ignore-vuln PYSEC-2026-1845
+
+    - name: Run Bandit
+      run: |
+        set -euo pipefail
+        bandit -r backend/app -ll
+
+    - name: Check python-multipart is absent
+      run: |
+        set -euo pipefail
+        ! pip show python-multipart
+
+    - name: Check residual advisory reachability
+      run: |
+        set -euo pipefail
+        ! grep -rEn "request\.form|request\.url|StaticFiles|HTTPEndpoint|Route\(|set_key|unset_key|\bclick\b" \
+            --include=*.py backend/app/
+
+    - name: Check the application starts
+      run: |
+        python -c "import backend.app.main"
+
+    - name: Apply and reverse the migrations
+      run: |
+        set -euo pipefail
+
+        cd backend
+        # Every revision must apply, reverse one step at a time to the base
+        # and reapply, which is what makes the schema change reversible from
+        # the code. Reaching the base is read back from the database below
+        # rather than assumed; that each revision reverses independently is
+        # asserted by backend/tests/security/test_migration_gate.py.
+        alembic upgrade head
+        alembic current
+
+        # The reversal takes one step per revision in the chain, and the
+        # number of steps is read from the chain, so a revision added later
+        # is reversed by this gate without it being edited.
+        revisions="$(python - <<'PY'
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        chain = ScriptDirectory.from_config(Config("alembic.ini"))
+        print(len(list(chain.walk_revisions())))
+        PY
+        )"
+
+        for _ in $(seq 1 "$revisions"); do
+          alembic downgrade -1
+          alembic current
+        done
+
+        python - <<'PY'
+        import os
+
+        from sqlalchemy import create_engine, inspect, text
+
+        engine = create_engine(os.environ["DATABASE_URL"])
+        with engine.connect() as connection:
+            remaining = sorted(inspect(connection).get_table_names())
+            stamped = connection.execute(
+                text("select count(*) from alembic_version")
+            ).scalar()
+        assert remaining == ["alembic_version"], remaining
+        assert stamped == 0, stamped
+        print("the reversal reached the base")
+        PY
+
+        alembic upgrade head
+        alembic current
+
+    - name: Check exactly one administrator holds the role
+      run: |
+        set -euo pipefail
+
+        python - <<'PY'
+        import os
+
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(os.environ["DATABASE_URL"])
+        with engine.connect() as connection:
+            administrators = connection.execute(
+                text("select count(*) from users where role = 'admin'")
+            ).scalar()
+            others = connection.execute(
+                text("select count(*) from users where role <> 'admin'")
+            ).scalar()
+        assert administrators == 1, administrators
+        assert others == 0, others
+        print("exactly one administrator, %d other accounts" % others)
+        PY
+
+    # The two steps below partition the backend suite: the security subtree
+    # runs here and is excluded from the step after it, so each test is
+    # executed exactly once while the two gates still report separately.
+    # Coverage is measured across both runs, and the floor declared in
+    # setup.cfg is enforced by the second one, which appends to the data
+    # this one records.
+    - name: Run backend security tests
+      run: |
+        python -m pytest backend/tests/security -q \
+          --cov=backend/app \
+          --cov-report= \
+          --cov-fail-under=0
+
+    - name: Run backend unit tests
+      run: |
+        python -m pytest backend/tests \
+          --ignore=backend/tests/security \
+          --cov=backend/app \
+          --cov-append \
+          --cov-report=xml:backend/coverage.xml
+
+    - name: Run the production-dialect integration tests
+      run: |
+        # The cases marked postgres are the ones that cannot be trusted on
+        # SQLite: the migration revisions on the real dialect, the schema
+        # each added column reaches, the row lock two concurrent failed
+        # logins contend for, and the unique index a repeated webhook
+        # delivery blocks on. REQUIRE_POSTGRES_TESTS is set for this job,
+        # so an unreachable server fails these rather than skipping them.
+        python -m pytest backend/tests -m postgres -q
+
+  runtime-integration:
+    name: Integration
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:13-alpine
+        env:
+          POSTGRES_DB: apartment_finder
+          POSTGRES_USER: apartment_finder
+          POSTGRES_PASSWORD: ci_only_not_a_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U apartment_finder -d apartment_finder"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    # ENV_FILE is deliberately empty: no environment file is read, so every
+    # setting below arrives from the process environment and nothing is
+    # inherited from a file a developer happens to keep. ENVIRONMENT is local,
+    # which is what allows the non-functional provider placeholders here.
+    # None of these values is a credential.
+    env:
+      ENV_FILE: ''
+      ENVIRONMENT: local
+      DATABASE_URL: postgresql://apartment_finder:ci_only_not_a_secret@127.0.0.1:5432/apartment_finder
+      SECRET_KEY: ci-signing-key-not-a-secret-Qz7#mV
+      ZILLOW_API_KEY: ci_zillow_key_value
+      PAYPAL_CLIENT_ID: ci_paypal_client_id
+      PAYPAL_CLIENT_SECRET: ci_paypal_client_secret
+      PAYPAL_WEBHOOK_ID: ci_paypal_webhook_id
+      SENDGRID_API_KEY: ci_sendgrid_key_value
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        node-version: '14'
+        ref: ${{ env.CHECKOUT_REF }}
+
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.9'
 
     - name: Install Python dependencies
       run: |
-        python -m pip install --upgrade pip
+        set -euo pipefail
+
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
         pip install -r backend/requirements.txt
+        pip install -r backend/requirements-dev.txt
+
+    - name: Apply the migrations, then reverse and reapply them
+      run: |
+        set -euo pipefail
+
+        # Every revision must apply, reverse one step at a time and reapply,
+        # which is what makes the schema change reversible from the code. The
+        # number of reversal steps is read from the chain, so a revision added
+        # later is reversed by this gate without it being edited.
+        python -m alembic -c backend/alembic.ini upgrade head
+        python -m alembic -c backend/alembic.ini current
+
+        revisions="$(python - <<'PY'
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        chain = ScriptDirectory.from_config(Config("backend/alembic.ini"))
+        print(len(list(chain.walk_revisions())))
+        PY
+        )"
+
+        for _ in $(seq 1 "$revisions"); do
+          python -m alembic -c backend/alembic.ini downgrade -1
+          python -m alembic -c backend/alembic.ini current
+        done
+
+        python - <<'PY'
+        import os
+
+        from sqlalchemy import create_engine, inspect, text
+
+        engine = create_engine(os.environ["DATABASE_URL"])
+        with engine.connect() as connection:
+            remaining = sorted(inspect(connection).get_table_names())
+            stamped = connection.execute(
+                text("select count(*) from alembic_version")
+            ).scalar()
+        assert remaining == ["alembic_version"], remaining
+        assert stamped == 0, stamped
+        print("the reversal reached the base")
+        PY
+
+        python -m alembic -c backend/alembic.ini upgrade head
+        python -m alembic -c backend/alembic.ini current
+
+    - name: Assert exactly one account holds the administrative role
+      run: |
+        set -euo pipefail
+
+        python - <<'PY'
+        from sqlalchemy import create_engine, text
+        from backend.app.core.config import settings
+
+        engine = create_engine(settings.DATABASE_URL)
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text("SELECT email FROM users WHERE role = 'admin'")
+            ).fetchall()
+        assert len(rows) == 1, f"expected one administrator, found {rows}"
+        print("administrator:", rows[0][0])
+        PY
+
+    - name: Verify the application starts
+      run: |
+        python -c "import backend.app.main"
+
+    - name: Serve the application and exercise it over HTTP
+      run: |
+        set -euo pipefail
+
+        python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 \
+          --no-proxy-headers &
+        server=$!
+        trap 'kill "$server" 2>/dev/null || true' EXIT
+
+        for attempt in $(seq 1 30); do
+          if curl --fail --silent --show-error http://127.0.0.1:8000/health; then
+            break
+          fi
+          if [ "$attempt" -eq 30 ]; then
+            echo "the application did not answer /health"
+            exit 1
+          fi
+          sleep 2
+        done
+
+        # Readiness answers 503 while the database is unusable, so this asserts
+        # the schema the migrations installed is reachable, not merely that the
+        # process is up.
+        curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
+
+        # One real request through the database, the password hasher and the
+        # token minter: register an account, then sign in as it and require a
+        # bearer token in the documented response shape.
+        python - <<'PY'
+        import json
+        import urllib.request
+        import uuid
+
+        BASE = "http://127.0.0.1:8000"
+        # A fresh address each run, so this step is repeatable and never
+        # answered with the duplicate-account refusal.
+        CREDENTIALS = {
+            "email": f"ci-integration-{uuid.uuid4().hex}@example.com",
+            "password": "Ci_Integration_2026!aB",
+        }
+
+        def post(path, payload):
+            request = urllib.request.Request(
+                BASE + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return response.status, json.loads(response.read())
+
+        status, _ = post("/auth/register", CREDENTIALS)
+        assert status == 200, f"registration answered {status}"
+
+        status, body = post("/auth/login", CREDENTIALS)
+        assert status == 200, f"login answered {status}"
+        assert body.get("token_type") == "bearer", body
+        assert body.get("access_token"), "login returned no access token"
+
+        listings = urllib.request.urlopen(BASE + "/listings/", timeout=15)
+        assert listings.status == 200, "the public listings read is not reachable"
+        print("integration checks passed")
+        PY
+
+  # The suite above builds its schema on in-memory SQLite. This job runs
+  # the migration and persistence cases against the dialect the service is
+  # deployed on, so the DDL the revisions emit, the transaction the grant
+  # revision rolls back, the row lock the login lockout depends on, the
+  # fixed-scale numeric the subscription amount is stored as, the
+  # timezone-aware instant the lock expiry is stored as, and the two named
+  # uniqueness constraints are all exercised on PostgreSQL 13. That is the
+  # version infrastructure/docker/docker-compose.yml and
+  # infrastructure/terraform/main.tf both pin.
+  postgres-integration:
+    name: PostgreSQL 13 migration and persistence
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_DB: apartment_finder_test
+          POSTGRES_USER: apartment_finder
+          POSTGRES_PASSWORD: apartment_finder_ci_not_a_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U apartment_finder -d apartment_finder_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      POSTGRES_TEST_DATABASE_URL: postgresql+psycopg2://apartment_finder:apartment_finder_ci_not_a_secret@127.0.0.1:5432/apartment_finder_test
+      # Turns a case that would be skipped for want of a database into a
+      # failure, so a service that did not start cannot leave this job
+      # green for having run nothing.
+      POSTGRES_TEST_REQUIRED: "true"
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
+
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.9'
+
+    - name: Install Python dependencies
+      run: |
+        set -euo pipefail
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
+        pip install -r backend/requirements.txt
+        pip install -r backend/requirements-dev.txt
+
+    - name: Report the database version
+      run: |
+        set -euo pipefail
+        python - <<'PY'
+        import os
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(os.environ["POSTGRES_TEST_DATABASE_URL"])
+        with engine.connect() as connection:
+            print(connection.execute(text("SELECT version()")).scalar())
+        engine.dispose()
+        PY
+
+    - name: Run the PostgreSQL migration and persistence suite
+      run: |
+        set -euo pipefail
+        # --no-cov because this job measures database behaviour rather than
+        # application coverage, which the unit job above reports.
+        # POSTGRES_TEST_REQUIRED makes a case that cannot reach the service
+        # fail rather than skip.
+        python -m pytest backend/tests/integration -v --no-cov
+
+  integration:
+    name: Integration gate
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:13-alpine
+        env:
+          POSTGRES_DB: apartment_finder
+          POSTGRES_USER: apartment_finder
+          POSTGRES_PASSWORD: apartment_finder_ci_not_a_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U apartment_finder -d apartment_finder"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      ENVIRONMENT: local
+      DATABASE_URL: postgresql://apartment_finder:apartment_finder_ci_not_a_secret@127.0.0.1:5432/apartment_finder
+      SECRET_KEY: ci7Gk2Qm9Vb4Xt6Ln1Rw3Ys8Zc5Jf0Ad2Ph
+      JWT_ALGORITHMS: '["HS256"]'
+      JWT_ISSUER: apartment-finder-service
+      JWT_AUDIENCE: apartment-finder-web
+      # The origins the frontend is served under, in both loopback
+      # spellings and with the default port omitted as a browser omits it.
+      # The API's own origin is not one of them.
+      ALLOWED_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000","http://localhost","http://127.0.0.1"]'
+      ALLOWED_HOSTS: '["127.0.0.1","localhost"]'
+      # An origin outside the list above, used to prove a refusal.
+      FOREIGN_ORIGIN: https://attacker.example.com
+      RATE_LIMIT_STORAGE_URI: bounded-memory://
+      ZILLOW_API_KEY: ci_zillow_api_key_value
+      PAYPAL_CLIENT_ID: ci_paypal_client_id_value
+      PAYPAL_CLIENT_SECRET: ci_paypal_client_secret_value
+      PAYPAL_WEBHOOK_ID: ci_paypal_webhook_id_value
+      SENDGRID_API_KEY: ci_sendgrid_api_key_value
+      BASE_URL: http://127.0.0.1:8000
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
+
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.9'
+
+    - name: Install Python dependencies
+      run: |
+        set -euo pipefail
+
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
+        pip install -r backend/requirements.txt
+
+    - name: Apply database migrations
+      run: |
+        set -euo pipefail
+        python -m alembic -c backend/alembic.ini upgrade head
+
+    - name: Confirm exactly one administrator exists
+      run: |
+        set -euo pipefail
+        holders="$(psql "$DATABASE_URL" -tAc \
+          "SELECT count(*) FROM users WHERE role = 'admin'")"
+        others="$(psql "$DATABASE_URL" -tAc \
+          "SELECT count(*) FROM users WHERE role <> 'registered' AND role <> 'admin'")"
+        echo "administrators=$holders other-roles=$others"
+        test "$holders" = "1"
+        test "$others" = "0"
+
+    - name: Start the API
+      run: |
+        set -euo pipefail
+        nohup python -m uvicorn backend.app.main:app \
+          --host 127.0.0.1 --port 8000 --no-proxy-headers > uvicorn.log 2>&1 &
+        echo "$!" > uvicorn.pid
+        for attempt in $(seq 1 30); do
+          if curl --fail --silent "$BASE_URL/health" > /dev/null; then
+            echo "the API answered on attempt $attempt"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "the API did not answer on $BASE_URL/health"
+        cat uvicorn.log
+        exit 1
+
+    - name: Probe liveness and readiness
+      run: |
+        set -euo pipefail
+        curl --fail --silent --show-error "$BASE_URL/health" > /dev/null
+        curl --fail --silent --show-error "$BASE_URL/health/ready" > /dev/null
+        echo "liveness and readiness both answered"
+
+    - name: Probe the public listing read
+      run: |
+        set -euo pipefail
+        status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+          "$BASE_URL/listings/?limit=1")"
+        echo "anonymous GET /listings/ -> $status"
+        test "$status" = "200"
+
+    - name: Probe the cross-origin preflight from each served origin
+      run: |
+        set -euo pipefail
+
+        # Every origin the frontend is served under must survive a
+        # credentialed preflight and be echoed back exactly, since an
+        # origin is matched as a whole string and a browser sends the one
+        # it was addressed by.
+        for origin in \
+          http://localhost:3000 \
+          http://127.0.0.1:3000 \
+          http://localhost \
+          http://127.0.0.1
+        do
+          headers="$(curl --silent --show-error --dump-header - --output /dev/null \
+            -X OPTIONS \
+            -H "Origin: $origin" \
+            -H 'Access-Control-Request-Method: POST' \
+            -H 'Access-Control-Request-Headers: content-type,authorization' \
+            "$BASE_URL/auth/login")"
+
+          status="$(printf '%s' "$headers" | head -n 1)"
+          echo "preflight from $origin -> $status"
+          printf '%s' "$status" | grep -q ' 200 '
+          printf '%s' "$headers" \
+            | grep -qi "^access-control-allow-origin: $origin"'\r\?$'
+          printf '%s' "$headers" \
+            | grep -qi '^access-control-allow-credentials: true'
+          if printf '%s' "$headers" | grep -qi 'allow-origin: \*'; then
+            echo 'a credentialed response named a wildcard origin'
+            exit 1
+          fi
+        done
+
+        # An origin outside the list is refused, and no allow-origin
+        # header is returned for it.
+        refused="$(curl --silent --show-error --dump-header - --output /dev/null \
+          -X OPTIONS \
+          -H "Origin: $FOREIGN_ORIGIN" \
+          -H 'Access-Control-Request-Method: POST' \
+          "$BASE_URL/auth/login")"
+        echo "preflight from $FOREIGN_ORIGIN -> $(printf '%s' "$refused" | head -n 1)"
+        printf '%s' "$refused" | head -n 1 | grep -q ' 400 '
+        if printf '%s' "$refused" | grep -qi '^access-control-allow-origin:'; then
+          echo 'the refused origin was answered with an allow-origin header'
+          exit 1
+        fi
+
+    - name: Probe registration, login and the role refusal
+      run: |
+        set -euo pipefail
+
+        address="ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT@example.com"
+        secret='TestPassw0rd!2024'
+        body="$(printf '{"email":"%s","password":"%s"}' "$address" "$secret")"
+
+        registered="$(curl --fail --silent --show-error \
+          -H 'Content-Type: application/json' \
+          -d "$body" "$BASE_URL/auth/register")"
+        echo "$registered" | python -c \
+          'import json,sys; d=json.load(sys.stdin); assert d["token_type"]=="bearer"; assert d["access_token"]; assert d["user"]["email"]'
+
+        signed_in="$(curl --fail --silent --show-error \
+          -H 'Content-Type: application/json' \
+          -d "$body" "$BASE_URL/auth/login")"
+        token="$(echo "$signed_in" | python -c \
+          'import json,sys; d=json.load(sys.stdin); assert sorted(d)==["access_token","token_type"]; print(d["access_token"])')"
+
+        listing='{"address":"1 Integration Way","price":1000,"bedrooms":1,"bathrooms":1}'
+
+        anonymous="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+          -H 'Content-Type: application/json' \
+          -d "$listing" "$BASE_URL/listings/")"
+        echo "anonymous POST /listings/ -> $anonymous"
+        test "$anonymous" = "401"
+
+        as_registered="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+          -H 'Content-Type: application/json' \
+          -H "Authorization: Bearer $token" \
+          -d "$listing" "$BASE_URL/listings/")"
+        echo "registered POST /listings/ -> $as_registered"
+        test "$as_registered" = "403"
+
+        owned="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+          -H "Authorization: Bearer $token" "$BASE_URL/filters/")"
+        echo "registered GET /filters/ -> $owned"
+        test "$owned" = "200"
+
+    - name: Stop the API
+      if: always()
+      run: |
+        set -euo pipefail
+
+        if [ -f uvicorn.pid ]; then
+          kill "$(cat uvicorn.pid)" || echo "the API had already stopped"
+        fi
+        if [ -f uvicorn.log ]; then
+          cat uvicorn.log
+        fi
+
+  frontend:
+    name: Frontend gates
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ env.CHECKOUT_REF }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      with:
+        node-version: '22'
 
     - name: Install Node.js dependencies
       run: |
+        set -euo pipefail
+
         cd frontend
         npm ci
 
     - name: Run ESLint
+      env:
+        # Enforce the documented frontend warning budget while preserving
+        # the report artifact.
+        ESLINT_WARNING_BUDGET: '8'
       run: |
-        cd frontend
-        npm run lint
+        set -euo pipefail
 
-    - name: Run Flake8
+        cd frontend
+        npx --no-install eslint src --ext .ts,.tsx,.js,.jsx \
+          -f json -o eslint-report.json || true
+
+        node ../.github/scripts/check_frontend_lint_budget.js \
+          eslint-report.json
+
+    - name: Upload the ESLint report
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: frontend-eslint
+        path: frontend/eslint-report.json
+
+    - name: Audit the frontend dependency tree
       run: |
-        cd backend
-        flake8 .
+        set -euo pipefail
+
+        cd frontend
+
+        # npm exits non-zero while any advisory remains, which says nothing
+        # about whether the advisory is one the register already carries, so
+        # each report is written here and judged by the gate below. The two
+        # trees are judged separately: the first is what the client would
+        # ship with, the second adds the build and test toolchain.
+        npm audit --omit=dev --json > npm-audit-production.json || true
+        npm audit --json > npm-audit-full.json || true
+
+        node ../.github/scripts/check_frontend_audit_budget.js \
+          npm-audit-production.json production
+        node ../.github/scripts/check_frontend_audit_budget.js \
+          npm-audit-full.json full
+
+    - name: Upload the frontend audit reports
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: frontend-npm-audit
+        path: |
+          frontend/npm-audit-production.json
+          frontend/npm-audit-full.json
 
     - name: Run frontend unit tests
       run: |
+        set -euo pipefail
+
+        # The workspace carries no test file. --passWithNoTests reports that
+        # honestly instead of failing, and the step still fails if a test is
+        # added and does not pass.
         cd frontend
-        npm test -- --coverage
-
-    - name: Run backend unit tests
-      run: |
-        cd backend
-        python -m pytest --cov=./ --cov-report=xml
-
-    - name: Run integration tests
-      run: |
-        # HUMAN ASSISTANCE NEEDED
-        # Add commands to run integration tests. This might involve setting up a test database,
-        # starting both frontend and backend services, and running end-to-end tests.
+        npm test -- --coverage --watchAll=false --passWithNoTests
 
     - name: Upload frontend test coverage
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: frontend-coverage
         path: frontend/coverage
 
-    - name: Upload backend test coverage
-      uses: actions/upload-artifact@v2
+  infrastructure:
+    name: Infrastructure definitions
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        name: backend-coverage
-        path: backend/coverage.xml
+        ref: ${{ env.CHECKOUT_REF }}
+
+    - name: Set up Python
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.9'
+
+    - name: Install Python dependencies
+      run: |
+        set -euo pipefail
+
+        python -m pip install --upgrade "pip==${PIP_VERSION}"
+        pip install -r backend/requirements.txt
+        pip install -r backend/requirements-dev.txt
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+      with:
+        # Exact release rather than a range, so the binary this job runs is
+        # the one the configuration is verified with. It also clears the 1.11
+        # floor the ephemeral input variables and write-only secret arguments
+        # in infrastructure/terraform/main.tf need. That file declares no
+        # required_version of its own; docs/security/DECISION_LOG.md rows
+        # 91.1.1 and 96.1.1 own that.
+        terraform_version: 1.15.8
+        terraform_wrapper: false
+
+    - name: Validate the Terraform configuration
+      run: |
+        set -euo pipefail
+
+        cd infrastructure/terraform
+        terraform fmt -check -recursive
+        terraform init -backend=false -input=false
+        terraform validate
+
+    - name: Check the deployment manifests against the settings contract
+      run: |
+        set -euo pipefail
+
+        # Run the reusable contract checker.
+        python .github/scripts/check_manifest_settings_contract.py

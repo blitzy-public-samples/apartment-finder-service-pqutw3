@@ -1,0 +1,43 @@
+# Development and verification dependencies for CPython 3.9.
+# Install with: pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+# Accepted advisory details are documented in docs/security/RESIDUAL_RISK.md.
+
+# --- Test framework ----------------------------------------------------------
+pytest==8.4.2
+pytest-asyncio==1.2.0
+pytest-cov==7.1.0
+httpx==0.28.1
+
+# --- Static analysis ---------------------------------------------------------
+bandit==1.8.6
+
+# --- Lint --------------------------------------------------------------------
+flake8==7.3.0
+
+# --- Declaration parsing -----------------------------------------------------
+# Reads infrastructure/docker/docker-compose.yml in
+# backend/tests/security/test_deployment_contract.py. Resolved as a
+# dependency of bandit and pinned here at the resolved version.
+PyYAML==6.0.3
+
+# --- Mail-client types the tests assert against ------------------------------
+# Imported by backend/tests/test_services.py, which drives the SendGrid
+# client through its own client and exception classes rather than restating
+# them. Resolved as a dependency of sendgrid in backend/requirements.txt and
+# pinned here at the resolved version, so the import a test depends on is
+# declared by the manifest that installs the tests rather than left to a
+# transitive resolution.
+python-http-client==3.3.7
+
+# --- Bootstrap installer, inventoried rather than declared --------------------
+#
+#   pip==26.0.1
+#
+# The installer that reads this file. It is not a requirement line: pip
+# cannot install itself from a manifest it is resolving, and a line here
+# would place it inside the audited set it is the tool for. It is pinned
+# once, at workflow scope in .github/workflows/ci.yml as PIP_VERSION, and
+# every job that installs a manifest reads that value, so the five installs
+# cannot drift and none resolves whatever release the index serves at the
+# moment the gate runs. Its inventory entry is here and its record is in
+# docs/security/RESIDUAL_RISK.md.

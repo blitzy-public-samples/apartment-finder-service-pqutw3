@@ -1,0 +1,19 @@
+# Line-ending policy for this repository. This file states what each
+# directive does; the rationale is recorded in
+# docs/security/DECISION_LOG.md row 96.8.1.
+#
+# `* text=auto` normalises every text file to LF in the committed blob and
+# lets a checkout follow the platform convention, so a Windows working tree
+# with core.autocrlf=true may hold CRLF while the blob stays LF.
+#
+# `*.sh text eol=lf` additionally checks shell scripts out with LF on every
+# platform. Four of them are executed by a POSIX shell:
+# scripts/deploy.sh and scripts/render_kubernetes_manifests.sh by the
+# release path, .github/scripts/check_secret_policy.sh by the `backend` job
+# of .github/workflows/ci.yml, and scripts/setup_dev_environment.sh by
+# backend/tests/security/test_deployment_contract.py.
+#
+# Adding this file changes no committed blob: no tracked blob in this
+# repository carries a carriage return.
+* text=auto
+*.sh text eol=lf

@@ -1,62 +1,965 @@
 name: Continuous Deployment
 
+# Deploy only the commit from a successful completed CI run.
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One release at a time, and a release in flight is never cancelled: it
+# publishes images, applies Alembic revisions and rolls two Deployments
+# forward, and a run stopped between those steps leaves the cluster
+# part-way through them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
 
 env:
+  # Release target. PROJECT_ID and GKE_CLUSTER are repository secrets;
+  # the rest are repository variables, because none of them is a
+  # credential. Every one is required and is validated before it reaches
+  # a command line.
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GKE_CLUSTER: ${{ secrets.GKE_CLUSTER_NAME }}
-  GKE_ZONE: ${{ secrets.GKE_CLUSTER_ZONE }}
+  # The cluster infrastructure/terraform/main.tf creates is regional: its
+  # location is var.region and it is addressed with --region. The
+  # kubernetes_cluster_location output carries the value this variable
+  # must hold.
+  GKE_REGION: ${{ vars.GKE_CLUSTER_REGION }}
+  # Namespace the manifests declare. It must equal the Terraform variable
+  # kubernetes_namespace, which the kubernetes_namespace output carries.
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'apartment-finder' }}
+  # Registry the images are published to and pulled from. Its host is
+  # <location>-docker.pkg.dev, which is the Artifact Registry repository
+  # Terraform provisions. The retired container-registry host is named
+  # nowhere in this workflow.
+  REGISTRY_LOCATION: ${{ vars.ARTIFACT_REGISTRY_LOCATION || vars.GKE_CLUSTER_REGION }}
+  # Two names for one repository, both read below and both resolved
+  # from the same repository variable so they cannot disagree: the
+  # short name composes the registry path in the build job, the long
+  # name is the one the release script and its input checks use.
+  REGISTRY_REPOSITORY: ${{ vars.ARTIFACT_REGISTRY_REPOSITORY || 'apartment-finder' }}
+  ARTIFACT_REGISTRY_REPOSITORY: ${{ vars.ARTIFACT_REGISTRY_REPOSITORY || 'apartment-finder' }}
+  # The commit CI verified, which is what is built, published and rolled
+  # out. It is not github.sha: a workflow_run event carries the workflow
+  # file's commit there, which need not be the commit that was verified.
+  VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+  RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+  IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+  RELEASE_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+  # Name google_cloudfunctions_function.function is deployed under,
+  # matching the cloud_function_name output of
+  # infrastructure/terraform/outputs.tf.
+  CLOUD_FUNCTION_NAME: ${{ vars.CLOUD_FUNCTION_NAME || 'apartment-finder-probe' }}
+  # Whether the function exists to be verified. It mirrors the Terraform
+  # variable and the release script's input of the same name, and defaults
+  # to false for the same reason both of those do: the function's runtime
+  # pin names a runtime Cloud Functions has decommissioned, so the resource
+  # is not created until a release owner decides that conflict. The invoker
+  # policy check below is gated on it, because a check that describes a
+  # function nothing created fails the deployment over infrastructure the
+  # default configuration deliberately does not provision.
+  CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED: ${{ vars.CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED || 'false' }}
+  # Kubernetes service account the workloads run as, and the Google
+  # identity its workload-identity annotation must name. The second is
+  # the backend_runtime_service_account_email output.
+  K8S_SERVICE_ACCOUNT: ${{ vars.K8S_SERVICE_ACCOUNT || 'backend' }}
+  BACKEND_RUNTIME_SERVICE_ACCOUNT: ${{ secrets.BACKEND_GCP_SERVICE_ACCOUNT_EMAIL }}
+  # Bounds on every readiness probe below, so a probe cannot hang.
+  CURL_CONNECT_TIMEOUT: '5'
+  CURL_MAX_TIME: '15'
+  # Image definitions. Neither sits inside the context it builds, so
+  # every build below names its Dockerfile explicitly rather than
+  # relying on a default one that does not exist.
+  BACKEND_DOCKERFILE: infrastructure/docker/Dockerfile.backend
+  FRONTEND_DOCKERFILE: infrastructure/docker/Dockerfile.frontend
+  # The two build arguments infrastructure/docker/Dockerfile.frontend
+  # declares. Create React App inlines them into the published bundle, so
+  # both are public values and both are repository variables -- the same
+  # context the manifest-rendering step below reads PAYPAL_CLIENT_ID from,
+  # and the context README.md documents them under. Neither is a secret,
+  # and the PayPal client secret is never a build argument.
+  REACT_APP_API_BASE_URL: ${{ vars.REACT_APP_API_BASE_URL }}
+  REACT_APP_PAYPAL_CLIENT_ID: ${{ vars.PAYPAL_CLIENT_ID }}
 
 jobs:
-  deploy:
-    name: Deploy to GCP
+  # Validate the release target before any build or deployment job runs.
+  preflight:
+    name: Confirm the deployment path exists
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == 'main'
+      && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
+    - name: Checkout the verified commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.workflow_run.head_sha }}
+
+    - name: Confirm the cluster jobs have a runner inside the VPC
+      env:
+        RUNNER_LABEL: ${{ vars.GKE_DEPLOY_RUNNER_LABEL }}
+      run: |
+        set -euo pipefail
+
+        # infrastructure/terraform/main.tf disables the public control-plane
+        # endpoint, so kubectl reaches the API server only from a private
+        # address inside an authorized range. A GitHub-hosted runner has
+        # neither. The cluster jobs below therefore run on a self-hosted
+        # runner placed in the VPC, named by the repository variable
+        # GKE_DEPLOY_RUNNER_LABEL, and this step refuses the run when that
+        # variable is unset or names a hosted image.
+        if [ -z "${RUNNER_LABEL}" ]; then
+          echo "::error::GKE_DEPLOY_RUNNER_LABEL is not set. Register a" \
+            "self-hosted runner inside the VPC, add its CIDR to" \
+            "var.gke_master_authorized_networks, and set the repository" \
+            "variable to that runner's label."
+          exit 1
+        fi
+
+        # Each image is a separate quoted word, so the list is read as
+        # written rather than by splitting one value on whitespace.
+        for label in \
+          "ubuntu-latest" "ubuntu-24.04" "ubuntu-22.04" "ubuntu-20.04" \
+          "windows-latest" "windows-2025" "windows-2022" "windows-2019" \
+          "macos-latest" "macos-15" "macos-14" "macos-13"; do
+          if [ "${RUNNER_LABEL}" = "${label}" ]; then
+            echo "::error::GKE_DEPLOY_RUNNER_LABEL names the hosted image" \
+              "${label}, which has no network path to a private control" \
+              "plane. Name a self-hosted runner inside the VPC instead."
+            exit 1
+          fi
+        done
+        echo "Cluster jobs will run on the self-hosted label ${RUNNER_LABEL}."
+
+    - name: Confirm the public frontend build values are present
+      env:
+        # Both are inlined into the built bundle and read by the browser, so
+        # neither is a credential and both are repository variables. The
+        # manifest-render step in the deploy job reads PAYPAL_CLIENT_ID from
+        # vars as well, and README.md documents both as variables.
+        REACT_APP_API_BASE_URL: ${{ vars.REACT_APP_API_BASE_URL }}
+        PAYPAL_CLIENT_ID: ${{ vars.PAYPAL_CLIENT_ID }}
+      run: |
+        set -euo pipefail
+
+        # An undefined repository variable expands to the empty string, and
+        # `react-scripts build` inlines an empty value without complaint, so
+        # the bundle would be published addressing "/api/..." with no origin
+        # and offering no PayPal client id. Neither failure is visible until a
+        # browser runs the bundle, which is after the release has reported
+        # success. This step names the missing value before anything is built.
+        missing=""
+        for name in REACT_APP_API_BASE_URL PAYPAL_CLIENT_ID; do
+          eval "value=\${$name}"
+          if [ -z "${value}" ]; then
+            missing="${missing} ${name}"
+          fi
+        done
+
+        if [ -n "${missing}" ]; then
+          echo "::error::The repository variable(s)${missing} are unset or" \
+            "empty. Both are public build arguments for the frontend image," \
+            "not secrets: set them as repository variables. See the" \
+            "Deployment section of README.md."
+          exit 1
+        fi
+        echo "Both public frontend build values are set."
+
+    - name: Confirm every frontend import is a declared dependency
+      run: |
+        set -euo pipefail
+
+        # Report undeclared scoped frontend imports before the image build.
+        missing=""
+        while IFS= read -r package; do
+          [ -n "${package}" ] || continue
+          if ! grep -q "\"${package}\"" frontend/package.json; then
+            missing="${missing} ${package}"
+          fi
+        done < <(grep -rhoE "from '@[^']+'" frontend/src \
+              | sed -E "s/from '//; s/'$//" \
+              | cut -d/ -f1,2 | sort -u)
+
+        if [ -n "${missing}" ]; then
+          echo "::error::frontend/src imports package(s) that" \
+            "frontend/package.json does not declare:${missing}. The" \
+            "frontend image cannot build until they are declared. The" \
+            "frontend tree is read-only for this remediation, so this is" \
+            "reported at docs/security/DECISION_LOG.md rather than fixed" \
+            "here."
+          exit 1
+        fi
+        echo "Every scoped frontend import is declared."
+
+    - name: Confirm the frontend build values are populated
+      run: |
+        set -euo pipefail
+
+        # Both values are inlined into the browser bundle at build time, so
+        # an unset one produces an image that builds successfully and then
+        # cannot reach the API or open hosted checkout -- a failure that
+        # surfaces to an end user rather than to this pipeline. They are
+        # checked here, before anything is built, because an empty
+        # --build-arg is not an error to docker.
+        for name in REACT_APP_API_BASE_URL REACT_APP_PAYPAL_CLIENT_ID; do
+          eval "value=\${${name}:-}"
+          if [ -z "${value}" ]; then
+            echo "::error::The repository variable behind ${name} is not" \
+              "set. Both frontend build values are repository variables," \
+              "not secrets: set vars.REACT_APP_API_BASE_URL and" \
+              "vars.PAYPAL_CLIENT_ID. The same vars.PAYPAL_CLIENT_ID is" \
+              "read when the manifests are rendered, so one value reaches" \
+              "both the bundle and the backend configuration."
+            exit 1
+          fi
+        done
+        echo "Both frontend build values are populated."
+
+  # Deploy only the commit from a successful completed CI run.
+  verify:
+    name: Verify
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+    # A reusable workflow runs the definition its caller holds and, left to
+    # itself, checks out the caller's revision. The commit being released
+    # is passed in, and every checkout in that workflow resolves it, so the
+    # gate runs against that commit.
+    with:
+      verified_ref: ${{ github.event.workflow_run.head_sha }}
+    permissions:
+      contents: read
+
+  build:
+    name: Build and publish the images
+    outputs:
+      backend_digest: ${{ steps.digests.outputs.backend_digest }}
+      frontend_digest: ${{ steps.digests.outputs.frontend_digest }}
+    # Building and pushing needs registry reachability, not cluster
+    # reachability, so it runs on a hosted runner. Only the deploy job
+    # below has to sit inside the VPC.
+    runs-on: ubuntu-latest
+    needs: verify
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout the verified commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.workflow_run.head_sha }}
+
+    # Building before authenticating means no credential file exists in the
+    # workspace while an image is being built, so none can be captured into
+    # a layer. The ignore rules for gha-creds-*.json are the second control.
+    - name: Build Docker images
+      run: |
+        set -euo pipefail
+
+        REGISTRY="${REGISTRY_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${REGISTRY_REPOSITORY}"
+        echo "REGISTRY=${REGISTRY}" >> "$GITHUB_ENV"
+
+        # Each image is built from the Dockerfile and context
+        # infrastructure/docker/docker-compose.yml declares for it. Neither
+        # context carries a default Dockerfile, so -f is load-bearing:
+        # Dockerfile.backend copies requirements.txt from the root of its
+        # context and Dockerfile.frontend copies package-lock.json from the
+        # root of its own. The frontend receives the two non-secret build
+        # arguments its image declares, so the bundle is not built blind.
+        # Both come from the workflow environment, which resolves them from
+        # repository variables, and the preflight job has already refused
+        # the run if either is empty.
+        for name in REACT_APP_API_BASE_URL REACT_APP_PAYPAL_CLIENT_ID; do
+          eval "value=\${${name}:-}"
+          if [ -z "${value}" ]; then
+            echo "::error::${name} is empty at build time. The bundle" \
+              "would be published unable to reach the API or open hosted" \
+              "checkout."
+            exit 1
+          fi
+        done
+
+        docker build \
+          -f infrastructure/docker/Dockerfile.backend \
+          -t "$REGISTRY/backend:${VERIFIED_SHA}" \
+          ./backend
+        docker build \
+          -f infrastructure/docker/Dockerfile.frontend \
+          --build-arg "REACT_APP_API_BASE_URL=${REACT_APP_API_BASE_URL}" \
+          --build-arg "REACT_APP_PAYPAL_CLIENT_ID=${REACT_APP_PAYPAL_CLIENT_ID}" \
+          -t "$REGISTRY/frontend:${VERIFIED_SHA}" \
+          ./frontend
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+        # The action writes a short-lived credential file named
+        # gha-creds-*.json into the workspace. That name is excluded by
+        # .gitignore and by every .dockerignore in this repository, and the
+        # file is removed when the job finishes.
+        cleanup_credentials: true
 
     - name: Set up Google Cloud SDK
-      uses: google-github-actions/setup-gcloud@v0.2.1
+      uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
       with:
         project_id: ${{ env.PROJECT_ID }}
-        service_account_key: ${{ secrets.GCP_SA_KEY }}
-        export_default_credentials: true
 
-    - name: Authenticate with Google Cloud
+    - name: Configure Docker credential helper
       run: |
-        gcloud auth configure-docker
+        set -euo pipefail
+        # Artifact Registry. The retired container-registry host is named
+        # nowhere. The repository is
+        # infrastructure/terraform's google_artifact_registry_repository.
+        gcloud auth configure-docker "${REGISTRY_LOCATION}-docker.pkg.dev" --quiet
 
-    - name: Build and push Docker images
+    - name: Push Docker images
       run: |
-        docker build -t gcr.io/$PROJECT_ID/frontend:${{ github.sha }} ./frontend
-        docker build -t gcr.io/$PROJECT_ID/backend:${{ github.sha }} ./backend
-        docker push gcr.io/$PROJECT_ID/frontend:${{ github.sha }}
-        docker push gcr.io/$PROJECT_ID/backend:${{ github.sha }}
+        set -euo pipefail
+
+        # Publishing is the only step that needs the registry credential,
+        # so it is the only one that runs after authentication. No image
+        # layer is created while a credential file is in the workspace.
+        docker push "$REGISTRY/backend:${VERIFIED_SHA}"
+        docker push "$REGISTRY/frontend:${VERIFIED_SHA}"
+
+    - name: Resolve the published digests
+      id: digests
+      run: |
+        set -euo pipefail
+
+        REGISTRY="${REGISTRY_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${REGISTRY_REPOSITORY}"
+
+        # The registry is asked for the digest it stored, so the rollout
+        # names content rather than a tag. A tag can be moved after this
+        # run; a digest cannot.
+        for workload in backend frontend; do
+          reference="${REGISTRY}/${workload}:${VERIFIED_SHA}"
+          digest="$(gcloud artifacts docker images describe "$reference" \
+            --project="$PROJECT_ID" --quiet \
+            --format='value(image_summary.digest)')"
+
+          if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::the registry reported no digest for ${reference}."
+            exit 1
+          fi
+
+          echo "${workload}_digest=${digest}" >> "$GITHUB_OUTPUT"
+        done
+
+  deploy:
+    name: Deploy to GKE
+    needs: build
+    # Self-hosted runner inside the VPC. The control plane has no public
+    # endpoint, so this is the only place kubectl can reach it from. The
+    # preflight job refuses the run when this label is unset or names a
+    # GitHub-hosted image.
+    runs-on: ${{ vars.GKE_DEPLOY_RUNNER_LABEL }}
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout the verified commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        ref: ${{ github.event.workflow_run.head_sha }}
+
+    - name: Check the deployment inputs are present
+      run: |
+        set -euo pipefail
+        missing=""
+        for name in PROJECT_ID GKE_CLUSTER GKE_REGION; do
+          eval "value=\${$name:-}"
+          if [ -z "$value" ]; then
+            missing="$missing $name"
+          fi
+        done
+        if [ -n "$missing" ]; then
+          echo "Required deployment inputs are not set:$missing" >&2
+          exit 1
+        fi
+
+    - name: Validate the release target
+      run: |
+        set -euo pipefail
+
+        # Every value below reaches a gcloud or kubectl command line, so
+        # each one is matched whole against the form its own service
+        # accepts. A value carrying whitespace, a leading hyphen or a
+        # newline is refused here rather than parsed as an extra argument
+        # or option further down.
+        require() {
+          local name="$1"
+          local pattern="$2"
+          local value="${!name-}"
+
+          if [ -z "$value" ]; then
+            echo "::error::${name} is empty. Set it as the repository" \
+              "secret or variable this workflow reads."
+            exit 1
+          fi
+
+          if ! [[ $value =~ $pattern ]]; then
+            echo "::error::${name} does not match ${pattern}."
+            exit 1
+          fi
+        }
+
+        require PROJECT_ID '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'
+        require GKE_CLUSTER '^[a-z]([-a-z0-9]{0,38}[a-z0-9])?$'
+        require GKE_REGION '^[a-z]+-[a-z]+[0-9]$'
+        require K8S_NAMESPACE '^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'
+        require REGISTRY_LOCATION '^[a-z]+-[a-z]+[0-9]$'
+        require ARTIFACT_REGISTRY_REPOSITORY \
+          '^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'
+        require RELEASE_SHA '^[0-9a-f]{40}$'
+        require RELEASE_RUN '^[0-9]+-[0-9]+$'
+
+        registry="${REGISTRY_LOCATION}-docker.pkg.dev"
+        {
+          echo "REGISTRY_HOST=${registry}"
+          echo "IMAGE_PREFIX=${registry}/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPOSITORY}"
+          echo "EXPECTED_CONTEXT=gke_${PROJECT_ID}_${GKE_REGION}_${GKE_CLUSTER}"
+        } >> "$GITHUB_ENV"
+
+    - name: Check the deployment target is fully configured
+      run: |
+        set -euo pipefail
+
+        # An absent repository secret renders as an empty string, which
+        # would otherwise reach gcloud and kubectl as a missing flag
+        # value and target something unintended.
+        missing=""
+        for name in PROJECT_ID GKE_CLUSTER GKE_REGION K8S_NAMESPACE \
+                    REGISTRY_LOCATION REGISTRY_REPOSITORY; do
+          if [ -z "${!name:-}" ]; then
+            missing="$missing $name"
+          fi
+        done
+        if [ -n "$missing" ]; then
+          echo "the following deployment settings carry no value:$missing"
+          echo "each is supplied as a repository secret; see README.md"
+          exit 1
+        fi
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+        # The action removes the credential file it wrote as a post-step,
+        # which runs even when a step above has failed. The explicit removal
+        # at the end of this job is kept as well, so the file is gone whether
+        # the job ended normally or not.
+        cleanup_credentials: true
+
+    - name: Set up Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      with:
+        project_id: ${{ env.PROJECT_ID }}
+        install_components: gke-gcloud-auth-plugin
+
+    - name: Resolve the image references
+      env:
+        BACKEND_DIGEST: ${{ needs.build.outputs.backend_digest }}
+        FRONTEND_DIGEST: ${{ needs.build.outputs.frontend_digest }}
+      run: |
+        set -euo pipefail
+        : "${PROJECT_ID:?GCP_PROJECT_ID must be configured}"
+        : "${REGISTRY_LOCATION:?ARTIFACT_REGISTRY_LOCATION must be configured}"
+        : "${REGISTRY_REPOSITORY:?ARTIFACT_REGISTRY_REPOSITORY must be configured}"
+        : "${ARTIFACT_REGISTRY_REPOSITORY:?ARTIFACT_REGISTRY_REPOSITORY must be configured}"
+        gcloud auth configure-docker "${REGISTRY_LOCATION}-docker.pkg.dev" --quiet
+
+        registry="${REGISTRY_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPOSITORY}"
+
+        # The digests the build job read back from the registry. Each
+        # rendered manifest carries the image by digest, so a tag moved
+        # after that job cannot be resolved in its place.
+        backend_digest="${BACKEND_DIGEST:?the build job published no backend digest}"
+        frontend_digest="${FRONTEND_DIGEST:?the build job published no frontend digest}"
+        {
+          echo "REGISTRY=${registry}"
+          echo "BACKEND_IMAGE=${registry}/backend@${backend_digest}"
+          echo "FRONTEND_IMAGE=${registry}/frontend@${frontend_digest}"
+          # The migration Job name comes from its renderer, which folds the tag
+          # to the alphabet a Kubernetes name accepts, so the name
+          # applied and the name waited on are always one name.
+          echo "MIGRATION_JOB_NAME=$(scripts/render_kubernetes_manifests.sh job-name migration)"
+        } >> "$GITHUB_ENV"
+
+    - name: Configure the Docker credential helper
+      run: |
+        set -euo pipefail
+
+        # Reading a manifest back from the repository needs the same
+        # credential helper the build job configured. Nothing is built or
+        # pushed here: the build job above published this release, and
+        # this job rolls out the digests it recorded.
+        gcloud auth configure-docker "$REGISTRY_HOST" --quiet
 
     - name: Get GKE credentials
       run: |
-        gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE
+        set -euo pipefail
+
+        # --region matches the regional cluster Terraform declares. The
+        # control plane carries no external address, so this runner reaches
+        # it over the DNS-based endpoint, which authorizes by IAM rather
+        # than by source address and never resolves the public endpoint the
+        # cluster does not expose.
+        gcloud container clusters get-credentials "$GKE_CLUSTER" \
+          --region="$GKE_REGION" \
+          --project="$PROJECT_ID" \
+          --dns-endpoint \
+          --quiet
+
+        context="$(kubectl config current-context)"
+
+        if [ "$context" != "$EXPECTED_CONTEXT" ]; then
+          echo "::error::the active context is ${context} rather than" \
+            "${EXPECTED_CONTEXT}."
+          exit 1
+        fi
+
+        if ! kubectl get namespace "$K8S_NAMESPACE" \
+             --request-timeout=60s > /dev/null; then
+          echo "::error::namespace ${K8S_NAMESPACE} does not exist in" \
+            "${context}."
+          exit 1
+        fi
+
+    - name: Confirm the private control plane is reachable
+      run: |
+        set -euo pipefail
+
+        if ! kubectl version --request-timeout=30s > /dev/null; then
+          echo "The cluster control plane did not answer." >&2
+          echo "google_container_cluster.primary sets enable_private_endpoint," >&2
+          echo "so this job must run on a runner inside the cluster's VPC and" >&2
+          echo "that runner's CIDR must appear in" >&2
+          echo "var.gke_master_authorized_networks." >&2
+          exit 1
+        fi
+
+    - name: Check the release inventory
+      run: |
+        set -euo pipefail
+
+        # This workflow publishes into an inventory that already exists
+        # and creates no workload, so both Deployments and the container
+        # inside each are checked before anything is changed. The same
+        # inventory is the one scripts/deploy.sh addresses.
+        for workload in backend frontend; do
+          if ! kubectl get "deployment/${workload}" \
+            --namespace="$K8S_NAMESPACE" \
+            --request-timeout=60s > /dev/null; then
+            echo "::error::Deployment ${workload} does not exist in" \
+              "namespace ${K8S_NAMESPACE}."
+            exit 1
+          fi
+
+          containers="$(kubectl get "deployment/${workload}" \
+            --namespace="$K8S_NAMESPACE" \
+            --request-timeout=60s \
+            -o jsonpath='{.spec.template.spec.containers[*].name}')"
+
+          if [[ " ${containers} " != *" ${workload} "* ]]; then
+            echo "::error::Deployment ${workload} declares the containers" \
+              "[${containers}], none of which is named ${workload}."
+            exit 1
+          fi
+        done
+
+    - name: Apply the workload prerequisites
+      env:
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        BACKEND_GCP_SERVICE_ACCOUNT_EMAIL: ${{ secrets.BACKEND_GCP_SERVICE_ACCOUNT_EMAIL }}
+        BACKEND_ENVIRONMENT: ${{ vars.BACKEND_ENVIRONMENT }}
+        BACKEND_ALLOWED_ORIGINS: ${{ vars.BACKEND_ALLOWED_ORIGINS }}
+        BACKEND_ALLOWED_HOSTS: ${{ vars.BACKEND_ALLOWED_HOSTS }}
+        PAYPAL_CLIENT_ID: ${{ vars.PAYPAL_CLIENT_ID }}
+        PAYPAL_MODE: ${{ vars.PAYPAL_MODE }}
+        PAYPAL_API_BASE: ${{ vars.PAYPAL_API_BASE }}
+        PAYPAL_RETURN_URL: ${{ vars.PAYPAL_RETURN_URL }}
+        PAYPAL_CANCEL_URL: ${{ vars.PAYPAL_CANCEL_URL }}
+        ZILLOW_API_URL: ${{ vars.ZILLOW_API_URL }}
+        FROM_EMAIL: ${{ vars.FROM_EMAIL }}
+      run: |
+        set -euo pipefail
+
+        # The namespace, the two service accounts, the settings map and the
+        # Secret Manager provider class. None of them carries a serving
+        # image, so applying them starts nothing. Every credential the
+        # backend reads is fetched by the provider class at pod start from
+        # Secret Manager, using the workload identity of the backend
+        # service account; nothing here reads or carries a credential.
+        scripts/render_kubernetes_manifests.sh prerequisites \
+          | kubectl apply --request-timeout=60s -f -
+
+    # Runs after the prerequisites, which create the namespace the secret
+    # below is created in.
+    - name: Publish the shared rate-limit store address
+      env:
+        # One name for the setting the application reads, the Secret Manager
+        # secret_id infrastructure/terraform/main.tf creates and the key
+        # inside the Kubernetes secret, and one name for that secret --
+        # which is what infrastructure/kubernetes/40-backend.yaml references.
+        RATE_LIMIT_SETTING: RATE_LIMIT_STORAGE_URI
+        RATE_LIMIT_STORE_SECRET: backend-rate-limit-store
+      run: |
+        set -euo pipefail
+
+        # The application refuses a rate-limit store held inside one process
+        # under any environment other than local, so the workload reads the
+        # shared store's address from this secret. Terraform provisions the
+        # store and writes the assembled address into Secret Manager; this
+        # step copies it into the Kubernetes secret the workload references,
+        # so the value reaches no manifest, no command line and no log.
+        umask 077
+        work="$(mktemp -d)"
+        cleanup() {
+          rm -rf "$work"
+        }
+        trap cleanup EXIT
+        address="$work/$RATE_LIMIT_SETTING"
+
+        gcloud secrets versions access latest \
+          --secret="$RATE_LIMIT_SETTING" \
+          --project="$PROJECT_ID" > "$address"
+
+        if [ ! -s "$address" ]; then
+          echo "Secret Manager secret $RATE_LIMIT_SETTING carries no value"
+          exit 1
+        fi
+
+        # An in-process scheme is refused here, before any pod starts.
+        if grep -Eq '^(bounded-memory|memory|async\+memory)://' "$address"; then
+          echo "$RATE_LIMIT_SETTING names a store held inside one process;"
+          echo "it must name storage shared by every process"
+          exit 1
+        fi
+
+        # Both halves name the namespace: neither the kubeconfig this job
+        # writes nor the cluster's default context carries one, so a secret
+        # created without it lands in the default namespace instead of
+        # beside the workloads, where no pod reads it.
+        kubectl create secret generic "$RATE_LIMIT_STORE_SECRET" \
+          --namespace="$K8S_NAMESPACE" \
+          --from-file="$RATE_LIMIT_SETTING=$address" \
+          --dry-run=client -o yaml \
+          | kubectl apply --namespace="$K8S_NAMESPACE" \
+              --request-timeout=60s -f -
+
+    - name: Apply database migrations
+      env:
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      run: |
+        set -euo pipefail
+
+        # BACKEND_IMAGE and IMAGE_TAG are the digest reference and the
+        # verified commit the resolve step recorded, so the migration runs
+        # the same content the rollout below does.
+        JOB_NAME="${MIGRATION_JOB_NAME:?the resolve step recorded no job name}"
+
+        # The job reads the same settings map and the same provider class
+        # the backend reads, so it applies to a first deployment as well as
+        # to a later one. Nothing is copied from a running Deployment.
+        scripts/render_kubernetes_manifests.sh migration \
+          | kubectl apply --request-timeout=60s -f -
+
+        if ! kubectl -n "$K8S_NAMESPACE" wait "job/$JOB_NAME" \
+            --for=condition=complete --timeout=15m; then
+          echo "alembic upgrade head did not complete." >&2
+          if ! kubectl -n "$K8S_NAMESPACE" logs "job/$JOB_NAME" \
+               --tail=200 --request-timeout=60s; then
+            echo "logs for $JOB_NAME were not retrievable" >&2
+          fi
+          if ! kubectl -n "$K8S_NAMESPACE" describe "job/$JOB_NAME" \
+               --request-timeout=60s; then
+            echo "$JOB_NAME was not describable" >&2
+          fi
+          exit 1
+        fi
+
+        kubectl -n "$K8S_NAMESPACE" logs "job/$JOB_NAME" \
+          --tail=200 --request-timeout=60s
+
+    # Gives the seeded administrator a credential, replacing the value
+    # 0002_seed_single_admin.py stores, which no password produces. It
+    # runs only when the PROVISION_ADMIN_CREDENTIAL repository variable
+    # is true, after the migration step that creates the account.
+    # Repeating it is safe: the module leaves a credential already in
+    # place alone unless ADMIN_CREDENTIAL_RESET is true.
+    - name: Provision the administrator credential
+      if: vars.PROVISION_ADMIN_CREDENTIAL == 'true'
+      env:
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        ADMIN_PROVISIONER_GCP_SERVICE_ACCOUNT_EMAIL: ${{ secrets.ADMIN_PROVISIONER_GCP_SERVICE_ACCOUNT_EMAIL }}
+        ADMIN_CREDENTIAL_RESET: ${{ vars.ADMIN_CREDENTIAL_RESET || 'false' }}
+      run: |
+        set -euo pipefail
+
+        # The name the rendered Job carries, taken from the renderer that
+        # renders it, so the object applied is the object waited on.
+        JOB_NAME="$(scripts/render_kubernetes_manifests.sh job-name admin-credential)"
+
+        # A completed Job is retained by ttlSecondsAfterFinished and a Job's
+        # pod template cannot be changed in place, so a reset on an image tag
+        # that has already provisioned would be refused. Any previous run of
+        # this name is removed first and its removal confirmed, so the apply
+        # below creates the object it then waits on.
+        if kubectl -n "$K8S_NAMESPACE" get "job/$JOB_NAME" \
+             --request-timeout=60s >/dev/null 2>&1; then
+          kubectl -n "$K8S_NAMESPACE" delete "job/$JOB_NAME" \
+            --wait=true --timeout=5m --request-timeout=60s
+        fi
+        if kubectl -n "$K8S_NAMESPACE" get "job/$JOB_NAME" \
+             --request-timeout=60s >/dev/null 2>&1; then
+          echo "$JOB_NAME still exists after deletion; it was not" \
+            "recreated." >&2
+          exit 1
+        fi
+
+        # The credential is delivered by its own Secret Manager secret
+        # under its own identity, so no credential is written into a
+        # Kubernetes Secret and the serving workload cannot read it.
+        scripts/render_kubernetes_manifests.sh admin-credential \
+          | kubectl apply --request-timeout=60s -f -
+
+        if ! kubectl -n "$K8S_NAMESPACE" wait "job/$JOB_NAME" \
+            --for=condition=complete --timeout=15m; then
+          echo "administrator credential provisioning did not complete." >&2
+          if ! kubectl -n "$K8S_NAMESPACE" logs "job/$JOB_NAME" \
+               --tail=200 --request-timeout=60s; then
+            echo "logs for $JOB_NAME were not retrievable" >&2
+          fi
+          if ! kubectl -n "$K8S_NAMESPACE" describe "job/$JOB_NAME" \
+               --request-timeout=60s; then
+            echo "$JOB_NAME was not describable" >&2
+          fi
+          exit 1
+        fi
+
+        kubectl -n "$K8S_NAMESPACE" logs "job/$JOB_NAME" \
+          --tail=200 --request-timeout=60s
+
+    - name: Confirm the workload identity annotation names the runtime account
+      run: |
+        set -euo pipefail
+
+        annotated="$(kubectl get serviceaccount "$K8S_SERVICE_ACCOUNT" \
+          --namespace "$K8S_NAMESPACE" \
+          --request-timeout=60s \
+          -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}')"
+
+        if [ "$annotated" != "$BACKEND_RUNTIME_SERVICE_ACCOUNT" ]; then
+          echo "Service account $K8S_SERVICE_ACCOUNT in namespace $K8S_NAMESPACE" >&2
+          echo "is annotated for '${annotated:-nothing}' rather than" >&2
+          echo "'$BACKEND_RUNTIME_SERVICE_ACCOUNT', so the workloads cannot read" >&2
+          echo "the Secret Manager secrets bound to that account." >&2
+          exit 1
+        fi
+        echo "workload identity annotation names $annotated"
 
     - name: Deploy to GKE
+      env:
+        GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        BACKEND_GCP_SERVICE_ACCOUNT_EMAIL: ${{ secrets.BACKEND_GCP_SERVICE_ACCOUNT_EMAIL }}
+        FRONTEND_SERVICE_TYPE: ${{ vars.FRONTEND_SERVICE_TYPE }}
+        BACKEND_REPLICAS: ${{ vars.BACKEND_REPLICAS }}
+        FRONTEND_REPLICAS: ${{ vars.FRONTEND_REPLICAS }}
       run: |
-        kubectl set image deployment/frontend frontend=gcr.io/$PROJECT_ID/frontend:${{ github.sha }}
-        kubectl set image deployment/backend backend=gcr.io/$PROJECT_ID/backend:${{ github.sha }}
+        set -euo pipefail
 
-    - name: Update database schema
-      run: |
-        # HUMAN ASSISTANCE NEEDED
-        # Add commands to update database schema if necessary
-        # Example: kubectl exec -it $(kubectl get pod -l app=backend -o jsonpath="{.items[0].metadata.name}") -- npm run migrate
+        # The serving images change only here, after the migration above
+        # has completed, so the new code never reads a schema the
+        # migration has not reached. The manifests carry this release's
+        # image, so applying them is what rolls it out; no separate image
+        # mutation is issued.
+        scripts/render_kubernetes_manifests.sh workloads \
+          | kubectl apply --request-timeout=60s -f -
 
     - name: Run post-deployment health checks
+      env:
+        BACKEND_DIGEST: ${{ needs.build.outputs.backend_digest }}
+        FRONTEND_DIGEST: ${{ needs.build.outputs.frontend_digest }}
       run: |
-        # HUMAN ASSISTANCE NEEDED
-        # Add commands to run health checks
-        # Example: 
-        # kubectl rollout status deployment/frontend
-        # kubectl rollout status deployment/backend
-        # Add additional health check commands as needed
+        set -euo pipefail
+
+        kubectl -n "$K8S_NAMESPACE" rollout status deployment/frontend \
+          --timeout=10m
+        kubectl -n "$K8S_NAMESPACE" rollout status deployment/backend \
+          --timeout=10m
+
+        # What each container reports it is running, rather than the tag
+        # that was asked for. A tag moved between the build job and now
+        # would be visible here as a digest that does not match.
+        # The pod selector is read from the Deployment that owns the pods,
+        # so it is whatever the manifests label them with. A selector
+        # restated here would match nothing the moment the manifests
+        # labelled their pods differently, and an empty match reads back as
+        # an empty digest -- a rollout reported failed after the workloads
+        # have already changed.
+        pod_selector() {
+          local workload="$1"
+          local selector
+
+          # The braces and dollars below are Go template syntax read by
+          # kubectl, so the quotes stay single and the shell expands none
+          # of it.
+          # shellcheck disable=SC2016
+          selector="$(kubectl get "deployment/${workload}" \
+            --namespace="$K8S_NAMESPACE" \
+            --request-timeout=60s \
+            -o go-template='{{range $key, $value := .spec.selector.matchLabels}}{{$key}}={{$value}},{{end}}')"
+          selector="${selector%,}"
+
+          if [ -z "${selector}" ]; then
+            echo "::error::deployment/${workload} declares no pod selector," \
+              "so what is running cannot be read back."
+            exit 1
+          fi
+
+          printf '%s' "${selector}"
+        }
+
+        verify_digest() {
+          local workload="$1"
+          local expected="$2"
+          local selector
+          local running
+
+          selector="$(pod_selector "${workload}")"
+
+          running="$(kubectl get pods \
+            --namespace="$K8S_NAMESPACE" \
+            --selector="${selector}" \
+            --request-timeout=60s \
+            -o jsonpath='{.items[*].status.containerStatuses[*].imageID}')"
+
+          if [ -z "${running}" ]; then
+            echo "::error::no ${workload} container matching [${selector}]" \
+              "reports an image, so ${expected} cannot be confirmed running."
+            exit 1
+          fi
+
+          if [[ " ${running} " != *"${expected}"* ]]; then
+            echo "::error::${workload} reports imageID [${running}]," \
+              "which does not carry ${expected}."
+            exit 1
+          fi
+
+          echo "${workload} matched by [${selector}] reports ${expected}"
+        }
+
+        verify_digest backend "$BACKEND_DIGEST"
+        verify_digest frontend "$FRONTEND_DIGEST"
+
+        # Probes the readiness route rather than the liveness route, so a
+        # rollout whose database, secrets or network path are unusable
+        # fails here instead of being reported as healthy.
+        kubectl port-forward deployment/backend 8000:8000 \
+          --namespace="$K8S_NAMESPACE" &
+        forward_pid=$!
+        cleanup() {
+          kill "$forward_pid" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+
+        sleep 5
+
+        # Liveness answers once the process is serving. It is retried because
+        # the forward and the new pods settle at their own pace.
+        answered=""
+        deadline=$(( SECONDS + 120 ))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          if curl --fail --silent --show-error \
+               --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+               --max-time "$CURL_MAX_TIME" \
+               http://127.0.0.1:8000/health/ready; then
+            answered="yes"
+            break
+          fi
+          echo "readiness probe did not answer, retrying"
+          sleep 5
+        done
+
+        if [ -z "$answered" ]; then
+          echo "::error::the backend readiness endpoint did not answer on" \
+            "127.0.0.1:8000/health/ready"
+          echo "liveness answered:"
+          curl --silent --show-error \
+            --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+            --max-time "$CURL_MAX_TIME" \
+            http://127.0.0.1:8000/health || true
+          exit 1
+        fi
+
+        # Readiness reads the database through the connection string the
+        # Secret Manager secret carries, so an answer here is the deployed
+        # identity having read that secret.
+        curl --fail --silent --show-error \
+          --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+          --max-time "$CURL_MAX_TIME" \
+          http://127.0.0.1:8000/health/ready
+
+    - name: Confirm no public principal may invoke the Cloud Function
+      if: env.CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED == 'true'
+      run: |
+        set -euo pipefail
+
+        FUNCTION_NAME="$(gcloud functions describe "$CLOUD_FUNCTION_NAME" \
+          --region "$GKE_REGION" --format="value(name)")"
+        echo "checking the invoker policy of $FUNCTION_NAME"
+
+        public="$(gcloud functions get-iam-policy "$CLOUD_FUNCTION_NAME" \
+          --region "$GKE_REGION" --format=json \
+          | jq -r '[.bindings[]?
+                    | select(.role == "roles/cloudfunctions.invoker")
+                    | .members[]?
+                    | select(. == "allUsers" or . == "allAuthenticatedUsers")]
+                   | join(",")')"
+
+        if [ -n "$public" ]; then
+          echo "The Cloud Function still grants roles/cloudfunctions.invoker to" >&2
+          echo "$public. Apply google_cloudfunctions_function_iam_binding.invoker," >&2
+          echo "which replaces the role's whole member list." >&2
+          exit 1
+        fi
+        echo "no public principal holds roles/cloudfunctions.invoker"
+
+    # A skipped step with no explanation reads as a check that passed. This
+    # says which decision suppressed it, in the same terms
+    # scripts/deploy.sh reports its own unperformed function step.
+    - name: Report the Cloud Function check as not performed
+      if: env.CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED != 'true'
+      run: |
+        set -euo pipefail
+
+        echo "The Cloud Function invoker check was not performed."
+        echo "CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED is" \
+          "\"$CLOUD_FUNCTION_DEPLOYMENT_AUTHORIZED\", so Terraform creates" \
+          "no function and there is no invoker policy to read."
+        echo "Set the repository variable of that name to \"true\" once a" \
+          "release owner has decided the runtime conflict recorded as O-3" \
+          "in docs/security/RESIDUAL_RISK.md."
+
+    - name: Remove the generated credential file
+      if: always()
+      run: |
+        set -euo pipefail
+        rm -f gha-creds-*.json
+        rm -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" 2>/dev/null || true
+        echo "removed any credential file the authentication step wrote"

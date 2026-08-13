@@ -1,0 +1,117 @@
+# One-shot schema migration.
+#
+# The job runs `alembic upgrade head` from the same image the backend
+# serves from, reading the backend-config ConfigMap the backend reads and
+# one credential of its own: the Secret Manager CSI mount below is the
+# backend-database class declared by 35-migration-secrets.yaml, which
+# carries DATABASE_URL alone rather than the six of
+# 30-backend-secrets.yaml. It copies nothing from a running Deployment, so
+# it applies to a first deployment as well as to a later one.
+#
+# The name is derived from ${IMAGE_TAG} by
+# `scripts/render_kubernetes_manifests.sh job-name migration`, which folds
+# the tag to the alphabet and length a Kubernetes object name accepts. Both
+# delivery paths ask that script for the name they apply, wait on, read logs
+# from and describe, so all of them name this object. One name per release,
+# so the record of a previous release's migration is retained; a job that
+# has already run to completion for a tag is left alone rather than
+# replaced.
+#
+# The deployment path waits for this job to succeed before it changes any
+# serving image, so the new code never reads a schema the migration has
+# not reached.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${MIGRATION_JOB_NAME}
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: backend-migrate
+    app.kubernetes.io/part-of: apartment-finder
+spec:
+  # Wall-clock bound on the whole Job, matching the wait the two delivery
+  # paths place on it, so a migration that never finishes stops itself at
+  # the moment the release gives up on it rather than staying live behind a
+  # release that has already been reported as failed. One statement inside
+  # the run is bounded separately, by the
+  # DB_MIGRATION_STATEMENT_TIMEOUT_SECONDS entry of backend-config, which is
+  # below this deadline: a stalled schema statement is cancelled by the
+  # server while the Job is still able to report why it failed.
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend-migrate
+        app.kubernetes.io/part-of: apartment-finder
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${MIGRATION_SERVICE_ACCOUNT}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ${BACKEND_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              for name in DATABASE_URL; do
+                file="/var/run/secrets/backend/$name"
+                if [ ! -s "$file" ]; then
+                  echo "secret $name was not mounted at $file" >&2
+                  exit 1
+                fi
+                export "$name=$(cat "$file")"
+              done
+              exec python -m alembic -c backend/alembic.ini upgrade head
+          # The non-credential configuration map alone. The run resolves
+          # the database URL, the connection bounds and the schema
+          # statement bound and reads no other setting, so the shared
+          # rate-limit address the serving pods are given is not among
+          # the values this pod receives. This container is one of the two
+          # SETTINGS_FREE_CONTAINERS in
+          # .github/scripts/check_manifest_settings_contract.py, which is
+          # what keeps that gate and this omission in step.
+          envFrom:
+            - configMapRef:
+                name: backend-config
+                optional: false
+          env:
+            - name: ENV_FILE
+              value: ""
+          volumeMounts:
+            - name: backend-database
+              mountPath: /var/run/secrets/backend
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: backend-database
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: backend-database
+        - name: tmp
+          emptyDir: {}
